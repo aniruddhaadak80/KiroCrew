@@ -26,7 +26,8 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.constants import OPTIONS_RE_TRAILER
-from kiro_crew.messaging.renderer import Renderer, chunk_text
+from kiro_crew.messaging.renderer import Renderer
+from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 
 if TYPE_CHECKING:
@@ -111,7 +112,13 @@ class TeamsRenderer(Renderer):
         await self._client.send_typing(self._conversation_id, self._service_url)
         self._last_typing = now
 
-    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
+    async def on_prompt_choice(
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+    ) -> None:
         # Driver only dispatches prompt_choice for INTERACTIVE + a decider, and
         # Teams runs decider-less (deny-by-default) -- safe no-op.
         logger.debug("Teams: prompt_choice ignored (no interactive buttons)")
@@ -125,7 +132,9 @@ class TeamsRenderer(Renderer):
         self._finalized = True
         ok = stop_reason != "error"
         content = self.text() or ("…" if ok else _ERROR_TEXT)
-        chunks = chunk_text(content, self.capabilities.max_message_chars) or ["…"]
+        # Fence-safe, not a fixed-width slice: a cut through a code block leaves
+        # the next part with no opener, so every line in it renders as prose.
+        chunks = split_markdown_safe(content, self.capabilities.max_message_chars) or ["…"]
         for chunk in chunks:
             sent = await self._client.send_message(
                 self._conversation_id, chunk, self._service_url
