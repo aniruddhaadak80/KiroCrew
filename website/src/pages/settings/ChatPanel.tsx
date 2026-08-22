@@ -153,6 +153,7 @@ export function ChatPanel() {
     session?: { autocompact_pct?: number }
     session_summary?: { enabled?: boolean }
     agent?: {
+      acp_backend?: string
       model?: string
       role_models?: { background?: string; subagent?: string }
       role_efforts?: { background?: string; subagent?: string }

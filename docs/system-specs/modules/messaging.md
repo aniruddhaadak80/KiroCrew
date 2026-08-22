@@ -267,12 +267,16 @@ abstraction Slack uses, so one bot serves many parallel, topic-scoped sessions
 
 A message that arrives while a turn is still generating is not a new turn: the
 session semaphore is held, so running it directly would either block or open a
-second conversation against the same key. Two channels carry the full
-steer/queue/drain machinery, `telegram/transport_dispatch.py` and
-`discord/transport_dispatch.py`; both read the same
+second conversation against the same key. Discord and Telegram carry the full
+steer/queue/drain machinery (`telegram/transport_dispatch.py`,
+`discord/transport_dispatch.py`); both read the same
 `messaging.queue_mode` (`config/loader.py`, `"steer"` | `"queue"`, anything
 else normalized to `steer`) and both implement the same three primitives
 (`_handle_busy`, `_enqueue_with_receipt` + `_drain_queue`, `_handle_stop`).
+Slack uses `slack.handler.inject_busy_followup`: when `supports_steer` is
+true (kiro + KAS) it folds immediately; when it is not (spec adapters) it
+enqueues a follow-up and returns without waiting on the session semaphore.
+Spec adapters stay out of `ACP_BACKENDS_STEER`.
 
 The **channel-neutral half of the queue receipt is shared**, not duplicated:
 `messaging/queue_receipt.py` owns the receipt registry, the lock, the three

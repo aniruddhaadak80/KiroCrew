@@ -105,6 +105,7 @@ describe('AcpBackendCard', () => {
     renderCard()
     expect(await screen.findByRole('radio', { name: 'Kiro CLI' })).toBeTruthy()
     expect(screen.getByRole('radio', { name: 'OpenAI Codex' })).toBeTruthy()
+    expect(api.acpBackends).toHaveBeenCalledWith({ probe: true })
   })
 
   it('does NOT render a row for an unselectable backend', async () => {

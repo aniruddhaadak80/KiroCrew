@@ -109,11 +109,11 @@ def _resolve_owned_adapter(
     if descriptor.id == ACP_BACKEND_CODEX:
         from kiro_crew.acp import codex
 
-        return codex.resolve_argv(), codex.missing_adapter_message()
+        return codex.resolve_argv_cached(), codex.missing_adapter_message()
     if descriptor.id == ACP_BACKEND_CLAUDE:
-        from kiro_crew.acp.client import _resolve_claude_acp_bin
+        from kiro_crew.acp.client import _resolve_claude_acp_bin_cached
 
-        argv = _resolve_claude_acp_bin()
+        argv = _resolve_claude_acp_bin_cached()
         missing = (
             "claude-agent-acp not found. Install with "
             f"`{descriptor.install_command}`, or set CLAUDE_AGENT_ACP_BIN "
@@ -123,15 +123,15 @@ def _resolve_owned_adapter(
     if descriptor.id == ACP_BACKEND_GOOSE:
         from kiro_crew.acp import goose
 
-        return goose.resolve_argv(), goose.missing_adapter_message()
+        return goose.resolve_argv_cached(), goose.missing_adapter_message()
     if descriptor.id == ACP_BACKEND_OPENCODE:
         from kiro_crew.acp import opencode
 
-        return opencode.resolve_argv(), opencode.missing_adapter_message()
+        return opencode.resolve_argv_cached(), opencode.missing_adapter_message()
     if descriptor.id == ACP_BACKEND_PI:
         from kiro_crew.acp import pi
 
-        return pi.resolve_argv(), pi.missing_adapter_message()
+        return pi.resolve_argv_cached(), pi.missing_adapter_message()
     return None, ""
 
 
@@ -224,7 +224,9 @@ def _report_capabilities(backend: str, emit: Callable[[str], None]) -> None:
     emit(f"  capabilities: ⏹ {len(rows)} differ from kiro-cli or are unverified")
     for row in rows:
         emit(f"               - {row}")
-    if backend == ACP_BACKEND_PI:
+    from kiro_crew.acp import spec_servers
+
+    if spec_servers.crew_mcp_forwarding_unverified(backend):
         emit("  crew mcp:    ⏹ delivered on session/new; official pi-acp may")
         emit("               not forward those tools to the model, so spawn")
         emit("               and Crew tools can stay inert until it does.")

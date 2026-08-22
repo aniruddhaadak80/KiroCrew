@@ -215,7 +215,7 @@ def test_routing_records_how_each_backend_reaches_the_gate() -> None:
     assert backends.descriptor_for(ACP_BACKEND_CLAUDE).routing is Routing.SEEDED_SETTINGS
     assert backends.descriptor_for(ACP_BACKEND_CODEX).routing is Routing.SESSION_CONFIG
     assert backends.descriptor_for(ACP_BACKEND_GOOSE).routing is Routing.PERMISSION_REQUEST
-    assert backends.descriptor_for(ACP_BACKEND_OPENCODE).routing is Routing.PERMISSION_REQUEST
+    assert backends.descriptor_for(ACP_BACKEND_OPENCODE).routing is Routing.SEEDED_SETTINGS
     assert backends.descriptor_for(ACP_BACKEND_PI).routing is Routing.PERMISSION_REQUEST
 
 

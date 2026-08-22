@@ -42,12 +42,18 @@ class RecordingSlackClient(SlackClientOps):
         self.transcript.append((method, kw))
 
     # -- abstract methods --
-    async def post_message(self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None) -> str:
+    async def post_message(
+        self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ) -> str:
         self._rec("post_message", channel=channel, text=text, thread_ts=thread_ts)
         return self._next_ts()
 
-    async def post_blocks(self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None) -> str:
-        self._rec("post_blocks", channel=channel, text=text, thread_ts=thread_ts, n_blocks=len(blocks))
+    async def post_blocks(
+        self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ) -> str:
+        self._rec(
+            "post_blocks", channel=channel, text=text, thread_ts=thread_ts, n_blocks=len(blocks)
+        )
         return self._next_ts()
 
     async def update_message(self, channel, ts, text="", blocks=None) -> None:
@@ -76,7 +82,9 @@ class RecordingSlackClient(SlackClientOps):
         self._rec("views_publish", user_id=user_id)
 
     # -- streaming + assistant API (default impls in ABC; recorded here) --
-    async def start_stream(self, channel, thread_ts, initial_text=None, team_id=None, user_id=None) -> str | None:
+    async def start_stream(
+        self, channel, thread_ts, initial_text=None, team_id=None, user_id=None
+    ) -> str | None:
         self._rec("start_stream", channel=channel, thread_ts=thread_ts)
         if self.stream_disabled:
             return None
@@ -107,7 +115,9 @@ class RecordingSlackClient(SlackClientOps):
         self._rec("fetch_message", channel=channel, ts=ts)
         return None
 
-    async def fetch_thread_replies(self, channel, thread_ts, limit=200, warn_on_pagination=True) -> list[dict]:
+    async def fetch_thread_replies(
+        self, channel, thread_ts, limit=200, warn_on_pagination=True
+    ) -> list[dict]:
         self._rec("fetch_thread_replies", channel=channel, thread_ts=thread_ts)
         return []
 
@@ -168,6 +178,15 @@ class FakeSessions:
 
     def get_provider(self, session_key):
         return "acp"
+
+    def is_busy(self, session_key):
+        return False
+
+    def enqueue(self, session_key, msg_ts, text, *, force=False, **kwargs):
+        return False
+
+    def dequeue(self, session_key):
+        return None
 
     def record_success(self, session_key):
         return None

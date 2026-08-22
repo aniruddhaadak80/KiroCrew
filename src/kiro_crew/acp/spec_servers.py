@@ -45,6 +45,8 @@ import hashlib
 import logging
 import re
 
+from kiro_crew.acp.types import ACP_BACKEND_PI
+
 logger = logging.getLogger(__name__)
 
 #: Keys a strict spec-adapter deserializer accepts on an ``mcpServers`` entry.
@@ -230,6 +232,16 @@ def pin_session_callback_env(
     return pinned
 
 
+def crew_mcp_forwarding_unverified(backend: str) -> bool:
+    """True when Crew MCP is delivered on the wire but forwarding is unverified.
+
+    Official pi-acp accepts ``mcpServers`` on ``session/new`` and may not
+    wire them through to the agent. Delivery still happens when ROUTED;
+    do not treat spawn or Crew tools as verified on that backend.
+    """
+    return backend == ACP_BACKEND_PI
+
+
 def entry_is_spec_legal(entry: dict) -> bool:
     """Whether ``entry`` satisfies ``McpServerStdio``'s required field set.
 
@@ -242,6 +254,7 @@ def entry_is_spec_legal(entry: dict) -> bool:
 
 __all__ = [
     "SPEC_STDIO_SERVER_KEYS",
+    "crew_mcp_forwarding_unverified",
     "entry_is_spec_legal",
     "managed_spec_servers",
     "merge_session_servers",

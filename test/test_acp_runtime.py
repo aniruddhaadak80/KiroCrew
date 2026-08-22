@@ -334,6 +334,45 @@ async def test_ownerless_request_answered_once_not_broadcast():
 
 
 @pytest.mark.asyncio
+async def test_ownerless_permission_request_answered_once_not_enqueued():
+    """A permission REQUEST with no sessionId is not approved on any handle."""
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "sA", "sB")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "id": 9001,
+                "method": "session/request_permission",
+                "params": {
+                    "toolCall": {"title": "shell"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                    ],
+                },
+            },
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        replies = [json.loads(call.args[0].decode()) for call in proc.stdin.write.call_args_list]
+        errors = [r for r in replies if r.get("id") == 9001 and "error" in r]
+        assert len(errors) == 1, f"expected exactly one reply, got {replies}"
+        assert errors[0]["error"]["code"] == -32601
+        selected = [
+            r
+            for r in replies
+            if r.get("id") == 9001
+            and (r.get("result") or {}).get("outcome", {}).get("outcome") == "selected"
+        ]
+        assert selected == []
+        assert q["sA"].empty()
+        assert q["sB"].empty()
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
 async def test_ownerless_response_with_null_result_is_not_answered():
     """An id-carrying frame with NO method is a response, not a request.
 
@@ -1274,12 +1313,14 @@ async def test_handle_approve_tool():
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
-    handle._permission_options["req-7"] = {"allow_always": "allow_always"}
+    handle._permission_options["req-7"] = {
+        "allow_once": "allow_once",
+        "allow_always": "allow_always",
+    }
     await handle.approve_tool("req-7", option_id="allow_always", always=True)
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["id"] == "req-7"
-    assert sent["result"]["outcome"]["outcome"] == "selected"
-    assert sent["result"]["outcome"]["optionId"] == "allow_always"
+    assert sent["result"]["outcome"]["outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -4672,6 +4713,7 @@ async def test_handle_steer_stamps_write_time_and_provider_passes_it_through():
     early, so a refused steer must not move it.
     """
     rt = MagicMock()
+    rt.acp_backend = ACP_BACKEND_KIRO
 
     async def _send_request(method, params):
         return 1

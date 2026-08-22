@@ -87,6 +87,18 @@ describe('useAvailableModels placeholder before the first fetch resolves', () =>
       { wrapper },
     )
     await waitFor(() => expect(result.current.map((m) => m.name)).toEqual(['gpt-5.6-sol']))
-    expect(fetchAvailableModels).toHaveBeenCalledWith({ slot: 'chat-1' })
+    expect(fetchAvailableModels).toHaveBeenCalledWith({ slot: 'chat-1', scope: 'slot:chat-1' })
+  })
+
+  it('withholds auto for the sidebar bulk switcher on an adapter live session', () => {
+    // ChatSidebar now passes the live slot + harness. The first paint must not
+    // offer Auto when that harness does not serve it.
+    fetchAvailableModels.mockReturnValue(new Promise(() => {}))
+    const { result } = renderHook(
+      () => useAvailableModels({ enabled: true, slot: 'chat-9', backend: 'opencode' }),
+      { wrapper },
+    )
+    expect(result.current).toEqual([])
+    expect(fetchAvailableModels).toHaveBeenCalledWith({ slot: 'chat-9', scope: 'slot:chat-9' })
   })
 })

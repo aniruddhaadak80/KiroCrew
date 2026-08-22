@@ -822,8 +822,10 @@ class TestAcpClientBackendSelection:
         import kiro_crew.acp.client as _mod
 
         _mod._claude_acp_argv_cache = _mod._UNRESOLVED
+        _mod._claude_code_executable_cache = _mod._UNRESOLVED
         yield
         _mod._claude_acp_argv_cache = _mod._UNRESOLVED
+        _mod._claude_code_executable_cache = _mod._UNRESOLVED
 
     @pytest.fixture(autouse=True)
     def _no_cgroup_scope(self):
@@ -908,6 +910,34 @@ class TestAcpClientBackendSelection:
             assert argv[0] == "/usr/bin/kiro-cli"
             assert argv[1] == "acp"
             assert "--agent" in argv
+
+        await _stop_stderr_drain(client)
+
+    @pytest.mark.asyncio
+    async def test_spawn_kiro_does_not_resolve_claude_code_executable(self, tmp_path):
+        """H9: the kiro arm must not pay for Claude's mise/PATH lookup."""
+        client = AcpClient(work_dir=tmp_path)
+        with (
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+            patch(
+                "kiro_crew.acp.client.wrap_argv",
+                side_effect=lambda argv, mode, **kwargs: (argv, None),
+            ),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+            patch("kiro_crew.acp.client._resolve_claude_code_executable") as resolve_exe,
+            patch("kiro_crew.acp.client._resolve_claude_spawn_bins") as spawn_bins,
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+            resolve_exe.assert_not_called()
+            spawn_bins.assert_not_called()
 
         await _stop_stderr_drain(client)
 
@@ -1252,6 +1282,44 @@ class TestResolveClaudeCodeExecutable:
         monkeypatch.setattr(client_mod, "_mise_which", lambda tool: None)
         monkeypatch.setattr(client_mod.shutil, "which", lambda name, path=None: None)
         assert client_mod._resolve_claude_code_executable() is None
+
+    def test_cached_success_skips_mise(self, tmp_path, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        client_mod._claude_code_executable_cache = client_mod._UNRESOLVED
+        exe = tmp_path / "claude"
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        calls = {"n": 0}
+
+        def fake_mise(tool: str) -> str:
+            calls["n"] += 1
+            return str(exe)
+
+        monkeypatch.delenv("CLAUDE_CODE_EXECUTABLE", raising=False)
+        monkeypatch.setattr(client_mod, "_mise_which", fake_mise)
+        assert client_mod._resolve_claude_code_executable_cached() == str(exe)
+        assert client_mod._resolve_claude_code_executable_cached() == str(exe)
+        assert calls["n"] == 1
+        client_mod._claude_code_executable_cache = client_mod._UNRESOLVED
+
+    def test_failed_lookup_is_not_cached(self, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        client_mod._claude_code_executable_cache = client_mod._UNRESOLVED
+        calls = {"n": 0}
+
+        def fake_mise(tool: str) -> None:
+            calls["n"] += 1
+            return None
+
+        monkeypatch.delenv("CLAUDE_CODE_EXECUTABLE", raising=False)
+        monkeypatch.setattr(client_mod, "_mise_which", fake_mise)
+        monkeypatch.setattr(client_mod.shutil, "which", lambda name, path=None: None)
+        assert client_mod._resolve_claude_code_executable_cached() is None
+        assert client_mod._resolve_claude_code_executable_cached() is None
+        assert calls["n"] == 2
+        assert client_mod._claude_code_executable_cache is client_mod._UNRESOLVED
 
 
 class TestMiseWhich:
@@ -3857,6 +3925,7 @@ class TestSendPipeErrors:
         )
 
         client = AcpClient()
+        client._session_id = "s1"
 
         text_msg = JsonRpcMessage(
             method="session/update",
@@ -3871,6 +3940,7 @@ class TestSendPipeErrors:
             id=99,
             method="session/requestPermission",
             params={
+                "sessionId": "s1",
                 "toolName": "shell",
                 "toolInput": "rm -rf /tmp/test",
                 "options": [{"id": "allow_once", "label": "Allow"}],
@@ -4890,10 +4960,12 @@ class TestDispatchEventsExtended:
         from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, JsonRpcMessage
 
         client = AcpClient()
+        client._session_id = "s1"
         perm_msg = JsonRpcMessage(
             id=99,
             method="session/requestPermission",
             params={
+                "sessionId": "s1",
                 "toolCall": {"title": "shell", "toolCallId": "tc1"},
                 "options": [{"id": "allow_once", "label": "Allow"}],
             },
@@ -5480,7 +5552,7 @@ class TestBuildPermissionEvent:
             },
         )
         event = client._build_permission_event(msg)  # must not raise
-        assert event.options == [{"id": "allow_once", "label": "Allow once"}]
+        assert event.options == [{"id": "allow_once", "label": "Allow once", "kind": "allow_once"}]
 
     def test_cached_tool_input_used(self):
         client = AcpClient()
@@ -5596,6 +5668,63 @@ class TestBuildPermissionEvent:
         client._build_permission_event(msg)
         assert client._permission_options[23] == {}
 
+    def test_v2_command_and_raw_input_match_shared_builder(self):
+        """The client path must accept the same ACP v2 command / rawInput
+        shapes as AcpSessionHandle: both go through build_permission_event.
+        The local builder ignored subject.type==\"command\", skipped rawInput
+        on fallback, and never set raw_params_trusted / shell_classified."""
+        from kiro_crew.acp._dispatch import build_permission_event
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, JsonRpcMessage
+
+        client = AcpClient()
+        command_msg = JsonRpcMessage(
+            id=30,
+            method="session/requestPermission",
+            params={
+                "title": "Run ls",
+                "subject": {
+                    "type": "command",
+                    "command": "ls -la",
+                    "cwd": "/tmp",
+                    "toolCallId": "tc-cmd",
+                },
+                "options": [
+                    {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                ],
+            },
+        )
+        raw_input_msg = JsonRpcMessage(
+            id=31,
+            method="session/requestPermission",
+            params={
+                "toolCall": {
+                    "title": "write",
+                    "toolCallId": "tc-ri",
+                    "rawInput": {"path": "/tmp/x", "contents": "hi"},
+                },
+                "options": [{"id": "allow_once", "label": "Allow"}],
+            },
+        )
+
+        client_cmd = client._build_permission_event(command_msg)
+        shared_cmd, _ = build_permission_event(command_msg)
+        assert client_cmd.kind == EVENT_PERMISSION_REQUEST
+        assert client_cmd.is_shell is True
+        assert client_cmd.raw_params_trusted is True
+        assert client_cmd.shell_classified is True
+        assert client_cmd.raw_tool_params == {"command": "ls -la", "cwd": "/tmp"}
+        assert client_cmd.raw_tool_params == shared_cmd.raw_tool_params
+        assert client_cmd.is_shell == shared_cmd.is_shell
+        assert client_cmd.raw_params_trusted == shared_cmd.raw_params_trusted
+        assert client_cmd.shell_classified == shared_cmd.shell_classified
+
+        client_ri = client._build_permission_event(raw_input_msg)
+        shared_ri, _ = build_permission_event(raw_input_msg)
+        assert "/tmp/x" in client_ri.tool_input
+        assert client_ri.raw_tool_params == {"path": "/tmp/x", "contents": "hi"}
+        assert client_ri.raw_tool_params == shared_ri.raw_tool_params
+        assert client_ri.tool_input == shared_ri.tool_input
+
 
 class TestApproveTool:
     """Tests for approve_tool always= and recorded-option dispatch."""
@@ -5610,7 +5739,7 @@ class TestApproveTool:
         await client.approve_tool(42, always=True)
         client._send_response.assert_awaited_once_with(
             42,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow_always"}},
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow"}},
         )
         assert 42 not in client._permission_options
 
@@ -5736,15 +5865,38 @@ class TestHandlePermission:
         client = AcpClient(work_dir=tmp_path)
         from kiro_crew.acp.types import JsonRpcMessage
 
+        client._session_id = "s1"
         msg = JsonRpcMessage(
             id=55,
             method="session/requestPermission",
-            params={"toolCall": {"title": "bash"}, "options": []},
+            params={
+                "sessionId": "s1",
+                "toolCall": {"title": "bash"},
+                "options": [{"id": "allow_once", "label": "Allow"}],
+            },
         )
         client.approve_tool = AsyncMock()
 
         await client._handle_permission(msg)
         client.approve_tool.assert_awaited_once_with(55)
+
+    @pytest.mark.asyncio
+    async def test_missing_session_id_is_rejected(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path)
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        client._session_id = "s1"
+        msg = JsonRpcMessage(
+            id=56,
+            method="session/requestPermission",
+            params={"toolCall": {"title": "bash"}, "options": []},
+        )
+        client.approve_tool = AsyncMock()
+        client.reject_tool = AsyncMock()
+
+        await client._handle_permission(msg)
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_awaited_once_with(56)
 
 
 class TestReadNewToolResultsSync:
@@ -6100,10 +6252,15 @@ class TestPromptLoopReleasesTurnDone:
         from kiro_crew.acp.types import JsonRpcMessage
 
         client = AcpClient()
+        client._session_id = "s1"
         perm_msg = JsonRpcMessage(
             id=99,
             method="session/requestPermission",
-            params={"toolCall": {"title": "shell"}, "options": []},
+            params={
+                "sessionId": "s1",
+                "toolCall": {"title": "shell"},
+                "options": [{"id": "allow_once", "label": "Allow"}],
+            },
         )
         complete_msg = JsonRpcMessage(id=1, result={})
         client.approve_tool = AsyncMock()

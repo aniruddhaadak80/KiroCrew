@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.acp import claude, tool_gate
+from kiro_crew.acp import claude, opencode, tool_gate
 from kiro_crew.acp.codex import Verdict
 from kiro_crew.acp.tool_gate import ToolGateUnroutable
 from kiro_crew.acp.types import (
@@ -24,6 +24,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
 )
 
 
@@ -100,6 +101,23 @@ class TestCodexSessionConfig:
         assert "acp_backend_allow_ungated_tools" in message
 
 
+class TestReadOnlyRoutingProbe:
+    """GET / doctor must observe disk, not create the seed that makes ROUTED."""
+
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE])
+    def test_routing_verdict_does_not_write_settings(self, backend: str, tmp_path: Path) -> None:
+        verdict, _ = tool_gate.routing_verdict(backend, tmp_path)
+        assert verdict is Verdict.INDETERMINATE
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE])
+    def test_resolve_verdict_is_also_read_only(self, backend: str, tmp_path: Path) -> None:
+        """``resolve_verdict`` is the same read-only probe as ``routing_verdict``."""
+        verdict, _ = tool_gate.resolve_verdict(backend, tmp_path)
+        assert verdict is Verdict.INDETERMINATE
+        assert not any(tmp_path.iterdir())
+
+
 class TestClaudeSeededSettings:
     def test_unseeded_is_made_routed_by_seeding(self, tmp_path: Path) -> None:
         tool_gate.enforce(ACP_BACKEND_CLAUDE, tmp_path, allow_ungated=False)
@@ -134,6 +152,44 @@ class TestClaudeSeededSettings:
         after = json.loads(path.read_text())
         assert after["permissions"]["defaultMode"] == "default"
         assert after["availableModels"] == ["a", "b"]
+
+
+class TestOpenCodeSeededSettings:
+    def test_unseeded_is_made_routed_by_seeding(self, tmp_path: Path) -> None:
+        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+        written = json.loads(opencode.project_config_path(tmp_path).read_text())
+        assert written["permission"] == "ask"
+
+    def test_an_explicit_allow_is_not_overwritten(self, tmp_path: Path) -> None:
+        path = tmp_path / "opencode.json"
+        path.write_text(json.dumps({"permission": "allow", "keep": 1}))
+
+        with pytest.raises(ToolGateUnroutable):
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+
+        after = json.loads(path.read_text())
+        assert after["permission"] == "allow"
+        assert after["keep"] == 1
+
+    def test_seeding_preserves_unrelated_keys(self, tmp_path: Path) -> None:
+        path = tmp_path / "opencode.json"
+        path.write_text(json.dumps({"model": "kept"}))
+        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+        after = json.loads(path.read_text())
+        assert after["permission"] == "ask"
+        assert after["model"] == "kept"
+
+    def test_probe_reads_the_file_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that never landed must not be trusted as ROUTED."""
+        monkeypatch.setattr(
+            "kiro_crew.acp.opencode.ensure_routed_settings",
+            lambda work_dir: True,
+        )
+        with pytest.raises(ToolGateUnroutable):
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+        assert not (tmp_path / "opencode.json").exists()
 
 
 class TestInBandDetection:

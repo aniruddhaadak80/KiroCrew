@@ -204,6 +204,9 @@ describe('model-list liveness (self-heal signal)', () => {
     vi.clearAllMocks()
     localStorage.clear()
     markModelsDegraded('acp', false)
+    markModelsDegraded('acp', false, 'config:')
+    markModelsDegraded('acp', false, 'config:codex')
+    markModelsDegraded('acp', false, 'slot:chat-1')
   })
 
   it('marks degraded on failure and clears it on a live success', async () => {
@@ -243,6 +246,34 @@ describe('model-list liveness (self-heal signal)', () => {
 
   it('does not poll an unmarked/unknown provider', () => {
     expect(modelListRefetchInterval({ queryKey: ['available-models', 'other'] })).toBe(false)
+  })
+
+  it('does not let a config-namespace 503 restart a live-slot poll', async () => {
+    ;(api.models as any).mockRejectedValue(new Error('503'))
+    const adapter = new AcpAdapter()
+    await adapter.fetchAvailableModels({ scope: 'config:codex' })
+    expect(modelsDegraded('acp')).toBe(false)
+    expect(modelsDegraded('acp', 'slot:chat-1')).toBe(false)
+    expect(modelListRefetchInterval({ queryKey: ['available-models', 'acp', 'slot:chat-1'] })).toBe(
+      false,
+    )
+    expect(modelListRefetchInterval({ queryKey: ['available-models', 'acp', 'config:codex'] })).toBe(
+      8_000,
+    )
+  })
+
+  it('marks a slot-scoped 503 on that slot without flapping config', async () => {
+    ;(api.models as any).mockRejectedValue(new Error('503'))
+    const adapter = new AcpAdapter()
+    await adapter.fetchAvailableModels({ slot: 'chat-1', scope: 'slot:chat-1' })
+    expect(modelsDegraded('acp', 'slot:chat-1')).toBe(true)
+    expect(modelsDegraded('acp')).toBe(true)
+    expect(modelListRefetchInterval({ queryKey: ['available-models', 'acp', 'slot:chat-1'] })).toBe(
+      8_000,
+    )
+    expect(modelListRefetchInterval({ queryKey: ['available-models', 'acp', 'config:'] })).toBe(
+      false,
+    )
   })
 })
 

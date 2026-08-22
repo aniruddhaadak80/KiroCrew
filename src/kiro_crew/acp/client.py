@@ -37,9 +37,9 @@ from kiro_crew import model_registry, platform_compat
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp import tool_gate
 from kiro_crew.acp._dispatch import (
-    _PERMISSION_OPTION_KINDS,
     _kiro_mcp_server_name,
     _kiro_tool_name,
+    build_permission_event,
     derive_edit_diff,
     extract_tool_purpose,
     make_unified_diff,
@@ -47,6 +47,9 @@ from kiro_crew.acp._dispatch import (
     parse_session_modes,
     parse_usage_cost,
     parse_usage_update,
+    permission_answerable_on_handle,
+    reject_option_id,
+    resolve_permission_allow_id,
 )
 from kiro_crew.acp.liveness import (
     VERDICT_WORKING,
@@ -72,7 +75,6 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
-    EVENT_PERMISSION_REQUEST,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
     EVENT_TEXT_CHUNK,
@@ -96,14 +98,12 @@ from kiro_crew.acp.types import (
     METHOD_PROMPT,
     METHOD_REQUEST_PERMISSION,
     METHOD_SESSION_LOAD,
-    METHOD_SESSION_STEER,
     METHOD_SESSION_NEW,
+    METHOD_SESSION_STEER,
     METHOD_SESSION_UPDATE,
     METHOD_SET_MODE,
     METHOD_SET_MODEL,
     METHOD_SUBAGENT_LIST_UPDATE,
-    OPTION_ALLOW_ALWAYS,
-    OPTION_ALLOW_ONCE,
     OUTCOME_CANCELLED,
     OUTCOME_SELECTED,
     STOP_REASON_END_TURN,
@@ -488,6 +488,7 @@ def _resolve_node_for_script(script_path: str) -> str | None:
 
 _UNRESOLVED: object = object()  # sentinel for "not yet resolved"
 _claude_acp_argv_cache: list[str] | None | object = _UNRESOLVED
+_claude_code_executable_cache: str | None | object = _UNRESOLVED
 
 
 def _vendored_claude_acp_roots(pkg_dir: Path | None = None) -> list[Path]:
@@ -611,6 +612,22 @@ def _resolve_claude_acp_bin() -> list[str] | None:
     return None
 
 
+def _resolve_claude_acp_bin_cached() -> list[str] | None:
+    """``_resolve_claude_acp_bin`` memoising only SUCCESS.
+
+    A failed resolution is not cached, so installing the adapter takes effect
+    on the next spawn without restarting the gateway. Doctor and the install
+    probe share this cache with spawn so they do not re-walk the ladder.
+    """
+    global _claude_acp_argv_cache  # noqa: PLW0603
+    if isinstance(_claude_acp_argv_cache, list):
+        return _claude_acp_argv_cache
+    resolved = _resolve_claude_acp_bin()
+    if resolved:
+        _claude_acp_argv_cache = resolved
+    return resolved
+
+
 def _resolve_claude_code_executable() -> str | None:
     """Find the Claude backend CLI binary for CLAUDE_CODE_EXECUTABLE.
 
@@ -642,6 +659,34 @@ def _resolve_claude_code_executable() -> str | None:
     # Casing-normalize (Windows): a `which`-resolved .EXE reaches the launcher shim
     # with its true on-disk name (see _normalize_exe_casing).
     return _normalize_exe_casing(shutil.which(CLAUDE_CODE_BIN, path=search_path))
+
+
+def _resolve_claude_code_executable_cached() -> str | None:
+    """``_resolve_claude_code_executable`` memoising only SUCCESS.
+
+    ``_mise_which`` is a ``subprocess.run(..., timeout=5)``. A hung ``mise``
+    on the event loop stalls chat, Slack, cron, and the heartbeat. Callers
+    must run this off-loop — the Claude ``_spawn`` arm pairs it with argv
+    resolution in one ``to_thread`` hop. A miss is retried so an install
+    takes effect without a gateway restart.
+    """
+    global _claude_code_executable_cache  # noqa: PLW0603
+    if isinstance(_claude_code_executable_cache, str):
+        return _claude_code_executable_cache
+    resolved = _resolve_claude_code_executable()
+    if resolved:
+        _claude_code_executable_cache = resolved
+    return resolved
+
+
+def _resolve_claude_spawn_bins() -> tuple[list[str] | None, str | None]:
+    """Resolve Claude adapter argv and ``CLAUDE_CODE_EXECUTABLE`` together.
+
+    Both ladders can call ``_mise_which``. One off-loop hop keeps a hung
+    ``mise`` off the event loop. Never called from the kiro spawn arm
+    (harness-parity H9): dispatch is ``_is_claude`` only.
+    """
+    return _resolve_claude_acp_bin_cached(), _resolve_claude_code_executable_cached()
 
 
 def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
@@ -950,17 +995,6 @@ _WAIT_RESPONSE_MAX_TIMEOUT = 600.0  # 10 min absolute ceiling
 # and must never gate tool dispatch, so a wedged SEL backend is abandoned (the
 # worker thread may leak, which is survivable) after this timeout.
 _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
-# Legacy kiro permission options omit the spec-mandated `kind` field. Only
-# synthesize a kind for these well-known literals — unknown ids stay empty
-# so we don't fabricate intent the agent didn't express.
-_LEGACY_OPTION_KIND: dict[str, str] = {
-    OPTION_ALLOW_ONCE: "allow_once",
-    "allow": "allow_once",
-    OPTION_ALLOW_ALWAYS: "allow_always",
-    "reject_once": "reject_once",
-    "reject_always": "reject_always",
-}
-
 # Canonical ACP tool-kind value for shell/exec tools. kiro-cli and
 # claude-agent-acp both report shell commands with kind="execute". This is the
 # ONE place the ACP shell literal lives — _is_shell_kind() maps it to the
@@ -2493,6 +2527,13 @@ class AcpClient:
             return []
 
         managed = spec_servers.managed_spec_servers()
+        if managed and spec_servers.crew_mcp_forwarding_unverified(self.backend):
+            logger.info(
+                "Crew MCP delivered on session/new for %s; the adapter may "
+                "accept mcpServers without forwarding them to the model, so "
+                "spawn and Crew tools can stay inert (capability unverified).",
+                self.backend,
+            )
         return managed
 
     async def _session_mcp_servers(self) -> list:
@@ -3014,6 +3055,7 @@ class AcpClient:
             raise AcpToolGateUnroutable(str(exc)) from exc
 
         registry_env: dict[str, str] = {}
+        claude_code_exe: str | None = None
         if self._is_claude:
             # Binary resolution only. The permission seed that makes this
             # backend ROUTED is ``claude.ensure_routed_settings``, run by
@@ -3027,10 +3069,7 @@ class AcpClient:
                     _seed()
                 except (OSError, ValueError, TypeError):
                     logger.warning("initial seed of settings.local.json failed", exc_info=True)
-            global _claude_acp_argv_cache  # noqa: PLW0603
-            if _claude_acp_argv_cache is _UNRESOLVED:
-                _claude_acp_argv_cache = await asyncio.to_thread(_resolve_claude_acp_bin)
-            claude_argv = _claude_acp_argv_cache
+            claude_argv, claude_code_exe = await asyncio.to_thread(_resolve_claude_spawn_bins)
             if not isinstance(claude_argv, list) or not claude_argv:
                 raise AcpError(
                     f"{CLAUDE_ACP_BIN} not found. Install it with "
@@ -3154,12 +3193,11 @@ class AcpClient:
         pin_gateway_child_port(env)
         env["PATH"] = augmented_path(env.get("PATH", ""))
         if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
-            # The adapter's SDK needs a native Claude binary we don't vendor
-            # and does NOT search PATH for `claude` itself, so point it at one
-            # explicitly. Only set when unset so an operator override always wins.
-            claude_exe = _resolve_claude_code_executable()
-            if claude_exe:
-                env["CLAUDE_CODE_EXECUTABLE"] = claude_exe
+            # Resolved off-loop in the Claude argv hop above. Never look up
+            # here: ``_mise_which`` is a blocking subprocess and this site
+            # used to run it on the loop at every Claude session start.
+            if claude_code_exe:
+                env["CLAUDE_CODE_EXECUTABLE"] = claude_code_exe
             else:
                 logger.warning(
                     "%s not found on PATH; the claude-agent-acp adapter will "
@@ -3690,7 +3728,11 @@ class AcpClient:
             # goose (and any adapter whose handshake has no resume/fork): a
             # session/load that cannot work must not silently fall through to
             # session/new. Callers that need prior context (spawn_continue)
-            # fail closed on ``resumed is False``.
+            # fail closed on ``resumed is False``. OpenCode / pi / KAS are not
+            # marked UNAVAILABLE without a measured live load; the handshake
+            # probe ``_can_load_session`` is what skips them when ``loadSession``
+            # is absent.
+
             logger.info(
                 "Skipping session/load for %s: native resume is unavailable on %s",
                 resume_sid,
@@ -4791,6 +4833,9 @@ class AcpClient:
                 # Layer-2 evidence that the backend actually asks. The pre-flight
                 # probe reads configuration; this records observed behaviour, so a
                 # backend whose config claimed it would ask but does not is caught.
+                if not self._permission_frame_answerable(msg):
+                    await self._reject_unanswerable_permission(msg)
+                    continue
                 self._saw_permission_request = True
                 yield self._build_permission_event(msg)
             elif action == "server_request_unknown":
@@ -5040,15 +5085,9 @@ class AcpClient:
     ) -> None:
         """Approve only an optionId this permission request advertised."""
         recorded = self._permission_options.pop(request_id, None) or {}
-        kind = "allow_always" if always else "allow_once"
-        advertised_id = recorded.get(kind)
-        # An explicit pick that this request never advertised under this kind is
-        # a stale or superseded prompt. Cancel it: substituting the advertised
-        # id would approve an option the operator did not choose, and accepting
-        # it verbatim would send an optionId the agent cannot resolve.
-        resolved_id = advertised_id if option_id is None else None
-        if option_id is not None and option_id == advertised_id:
-            resolved_id = option_id
+        # One-shot only: Crew has no grant storage, so allow_always is never
+        # sent. `always` is accepted for call-site compatibility.
+        resolved_id = resolve_permission_allow_id(recorded, option_id, always=always)
         if resolved_id is None:
             await self._send_response(
                 request_id,
@@ -5366,15 +5405,36 @@ class AcpClient:
         self._turn_done.set()
         raise AcpTimeoutError(partial_output="".join(output))
 
-    async def _handle_permission(self, msg: JsonRpcMessage) -> None:
-        """Auto-approve tool permissions."""
-        request_id = msg.id if msg.id is not None else ""
+    def _permission_frame_answerable(self, msg: JsonRpcMessage) -> bool:
+        """True when this client may approve the permission frame."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        return permission_answerable_on_handle(params, self._session_id or "")
 
-        params = msg.params or {}
+    async def _reject_unanswerable_permission(self, msg: JsonRpcMessage) -> None:
+        """Fail-closed answer for a permission this client must not approve."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        request_id = msg.id if msg.id is not None else ""
+        if request_id == "":
+            return
+        reject_id = reject_option_id(params)
+        if reject_id is not None:
+            self._permission_options[request_id] = {"reject_once": reject_id}
+        await self.reject_tool(request_id)
+
+    async def _handle_permission(self, msg: JsonRpcMessage) -> None:
+        """Auto-approve tool permissions (one-shot only)."""
+        request_id = msg.id if msg.id is not None else ""
+        if not self._permission_frame_answerable(msg):
+            await self._reject_unanswerable_permission(msg)
+            return
+
+        params = msg.params if isinstance(msg.params, dict) else {}
         tool_call = params.get("toolCall", {})
-        title = tool_call.get("title", "unknown")
+        title = tool_call.get("title", "unknown") if isinstance(tool_call, dict) else "unknown"
         logger.info("Auto-approving tool: %s", title)
 
+        # Record advertised optionIds so approve_tool can echo allow_once.
+        self._build_permission_event(msg)
         await self.approve_tool(request_id)
 
     async def _reject_unknown_server_request(self, msg: JsonRpcMessage) -> None:
@@ -6146,163 +6206,32 @@ class AcpClient:
             logger.debug("Could not record in-band ungated-tool event", exc_info=True)
 
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
-        request_id = msg.id if msg.id is not None else ""
-        params = msg.params or {}
-        # The permission payload comes straight from the agent process. A
-        # malformed toolCall (null/list/string) or options (null/dict/string,
-        # or non-dict entries) would raise AttributeError/TypeError here — and
-        # this runs inside the prompt-turn event generator, so the crash tears
-        # down the whole turn instead of degrading to the default options.
-        tool_call = params.get("toolCall", {})
-        if not isinstance(tool_call, dict):
-            tool_call = {}
-        title = tool_call.get("title", "unknown")
-        # The ACP toolCall carries a `kind` ("execute" for Bash, "read"/"edit"/
-        # …). Carry it onto the event as display/telemetry metadata. NOTE: the
-        # tool-name length-cap exemption does NOT key off this value — it uses
-        # the is_shell flag resolved below from the trusted tool_call cache, not
-        # the agent-influenced permission payload. Missing/empty stays "".
-        tool_kind = tool_call.get("kind", "")
-        # ACP spec uses optionId/name + kind ("allow_once"|"allow_always"|
-        # "reject_once"|"reject_always"); kiro-cli uses id/label
-        # with id values "allow_once"/"allow_always". Accept both shapes and
-        # remember the actual optionIds keyed by kind so approve_tool/
-        # reject_tool can echo the exact id the agent advertised.
-        options: list[dict[str, str]] = []
-        kind_to_id: dict[str, str] = {}
-        raw_options = params.get("options", [])
-        if not isinstance(raw_options, list):
-            raw_options = []
-        for o in raw_options:
-            if not isinstance(o, dict):
-                continue
-            opt_id = o.get("optionId") or o.get("id") or ""
-            opt_label = o.get("name") or o.get("label") or ""
-            opt_kind = o.get("kind") or ""
-            # A non-string id would crash opt_id.lower() below (and non-string
-            # label/kind would leak into the typed options list) — skip them.
-            if not isinstance(opt_id, str) or not opt_id:
-                continue
-            if not isinstance(opt_label, str):
-                opt_label = ""
-            if not isinstance(opt_kind, str):
-                opt_kind = ""
-            options.append({"id": opt_id, "label": opt_label})
-            if not opt_kind:
-                # Only synthesize a kind for well-known literals; unknown ids
-                # leave kind empty so we don't mis-classify agent intent.
-                opt_kind = _LEGACY_OPTION_KIND.get(opt_id.lower(), "")
-            if opt_kind:
-                kind_to_id.setdefault(opt_kind, opt_id)
-        # Record optionIds the agent advertised so approve_tool / reject_tool
-        # can echo the exact ids, KEYED BY ACP KIND — the same vocabulary
-        # ``_dispatch.build_permission_event`` records, so the two transports
-        # cannot drift (this file previously stored short aliases while the
-        # shared builder stored kinds, and the consumers read one of the two).
-        # claude-agent-acp advertises a {kind:"reject_once", optionId:"reject"}
-        # option whose selection yields behavior:"deny" — sending that is far
-        # better than a "cancelled" outcome, which the adapter turns into the
-        # cryptic "Tool use aborted". kiro-cli advertises no reject option, so
-        # reject_tool falls back to "cancelled" there (handled as a clean
-        # rejection by kiro).
-        #
-        # NO cross-kind aliasing: an allow_once pick must never resolve to an
-        # allow_always id. The old fallback did exactly that when a request
-        # advertised only an always option, silently persisting a grant the
-        # operator did not give.
-        if request_id != "":
-            recorded = {k: v for k, v in kind_to_id.items() if k in _PERMISSION_OPTION_KINDS}
-            self._permission_options[request_id] = recorded
+        """Build an AcpEvent for a permission request via the shared parser.
 
-        # Resolve full tool input — the preceding ToolCall session/notification
-        # carries the complete params that we cache by toolCallId.  The
-        # request_permission message only has a truncated human-readable title.
-        tool_input = ""
-        tool_call_id = tool_call.get("toolCallId", "")
-
-        # 1. Look up cached input from the ToolCall notification
-        if tool_call_id and tool_call_id in self._tool_call_inputs:
-            tool_input = self._tool_call_inputs.pop(tool_call_id)
-
-        # Recover the STRUCTURED raw params cached at the ToolCall notification
-        # (or carried inline on this permission message) so the governance gate
-        # can evaluate the filesystem.write (edit path) / network.egress (fetch
-        # url) scopes — the title alone cannot carry these.
-        raw_params: dict | None = None
-        if tool_call_id and tool_call_id in self._tool_call_params:
-            raw_params = self._tool_call_params.pop(tool_call_id)
-
-        # 2. Fallback: check if toolCall itself carries input/params
-        if not tool_input:
-            raw_input = tool_call.get("input") or tool_call.get("params")
-            if raw_input:
-                tool_input = (
-                    json.dumps(raw_input, indent=2)
-                    if isinstance(raw_input, (dict, list))
-                    else str(raw_input)
-                )
-                if raw_params is None and isinstance(raw_input, dict):
-                    raw_params = raw_input
-        elif raw_params is None:
-            # tool_input came from the cache; the permission message may still
-            # carry an inline params dict the gate can use.
-            inline = tool_call.get("input") or tool_call.get("params")
-            if isinstance(inline, dict):
-                raw_params = inline
-
-        # Resolve the canonical shell signal. SECURITY (deny-by-default): the
-        # ONLY trusted source is the value cached from the preceding tool_call
-        # notification (keyed by toolCallId). We deliberately do NOT fall back
-        # to the permission payload's own `kind`: that field is agent/LLM-
-        # influenced, and trusting it to waive the tool-name length cap on the
-        # very name being validated would let a malicious agent set
-        # kind="execute" on the permission payload to bypass the check. On a
-        # cache miss is_shell stays False and the length cap is enforced.
-        #
-        # Use .get() (not .pop()): a later tool_call_update refinement for the
-        # same toolCallId reads this same cache, so popping here would make that
-        # refinement wrongly report is_shell=False if it arrives after the
-        # permission event. The per-turn dispatch-loop .clear() handles cleanup.
-        cached_shell = self._tool_call_is_shell.get(tool_call_id) if tool_call_id else None
-        is_shell = bool(cached_shell)
-        if cached_shell is None and tool_input:
-            # Input resolved but the shell signal did not — the cache invariant
-            # (tool_call precedes permission) did not hold. Surface it so the
-            # miss is observable rather than silently enforcing the length cap.
-            logger.info(
-                "Permission event resolved tool_input but missed is_shell cache "
-                "(req=%s tool_call_id=%s)",
-                request_id,
-                tool_call_id,
-            )
-
-        logger.info("Permission requested for tool: %s (req=%s)", title, request_id)
+        Delegates to ``_dispatch.build_permission_event`` so this transport
+        reads the same v1/v2 shapes (command subjects, ``rawInput`` fallback,
+        ``raw_params_trusted`` / ``shell_classified``) as ``AcpSessionHandle``.
+        Caches stay unscoped: this client writes them by ``toolCallId`` alone
+        (one process per session; no multiplexed child origin).
+        """
+        event, recorded = build_permission_event(
+            msg,
+            tool_input_cache=self._tool_call_inputs,
+            shell_cache=self._tool_call_is_shell,
+            raw_params_cache=self._tool_call_params,
+            mcp_server_name_cache=self._tool_call_mcp_server,
+            tool_name_cache=self._tool_call_tool_name,
+        )
+        if recorded is not None and event.request_id != "":
+            self._permission_options[event.request_id] = recorded
+        logger.info("Permission requested for tool: %s (req=%s)", event.title, event.request_id)
         if logger.isEnabledFor(logging.DEBUG):
-            _tc_redacted = repr(tool_call)
+            _params = msg.params if isinstance(msg.params, dict) else {}
+            _tc_redacted = repr(_params.get("toolCall", {}))
             _tc_redacted, _ = redact_exfiltration_urls(_tc_redacted)
             _tc_redacted, _ = redact_credentials(_tc_redacted)
             logger.debug("Permission toolCall payload: %s", _tc_redacted)
-        return AcpEvent(
-            kind=EVENT_PERMISSION_REQUEST,
-            request_id=request_id,
-            title=title,
-            tool_kind=tool_kind,
-            options=options,
-            tool_input=tool_input,
-            tool_call_id=tool_call_id,
-            raw_tool_params=raw_params,
-            is_shell=is_shell,
-            # Trusted MCP server identity recovered from the preceding tool_call
-            # (the permission payload has no _meta). .get() mirrors the is_shell
-            # cache-read; empty on a miss (fail-closed for app-own auto-approve).
-            mcp_server_name=(
-                self._tool_call_mcp_server.get(tool_call_id, "") if tool_call_id else ""
-            ),
-            # Trusted tool name recovered from the preceding tool_call, mirroring
-            # mcp_server_name — lets the app-own-server auto-approve govern the
-            # canonical mcp__<server>__<tool> on this permission path.
-            tool_name=(self._tool_call_tool_name.get(tool_call_id, "") if tool_call_id else ""),
-        )
+        return event
 
     def _backfill_context_window(self, pct: float) -> None:
         """Derive window/used tokens from a percentage-only reading.

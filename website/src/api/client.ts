@@ -1825,10 +1825,11 @@ export const api = {
     del('/api/agents/' + encodeURIComponent(name)).then(j),
   models: (opts?: { slot?: string }) =>
     fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
-  // `probe=1` asks the Gateway to walk each adapter's resolution ladder. Only
-  // the ACP-backends preview surface calls this, so a client that has not opted
-  // in never pays for the filesystem scan.
-  acpBackends: () => fetch('/api/acp-backends?probe=1').then(j),
+  // `probe=1` walks each adapter's resolution ladder. Default is off: the
+  // Services tab only needs the active label. The Settings card passes
+  // `probe: true` because it renders the install ladder.
+  acpBackends: ({ probe }: { probe?: boolean } = {}) =>
+    fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   slashCommands: () => fetch('/api/slash-commands').then(j),

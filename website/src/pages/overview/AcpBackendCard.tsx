@@ -125,7 +125,7 @@ export function AcpBackendCard({ onSave }: Props) {
 
   const load = useCallback(async () => {
     try {
-      setData((await api.acpBackends()) as AcpBackendsPayload)
+      setData((await api.acpBackends({ probe: true })) as AcpBackendsPayload)
       setFailed(false)
     } catch {
       // Owner-only endpoint: a non-owner viewer gets 403. Render nothing rather

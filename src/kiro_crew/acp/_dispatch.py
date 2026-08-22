@@ -563,6 +563,64 @@ def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
 _ACP_SHELL_KIND = "execute"
 
 
+def permission_frame_session_id(params: dict | None) -> str:
+    """The ``sessionId`` a permission frame names, or ``""`` if missing/unusable."""
+    if not isinstance(params, dict):
+        return ""
+    raw = params.get("sessionId")
+    if isinstance(raw, str) and raw:
+        return raw
+    return ""
+
+
+def permission_answerable_on_handle(
+    params: dict | None,
+    handle_session_id: str,
+    *,
+    registered_session_ids: frozenset[str] | set[str] = frozenset(),
+) -> bool:
+    """True when this handle may answer the permission frame.
+
+    A missing ``sessionId`` is never answerable here — the runtime answers
+    ownerless requests once at connection level. A ``sessionId`` that belongs
+    to a *different* registered handle is never answerable on this one (fail
+    closed). A foreign id that is not another registered session is a routed
+    backend-internal child and may be answered on the owner handle.
+    """
+    frame_sid = permission_frame_session_id(params)
+    if not frame_sid or not handle_session_id:
+        return False
+    if frame_sid == handle_session_id:
+        return True
+    if frame_sid in registered_session_ids:
+        return False
+    return True
+
+
+def resolve_permission_allow_id(
+    recorded: dict[str, str] | None,
+    option_id: str | None = None,
+    *,
+    always: bool = False,
+) -> str | None:
+    """Resolve a one-shot allow optionId, or ``None`` so the caller cancels.
+
+    Kiro Crew has no grant storage: ``allow_always`` is never selected, even
+    when ``always=True`` or when that is the only advertised allow option.
+    ``always`` is accepted for call-site compatibility and treated as
+    ``allow_once``. An explicit ``option_id`` is accepted only when it equals
+    the advertised ``allow_once`` id — anything else (unknown, other kind,
+    stale prompt) fails closed.
+    """
+    del always  # Crew has no grant storage; never select allow_always.
+    advertised_once = (recorded or {}).get("allow_once")
+    if not advertised_once:
+        return None
+    if option_id is None or option_id == advertised_once:
+        return advertised_once
+    return None
+
+
 def reject_option_id(params: dict) -> str | None:
     """The least-destructive reject optionId a permission request advertises.
 
@@ -1502,6 +1560,10 @@ __all__ = [
     "parse_metadata",
     "classify_notification",
     "build_permission_event",
+    "permission_answerable_on_handle",
+    "permission_frame_session_id",
+    "reject_option_id",
+    "resolve_permission_allow_id",
     "parse_session_update",
     "parse_rate_limit",
     "parse_usage_cost",

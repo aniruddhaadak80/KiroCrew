@@ -127,7 +127,7 @@ command, credential leaves, process markers, and a capability map.
 | Field | Purpose |
 |---|---|
 | `dialect` | `KIRO` (date `protocolVersion`, `set_mode`, `set_model`, empty `mcpServers`) or `SPEC` (integer version, no `set_mode`, `set_config_option`, `mcpServers` in session params) |
-| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS`, `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, `PERMISSION_REQUEST` (goose / OpenCode / pi: privileged tools arrive as `session/request_permission`), or fail-closed `UNVERIFIED` |
+| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS` (Claude `permissions.defaultMode`; OpenCode project `permission: ask`), `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, `PERMISSION_REQUEST` (goose / pi: privileged tools arrive as `session/request_permission`), or fail-closed `UNVERIFIED` |
 | `permission_config_id` / `permission_config_value` | The ACP v1 session config option and the exact value a `SESSION_CONFIG` backend must accept before its first prompt (codex-acp: `mode` = `read-only`); empty for every other routing |
 | `capabilities` | Per-capability `SUPPORTED` / `DEGRADED` / `UNAVAILABLE` / `UNVERIFIED` |
 
@@ -163,14 +163,16 @@ inferences that previously meant "kiro" are converted — see
 
 Shipped modules: `acp/codex.py` (paths, resolution ladder, approval-policy probe,
 MCP shaping, model-id translation), `acp/claude.py` (permission-mode probe and
-seeding), `acp/goose.py` / `acp/opencode.py` / `acp/pi.py` (owned resolution
-ladders; `PERMISSION_REQUEST` routing), `acp/tool_gate.py` (routing verdicts and
-enforcement), `acp/spec_agent_guard.py` (agent-profile fail-closed guard),
-`acp/doctor.py` (doctor rows). Selectable spec adapters that route through
-`session/request_permission` (goose, OpenCode, pi) start without the ungated-tools
-opt-out and receive Crew MCP on `session/new` when ROUTED. OpenCode is not
-settings-seeded. Pi may leave delivered Crew servers inert until `pi-acp`
-forwards MCP.
+seeding), `acp/goose.py` / `acp/pi.py` (owned resolution ladders;
+`PERMISSION_REQUEST` routing), `acp/opencode.py` (owned resolution plus
+`SEEDED_SETTINGS` `permission: ask` seed), `acp/tool_gate.py` (routing verdicts
+and enforcement), `acp/spec_agent_guard.py` (agent-profile fail-closed guard),
+`acp/doctor.py` (doctor rows). Selectable spec adapters that resolve ROUTED
+(goose, OpenCode, pi) start without the ungated-tools opt-out and receive Crew
+MCP on `session/new`. OpenCode is seeded in the session `work_dir` the same
+shape as Claude: write only when nothing is configured, never overwrite
+`allow`, never write `~/.config/opencode`. Pi may leave delivered Crew servers
+inert until `pi-acp` forwards MCP.
 
 ### Model list surface (`GET /api/models`)
 
@@ -276,6 +278,9 @@ the route move with the card. Two conditions shape it:
   `highlight=key:agent.acp_backend` link would strip its own param and scroll
   nowhere. The card scrolls on hash arrival once its payload has landed, and only
   then, so opening Developer > Config directly leaves the reader where they are.
+  The dashboard client sends `?probe=1` only from that Settings card
+  (`AcpBackendCard`); Services and other callers omit it so they do not walk
+  every owned resolver for a label they already have.
 
 ### Config (`config/loader.py`)
 

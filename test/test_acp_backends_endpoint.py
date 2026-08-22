@@ -7,6 +7,8 @@ would have no way to tell which was right.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from kiro_crew.acp import backends
@@ -349,11 +351,43 @@ class TestActiveState:
             probed.append(True)
             raise AssertionError("must not probe on the default backend")
 
-        monkeypatch.setattr("kiro_crew.acp.tool_gate.resolve_verdict", _boom)
+        monkeypatch.setattr("kiro_crew.acp.tool_gate.routing_verdict", _boom)
         state = handler._active_state()
         if not state["active"]:
             assert not probed
             assert state["routing_verdict"] == ""
+
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE])
+    def test_does_not_seed_settings_files(
+        self, backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Settings/Services GET must not write Claude or OpenCode config.
+
+        The card is a probe; the seed that makes ``SEEDED_SETTINGS`` backends
+        ROUTED belongs to enforce / spawn, not ``config_dir()/workspace``.
+        """
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        class _Agent:
+            acp_backend = backend
+            acp_backend_allow_ungated_tools = False
+
+        class _Cfg:
+            agent = _Agent()
+
+        monkeypatch.setattr(
+            "kiro_crew.config.loader.KiroCrewConfig.load",
+            classmethod(lambda cls: _Cfg()),
+        )
+        monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: tmp_path)
+
+        state = handler._active_state()
+        assert state["active"] == backend
+        assert state["routing_verdict"] == "indeterminate"
+        assert not (workspace / "opencode.json").exists()
+        assert not (workspace / ".opencode" / "opencode.json").exists()
+        assert not (workspace / ".claude" / "settings.local.json").exists()
 
     def test_a_config_failure_degrades_rather_than_raising(
         self, monkeypatch: pytest.MonkeyPatch

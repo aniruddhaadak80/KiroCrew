@@ -84,7 +84,9 @@ class Routing(str, Enum):
     unadvertised.
     PERMISSION_REQUEST: the adapter's ACP path sends ``session/request_permission``
     for privileged tools even when the client does not serve ``fs/*``. The gate
-    sees the request, not the bytes. Used for goose, OpenCode, and pi.
+    sees the request, not the bytes. Used for goose and pi. OpenCode is
+    SEEDED_SETTINGS: its own default is permissive, so Kiro Crew writes
+    ``permission: ask`` into the session work_dir and reads it back.
     UNVERIFIED: Kiro Crew has NOT established how (or whether) this adapter can
     be made to ask. The default for anything discovered through the registry.
     Always resolves INDETERMINATE, so it refuses unless the operator sets the one
@@ -341,7 +343,7 @@ _OPENCODE = BackendDescriptor(
     label="OpenCode",
     experimental=True,
     dialect=Dialect.SPEC,
-    routing=Routing.PERMISSION_REQUEST,
+    routing=Routing.SEEDED_SETTINGS,
     signin_command="opencode auth login",
     install_command="",
     registry_id="opencode",

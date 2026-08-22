@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.acp import claude, doctor
+from kiro_crew.acp import claude, client as acp_client, codex, doctor, goose, opencode, pi
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -30,6 +30,17 @@ def codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def _reset_adapter_caches() -> None:
+    """Doctor now shares spawn's success-only caches; isolate each test."""
+    acp_client._claude_acp_argv_cache = acp_client._UNRESOLVED
+    acp_client._claude_code_executable_cache = acp_client._UNRESOLVED
+    codex._argv_cache = codex._UNRESOLVED
+    goose._argv_cache = goose._UNRESOLVED
+    opencode._argv_cache = opencode._UNRESOLVED
+    pi._argv_cache = pi._UNRESOLVED
 
 
 def _run(backend: str, work_dir: Path, allow: bool = False) -> tuple[str, list[str]]:
@@ -310,6 +321,25 @@ class TestOpenCodeRows:
         text, _ = _run(ACP_BACKEND_OPENCODE, tmp_path)
         assert "owned by the vendor CLI" in text
         assert "opencode auth login" in text
+
+    def test_seeding_makes_the_gate_row_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.acp.opencode.resolve_argv",
+            lambda: ["/usr/local/bin/opencode", "acp"],
+        )
+        text, issues = _run(ACP_BACKEND_OPENCODE, tmp_path)
+        assert "tool gate:   ✅" in text
+        assert not any("bypass" in i for i in issues)
+        written = json.loads(opencode.project_config_path(tmp_path).read_text())
+        assert written["permission"] == "ask"
+
+    def test_a_configured_allow_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "opencode.json"
+        path.write_text(json.dumps({"permission": "allow"}))
+        _, issues = _run(ACP_BACKEND_OPENCODE, tmp_path)
+        assert any("bypass the PreToolUse gate" in i for i in issues)
 
 
 class TestPiRows:

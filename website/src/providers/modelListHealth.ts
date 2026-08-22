@@ -6,20 +6,35 @@
 // degraded fallback, and would stop polling the moment a
 // possibly-stale cached multi-entry list is served.
 //
-// Keyed by provider id (read from the ['available-models', <providerId>] query
-// key) so it is provider-safe. Default is "not degraded" (undefined → false):
-// a provider whose adapter never marks itself only ever stops polling, so this
-// can never regress an unmarked provider into perpetual polling.
+// Keyed by provider id plus the useAvailableModels scope (`slot:…` /
+// `config:…`) so a Settings config-namespace 503 cannot restart the live
+// chat's 8s poll. Default is "not degraded" (undefined → false): a provider
+// whose adapter never marks itself only ever stops polling, so this can never
+// regress an unmarked provider into perpetual polling.
 import { useSyncExternalStore } from 'react'
 
-const degradedByProvider = new Map<string, boolean>()
+const degradedByKey = new Map<string, boolean>()
 const subscribers = new Set<() => void>()
 
-/** Record whether the last fetch for a provider was degraded (fallback) or
- *  live. The adapter calls this on every fetch outcome. */
-export function markModelsDegraded(providerId: string, degraded: boolean): void {
-  if (degradedByProvider.get(providerId) === degraded) return
-  degradedByProvider.set(providerId, degraded)
+/** Scope string that matches `useAvailableModels`' query-key third slot. */
+export function modelListScope(slot?: string, backend?: string | null): string {
+  return slot ? `slot:${slot}` : `config:${backend ?? ''}`
+}
+
+function healthKey(providerId: string, scope?: string): string {
+  return scope ? `${providerId}\x1f${scope}` : providerId
+}
+
+/** Record whether the last fetch for a provider+scope was degraded (fallback)
+ *  or live. The adapter calls this on every fetch outcome. */
+export function markModelsDegraded(
+  providerId: string,
+  degraded: boolean,
+  scope?: string,
+): void {
+  const key = healthKey(providerId, scope)
+  if (degradedByKey.get(key) === degraded) return
+  degradedByKey.set(key, degraded)
   for (const cb of subscribers) cb()
 }
 
@@ -30,10 +45,10 @@ function subscribe(cb: () => void): () => void {
   }
 }
 
-/** True only when the provider's last served list is known to be a degraded
- *  fallback. Unknown/never-fetched providers report false (not degraded). */
-export function modelsDegraded(providerId: string): boolean {
-  return degradedByProvider.get(providerId) === true
+/** True only when the provider+scope's last served list is known to be a
+ *  degraded fallback. Unknown/never-fetched keys report false (not degraded). */
+export function modelsDegraded(providerId: string, scope?: string): boolean {
+  return degradedByKey.get(healthKey(providerId, scope)) === true
 }
 
 /**
@@ -47,24 +62,25 @@ export function modelsDegraded(providerId: string): boolean {
  * component keeps rendering the previous decision until something unrelated
  * happens to re-render it.
  */
-export function useModelsDegraded(providerId: string): boolean {
+export function useModelsDegraded(providerId: string, scope?: string): boolean {
   return useSyncExternalStore(
     subscribe,
-    () => modelsDegraded(providerId),
+    () => modelsDegraded(providerId, scope),
     () => false,
   )
 }
 
 /**
- * refetch cadence for the ['available-models', <providerId>] query: poll every
- * 8s WHILE the served list is a degraded fallback, then stop the instant a LIVE
- * fetch succeeds. Reads the provider id from the query key (index 1), so it is
- * decoupled from the list shape and safe across providers. RQ v5 passes the
- * Query instance.
+ * refetch cadence for the ['available-models', <providerId>, <scope>] query:
+ * poll every 8s WHILE the served list is a degraded fallback, then stop the
+ * instant a LIVE fetch succeeds. Reads provider id (index 1) and scope
+ * (index 2) from the query key so a config-namespace 503 cannot flap a
+ * live-slot poll. RQ v5 passes the Query instance.
  */
 export function modelListRefetchInterval(
   query: { queryKey: readonly unknown[] },
 ): number | false {
   const providerId = typeof query.queryKey[1] === 'string' ? query.queryKey[1] : ''
-  return modelsDegraded(providerId) ? 8_000 : false
+  const scope = typeof query.queryKey[2] === 'string' ? query.queryKey[2] : undefined
+  return modelsDegraded(providerId, scope) ? 8_000 : false
 }

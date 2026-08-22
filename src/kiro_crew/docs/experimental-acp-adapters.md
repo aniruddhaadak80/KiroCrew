@@ -13,18 +13,20 @@ instead, so an existing vendor subscription does the work:
 | pi | `pi` (registry alias `pi-acp`) | `pi` | **Experimental**, selectable, routed |
 
 Selectable means the value may be persisted. Codex and Claude are gated before
-the first prompt. goose, OpenCode, and pi send `session/request_permission` for
-privileged tools, so sessions start without the ungated-tools opt-out. Kiro Crew
-does not implement `fs/*` or `terminal/*`. OpenCode operator config
-`permission: allow` / `--auto` can bypass the adapter's own prompts — Kiro Crew
-does not seed OpenCode settings. Pi may accept Crew MCP on `session/new` without
-forwarding it to the pi agent; those tools can stay inert. Doctor reports that
-as a capability note, not an install failure. Do not treat spawn or Crew tools
-as verified on Pi until the adapter forwards MCP.
+the first prompt. goose and pi send `session/request_permission` for privileged
+tools. OpenCode is seeded with project `permission: "ask"` in the session
+`work_dir` (never `~/.config/opencode`); an explicit `allow` is left alone and
+the session refuses unless the ungated-tools opt-out is on. All three start
+without that opt-out when ROUTED. Kiro Crew does not implement `fs/*` or
+`terminal/*`. Pi may accept Crew MCP on `session/new` without forwarding it to
+the pi agent; those tools can stay inert. Doctor reports that as a capability
+note, not an install failure. Do not treat spawn or Crew tools as verified on
+Pi until the adapter forwards MCP.
 
 Mid-turn steer (`_session/steer`) is kiro-cli and KAS only. On a spec adapter
-the dashboard queues the message, Slack waits for the current turn, and
-`spawn_steer` degrades to follow-up with a reason that names the harness.
+the dashboard and Slack queue the message as a follow-up (Slack does not wait
+on the session semaphore), and `spawn_steer` degrades to follow-up with a
+reason that names the harness.
 goose cannot native-resume (`session/load`); `spawn_continue` fail-closes
 instead of starting a blank child. Regular chat replays Crew's transcript
 the same way a provider switch does.
@@ -46,11 +48,13 @@ withheld.
 Each one clears the governability bar differently, which is why it is established
 per adapter rather than assumed:
 
-- **goose**, **OpenCode**, and **pi** ask per privileged tool via
-  `session/request_permission`. File I/O stays in the adapter because Kiro Crew
+- **goose** and **pi** ask per privileged tool via
+  `session/request_permission`. **OpenCode** is seeded with `permission: "ask"`
+  in the session work_dir so those permission frames actually fire (its own
+  default is permissive). File I/O stays in the adapter because Kiro Crew
   does not advertise `fs/*`. That is enough to start without the opt-out.
-  OpenCode is not settings-seeded. Crew MCP is delivered to all three when
-  ROUTED; on Pi the adapter may leave those servers inert until it forwards MCP.
+  Crew MCP is delivered to all three when ROUTED; on Pi the adapter may leave
+  those servers inert until it forwards MCP.
 - **Codex** is gated by ACP v1 session config `mode=read-only`, applied after
   `session/new` / `session/load`. The session is refused if the adapter does not
   advertise that value or the write fails.
@@ -159,6 +163,18 @@ Tool approval is handled for you: Kiro Crew writes `permissions.defaultMode:
 configured there, then reads it back to confirm. If you have deliberately set
 `auto` or `bypassPermissions`, Kiro Crew leaves your setting alone and refuses the
 session instead — your configuration is not overwritten behind your back.
+
+## OpenCode
+
+Install the OpenCode binary yourself (see https://opencode.ai) and sign in with
+`opencode auth login`. There is no npm adapter; `install_command` is empty on
+purpose.
+
+Tool approval is handled for you: Kiro Crew writes `permission: "ask"` into the
+session work_dir (`opencode.json`, or an existing `.opencode/opencode.json`)
+when nothing is configured there, then reads it back to confirm. If you have
+deliberately set `allow` (or `--auto`), Kiro Crew leaves your setting alone and
+refuses the session instead. It never writes `~/.config/opencode`.
 
 ## How features differ
 

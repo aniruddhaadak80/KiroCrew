@@ -47,9 +47,9 @@ def _probe_installed(backend: str) -> str:
 
             return "installed" if codex.resolve_argv_cached() else "missing"
         if backend == ACP_BACKEND_CLAUDE:
-            from kiro_crew.acp.client import _resolve_claude_acp_bin
+            from kiro_crew.acp.client import _resolve_claude_acp_bin_cached
 
-            return "installed" if _resolve_claude_acp_bin() else "missing"
+            return "installed" if _resolve_claude_acp_bin_cached() else "missing"
         if backend == ACP_BACKEND_KIRO:
             from kiro_crew.acp.client import _resolve_kiro_bin
 
@@ -126,8 +126,10 @@ def _active_state() -> dict:
     """The configured backend plus its routing verdict.
 
     The verdict is included so the card can show the same tool-gate status the
-    doctor does. Resolved defensively: a probe failure must degrade the row, not
-    fail the whole endpoint and leave the card with no data at all.
+    doctor does. ``routing_verdict`` is read-only: a Settings load must not
+    seed Claude/OpenCode config under ``config_dir()/workspace``. Resolved
+    defensively: a probe failure must degrade the row, not fail the whole
+    endpoint and leave the card with no data at all.
     """
     from kiro_crew.config.loader import KiroCrewConfig
 
@@ -146,7 +148,7 @@ def _active_state() -> dict:
             from kiro_crew.acp import tool_gate
             from kiro_crew.config.paths import config_dir
 
-            resolved, reason = tool_gate.resolve_verdict(active, config_dir() / "workspace")
+            resolved, reason = tool_gate.routing_verdict(active, config_dir() / "workspace")
             verdict = resolved.value
         except Exception:
             logger.debug("Could not resolve the tool-gate verdict", exc_info=True)
@@ -178,7 +180,8 @@ async def api_acp_backends(request: web.Request) -> web.Response:
         )
 
     # Off-loop: the config read can revalidate the schema and the routing probe
-    # stats (and for claude, writes) files.
+    # stats files. The probe is read-only; Claude/OpenCode seed belongs to
+    # enforce / _spawn, never this GET.
     state = await asyncio.to_thread(_active_state)
 
     # Install detection is OPT-IN via `?probe=1`, never the default. It walks the

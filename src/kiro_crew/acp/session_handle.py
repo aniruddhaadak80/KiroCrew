@@ -35,8 +35,10 @@ from kiro_crew.acp._dispatch import (
     parse_session_update,
     parse_text_chunk,
     parse_usage_update,
+    permission_answerable_on_handle,
     redact_text,
     reject_option_id,
+    resolve_permission_allow_id,
     set_mode_params,
     set_model_params,
 )
@@ -971,14 +973,9 @@ class AcpSessionHandle:
         """Approve only an optionId this permission request advertised."""
         recorded = self._permission_options.pop(request_id, None) or {}
         self._end_human_wait()
-        kind = "allow_always" if always else "allow_once"
-        advertised_id = recorded.get(kind)
-        # An explicit pick that this request never advertised under this kind is
-        # a stale or superseded prompt. Cancel it rather than substituting the
-        # advertised id, which would approve an option nobody chose.
-        resolved_id = advertised_id if option_id is None else None
-        if option_id is not None and option_id == advertised_id:
-            resolved_id = option_id
+        # One-shot only: Crew has no grant storage, so allow_always is never
+        # sent. `always` is accepted for call-site compatibility.
+        resolved_id = resolve_permission_allow_id(recorded, option_id, always=always)
         if resolved_id is None:
             await self._runtime.send_response(
                 request_id,
@@ -1024,6 +1021,41 @@ class AcpSessionHandle:
                     request_id,
                     exc_info=True,
                 )
+
+    def _registered_session_ids(self) -> frozenset[str]:
+        """Session ids currently registered on the shared runtime, if visible.
+
+        Used only to refuse answering a permission that names a *different*
+        registered handle. A missing map (tests, a protocol stub) is treated
+        as empty: foreign ids then look like routed children, matching the
+        runtime's owner-handle delivery.
+        """
+        queues = getattr(self._runtime, "_session_queues", None)
+        if not isinstance(queues, dict):
+            return frozenset()
+        return frozenset(str(key) for key in queues if key)
+
+    async def _reject_unanswerable_permission(self, msg: JsonRpcMessage) -> None:
+        """Fail-closed answer for a permission this handle must not approve."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        request_id = msg.id
+        if request_id is None:
+            return
+        reject_id = reject_option_id(params)
+        if reject_id is not None:
+            self._permission_options[request_id] = {"reject_once": reject_id}
+        await self.reject_tool(request_id)
+        frame_sid = str(params.get("sessionId") or "")
+        title = ""
+        tool_call = params.get("toolCall")
+        if isinstance(tool_call, dict):
+            title = str(tool_call.get("title") or "")
+        self._audit_handle_reject(
+            request_id,
+            title,
+            "permission_session_mismatch",
+            sub_session_id=frame_sid if frame_sid != self._session_id else "",
+        )
 
     def _audit_handle_reject(
         self,
@@ -2071,6 +2103,14 @@ class AcpSessionHandle:
                 action = self._classify(msg)
 
                 if action == "permission":
+                    _perm_params = msg.params if isinstance(msg.params, dict) else {}
+                    if not permission_answerable_on_handle(
+                        _perm_params,
+                        self._session_id,
+                        registered_session_ids=self._registered_session_ids(),
+                    ):
+                        await self._reject_unanswerable_permission(msg)
+                        continue
                     _perm_event = self._build_permission_event(msg)
                     if _perm_event.child_low_fidelity and not self.child_fidelity_aware:
                         # This consumer never opted into the child-fidelity

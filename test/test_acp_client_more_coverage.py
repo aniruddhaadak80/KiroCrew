@@ -1241,7 +1241,7 @@ class TestPermissionEvent:
         event = client._build_permission_event(msg)
 
         assert event.kind == EVENT_PERMISSION_REQUEST
-        assert event.options == [{"id": "allow_once", "label": ""}]
+        assert event.options == [{"id": "allow_once", "label": "", "kind": "allow_once"}]
         # Legacy id with no usable kind still resolves the allow ids.
         assert client._permission_options["req-1"]["allow_once"] == "allow_once"
         # is_shell is deny-by-default: the payload's own kind is untrusted.

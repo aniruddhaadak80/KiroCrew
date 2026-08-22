@@ -19,6 +19,7 @@ from pathlib import Path
 
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.codex import Verdict
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,38 @@ class ToolGateUnroutable(Exception):
     """
 
 
-def resolve_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
-    """Return the routing verdict for ``backend`` plus an operator-facing reason.
+def _seed_routed_settings(backend: str, work_dir: Path | str) -> None:
+    """Write the conservative permission seed for ``SEEDED_SETTINGS`` backends.
+
+    Spawn / ``enforce`` only. A dashboard GET or doctor probe must not call this:
+    OpenCode and Claude become ROUTED by this write, and doing it on every
+    Settings load creates files under ``config_dir()/workspace``.
+    """
+    descriptor = acp_backends.descriptor_for(backend)
+    if descriptor.routing is not acp_backends.Routing.SEEDED_SETTINGS:
+        return
+    # Positive identity (H5): Claude and OpenCode share this routing but
+    # own different files. Never call claude.ensure_routed_settings for
+    # OpenCode, and never let an added SEEDED_SETTINGS harness inherit
+    # either seed.
+    if backend == ACP_BACKEND_OPENCODE:
+        from kiro_crew.acp import opencode as opencode_backend
+
+        opencode_backend.ensure_routed_settings(work_dir)
+        return
+    if backend == ACP_BACKEND_CLAUDE:
+        from kiro_crew.acp import claude as claude_backend
+
+        claude_backend.ensure_routed_settings(work_dir)
+
+
+def routing_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
+    """Read-only routing probe. Never writes Claude or OpenCode settings.
 
     Dispatches on the descriptor's ``routing`` rather than the backend id, so a
     new backend declaring an existing routing mechanism needs no change here.
+    ``SEEDED_SETTINGS`` reads the file back only; the seed that makes those
+    backends ROUTED lives on ``enforce`` / ``_spawn``.
     """
     descriptor = acp_backends.descriptor_for(backend)
 
@@ -52,12 +80,19 @@ def resolve_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
         return (Verdict.ROUTED, "the spawn names an agent")
 
     if descriptor.routing is acp_backends.Routing.SEEDED_SETTINGS:
-        from kiro_crew.acp import claude as claude_backend
+        # Positive identity (H5): same split as ``_seed_routed_settings``.
+        if backend == ACP_BACKEND_OPENCODE:
+            from kiro_crew.acp import opencode as opencode_backend
 
-        # Seed first, then read back. The seed is conservative (it never
-        # overwrites a configured mode), so this cannot mask an explicit bypass.
-        claude_backend.ensure_routed_settings(work_dir)
-        return claude_backend.routing_verdict(work_dir)
+            return opencode_backend.routing_verdict(work_dir)
+        if backend == ACP_BACKEND_CLAUDE:
+            from kiro_crew.acp import claude as claude_backend
+
+            return claude_backend.routing_verdict(work_dir)
+        return (
+            Verdict.INDETERMINATE,
+            f"no settings seed for {descriptor.label}",
+        )
 
     if descriptor.routing is acp_backends.Routing.SESSION_CONFIG:
         return (
@@ -80,11 +115,13 @@ def resolve_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
         return (Verdict.ROUTED, "the adapter delegates file and terminal work")
 
     if descriptor.routing is acp_backends.Routing.PERMISSION_REQUEST:
-        # goose / OpenCode / pi send session/request_permission for privileged
-        # tools on the ACP path. We do not advertise fs/* or terminal/*, so file
-        # I/O stays in the adapter; the permission frame is still what reaches
+        # goose / pi send session/request_permission for privileged tools on
+        # the ACP path. We do not advertise fs/* or terminal/*, so file I/O
+        # stays in the adapter; the permission frame is still what reaches
         # HookManager.on_tool_call. Structural, like CLIENT_DELEGATED, without
-        # claiming we serve those client methods.
+        # claiming we serve those client methods. OpenCode is SEEDED_SETTINGS
+        # instead: its own default is permissive, so a seed+readback is the
+        # probe, not this structural ROUTED.
         return (
             Verdict.ROUTED,
             "the adapter asks per privileged tool via session/request_permission",
@@ -108,13 +145,29 @@ def resolve_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
     )
 
 
+def resolve_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
+    """Return the routing verdict for ``backend`` plus an operator-facing reason.
+
+    Read-only. The seed that makes ``SEEDED_SETTINGS`` backends ROUTED is
+    ``enforce`` / ``_spawn``; this probe must agree with ``GET /api/acp-backends``
+    and ``kirocrew doctor`` without creating files.
+    """
+    return routing_verdict(backend, work_dir)
+
+
 def remediation_for(backend: str, work_dir: Path | str) -> str:
     """The concrete change an operator must make, per backend."""
     descriptor = acp_backends.descriptor_for(backend)
     if descriptor.routing is acp_backends.Routing.SEEDED_SETTINGS:
-        from kiro_crew.acp import claude as claude_backend
+        if backend == ACP_BACKEND_OPENCODE:
+            from kiro_crew.acp import opencode as opencode_backend
 
-        return claude_backend.remediation_hint(work_dir)
+            return opencode_backend.remediation_hint(work_dir)
+        if backend == ACP_BACKEND_CLAUDE:
+            from kiro_crew.acp import claude as claude_backend
+
+            return claude_backend.remediation_hint(work_dir)
+        return ""
     if descriptor.routing is acp_backends.Routing.SESSION_CONFIG:
         return (
             f"Install a compatible {descriptor.label} adapter that advertises "
@@ -157,7 +210,8 @@ def enforce(
     the probe cannot tell — is exactly the "assumed but not present" case that
     silently disables the gate.
     """
-    verdict, reason = resolve_verdict(backend, work_dir)
+    _seed_routed_settings(backend, work_dir)
+    verdict, reason = routing_verdict(backend, work_dir)
     if verdict is Verdict.ROUTED:
         return
     enforce_runtime_routing(
@@ -273,5 +327,6 @@ __all__ = [
     "enforce_runtime_routing",
     "remediation_for",
     "resolve_verdict",
+    "routing_verdict",
     "session_config_issue",
 ]

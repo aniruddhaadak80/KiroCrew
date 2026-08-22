@@ -478,10 +478,16 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(opts?: { slot?: string }): Promise<ModelInfo[]> {
+  async fetchAvailableModels(opts?: { slot?: string; scope?: string }): Promise<ModelInfo[]> {
     const sessionScoped = !!opts?.slot
+    const markDegraded = (degraded: boolean) => {
+      markModelsDegraded(this.id, degraded, opts?.scope)
+      // Live-chat display still reads the unscoped getter. A config-namespace
+      // 503 must not flip that flag — that is the flap scoped keys stop.
+      if (sessionScoped) markModelsDegraded(this.id, degraded)
+    }
     try {
-      const raw = await api.models(opts)
+      const raw = await api.models(opts?.slot ? { slot: opts.slot } : undefined)
       // TWO shapes, and the shape itself identifies the namespace. The kiro
       // path answers with a BARE ARRAY; a non-kiro backend answers
       // `{models, backend}`. Reading only the array form treated a perfectly
@@ -510,7 +516,7 @@ export class AcpAdapter implements ProviderAdapter {
       if (!Array.isArray(models) || models.length === 0) {
         // Empty/unusable success: NOT a live list — keep polling, and serve the
         // last-good list only if it belongs to THIS backend's namespace.
-        markModelsDegraded(this.id, true)
+        markDegraded(true)
         if (sessionScoped) return []
         return readCachedModels(backend) ?? (servesAutoModel() ? this._defaultModels() : [])
       }
@@ -532,7 +538,7 @@ export class AcpAdapter implements ProviderAdapter {
       if (!sessionScoped) {
         writeCachedModels(result, backend) // good live list, stamped with its namespace
       }
-      markModelsDegraded(this.id, false) // live success → self-heal can stop polling
+      markDegraded(false) // live success → self-heal can stop polling
       return result
     } catch (e) {
       // Two different failures reach this catch and they need opposite answers.
@@ -551,7 +557,7 @@ export class AcpAdapter implements ProviderAdapter {
       // with the namespace that is actually active — otherwise a blip on a spec
       // adapter would resurrect kiro's ids, which is the very confusion the
       // branch above exists to prevent.
-      markModelsDegraded(this.id, true)
+      markDegraded(true)
       if (sessionScoped) return []
       const named = backendFromErrorBody(e)
       if (named !== null) rememberBackend(named)
