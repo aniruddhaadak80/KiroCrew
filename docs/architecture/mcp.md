@@ -843,14 +843,17 @@ no walk to get wrong.
 
 The directive marker is model-visible, since it comes back as tool-result text,
 so the consumer defends against forgery by honoring a directive only when the
-tool call it arrived under was recorded, from kiro-cli's out-of-band `_meta`
-channel, as an MCP-served call whose canonical name (`_meta.kiro.toolName`, with
-`_meta.kiro.mcpServerName` equal to `kirocrew-core`) is in `DIRECTIVE_TOOLS`. The
-LLM-authored `title` is explicitly not accepted, because a shell command titled
-`monitor_start` whose stdout forges the marker must not be honored. The gate fails
-closed when `_meta` identity is absent, and refuses native-sub-agent tool calls,
-which surface as flat events in the parent's loop but have no independently
-bindable slot. The marker is ASCII-only: an earlier invisible-separator prefix was
+tool call it arrived under was recorded as an MCP-served call whose canonical
+name (`event.tool_name`, with `event.mcp_server_name` equal to `kirocrew-core`)
+is in `DIRECTIVE_TOOLS`. That identity is kiro-cli's out-of-band `_meta.kiro`
+channel, or — when `_meta.kiro` is absent and `kind` is present and not
+execute — a spec-adapter `mcp__<server>__<tool>` title recovered by
+`acp/_dispatch.py`. A kiro-cli LLM-authored `title` is never parsed, because a
+shell command titled `monitor_start` whose stdout forges the marker must not be
+honored. The gate fails closed when neither identity channel is present, and
+refuses native-sub-agent tool calls, which surface as flat events in the
+parent's loop but have no independently bindable slot. The marker is ASCII-only:
+an earlier invisible-separator prefix was
 destroyed by `validation.build_tool_response`, which strips Unicode category `Cf`
 from every tool response, so every directive silently failed. A machine-facing
 framing token must not depend on characters that sanitizers and normalizers

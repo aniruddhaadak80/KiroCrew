@@ -2459,7 +2459,19 @@ class AcpClient:
 
         from kiro_crew.acp import spec_servers
 
-        return spec_servers.merge_session_servers(managed, pooled)
+        merged = spec_servers.merge_session_servers(managed, pooled)
+        if not self._is_spec_adapter:
+            return merged
+        # Adapter-spawned MCP children often inherit only the declared env.
+        # Session identity and the bound gateway port have to ride that list
+        # or workflow / follow-up tools resolve the wrong loopback.
+        bound = os.environ.get("KIROCREW_BOUND_PORT") or os.environ.get("KIROCREW_PORT") or ""
+        return spec_servers.pin_session_callback_env(
+            merged,
+            session_key=self._session_key or "",
+            channel_id=self._channel_id or "",
+            bound_port=bound,
+        )
 
     @property
     def is_ready(self) -> bool:

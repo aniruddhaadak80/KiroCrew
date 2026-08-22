@@ -5771,13 +5771,15 @@ async def _run_chat(
                     _raw = _raw[9:]
                 if event.tool_call_id:
                     _pending_tools[event.tool_call_id] = _raw
-                    # Forgery gate: record the directive-tool name ONLY
-                    # from the trusted _meta.kiro identity and ONLY for a genuine
-                    # call served by KiroCrew's OWN core MCP server — never the
-                    # title, and never another (possibly third-party) MCP server
-                    # that merely exposes a tool named e.g. "monitor_start". A
-                    # shell tool has no mcp_server_name and canonical tool_name
-                    # "execute_bash", so it can never register here. Recorded at
+                    # Forgery gate: record the directive-tool name ONLY from
+                    # the trusted identity on the event (kiro ``_meta.kiro``,
+                    # or a non-shell spec-adapter ``mcp__`` title) and ONLY
+                    # for a genuine call served by KiroCrew's OWN core MCP
+                    # server — never a kiro-cli prose title, and never another
+                    # (possibly third-party) MCP server that merely exposes a
+                    # tool named e.g. "monitor_start". A shell tool has no
+                    # mcp_server_name and canonical tool_name "execute_bash",
+                    # so it can never register here. Recorded at
                     # EVENT_TOOL_CALL only (the UPDATE refinement rewrites titles).
                     if event.mcp_server_name == session_directive.CORE_MCP_SERVER:
                         _cannon = session_directive.match_tool(event.tool_name)
@@ -5998,9 +6000,11 @@ async def _run_chat(
                 # tool's own return over the MCP pipe — this does NOT rewrite the
                 # model's tool result, which is why the tool's own message is
                 # written to not over-claim the (consumer-applied) effect.
-                # Gated on _pending_dir_tool — the CANONICAL _meta.kiro tool name
-                # for a genuine MCP call, NOT model-authored result/title text —
-                # so a forged marker under a shell/non-directive tool is ignored.
+                # Gated on _pending_dir_tool — the CANONICAL tool name for a
+                # genuine MCP call (kiro ``_meta.kiro`` or a non-shell
+                # spec-adapter ``mcp__`` title), NOT model-authored result
+                # text — so a forged marker under a shell/non-directive tool
+                # is ignored.
                 # A native sub-agent's tool calls DO surface here (flat events
                 # tagged in _native_tc_card) but have no independently bindable
                 # slot, so they are refused rather than applied to the parent —

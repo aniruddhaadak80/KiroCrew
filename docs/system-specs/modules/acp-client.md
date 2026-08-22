@@ -34,7 +34,9 @@ tree, which rode eight of the eleven. Converted sites:
 Crew serves `elicitation/create`. codex-acp gates MCP tool-call approvals on that
 capability: declare it and approvals arrive as `elicitation/create`, which Kiro
 Crew answers `-32601`, which codex-acp converts into `action: "cancel"` — every
-MCP tool call silently cancelled with no prompt and no visible error.
+MCP tool call silently cancelled with no prompt and no visible error. Follow-up
+questions and workflows therefore go through `session/request_permission` plus
+Crew's own `kirocrew-core` tools, not through elicitation.
 
 **Codex adapter resolution** (`acp/codex.py:resolve_argv`): `CODEX_ACP_BIN`
 override, then `codex-acp` via mise and the augmented PATH. There is deliberately
@@ -178,22 +180,24 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
   agent's own `model` field. Only the default kirocrew agent gets KiroCrew's
   configured model override.
 - **MCP servers**: backend-dependent.
-  - **kiro-cli**: `session/new` passes `mcpServers: []` — kiro-cli loads
-    servers from the agent config (respects `mcpServers` in the agent's config
-    file). Non-kirocrew agents (e.g. AIM-installed) load only their own
-    `mcpServers`. The kirocrew agent loads from global `~/.kiro/settings/mcp.json`
-    where `disabled` and `disabledTools` flags are respected. KiroCrew's dashboard
-    MCP tab writes directly to the global config.
-  - **claude-agent-acp**: does NOT read any config file or `--agent` flag, so
-    `session/new` (and `session/load`) must carry the servers in the
-    `mcpServers` param. `_claude_acp_mcp_servers()` reads the KiroCrew-owned
-    `~/.claude/agents/kirocrew.mcp.json` (kept current by
-    `agent.install_cc_agent_config`) and reshapes it to the ACP array via
-    `cc_agent.acp_servers_from_cc_map` (stdio → `{name,command,args,env:[{name,value}],type}`;
-    url → `{name,type:"http"|"sse",url,headers}`). kirocrew-core/cron are forced
-    to their canonical stdio command (overriding any stale `url`) and always
-    injected even when the registry is missing. Read per spawn so MCP
-    installs/toggles apply on the next session without a gateway restart.
+  - **kiro-cli**: servers arrive through the `--agent` spec. This seam returns
+    the pooled-broker list only; it does not inject managed servers a second
+    time (harness parity: an added harness adapts, it does not widen).
+  - **Spec adapters** (claude / Codex / a ROUTED registry adapter): they read
+    no Kiro Crew config, so `session/new` / `session/load` carry Crew's own
+    managed servers (`kirocrew-core`, `kirocrew-cron`, and `kirocrew-computer`
+    when its spec gate is open) via `acp/spec_servers.py`. User-configured
+    servers are never transmitted — their `env` routinely holds secrets.
+    Delivery requires a `ROUTED` verdict: an UNVERIFIED adapter (goose today)
+    starts without Crew's control plane. Each delivered entry is pinned with
+    `KIROCREW_SESSION_KEY` / `KIROCREW_BOUND_PORT` because adapter-spawned
+    stdio children often inherit only the declared env; without that pin
+    `workflow_run` misses the loopback and `ask_question` cannot attribute
+    the caller. Spec adapters do not emit `_meta.kiro`; `_dispatch` recovers
+    `mcp_server_name` / `tool_name` from a non-shell `mcp__<server>__<tool>`
+    title so chat_runner can still apply session directives
+    (`ask_question`, `suggest_followup`). A shell `kind=execute` whose title
+    forges that prefix is ignored.
 - **Tools/allowedTools/toolsSettings**: Applied by kiro-cli via `set_mode`.
 - **Prompt/resources/hooks**: Applied by kiro-cli via `set_mode`.
 - **deniedCommands**: Enforced by KiroCrew's `_enforce_denied_commands()` on

@@ -1027,41 +1027,75 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
     )
 
 
-def _kiro_tool_name(update: dict[str, Any]) -> str:
-    """The real tool name from ``_meta.kiro.toolName``, or "" when absent.
+_MCP_TITLE_PREFIX = "mcp__"
 
-    The user-visible ``title`` is LLM-authored prose ("Creating task list: …"),
-    so it cannot be used to identify a tool. Only this ``_meta`` channel is
-    stable.
+
+def _mcp_identity_from_title(title: object) -> tuple[str, str]:
+    """Parse ``mcp__<server>__<tool>`` from an adapter-authored title.
+
+    Spec adapters (claude-agent-acp, codex-acp) put that form in ``title`` and
+    do not emit ``_meta.kiro``. kiro-cli's LLM-authored titles never start with
+    this prefix. A shell tool whose model-written title forges it is rejected
+    by the caller when ``kind`` is execute.
+    """
+    if not isinstance(title, str) or not title.startswith(_MCP_TITLE_PREFIX):
+        return ("", "")
+    rest = title[len(_MCP_TITLE_PREFIX) :]
+    server, sep, tool = rest.rpartition("__")
+    if not sep or not server or not tool:
+        return ("", "")
+    return (server, tool)
+
+
+def _spec_mcp_identity(update: dict[str, Any]) -> tuple[str, str]:
+    """Title-derived MCP identity, or empty when the kind is missing or a shell.
+
+    A missing kind cannot be told from execute, so the title is not consulted.
+    """
+    kind = update.get("kind")
+    if not isinstance(kind, str) or not kind or is_shell_kind(kind):
+        return ("", "")
+    return _mcp_identity_from_title(update.get("title"))
+
+
+def _kiro_tool_name(update: dict[str, Any]) -> str:
+    """The real tool name from ``_meta.kiro.toolName``, or a spec-adapter title.
+
+    The user-visible ``title`` is LLM-authored prose on kiro-cli ("Creating
+    task list: …"), so it cannot identify a tool there. Spec adapters put the
+    canonical ``mcp__<server>__<tool>`` in ``title`` and emit no ``_meta``.
     """
     meta = update.get("_meta")
-    if not isinstance(meta, dict):
-        return ""
-    kiro = meta.get("kiro")
-    if not isinstance(kiro, dict):
-        return ""
-    name = kiro.get("toolName")
-    return name if isinstance(name, str) else ""
+    if isinstance(meta, dict):
+        kiro = meta.get("kiro")
+        if isinstance(kiro, dict):
+            name = kiro.get("toolName")
+            if isinstance(name, str) and name:
+                return name
+    _server, tool = _spec_mcp_identity(update)
+    return tool
 
 
 def _kiro_mcp_server_name(update: dict[str, Any]) -> str:
-    """The MCP server name from ``_meta.kiro.mcpServerName``, or "" for
-    built-in/shell tools.
+    """The MCP server name from ``_meta.kiro.mcpServerName``, or a spec title.
 
     kiro-cli sets this ONLY for MCP-served tool calls (see
     ``kiro_tool_identity_meta`` in the engine), so a non-empty value is the
     trusted discriminator "this tool call was served by an MCP server" — the
     signal a security gate needs to tell a genuine MCP directive tool from a
-    shell command whose stdout the model authored.
+    shell command whose stdout the model authored. Spec adapters do not emit
+    ``_meta.kiro``; their ``mcp__<server>__<tool>`` title is the equivalent
+    signal, and only when ``kind`` is present and not execute.
     """
     meta = update.get("_meta")
-    if not isinstance(meta, dict):
-        return ""
-    kiro = meta.get("kiro")
-    if not isinstance(kiro, dict):
-        return ""
-    name = kiro.get("mcpServerName")
-    return name if isinstance(name, str) else ""
+    if isinstance(meta, dict):
+        kiro = meta.get("kiro")
+        if isinstance(kiro, dict):
+            name = kiro.get("mcpServerName")
+            if isinstance(name, str) and name:
+                return name
+    server, _tool = _spec_mcp_identity(update)
+    return server
 
 
 def _todo_payload(raw_output: Any) -> dict[str, Any] | None:

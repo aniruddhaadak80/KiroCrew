@@ -188,6 +188,47 @@ def merge_session_servers(managed: list[dict], pooled: list[dict]) -> list[dict]
     return out
 
 
+def pin_session_callback_env(
+    entries: list[dict],
+    *,
+    session_key: str = "",
+    channel_id: str = "",
+    bound_port: str = "",
+) -> list[dict]:
+    """Stamp gateway callback identity onto each ``mcpServers`` env list.
+
+    Spec adapters spawn these stdio servers themselves and often pass ONLY the
+    declared env, not the ACP process environment. Session-bound tools
+    (``ask_question``, ``workflow_run``) resolve the caller and the loopback
+    port from env, so those values must ride the ``session/new`` entry.
+    Empty values are omitted rather than written as blanks: a blank
+    ``KIROCREW_SESSION_KEY`` would hide a later inherited identity.
+    """
+    extras: list[tuple[str, str]] = []
+    if session_key:
+        extras.append(("KIROCREW_SESSION_KEY", session_key))
+    if channel_id:
+        extras.append(("KIROCREW_CHANNEL_ID", channel_id))
+    if bound_port:
+        extras.append(("KIROCREW_BOUND_PORT", bound_port))
+        extras.append(("KIROCREW_PORT", bound_port))
+    if not extras:
+        return entries
+
+    overwrite = {key for key, _ in extras}
+    pinned: list[dict] = []
+    for entry in entries:
+        raw_env = entry.get("env")
+        kept: list[dict] = []
+        if isinstance(raw_env, list):
+            for pair in raw_env:
+                if isinstance(pair, dict) and pair.get("name") not in overwrite:
+                    kept.append(pair)
+        kept.extend({"name": key, "value": value} for key, value in extras)
+        pinned.append({**entry, "env": kept})
+    return pinned
+
+
 def entry_is_spec_legal(entry: dict) -> bool:
     """Whether ``entry`` satisfies ``McpServerStdio``'s required field set.
 
@@ -203,6 +244,7 @@ __all__ = [
     "entry_is_spec_legal",
     "managed_spec_servers",
     "merge_session_servers",
+    "pin_session_callback_env",
     "reduce_to_spec_keys",
     "reserved_managed_names",
     "safe_server_name",
