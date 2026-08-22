@@ -106,7 +106,9 @@
     "open_command_bar": "Command Bar खोलें",
     "focus_mode": "फ़ोकस मोड",
     "focus_mode_title": "फ़ोकस मोड · Alt+Shift+M",
-    "focus_mode_title_mac": "फ़ोकस मोड · ⌥⇧M"
+    "focus_mode_title_mac": "फ़ोकस मोड · ⌥⇧M",
+    "active_harness": "एजेंट हार्नेस: {{label}}",
+    "active_harness_open_settings": "एजेंट हार्नेस: {{label}} — ACP अडैप्टर सेटिंग्स खोलें"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4849,7 +4851,13 @@
       "upload_file": "फ़ाइल अपलोड करें",
       "use_a_skill": "स्किल का उपयोग करें",
       "used": "उपयोग",
-      "voice_input": "वॉइस इनपुट"
+      "voice_input": "वॉइस इनपुट",
+      "plan_limit": "प्लान सीमा",
+      "limit_type": "सीमा प्रकार",
+      "resets": "रीसेट",
+      "rate_limit_allowed": "ठीक",
+      "rate_limit_warning": "सीमा के करीब",
+      "rate_limit_rejected": "सीमित"
     },
     "chatPane": {
       "agent_list": "एजेंट सूची",
@@ -8794,7 +8802,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "इनबाउंड वेबहुक टोकन, पंजीकृत संदर्भ और रन इतिहास. API काम करता है, पेज अभी पूरा नहीं हुआ है.",
         "open_webhooks": "वेबहुक खोलें",
-        "webhooks": "वेबहुक"
+        "webhooks": "वेबहुक",
+        "acp_backends": "ACP अडैप्टर",
+        "experimental_acp_backends_claude_code_and_openai": "Kiro CLI के विकल्प के रूप में Claude Code और OpenAI Codex। अस्वीकृति पथ परीक्षित हैं; कोई सफल सत्र नहीं देखा गया है।"
       }
     },
     "developerPage": {
@@ -9919,6 +9929,41 @@
         "vector_memory": "वेक्टर मेमोरी",
         "vector_memory_is_initializing_the_embedding_mode": "वेक्टर मेमोरी शुरू हो रही है। एम्बेडिंग मॉडल (~610MB) बैकग्राउंड में स्वतः डाउनलोड होता है, और पुरानी मेमोरी अपने आप माइग्रेट हो जाती है — किसी कार्रवाई की ज़रूरत नहीं।",
         "verifying_model_integrity": "मॉडल की अखंडता जाँची जा रही है…"
+      },
+      "acpBackend": {
+        "title": "ACP अडैप्टर",
+        "experimental": "प्रयोगात्मक",
+        "all_features_supported": "डिफ़ॉल्ट। सभी सुविधाएँ समर्थित हैं।",
+        "features_differ": "{{total}} में से {{count}} सुविधाएँ अलग तरह से काम करती हैं, अनुपलब्ध हैं या सत्यापित नहीं हैं।",
+        "show_what_changes": "दिखाएँ क्या बदलता है",
+        "applies_to_new_sessions": "अब से शुरू होने वाले सत्रों पर लागू होता है। खुले सत्र अपना मूल अडैप्टर बनाए रखते हैं।",
+        "not_enabled_in_this_build": "इस बिल्ड में सक्षम नहीं: {{backends}}। प्रयोगात्मक ACP अडैप्टर दस्तावेज़ देखें।",
+        "level_supported": "समर्थित",
+        "level_degraded": "भिन्न रूप से काम करता है",
+        "level_unavailable": "अनुपलब्ध",
+        "cap_session_sharing": "साझा सबएजेंट रनटाइम",
+        "cap_reasoning_effort": "तर्क प्रयास",
+        "cap_mcp_tool_search": "MCP टूल खोज",
+        "cap_agent_profiles": "एजेंट प्रोफ़ाइल",
+        "cap_slash_commands": "स्लैश कमांड",
+        "cap_turn_usage": "प्रति-टर्न उपयोग",
+        "cap_billing": "लागत और सीमाएँ",
+        "cap_native_resume": "सत्र पुनरारंभ",
+        "cap_registry_model_ids": "Kiro मॉडल कैटलॉग का उपयोग",
+        "cap_mid_turn_steer": "टर्न के बीच मार्गदर्शन",
+        "confirm_title": "{{backend}} पर स्विच करें?",
+        "confirm_body": "यह एडाप्टर प्रयोगात्मक है। {{total}} में से {{count}} Kiro Crew सुविधाएँ अलग तरह से काम करती हैं, अनुपलब्ध हैं या सत्यापित नहीं हैं।",
+        "confirm_open_sessions": "खुले सत्र प्रभावित नहीं होते और अपना वर्तमान अडैप्टर बनाए रखते हैं।",
+        "cancel": "रद्द करें",
+        "confirm_switch": "अडैप्टर बदलें",
+        "confirm_prerequisites": "पहले गेटवे होस्ट पर इन्हें क्रम से चलाएँ।",
+        "not_installed": "एडाप्टर इंस्टॉल नहीं है",
+        "level_unverified": "सत्यापित नहीं",
+        "routing_routed": "टूल कॉल {{productName}} के सुरक्षा गेट तक पहुँचते हैं",
+        "routing_indeterminate": "टूल-कॉल रूटिंग सत्यापित नहीं है — नए सत्र अस्वीकार किए जाएंगे",
+        "routing_bypassed": "टूल कॉल {{productName}} के सुरक्षा गेट को दरकिनार कर देंगे — नए सत्र अस्वीकार किए जाएंगे",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "अनियंत्रित टूल अनुमत हैं। अस्वीकृत-कमांड नियम, संवेदनशील-पथ अवरोधन और गवर्नेंस सीमा इस बैकएंड की स्व-अनुमोदित कॉल के लिए नहीं देखी जाती।"
       }
     },
     "overviewPage": {
@@ -10291,7 +10336,9 @@
       "stopped": "रुका हुआ",
       "threads": "थ्रेड",
       "uptime": "अपटाइम",
-      "working_directory": "कार्य डायरेक्टरी"
+      "working_directory": "कार्य डायरेक्टरी",
+      "acp_backend": "ACP अडैप्टर",
+      "acp_backend_experimental": "{{label}} (प्रयोगात्मक)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "फ़ज़ी फ़िल्टर (सबस्ट्रिंग मैच)",

@@ -136,6 +136,11 @@ send time.
   memory, leaving the new ACP process with zero history.
 - **Per-session semaphore**: serializes concurrent messages on the same
   thread key. `get_or_create()` acquires; caller must `release()` when done.
+- **New-session config refresh**: changing `agent.acp_backend`, `agent.model`, or
+  `agent.reasoning_effort` rebuilds the provider factory and drains the warm
+  pool, because those values are captured when the factory is built. Existing
+  sessions keep their current adapter and defaults; the next session uses the
+  new configuration without a gateway restart.
 - **Post-semaphore revalidation** (`_reacquire_and_validate`): the per-session
   semaphore may be held for a full turn, so it is ALWAYS acquired with the
   global `self._lock` RELEASED (pinning the lock across that wait would freeze

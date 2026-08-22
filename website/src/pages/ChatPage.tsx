@@ -974,6 +974,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const slotState = useAppSelector(s => s.chat.slotState)
   const contextPct = useAppSelector(s => s.chat.slotContextPct[s.chat.activeSlot ?? ''] ?? 0)
   const contextTokens = useAppSelector(s => s.chat.slotContextTokens?.[s.chat.activeSlot ?? ''])
+  // Plan quota for whatever harness this slot runs on — undefined for the ones
+  // that report none, which is most of them.
+  const rateLimit = useAppSelector(s => s.chat.slotRateLimit?.[s.chat.activeSlot ?? ''])
   // Length only. The two arrays themselves are mutated per streamed sub-agent /
   // tool chunk, and their only consumer is the Activity panel (SidePanel), which
   // is closed by default and now subscribes to them itself. Subscribing to the
@@ -7247,6 +7250,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               contextPct={contextPct}
               contextUsedTokens={contextTokens?.used}
               contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+              rateLimit={rateLimit}
               showContextPct={chatConfig.showContextPct}
               showContextTokens={chatConfig.showContextTokens}
               isRunning={composerBusy}

@@ -17,6 +17,7 @@ from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.acp.types import ACP_BACKENDS_AUTO_MODEL
 from kiro_crew.agent import (
     AGENT_FILENAME,
     clear_model_pin,
@@ -257,7 +258,9 @@ async def api_agent_config(request: web.Request) -> web.Response:
             # other JSON type (list, dict, number) would flow into the sidecar
             # helper as a dict key and crash the endpoint with a 500.
             raw_name = config.get("name")
-            name = raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
+            name = (
+                raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
+            )
             changed = await asyncio.to_thread(agent_state.lift_and_strip_bookkeeping, config, name)
             if changed:
                 logger.info(
@@ -726,6 +729,7 @@ async def api_agents_installed(request: web.Request) -> web.Response:
     (``resolve_agent_bindings(..., project_dir=...)``), spawn validation, and
     Slack — see ``agent_discovery.project_agent_names``.
     """
+
     # list_agents() does glob + per-file resolve(strict=True) + read_bytes +
     # json.loads over ~/.kiro/agents — blocking filesystem work that, on a large
     # agents dir (network home, many project-registry agents), can stall the
@@ -958,8 +962,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -998,6 +1005,75 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
 
+def _configured_acp_backend() -> str:
+    """The configured non-default ACP backend, or ``""`` for kiro-cli.
+
+    Fails closed to ``""``: an unreadable config keeps the kiro-cli path, which is
+    the behaviour that exists today.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.acp_backend or ""
+    except Exception:
+        return ""
+
+
+def _advertised_alt_backend_models(request: web.Request) -> list[dict[str, str]]:
+    """Models a live session's backend advertised, newest session first.
+
+    The ONLY correct source on a non-kiro backend: ids live in that backend's own
+    namespace, so neither the model registry nor ``kiro-cli --list-models`` can
+    supply them. Ids are passed through VERBATIM — a Codex row is spelled
+    ``<model>[<effort>]`` and rewriting it would produce something the adapter
+    never advertised.
+
+    Newest first because a just-created session reflects the operator's current
+    configuration; an older one may predate a backend switch. Returns the first
+    non-empty list rather than merging, since merging two backends' namespaces
+    would offer ids the active backend rejects.
+    """
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    active = getattr(sessions, "active_providers", None)
+    if not callable(active):
+        return []
+    try:
+        providers = list(active())
+    except Exception:
+        logger.debug("Could not enumerate active providers", exc_info=True)
+        return []
+
+    for provider in reversed(providers):
+        reader = getattr(provider, "available_models", None)
+        if not callable(reader):
+            client = getattr(provider, "client", None)
+            reader = getattr(client, "available_models", None)
+        if not callable(reader):
+            continue
+        try:
+            rows = reader()
+        except Exception:
+            continue
+        models: list[dict[str, str]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            model_id = row.get("modelId") or row.get("model_name") or ""
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            models.append(
+                {
+                    "model_name": model_id,
+                    "display_name": str(row.get("name") or model_id),
+                    "description": str(row.get("description") or ""),
+                }
+            )
+        if models:
+            return models
+    return []
+
+
 async def api_models(request: web.Request) -> web.Response:
     """GET /api/models — list available models from the live kiro-cli ACP session."""
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
@@ -1011,6 +1087,52 @@ async def api_models(request: web.Request) -> web.Response:
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked
+
+    # Backend scope, checked BEFORE the kiro-cli spawn: on another ACP backend
+    # that subprocess is both impossible (the binary may be absent) and wrong
+    # (its ids are kiro-namespace and the other backend rejects them). The
+    # advertised list from a live session is the only correct source there.
+    _alt_backend = await asyncio.to_thread(_configured_acp_backend)
+    if _alt_backend:
+        advertised = _advertised_alt_backend_models(request)
+        if not advertised:
+            # Degraded, NOT a genuine "zero models" answer — no session has
+            # advertised yet. Same keep-polling contract as the branches below;
+            # a cached [] renders an empty picker that only a refresh recovers.
+            #
+            # `backend` is reported on the FAILURE too, not just on success: the
+            # client caches model lists, and a cache is only safe to reuse for
+            # the namespace it was written for. Naming the backend here lets a
+            # degraded answer still identify the namespace, so the client can
+            # refuse a cache belonging to a different one.
+            return web.json_response(
+                {
+                    "error": "no live ACP session has advertised its models yet",
+                    "code": "acp_backend_models_unavailable",
+                    "backend": _alt_backend,
+                    "serves_auto": _alt_backend in ACP_BACKENDS_AUTO_MODEL,
+                },
+                status=503,
+            )
+        # The kiro path below answers with a BARE ARRAY, so the object shape here
+        # is itself the discriminator for "not kiro"; `backend` names which one.
+        #
+        # `serves_auto` travels on the SUCCESS and the FAILURE alike, for the same
+        # reason `backend` does. It answers a question the model list itself
+        # cannot: whether the picker may synthesize an "auto" row when it has no
+        # live list to show. That is exactly the degraded state, so a flag sent
+        # only on success would be absent precisely when it is needed. Reported
+        # from ACP_BACKENDS_AUTO_MODEL so the frontend never mirrors the
+        # membership -- a backend added to that set is picked up here with no
+        # client change.
+        return web.json_response(
+            {
+                "models": advertised,
+                "backend": _alt_backend,
+                "serves_auto": _alt_backend in ACP_BACKENDS_AUTO_MODEL,
+            }
+        )
+
     kiro_bin: str | None = None
     try:
         from kiro_crew.acp.client import (  # noqa: F811

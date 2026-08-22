@@ -37,6 +37,7 @@ from kiro_crew.acp.liveness import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     JSONRPC_METHOD_NOT_FOUND,
     AcpPromptStats,
 )
@@ -908,18 +909,114 @@ class TestAcpClientBackendSelection:
 
         await _stop_stderr_drain(client)
 
+    def test_models_come_from_the_model_config_option_when_models_is_absent(self, tmp_path):
+        """claude-agent-acp advertises no `models` payload — its list is a configOption.
+
+        Measured against the real adapter: `session/new` carries neither
+        `models.availableModels` nor `currentModelId`, only a configOptions entry
+        `id="model"`. Reading the spec field alone left the picker empty on the
+        one backend whose list the old comment cited as the example.
+        """
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._store_session_config(
+            {
+                "configOptions": [
+                    {"id": "effort", "options": [{"value": "low", "name": "Low"}]},
+                    {
+                        "id": "model",
+                        "currentValue": "global.anthropic.claude-sonnet-5",
+                        "options": [
+                            {"value": "default", "name": "Default", "description": "Opus"},
+                            {"value": "global.anthropic.claude-sonnet-5", "name": "Sonnet"},
+                        ],
+                    },
+                ]
+            }
+        )
+        # Ids VERBATIM — a rewritten id is one the adapter never offered.
+        assert [m["modelId"] for m in client.available_models()] == [
+            "default",
+            "global.anthropic.claude-sonnet-5",
+        ]
+        assert client._resolved_model_id == "global.anthropic.claude-sonnet-5"
+
+    def test_the_models_payload_still_wins_over_the_config_option(self, tmp_path):
+        """The spec field stays authoritative; the configOption is only a fallback."""
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._capture_available_models(
+            {"models": {"availableModels": [{"modelId": "spec-model", "name": "Spec"}]}}
+        )
+        client._store_session_config(
+            {"configOptions": [{"id": "model", "options": [{"value": "option-model"}]}]}
+        )
+        assert [m["modelId"] for m in client.available_models()] == ["spec-model"]
+
+    @pytest.mark.asyncio
+    async def test_a_stale_startup_model_does_not_prevent_the_session_starting(self, tmp_path):
+        """A model persisted under another backend must not make this one unstartable.
+
+        Reproduces a live failure: `gpt-5.6-sol` is a kiro-namespace id, and
+        applying it to the claude dialect is refused with -32603. Letting that
+        propagate failed ensure_ready, so switching backends while a kiro model
+        was selected left the new backend permanently unable to start — and the
+        model picker that would correct it lives BEHIND the session that cannot
+        start. The entitlement check cannot catch this: it is gated on kiro
+        because a spec adapter advertises a different id namespace.
+        """
+        from kiro_crew.acp.client import DEFAULT_MODEL
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._session_id = "sess-stale"
+        client._model = "gpt-5.6-sol"
+
+        async def refuse(*_a, **_k):
+            raise acp_client.AcpError(
+                "JSON-RPC error: {'code': -32603, 'message': 'Internal error', "
+                "'data': {'details': 'Invalid value for config option model: "
+                "gpt-5.6-sol'}}"
+            )
+
+        client.set_config_option = refuse  # type: ignore[assignment]
+
+        # Must NOT raise: the session has to come up on the backend's default.
+        await client._apply_startup_model()
+
+        # Reset so the warm-pool re-apply does not retry the refused id.
+        assert client._model == DEFAULT_MODEL
+
     @pytest.mark.asyncio
     async def test_initialize_protocol_version_per_backend(self, tmp_path):
-        """kiro expects a date string; claude-agent-acp expects an integer."""
+        """kiro sends a date string; EVERY spec-dialect adapter sends the integer.
+
+        Derived from the dialect rather than a hand-listed pair. A hand-listed
+        pair named only kiro and claude, so codex and goose silently inherited
+        kiro's date string and every session/new was refused at initialize with
+        "expected number, received string" — a defect no mocked test caught
+        because the fake backend accepts whatever it is sent.
+        """
+        from kiro_crew.acp import backends as acp_backends
         from kiro_crew.acp.client import (
             PROTOCOL_VERSION,
-            PROTOCOL_VERSION_CLAUDE,
+            PROTOCOL_VERSION_SPEC,
         )
+        from kiro_crew.acp.types import ACP_BACKENDS_SELECTABLE
 
-        for backend, expected in (
-            ("", PROTOCOL_VERSION),
-            (ACP_BACKEND_CLAUDE, PROTOCOL_VERSION_CLAUDE),
-        ):
+        cases = [
+            (
+                backend,
+                (
+                    PROTOCOL_VERSION_SPEC
+                    if acp_backends.dialect_of(backend) is acp_backends.Dialect.SPEC
+                    else PROTOCOL_VERSION
+                ),
+            )
+            for backend in sorted(ACP_BACKENDS_SELECTABLE)
+        ]
+        # The set must actually exercise both arms, or this asserts nothing.
+        assert PROTOCOL_VERSION_SPEC in {expected for _, expected in cases}
+        assert PROTOCOL_VERSION in {expected for _, expected in cases}
+
+        for backend, expected in cases:
             client = AcpClient(work_dir=tmp_path, acp_backend=backend)
             client._session_id = "sess-1"  # short-circuit past the new-session call
             sent_params: dict = {}
@@ -3341,7 +3438,9 @@ class TestDeriveEditDiff:
     def test_create_content_becomes_addition_diff(self):
         from kiro_crew.acp._dispatch import derive_edit_diff
 
-        diff = derive_edit_diff({"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"})
+        diff = derive_edit_diff(
+            {"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"}
+        )
         assert "+x = 1" in diff
         assert "+y = 2" in diff
         assert "+++ /a/new.py" in diff
@@ -3368,8 +3467,16 @@ class TestDeriveEditDiff:
         letting a TypeError out of difflib abort the whole dispatch mid-turn."""
         from kiro_crew.acp._dispatch import derive_edit_diff
 
-        assert derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"}) == ""
-        assert derive_edit_diff({"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}) == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        assert (
+            derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"})
+            == ""
+        )
+        assert (
+            derive_edit_diff(
+                {"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}
+            )
+            == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        )
         assert derive_edit_diff({"path": ["/a"], "command": "create", "fileText": "x"}) == ""
         assert derive_edit_diff({"path": "/a/b", "command": "create", "fileText": 7}) == ""
 
@@ -4327,31 +4434,35 @@ class TestInitializeSession:
         finally:
             session_file.unlink(missing_ok=True)
 
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
     @pytest.mark.asyncio
-    async def test_cc_resume_skips_load_when_transcript_missing(self, tmp_path):
-        """claude backend: a stale persisted sid with NO transcript on disk
-        must fall back to session/new (a fresh start), not replay via
-        session/load. Guards against the ~38%-on-'hi' base-context bloat."""
-        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+    async def test_spec_adapter_resume_uses_opaque_session_id(self, tmp_path, backend):
+        """Spec adapters resume from their own stores, without a ~/.kiro file."""
+        client = self._make_client(tmp_path, acp_backend=backend)
+        client._resume_session_id = "old-spec-session"
 
-        client = self._make_client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
-        client._resume_session_id = "ghost-sess"  # no transcript exists for it
-
-        call_idx = [0]
+        responses = {
+            1: {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}},
+            2: {
+                "modes": {"availableModes": []},
+                "models": {"availableModels": [], "currentModelId": "gpt-5.2"},
+                "configOptions": (
+                    [{"id": "mode", "options": [{"value": "read-only"}]}]
+                    if backend == ACP_BACKEND_CODEX
+                    else []
+                ),
+            },
+        }
 
         async def fake_wait(req_id, timeout=50.0):
-            call_idx[0] += 1
-            if call_idx[0] == 1:
-                return {"protocolVersion": "2025-08-22", "agentCapabilities": {"loadSession": True}}
-            # session/load must NOT be called; the next request is session/new.
-            return {"sessionId": "fresh-sess"}
+            return responses.get(req_id, {})
 
         client._wait_for_response = AsyncMock(side_effect=fake_wait)
         client._drain_notifications = AsyncMock()
 
         await client._initialize_session()
-        assert client._session_id == "fresh-sess"
-        assert client._resumed is False
+        assert client._session_id == "old-spec-session"
+        assert client._resumed is True
 
     @pytest.mark.asyncio
     async def test_set_model_when_non_default(self, tmp_path):
@@ -5299,7 +5410,7 @@ class TestBuildPermissionEvent:
         event = client._build_permission_event(msg)
         assert event.tool_kind == ""
 
-    def test_default_options_when_empty(self):
+    def test_empty_options_stay_empty_and_pending(self):
         client = AcpClient()
         from kiro_crew.acp.types import JsonRpcMessage
 
@@ -5309,15 +5420,15 @@ class TestBuildPermissionEvent:
             params={"toolCall": {"title": "rm"}, "options": []},
         )
         event = client._build_permission_event(msg)
-        assert len(event.options) == 2
-        assert event.options[0]["id"] == "allow_once"
+        assert event.options == []
+        assert client._permission_options[10] == {}
 
     @pytest.mark.parametrize("bad_options", [None, "allow", 42, {"id": "allow_once"}])
-    def test_non_list_options_degrade_to_defaults(self, bad_options):
+    def test_non_list_options_degrade_to_empty_pending_request(self, bad_options):
         """The permission payload comes straight from the agent process; a
         non-list options value made the for-loop raise TypeError (or iterate
         dict keys), tearing down the prompt-turn event generator instead of
-        degrading to the default allow options."""
+        degrading to a cancellable request with no selectable options."""
         client = AcpClient()
         from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, JsonRpcMessage
 
@@ -5328,8 +5439,8 @@ class TestBuildPermissionEvent:
         )
         event = client._build_permission_event(msg)  # must not raise
         assert event.kind == EVENT_PERMISSION_REQUEST
-        assert len(event.options) == 2
-        assert event.options[0]["id"] == "allow_once"
+        assert event.options == []
+        assert client._permission_options[12] == {}
 
     @pytest.mark.parametrize("bad_toolcall", [None, "shell", ["x"], 7])
     def test_non_dict_toolcall_degrades_to_unknown(self, bad_toolcall):
@@ -5419,7 +5530,10 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert client._permission_options[20] == {"once": "allow", "always": "allow_always"}
+        assert client._permission_options[20] == {
+            "allow_once": "allow",
+            "allow_always": "allow_always",
+        }
 
     def test_legacy_kiro_shape_records_optionids(self):
         """Legacy kiro shape (id/label, no kind) is classified by literal id."""
@@ -5439,8 +5553,8 @@ class TestBuildPermissionEvent:
         )
         client._build_permission_event(msg)
         assert client._permission_options[21] == {
-            "once": "allow_once",
-            "always": "allow_always",
+            "allow_once": "allow_once",
+            "allow_always": "allow_always",
         }
 
     def test_reject_option_recorded_even_without_allow(self):
@@ -5462,7 +5576,7 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert client._permission_options[22].get("reject") == "reject_once"
+        assert client._permission_options[22].get("reject_once") == "reject_once"
 
     def test_unknown_legacy_id_not_classified(self):
         """Unknown legacy ids do not get a synthesized kind."""
@@ -5478,7 +5592,7 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert 23 not in client._permission_options
+        assert client._permission_options[23] == {}
 
 
 class TestApproveTool:
@@ -5489,7 +5603,7 @@ class TestApproveTool:
         from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[42] = {"once": "allow", "always": "allow_always"}
+        client._permission_options[42] = {"allow_once": "allow", "allow_always": "allow_always"}
         client._send_response = AsyncMock()
         await client.approve_tool(42, always=True)
         client._send_response.assert_awaited_once_with(
@@ -5503,7 +5617,7 @@ class TestApproveTool:
         from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[43] = {"once": "allow", "always": "allow_always"}
+        client._permission_options[43] = {"allow_once": "allow", "allow_always": "allow_always"}
         client._send_response = AsyncMock()
         await client.approve_tool(43)
         client._send_response.assert_awaited_once_with(
@@ -5512,69 +5626,49 @@ class TestApproveTool:
         )
 
     @pytest.mark.asyncio
-    async def test_no_recorded_falls_back_to_literal(self, tmp_path):
-        from kiro_crew.acp.types import (
-            OPTION_ALLOW_ALWAYS,
-            OPTION_ALLOW_ONCE,
-            OUTCOME_SELECTED,
-        )
+    async def test_no_recorded_option_cancels(self, tmp_path):
+        from kiro_crew.acp.types import OUTCOME_CANCELLED
 
         client = AcpClient(work_dir=tmp_path)
         client._send_response = AsyncMock()
         await client.approve_tool(44)
         client._send_response.assert_awaited_with(
             44,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ONCE}},
+            {"outcome": {"outcome": OUTCOME_CANCELLED}},
         )
         await client.approve_tool(45, always=True)
         client._send_response.assert_awaited_with(
             45,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ALWAYS}},
+            {"outcome": {"outcome": OUTCOME_CANCELLED}},
         )
 
     @pytest.mark.asyncio
-    async def test_explicit_option_id_skips_recorded_pop(self, tmp_path):
-        """Explicit option_id bypasses the recorded entry — defensive retries
-        with a recorded entry left intact still send the explicit id."""
-        from kiro_crew.acp.types import OUTCOME_SELECTED
+    async def test_unadvertised_explicit_option_cancels_and_consumes(self, tmp_path):
+        from kiro_crew.acp.types import OUTCOME_CANCELLED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[46] = {"once": "allow", "always": "allow_always"}
+        client._permission_options[46] = {"allow_once": "allow"}
         client._send_response = AsyncMock()
         await client.approve_tool(46, option_id="custom_id")
         client._send_response.assert_awaited_with(
             46,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "custom_id"}},
+            {"outcome": {"outcome": OUTCOME_CANCELLED}},
         )
-        assert client._permission_options[46] == {"once": "allow", "always": "allow_always"}
+        assert 46 not in client._permission_options
 
     @pytest.mark.asyncio
-    async def test_reject_only_recorded_falls_back_to_literal_on_approve(self, tmp_path):
-        """A request that advertised only a reject option records {"reject": ...}
-        with no "once"/"always" keys. Approving it must fall back to the canonical
-        allow id rather than KeyError-ing on the missing key."""
-        from kiro_crew.acp.types import (
-            OPTION_ALLOW_ALWAYS,
-            OPTION_ALLOW_ONCE,
-            OUTCOME_SELECTED,
-        )
+    async def test_reject_only_request_cannot_be_approved(self, tmp_path):
+        from kiro_crew.acp.types import OUTCOME_CANCELLED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[47] = {"reject": "reject_once"}
+        client._permission_options[47] = {"reject_once": "reject_once"}
         client._send_response = AsyncMock()
         await client.approve_tool(47)
         client._send_response.assert_awaited_with(
             47,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ONCE}},
+            {"outcome": {"outcome": OUTCOME_CANCELLED}},
         )
         assert 47 not in client._permission_options
-
-        client._permission_options[48] = {"reject": "reject_once"}
-        await client.approve_tool(48, always=True)
-        client._send_response.assert_awaited_with(
-            48,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ALWAYS}},
-        )
 
 
 class TestRejectTool:
@@ -5588,8 +5682,9 @@ class TestRejectTool:
         from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        # claude-agent-acp advertises optionId "reject" with kind "reject_once"
-        client._permission_options[60] = {"once": "allow", "reject": "reject"}
+        # claude-agent-acp advertises optionId "reject" with kind "reject_once";
+        # the map is keyed by KIND, so the id and the key differ here on purpose.
+        client._permission_options[60] = {"allow_once": "allow", "reject_once": "reject"}
         client._send_response = AsyncMock()
         await client.reject_tool(60)
         client._send_response.assert_awaited_once_with(
@@ -5605,7 +5700,10 @@ class TestRejectTool:
         from kiro_crew.acp.types import OUTCOME_CANCELLED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[61] = {"once": "allow_once", "always": "allow_always"}
+        client._permission_options[61] = {
+            "allow_once": "allow_once",
+            "allow_always": "allow_always",
+        }
         client._send_response = AsyncMock()
         await client.reject_tool(61)
         client._send_response.assert_awaited_once_with(
@@ -7889,15 +7987,11 @@ class TestIsTransientRawError:
         # Session expiry with a co-occurring 5xx token: the session-expiry
         # branch must win (checked first).
         assert (
-            _is_transient_raw_error(
-                {"data": "DispatchFailure: session expired", "message": ""}
-            )
+            _is_transient_raw_error({"data": "DispatchFailure: session expired", "message": ""})
             is False
         )
         assert (
-            _is_transient_raw_error(
-                {"data": "ConnectionResetError: not logged in", "message": ""}
-            )
+            _is_transient_raw_error({"data": "ConnectionResetError: not logged in", "message": ""})
             is False
         )
         # A bare 401/403 — the shape an expired session actually arrives in.
@@ -9606,6 +9700,46 @@ class TestSpawnEnvChannelCredentialScrub:
         assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
         assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
 
+    @pytest.mark.asyncio
+    async def test_client_spawn_pins_callbacks_to_parent_bound_port(self, monkeypatch):
+        monkeypatch.setenv("KIROCREW_PORT", "6776")
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7959")
+        captured: dict[str, object] = {}
+
+        class _StopSpawn(Exception):
+            pass
+
+        async def _fake_exec(*_args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            raise _StopSpawn()
+
+        monkeypatch.setattr(acp_client, "_resolve_kiro_bin", lambda: "/fake/kiro")
+        monkeypatch.setattr(
+            acp_client,
+            "wrap_argv",
+            lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+        )
+        monkeypatch.setattr(acp_client, "cgroup_scope_argv", lambda argv: argv)
+        monkeypatch.setattr(acp_client, "augmented_path", lambda p: p)
+        monkeypatch.setattr(acp_client, "resolve_krb5_ccname", lambda env: None)
+        monkeypatch.setattr(acp_client, "_resolve_ssh_auth_sock", lambda env: None)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        client = AcpClient(
+            sandbox_mode="auto",
+            extra_env={
+                "KIROCREW_PORT": "9000",
+                "KIROCREW_BOUND_PORT": "9001",
+            },
+        )
+        with pytest.raises(_StopSpawn):
+            await client._spawn()
+
+        env = captured["env"]
+        assert isinstance(env, dict)
+        assert env.get("KIROCREW_PORT") == "7959"
+        assert env.get("KIROCREW_BOUND_PORT") == "7959"
+
 
 class TestSetModelRebasesContextStats:
     """A mid-session set_model must re-anchor the context-meter stats.
@@ -10076,8 +10210,7 @@ class TestMiseNodeInstallsDir:
 
         monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "custom-mise"))
         assert (
-            client_mod._mise_node_installs_dir()
-            == tmp_path / "custom-mise" / "installs" / "node"
+            client_mod._mise_node_installs_dir() == tmp_path / "custom-mise" / "installs" / "node"
         )
 
     def test_xdg_data_home_is_honoured(self, tmp_path, monkeypatch):
@@ -10085,8 +10218,7 @@ class TestMiseNodeInstallsDir:
 
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         assert (
-            client_mod._mise_node_installs_dir()
-            == tmp_path / "xdg" / "mise" / "installs" / "node"
+            client_mod._mise_node_installs_dir() == tmp_path / "xdg" / "mise" / "installs" / "node"
         )
 
     @_POSIX_EXEC_PATHS_ONLY

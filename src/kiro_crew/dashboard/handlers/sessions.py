@@ -22,12 +22,13 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
+from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import DashboardState, active_acp_backend
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.history import SEARCH_MIN_CHARS, _archive_dir, is_incognito_transcript
 from kiro_crew.llm_helpers import run_bg_oneliner
@@ -127,9 +128,7 @@ _MAX_BONUS_NAME_CHARS = 100
 _MAX_BONUS_CREDITS = 1_000_000.0
 _MAX_BONUS_DAYS_LEFT = 3_650
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-_BONUS_DASH_RE = re.compile(
-    r"^([\d.]+)/([\d.]+)\s+used\s+\((\d+)\s+days?\s+left\)$"
-)
+_BONUS_DASH_RE = re.compile(r"^([\d.]+)/([\d.]+)\s+used\s+\((\d+)\s+days?\s+left\)$")
 _BONUS_COLON_RE = re.compile(
     r"^(.+?):\s*([\d.]+)/([\d.]+)\s*\(expires\s+in\s+(\d+)\s+days?\)$",
     re.IGNORECASE,
@@ -371,9 +370,7 @@ def _parse_usage(raw: str) -> dict[str, object]:
             or not name.isprintable()
         ):
             continue
-        bonus_credits.append(
-            {"name": name, "used": used, "total": total, "days_left": days_left}
-        )
+        bonus_credits.append({"name": name, "used": used, "total": total, "days_left": days_left})
         if len(bonus_credits) >= _MAX_BONUS_GRANTS:
             break
     # Preserve an observed empty section as an explicit empty list, so callers
@@ -919,6 +916,20 @@ async def _fetch_usage_bg() -> None:
 
 async def api_sessions_usage(request: web.Request) -> web.Response:
     """GET /api/sessions/usage — cached kiro credit usage (background refresh)."""
+    state: DashboardState = request.app["state"]
+    # A harness that bills its own vendor account draws nothing down here, so the
+    # honest answer is "unavailable" and the scrape must not run at all: it costs a
+    # BILLED `kiro-cli chat ... /usage` turn on a 30s timer, and kiro-cli being
+    # INSTALLED is not evidence that it is what the operator is running. Answered
+    # ahead of the readiness check because kiro-cli's sign-in state is not a
+    # question about a harness that never touches it. Membership is asked of the
+    # gateway's own predicate (H5/H6, positive identity); an unreadable backend is
+    # UNKNOWN and keeps the existing behaviour rather than blanking a real balance.
+    # The cache is left untouched, so switching back to Kiro still serves the last
+    # good value while the first refresh runs.
+    backend = active_acp_backend(getattr(state, "sessions", None))
+    if backend is not None and not acp_backends.bills_kiro_credits(backend):
+        return web.json_response({"usage": {"available": False}})
     # Same browser-storm guard as api_models: the /usage scrape shells out to
     # `kiro-cli chat --no-interactive ... /usage`, which auto-opens a browser
     # login while signed out. This endpoint is polled every 30s by the top-bar
@@ -935,7 +946,6 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
         # would fire on nearly every poll, and each fire can reach the `/usage`
         # text scrape, which spends credits. A faster readout is not worth billing
         # the user for it; a profile switch is picked up on the next interval.
-        state: DashboardState = request.app["state"]
         task = asyncio.create_task(_fetch_usage_bg())
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)
@@ -1145,9 +1155,7 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
         try:
             await loop.run_in_executor(
                 None,
-                functools.partial(
-                    log.set_cached_summary, key, summary, sig, generation
-                ),
+                functools.partial(log.set_cached_summary, key, summary, sig, generation),
             )
         except Exception:
             logger.debug("Failed to persist summary cache for %s", key, exc_info=True)
@@ -1307,8 +1315,7 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             try:
                 await crew.purge_slot(candidate)
             except Exception:
-                logger.warning("History delete: crew purge failed for %s",
-                               candidate, exc_info=True)
+                logger.warning("History delete: crew purge failed for %s", candidate, exc_info=True)
     try:
         await state.remove_chat_pins_for_slots(pin_slot_keys)
     except Exception:
@@ -1874,9 +1881,7 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     synced = 0
     sync_ok = True
     try:
-        to_sync = await asyncio.wait_for(
-            asyncio.to_thread(sync_discovered_servers), timeout=30
-        )
+        to_sync = await asyncio.wait_for(asyncio.to_thread(sync_discovered_servers), timeout=30)
         synced = len(to_sync)
     except Exception:
         # The restart still proceeds (it applies whatever IS on disk), but the

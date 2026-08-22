@@ -55,6 +55,18 @@ export interface StatusData {
   release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
+  /**
+   * The agent harness NEW sessions run on, resolved by the gateway. `label` is
+   * the harness's display name ("Kiro CLI", "Claude Code", …) and `backend` its
+   * id (`""` is kiro-cli). `kiro_credits` says whether a turn on it draws down
+   * the signed-in Kiro account's credit plan — the gateway owns that membership
+   * rule, so never mirror it here.
+   *
+   * Absent or `null` means UNKNOWN: an older gateway, or one that could not read
+   * the config. Treat that as "behave as before" — leave a readout as it was
+   * rather than asserting a harness or hiding a real balance.
+   */
+  harness?: { backend: string; label: string; kiro_credits: boolean } | null
   platform?: string
   yolo?: boolean
   /** ISO timestamp when the current timed auto-approve grant expires ("" when none). */

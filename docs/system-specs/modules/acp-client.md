@@ -6,6 +6,45 @@ The ACP layer spans **five** modules: the legacy per-session client (`acp/client
 
 ## Backend Selection
 
+`AcpClient(acp_backend=...)` selects which subprocess to launch. The id is
+validated against `ACP_BACKENDS_KNOWN` in the `AcpProvider` constructor, which
+raises `ValueError` rather than letting an unrecognised value fall through every
+`_is_<backend>` check and silently spawn kiro-cli.
+
+**Dialect predicates, not id tests.** `_is_kiro` and `_is_spec_adapter` resolve
+from the backend descriptor's `dialect` (see
+[`providers.md`](providers.md) § "Backend registry"). `_is_claude` and `_is_codex`
+survive only inside their own dialect adapters and the `_spawn` argv branch.
+
+This replaced eleven places where `not self._is_claude` was used to mean "kiro".
+That negation reads as a kiro test but means "not claude", so every backend added
+after it silently inherited the kiro arm — including the KAS backend already in
+tree, which rode eight of the eleven. Converted sites:
+
+| Keyed on | Behaviour |
+|---|---|
+| `_is_kiro` | `session/set_mode` (the only site that hard-raises), the kiro session-file `_meta`, the transcript JSONL seek, advertised-model entitlement pre-checks, the `cli.json` effort and Tool Search overlays |
+| `_is_spec_adapter` | integer `protocolVersion`, model via `set_config_option`, `mcpServers` carried in session params, the reduced stdio key set, the spec-adapter capability set |
+| `CAP_SESSION_SHARING` | `AcpProvider.start()`'s runtime-vs-client arm AND `is_session_sharing_eligible` — `start()` reads the property so the two cannot disagree; `AcpRuntime.spawn()` raises for a backend without the capability |
+| `CAP_MID_TURN_STEER` | `supports_steer` |
+| backend id | `wrap_argv(is_kiro_cli=...)` — names the BINARY, not the dialect: the flag drives macOS delegation to kiro-cli's own internal sandbox, and KAS speaks kiro's dialect but is a Node process with no such sandbox to defer to |
+
+**Spec-adapter client capabilities.** `ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER` is
+`ACP_CLIENT_CAPABILITIES` minus `elicitation`, and it must stay minus it until Kiro
+Crew serves `elicitation/create`. codex-acp gates MCP tool-call approvals on that
+capability: declare it and approvals arrive as `elicitation/create`, which Kiro
+Crew answers `-32601`, which codex-acp converts into `action: "cancel"` — every
+MCP tool call silently cancelled with no prompt and no visible error.
+
+**Codex adapter resolution** (`acp/codex.py:resolve_argv`): `CODEX_ACP_BIN`
+override, then `codex-acp` via mise and the augmented PATH. There is deliberately
+**no** `codex acp` rung — the Codex CLI treats `acp` as a prompt rather than
+starting an ACP server, so that fallback spawns an ordinary chat turn against the
+operator's subscription and then fails as a handshake timeout. Only success is
+memoised, so installing the adapter needs no gateway restart.
+
+## Backend Selection (per-backend subprocess)
+
 `AcpClient(acp_backend=...)` selects which subprocess to launch:
 
 - `""` (default): `kiro-cli acp --agent <name>` (resolved by `_resolve_kiro_bin`). Per-session kiro settings are layered in via the workspace overlay `<work_dir>/.kiro/settings/cli.json` (written by `AcpProvider`, not the client): reasoning **effort** (`chat.modelDefaults`) and **MCP Tool Search** (`toolSearch.enabled` + activation thresholds from `agent.tool_search_min_pct` / `tool_search_min_tokens`, gated by `agent.tool_search`, default on) — see providers.md.
@@ -68,12 +107,15 @@ cancelled caller still lets the worker settle).
 
 `PermissionOption` field names differ between backends — kiro-cli uses `id`/`label`, claude-agent-acp uses `optionId`/`name` (per the public ACP spec). `_build_permission_event` reads both and remembers the optionIds keyed by `kind` (`allow_once`/`allow_always`/`reject_once`/`reject_always`) on the request id — recording an entry when **either** an allow option (for `approve_tool`) **or** a reject option (for a clean `reject_tool`) was advertised. `approve_tool(request_id, *, always=False)` echoes the matching allow id back, so the host doesn't need to know whether it's talking to kiro (`"allow_once"`/`"allow_always"`) or claude-agent-acp (`"allow"`/`"allow_always"`). `reject_tool` prefers a **clean reject**: if a reject optionId was advertised it sends `outcome: "selected"` with that id (claude-agent-acp's `reject` → `behavior: "deny"`); otherwise it falls back to `outcome: "cancelled"` (kiro-cli, which handles it as an ordinary rejection). This matters because the claude-agent-acp adapter throws `Error("Tool use aborted")` on a `cancelled` outcome — so a host-side deny that sent `cancelled` surfaced to the user as a cryptic "Tool use aborted" with no prompt; the clean reject yields an explainable denial instead.
 
+**Only an advertised optionId is ever sent, and no answer is invented.** `approve_tool(request_id, option_id=None, *, always=False)` resolves the id for the requested kind (`allow_always` when `always`, else `allow_once`) from what THIS request recorded, and answers `outcome: "cancelled"` when there is none — a request advertising no allow option of that kind cannot be approved. There is **no cross-kind aliasing**: an `allow_once` pick never resolves to an `allow_always` id, because the old fallback did exactly that when a request advertised only an always option and so silently persisted a grant the operator never gave. An **explicit** `option_id` is accepted only when it equals the id this request advertised for that kind; anything else — a stale prompt, a superseded request, an id from another kind — cancels rather than substituting the advertised id, since substituting would approve an option nobody chose and echoing it verbatim would send an id the agent cannot resolve. Every path **consumes** the recorded entry, so a request can be answered at most once. `_cancel_pending_permissions` drains the map and answers every still-outstanding request with `cancelled` before a turn is cancelled and before teardown; without it the adapter is left blocked on a reverse request that will never be answered, which strands the turn rather than ending it.
+
 The host always sends one-shot approvals (`always=False`, the default). KiroCrew — not the agent — owns the trust scope (`slot._trust`, `slot._trust_reads`, `slot._trusted_patterns`, `safety_override`, `channel.trusted`, parent session `approval_policy`). Per-call `session/request_permission` is required so KiroCrew's PreToolUse hooks (`auto_deny_tools`, sensitive-path checks, credential redaction) fire on every tool invocation. The `always=True` path is reserved for a future "skip KiroCrew hooks for this exact tool" feature; no caller passes it today.
 
 The handshake also branches on the backend:
 
 - `protocolVersion` in the `initialize` request: kiro-cli expects the date string `"2025-08-22"`; claude-agent-acp expects an integer (`1`, per the upstream ACP SDK schema).
 - claude skips `session/set_mode` and uses `session/set_config_option` (configId `model`) instead of `session/set_model`.
+- a `SESSION_CONFIG` backend (codex-acp) gets `_apply_session_permission_routing` between mode activation and the startup model, so its permission route is armed and verified before `session/prompt` is reachable. A no-op for every other routing. See [`security.md`](security.md) § "ACP backend tool-gate routing".
 
 Sending the wrong shape yields `-32602 Invalid params` or `-32601 Method not found`.
 
@@ -384,6 +426,37 @@ kiro can return a `-32603` error that is an *advisory* that it substituted a dif
 
 **Per-turn kiro billing credits.** `_track_metadata()` parses each `_kiro.dev/metadata` notification via the shared `parse_metadata()`, capturing `meteringUsage` entries with `unit=="credit"` (kiro bills in credits; token fields are 0 for the acp provider) into `AcpPromptStats.credits`, accumulated across the turn and surfaced on `EVENT_COMPLETE`.
 
+**Adapter cost and plan quota on the usage frame.** A `usage_update` may carry two
+things beyond the token pair, each parsed at the shared chokepoint and each read
+INDEPENDENTLY of the counts (a frame whose `used`/`size` are missing or malformed
+can still carry a live figure, and discarding it because the tokens failed to
+parse is how the cost went unrecorded):
+
+- `parse_usage_cost()` → `AcpPromptStats.usage_cost` / `usage_cost_currency`. A
+  cumulative session total, so it is ASSIGNED rather than accumulated.
+- `parse_rate_limit()` reads `_meta["_claude/rateLimit"]`
+  (`types.META_CLAUDE_RATE_LIMIT`) into `AcpPromptStats.rate_limit`, an
+  `AcpRateLimit` of `status` (one of `RATE_LIMIT_STATES`), `limit_type`,
+  `utilization` and `resets_at`. claude-agent-acp forwards the Claude Code SDK's
+  block verbatim and emits it only when the state CHANGES, which sets the
+  lifetime: it survives `carry_over()` and is NOT cleared by
+  `reset_context_state()` / compaction, because it describes the ACCOUNT over a
+  rolling window rather than the turn or the transcript. An unrecognised `status`
+  is dropped rather than passed through — the states are ordered by whether a
+  turn can still be sent, so a spelling Kiro Crew has not seen would render at
+  whatever severity a consumer's fallback happens to use. `utilization` is
+  clamped to [0, 100] with `-1.0` = not reported (distinct from `0.0`), and
+  `resets_at` is normalized to epoch **seconds** by magnitude because the SDK
+  types it as a bare `number` and declares no unit. `to_payload()` OMITS every
+  unreported field so no sentinel reaches the wire.
+
+The key carries its own vendor namespace, so reading it needs no backend gate: an
+adapter that does not send it simply has no such key, and a positive
+`is_claude_backend` branch would add a conditional to a path every harness shares
+for no gain (H2). `AcpSessionHandle` deliberately parses neither — that path
+serves only `ACP_BACKENDS_SESSION_SHARING`, which claude-agent-acp is not in, so
+a branch there could not fire.
+
 ## Exceptions
 
 `AcpError` (base), `AcpTimeoutError` (has `partial_output`), `AcpPermissionNeeded`, `AcpProcessDied`, `AcpAuthRequired`, `AcpPromptBusy`.
@@ -400,6 +473,7 @@ Subprocess lifecycle:
 - **Windows exe-casing normalization** (`_normalize_exe_casing`, applied to the kiro / claude-agent-acp / claude-code resolver results): `shutil.which` builds the resolved name's extension from `PATHEXT`, which lists `.EXE` upper-case, so it returns e.g. `…\kiro-cli.EXE` even though the on-disk file is `kiro-cli.exe`. A case-sensitive multiplexer shim spawned as `kiro-cli.EXE` fails to dispatch, exits instantly, and the ACP pipe breaks (`AcpProcessDied`) → the dashboard shows **"session stuck"** on the first chat turn. `os.path.realpath()` restores the true directory-entry casing. No-op on POSIX (case-sensitive FS). Runnability is checked via `platform_compat.is_executable_file()` (POSIX execute bit; on Windows the X-bit is meaningless so a known runnable extension is required instead), so a bare `.js` adapter entry is correctly treated as **not** directly runnable on Windows and gets wrapped with `node`.
 - **OS-level sandbox**: `_spawn()` calls `sandbox.wrap_argv()` to wrap the kiro-cli command with platform-native isolation (Linux: two-stage `unshare -rm` → `unshare -U` bind-mounts + UID drop; macOS: `sandbox-exec` Seatbelt profile). Hides `~/.aws`, `~/.ssh`, `~/.gnupg`, `~/.docker`, `~/.kube` from the subprocess tree. Configurable via `sandbox_mode` constructor param (`"auto"` default, `"off"` to disable). See `docs/system-specs/modules/security.md`.
 - **Parent-level channel-credential scrub**: both spawn paths (`AcpClient._spawn` and `AcpRuntime._spawn`) build the child environment from a raw `os.environ` copy (plus `_extra_env`) and pass it directly to `create_subprocess_exec`, so they call `sandbox.scrub_agent_denied_env(env)` after merging `_extra_env` to strip `_AGENT_DENIED_ENV_KEYS` (Slack/WeCom/Telegram tokens + owner id seeded into `os.environ` by `config.loader.load_credentials`). This is required because these paths do NOT route through `sandboxed_spawn_argv`, and the OS-sandbox launcher only strips those keys for the `cc`/`strict` tiers — on the default `auto`/`standard` tier the launcher leaves them in place, so without the parent scrub they would be inherited by the agent subprocess. The scrub is deliberately narrower than `scrub_env`: it leaves the AWS/SSH env the `standard` sandbox intentionally exposes (git-over-SSH, AWS CLI, kubectl) untouched. One credential is settled per-backend rather than by the deny list: `KIRO_API_KEY` (kiro-cli's own model credential, in `_CREDENTIAL_KEYS` but deliberately NOT in `_AGENT_DENIED_ENV_KEYS`) is re-injected from the data home's `.env` via `config.loader.inject_kiro_cli_api_key` for a kiro-cli child (whose environment is where the CLI reads it — required after the Docker entrypoint scrubs it from the gateway's environ) and actively stripped via `strip_kiro_cli_api_key` for a foreign backend (Claude seam, KAS), which must never receive it; both run inside the spawn paths' existing off-loop env hop.
+- **Gateway callback port pinning**: both ACP spawn paths call `port_resolution.pin_gateway_child_port` after registry/adapter environment overlays are merged. When the parent gateway exported a valid `KIROCREW_BOUND_PORT`, the child receives that value as both `KIROCREW_BOUND_PORT` and `KIROCREW_PORT`, so the generic client resolver cannot prefer an inherited launcher target and send authenticated MCP callbacks to a sibling gateway. Bound truth is read from the parent process environment rather than the merged child mapping, so a registry descriptor or adapter-specific `extra_env` cannot retarget the control plane. With no valid bound export, the child environment is left untouched and direct CLI/pre-listen behavior keeps using its explicit `KIROCREW_PORT`.
 - `_resolve_kiro_bin()` delegates to the side-effect-free `kiro_cli.resolve_kiro_cli()` discovery module shared with first-run setup. It checks the explicit `KIROCREW_KIRO_BIN` operator/test override first, then the supported fixed install locations and augmented PATH; setup status may inspect the same candidates but never mutates the override or other process-global environment. The gateway's prerequisite service and the direct `chat`/`tui`/`run`/`consolidate`/`eval` CLI entry paths both register the override's canonical path and first-observed digest before any provider can be created; process-lifetime first-observation-wins semantics prevent a later service reconstruction from blessing replacement bytes. `runtime.py` imports and reuses the ACP wrapper so both ACP transports select the binary identically. Immediately before OS sandboxing, `sandbox.py` routes argv[0] through the edition-neutral `PlatformContext.agent_executable` resolver; the public Default is identity and a companion can return a direct executable behind an edition-managed launcher without changing the core.
 - The dashboard `/api/models` one-shot subprocess validates completion before parsing stdout: nonzero exit (with a bounded, redacted stderr tail), empty stdout, malformed JSON, or a payload without a model list each returns HTTP 503 so the client retries. A subprocess failure is never misreported as `JSONDecodeError` or cached as a successful empty model list.
 - **One-shot `kiro-cli` reads spawn at the CONFIGURED sandbox tier**, via `sandbox.configured_sandbox_mode()` (`agent.sandbox`, falling back to `"auto"` and warning when the config cannot be read — an unreadable config must not yield a looser tier). `wrap_argv`'s `mode` parameter defaults to `"auto"`, which coincides with the shipped `agent.sandbox` default but ignores what the operator configured. Where `agent.sandbox` is an explicit `"off"` (isolation deferred to kiro-cli's own internal sandbox, which cannot nest inside Kiro Crew's — see `modules/security.md` "macOS sandbox mutual exclusion"), a call that takes the parameter default requests a **stricter** tier than the interactive ACP spawns, which thread the configured mode through their `sandbox_mode` constructor argument — so on a host with no backend at all (**any Windows host**, macOS >= 26) the one-shot read fail-closed with `SandboxUnavailableError` while chat worked normally. On a **default** install the tier resolves to `"auto"` for both, so chat and these reads fail closed together on such a host and the fix is the `agent.sandbox_allow_unsandboxed_exec` opt-in, not this seam. The affected sites are `/api/models` (`--list-models`), and in `handlers/sessions.py` the `whoami` identity fetch and the `/usage` text scrape (both previously pinned `mode="standard"`). Symptoms this produced, all from the same cause: `/api/models` answered 503 on every 8s poll, and because the frontend's degraded fallback deliberately exposes only the `auto` sentinel (`adapters/acp.ts::_defaultModels`, which must never offer canonical registry keys the ACP CLI rejects), the picker showed **exactly one entry**; the credit pill lost its account email permanently (identity failure is non-fatal by design, so it degraded silently); and the `/usage` scrape's refusal fed the failure backoff that eventually parks it, despite being a **billed** turn that never ran. Use `configured_sandbox_mode()` for a spawn of the same binary under the same posture as chat — **not** for spawns that deliberately pin their own tier (the prerequisite probes' `strict`, the credential-free registry clones). Governance still clamps the result up via `_clamp_sandbox_mode`, so a `sandbox.min_level` floor overrides it like any other caller-supplied mode.

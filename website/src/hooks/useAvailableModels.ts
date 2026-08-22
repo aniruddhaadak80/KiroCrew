@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { useProvider } from '../providers'
+import { servesAutoModel } from '../providers/adapters/acp'
 import { modelListRefetchInterval } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
@@ -11,6 +12,12 @@ import type { ModelInfo } from '../providers/types'
  *  is a catalog key resolved where it renders, not an English literal living in
  *  a data module. */
 const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
+
+/** Nothing known yet. A separate frozen constant rather than a fresh `[]` per
+ *  call: the return value is a hook result read into render paths and effect
+ *  deps, so a new array identity on every render is a re-render loop waiting to
+ *  happen. */
+const EMPTY: ModelInfo[] = []
 
 /**
  * THE model list. Every picker reads it through here.
@@ -51,5 +58,12 @@ export function useAvailableModels({ enabled }: { enabled?: boolean } = {}): Mod
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
-  return data ?? PLACEHOLDER
+  // `data` is undefined only before the first fetch resolves for this key. The
+  // placeholder is a SYNTHETIC Auto row, so it may only be offered on a backend
+  // that serves `auto` — otherwise the picker's very first paint shows one row,
+  // it is the only thing to pick, and the id is rejected at the wire. Everything
+  // `fetchAvailableModels` does to avoid fabricating that row is undone here if
+  // this is left unconditional, because this branch runs BEFORE any of it.
+  if (data) return data
+  return servesAutoModel() ? PLACEHOLDER : EMPTY
 }

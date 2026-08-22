@@ -205,9 +205,7 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
                     # cutoff must still be excluded individually.
                     ts_raw = str(obj.get("ts") or "")
                     try:
-                        ts_str = (
-                            ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        )
+                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
                         ts_epoch = datetime.fromisoformat(ts_str).timestamp()
                     except (ValueError, TypeError, AttributeError):
                         continue
@@ -545,9 +543,7 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
                     raw = obj.get("ctx_blocks")
                     if not isinstance(raw, dict) or not raw:
                         continue
-                    blocks = {
-                        str(k): _coerce_int(v) for k, v in raw.items() if _coerce_int(v) > 0
-                    }
+                    blocks = {str(k): _coerce_int(v) for k, v in raw.items() if _coerce_int(v) > 0}
                     if not blocks:
                         continue
                     for label, size in blocks.items():
@@ -703,9 +699,11 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
                     if credits > float(priciest["credits"]):
                         priciest = {"credits": credits, "slot": slot, "ts": ts_raw}
 
-                    for bucket, name in ((by_model, model),
-                                         (by_channel, telemetry_channel_of(slot or None)),
-                                         (by_category, session_category(slot))):
+                    for bucket, name in (
+                        (by_model, model),
+                        (by_channel, telemetry_channel_of(slot or None)),
+                        (by_category, session_category(slot)),
+                    ):
                         e = bucket.setdefault(name, {"name": name, "credits": 0.0, "turns": 0})
                         e["credits"] = float(e["credits"]) + credits
                         e["turns"] = int(e["turns"]) + 1
@@ -717,8 +715,15 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
                     if slot:
                         c = convos.setdefault(
                             slot,
-                            {"slot": slot, "credits": 0.0, "turns": 0, "peak_pct": 0.0,
-                             "first_ts": ts_epoch, "last_ts": ts_epoch, "_occ": []},
+                            {
+                                "slot": slot,
+                                "credits": 0.0,
+                                "turns": 0,
+                                "peak_pct": 0.0,
+                                "first_ts": ts_epoch,
+                                "last_ts": ts_epoch,
+                                "_occ": [],
+                            },
                         )
                         c["credits"] = float(c["credits"]) + credits
                         c["turns"] = int(c["turns"]) + 1
@@ -744,8 +749,9 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
 
     total = float(cur_tot["credits"])
 
-    def _rank(bucket: dict[str, dict[str, Any]], deltas: dict[str, float] | None
-              ) -> list[dict[str, Any]]:
+    def _rank(
+        bucket: dict[str, dict[str, Any]], deltas: dict[str, float] | None
+    ) -> list[dict[str, Any]]:
         out = []
         for e in sorted(bucket.values(), key=lambda x: -float(x["credits"])):
             row = {
@@ -844,9 +850,7 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
             "prior_turns": int(prev_tot["turns"]),
             "prior_per_turn": _per_turn(prev_tot),
             "delta_pct": (
-                round((total - prev_credits) / prev_credits * 100, 0)
-                if prev_credits > 0
-                else None
+                round((total - prev_credits) / prev_credits * 100, 0) if prev_credits > 0 else None
             ),
             "priciest": {
                 "credits": round(float(priciest["credits"]), 1),
@@ -969,11 +973,7 @@ def read_effective_model(source: object) -> str:
         for attr in ("_resolved_model_id", "_model"):
             for node in chain:
                 candidate = getattr(node, attr, "")
-                if (
-                    isinstance(candidate, str)
-                    and candidate
-                    and candidate.strip().lower() != "auto"
-                ):
+                if isinstance(candidate, str) and candidate and candidate.strip().lower() != "auto":
                     return candidate
     except Exception:
         pass
@@ -1152,8 +1152,7 @@ def _finite_only(record: dict[str, Any]) -> dict[str, Any]:
     is exactly what a bad one looks like, so the check cannot be a type check.
     """
     return {
-        k: (0.0 if isinstance(v, float) and not math.isfinite(v) else v)
-        for k, v in record.items()
+        k: (0.0 if isinstance(v, float) and not math.isfinite(v) else v) for k, v in record.items()
     }
 
 
@@ -1186,8 +1185,7 @@ def _write_token_record(record: dict[str, Any], now: datetime) -> None:
         if not non_finite:
             raise
         logger.warning(
-            "token usage: replaced non-finite value(s) with 0.0 before persisting; "
-            "fields=%s",
+            "token usage: replaced non-finite value(s) with 0.0 before persisting; " "fields=%s",
             ",".join(non_finite),
         )
         line = json.dumps(_finite_only(record), allow_nan=False)
@@ -1526,10 +1524,124 @@ def _parse_token_history() -> dict[str, Any]:
     return result
 
 
+def _configured_acp_backend() -> str:
+    """The configured non-default ACP backend, or ``""`` for kiro-cli.
+
+    Fails closed to ``""``: an unreadable config keeps the existing kiro
+    behaviour rather than switching the data source underneath the page.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.acp_backend or ""
+    except Exception:
+        return ""
+
+
+def _sessions_from_own_records() -> dict:
+    """Session analytics built from Kiro Crew's OWN token shards.
+
+    Used when there is no kiro-cli sessions directory to read, which is the
+    normal state on a host running another ACP backend. Without this the endpoint
+    answers a permanent 200-carrying-an-error that is never cached, so it
+    re-parses on every poll and the Usage page shows nothing at all.
+
+    Reads ``<data home>/usage/tokens/YYYY-MM-DD.jsonl``, the same shards the rest
+    of this module already aggregates, keyed by slot. A session is attributed to
+    the day of its EARLIEST in-window turn so it is counted once rather than once
+    per active day.
+
+    Fidelity limits, stated because the numbers are not equivalent to the kiro
+    path's and a reader comparing the two deserves to know why:
+
+    * ``messages`` counts COMPLETED TURNS only. The kiro path counts transcript
+      entries, which include the paired user prompt, so this reads roughly half.
+    * ``tool_calls`` is always 0. Tool calls are not recorded in a token shard.
+    * ``all_time_sessions`` is the same window-scoped count as
+      ``total_sessions``, not an unbounded total, because the shards outside the
+      retention window are gone.
+    """
+    daily_sessions: Counter = Counter()
+    daily_msgs: Counter = Counter()
+    first_day_for_slot: dict[str, str] = {}
+    msgs_for_slot: Counter = Counter()
+
+    for shard in _shards_in_window(_TOKEN_HISTORY_DAYS):
+        day = shard.stem
+        try:
+            raw = shard.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                continue
+            slot = obj.get("slot")
+            if not isinstance(slot, str) or not slot:
+                continue
+            msgs_for_slot[slot] += 1
+            # Earliest day wins: shards are per-day files, and a slot spanning
+            # several days is one session, not one per day.
+            existing = first_day_for_slot.get(slot)
+            if existing is None or day < existing:
+                first_day_for_slot[slot] = day
+
+    for slot, day in first_day_for_slot.items():
+        daily_sessions[day] += 1
+        daily_msgs[day] += msgs_for_slot[slot]
+
+    days = sorted(set(daily_sessions) | set(daily_msgs))
+    history = [
+        {
+            "date": day,
+            "sessions": daily_sessions.get(day, 0),
+            "messages": daily_msgs.get(day, 0),
+            "tool_calls": 0,
+        }
+        for day in days
+    ]
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today = [h for h in history if h["date"] == today_str]
+    week_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    week = [h for h in history if h["date"] >= week_cutoff]
+
+    total_sessions = len(first_day_for_slot)
+    return {
+        "total_sessions": total_sessions,
+        "total_messages": sum(msgs_for_slot.values()),
+        "total_tool_calls": 0,
+        "all_time_sessions": total_sessions,
+        "daily_history": history,
+        "today": {
+            "sessions": sum(h["sessions"] for h in today),
+            "messages": sum(h["messages"] for h in today),
+            "tool_calls": 0,
+        },
+        "this_week": {
+            "sessions": sum(h["sessions"] for h in week),
+            "messages": sum(h["messages"] for h in week),
+            "tool_calls": 0,
+        },
+    }
+
+
 def _parse_sessions() -> dict:
     """Parse local kiro session files for usage analytics."""
     sessions_dir = _sessions_dir()
     if not sessions_dir.exists():
+        # No kiro transcripts is the NORMAL state on another ACP backend, not an
+        # error to report forever. Fall back to Kiro Crew's own records so the
+        # page shows real numbers; keep the error for a kiro host, where an
+        # absent directory genuinely means something is wrong.
+        if _configured_acp_backend():
+            return _sessions_from_own_records()
         return {"error": "No sessions directory"}
 
     cutoff = time.time() - (30 * 86400)
@@ -1663,7 +1775,11 @@ async def _cached_parse_sessions() -> dict:
     # `is not None` (not truthiness) so a valid-but-empty {} parse is still a hit.
     if now - _SESSIONS_CACHE_TS < _CACHE_TTL and _SESSIONS_CACHE is not None:
         return _SESSIONS_CACHE
-    if not _sessions_dir().exists():
+    # An absent kiro sessions dir short-circuits to {} — EXCEPT on another ACP
+    # backend, where that is the normal state and _parse_sessions has a real
+    # fallback to serve. Returning {} there would make the cached path contradict
+    # the uncached one.
+    if not _sessions_dir().exists() and not _configured_acp_backend():
         return {}
     async with _SESSIONS_CACHE_LOCK:
         # Re-check: a concurrent request may have refreshed while we waited, so

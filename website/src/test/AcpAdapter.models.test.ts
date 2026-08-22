@@ -114,6 +114,60 @@ describe('AcpAdapter.fetchAvailableModels', () => {
     expect(cached.models).toHaveLength(2)
   })
 
+  it('uses the {models, backend} envelope a non-kiro backend returns', async () => {
+    // The kiro path answers with a bare array; a spec adapter answers an
+    // object. Reading only the array form treated this good list as a non-array
+    // "empty success" and fell through to the cache, serving kiro ids.
+    ;(api.models as any).mockResolvedValue({
+      models: [{ model_name: 'claude-opus-5', description: 'x' }],
+      backend: 'claude',
+    })
+    const models = await new AcpAdapter().fetchAvailableModels()
+    expect(models.map(m => m.name)).toEqual(['claude-opus-5'])
+  })
+
+  it('refuses a kiro-stamped cache after a bodyless failure on a spec adapter', async () => {
+    // Prime the cache from kiro (bare array) — these ids are kiro-namespace.
+    ;(api.models as any).mockResolvedValueOnce([
+      { model_name: 'auto', description: 'a' },
+      { model_name: 'gpt-5.6-sol', description: 'b' },
+    ])
+    const adapter = new AcpAdapter()
+    await adapter.fetchAvailableModels()
+
+    // A spec adapter identifies itself once...
+    ;(api.models as any).mockResolvedValueOnce({ models: [], backend: 'claude' })
+    await adapter.fetchAvailableModels()
+
+    // ...then the network dies, so the failure carries NO backend at all. The
+    // cache is stamped kiro, the active namespace is claude, so it must not be
+    // served even though serving something would look friendlier.
+    ;(api.models as any).mockRejectedValue(new Error('network down'))
+    expect(await adapter.fetchAvailableModels()).toEqual([])
+  })
+
+  it('serves NO rows when the backend namespace is unavailable, even with a warm cache', async () => {
+    // Prime the cache from a kiro session — these ids are kiro-namespace.
+    ;(api.models as any).mockResolvedValueOnce([
+      { model_name: 'auto', description: 'a' },
+      { model_name: 'gpt-5.6-sol', description: 'b' },
+    ])
+    const adapter = new AcpAdapter()
+    await adapter.fetchAvailableModels()
+    expect(localStorage.getItem('kc.acp.models.v1')).toBeTruthy()
+
+    // The operator has now switched to a spec adapter and no session has
+    // advertised its namespace. The cached kiro rows must NOT be offered: a
+    // plausible `gpt-5.6-sol` row is worse than none, because it reads as a
+    // real option and is rejected at the wire.
+    ;(api.models as any).mockRejectedValue(
+      Object.assign(new Error('503'), {
+        body: JSON.stringify({ code: 'acp_backend_models_unavailable' }),
+      })
+    )
+    expect(await adapter.fetchAvailableModels()).toEqual([])
+  })
+
   it('ignores a cache older than the TTL (bounds -32603 exposure)', async () => {
     // Write a stale cache (25h old) directly.
     localStorage.setItem(

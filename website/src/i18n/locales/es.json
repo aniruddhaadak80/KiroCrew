@@ -106,7 +106,9 @@
     "open_command_bar": "Abrir Command Bar",
     "focus_mode": "Modo de concentración",
     "focus_mode_title": "Modo de concentración · Alt+Mayús+M",
-    "focus_mode_title_mac": "Modo de concentración · ⌥⇧M"
+    "focus_mode_title_mac": "Modo de concentración · ⌥⇧M",
+    "active_harness": "Harness del agente: {{label}}",
+    "active_harness_open_settings": "Harness del agente: {{label}} — abrir la configuración del Adaptador de ACP"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4922,7 +4924,13 @@
       "upload_file": "Subir archivo",
       "use_a_skill": "Usar una skill",
       "used": "Usado",
-      "voice_input": "Entrada de voz"
+      "voice_input": "Entrada de voz",
+      "plan_limit": "Límite del plan",
+      "limit_type": "Tipo de límite",
+      "resets": "Se restablece",
+      "rate_limit_allowed": "Correcto",
+      "rate_limit_warning": "Cerca del límite",
+      "rate_limit_rejected": "Limitado"
     },
     "chatPane": {
       "agent_list": "Lista de agentes",
@@ -8905,7 +8913,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "Tokens de webhooks entrantes, contextos registrados e historial de ejecuciones. La API funciona; la página no está terminada.",
         "open_webhooks": "Abrir Webhooks",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "acp_backends": "Adaptadores de ACP",
+        "experimental_acp_backends_claude_code_and_openai": "Claude Code y OpenAI Codex como alternativas a Kiro CLI. Las rutas de rechazo están probadas; no se ha observado ninguna sesión correcta."
       }
     },
     "developerPage": {
@@ -10037,6 +10047,41 @@
         "vector_memory": "Memoria vectorial",
         "vector_memory_is_initializing_the_embedding_mode": "La memoria vectorial está inicializándose. El modelo de embeddings (~610MB) se descarga automáticamente en segundo plano y la memoria antigua se migra por sí sola — no hace falta hacer nada.",
         "verifying_model_integrity": "Verificando la integridad del modelo…"
+      },
+      "acpBackend": {
+        "title": "Adaptador de ACP",
+        "experimental": "Experimental",
+        "all_features_supported": "Predeterminado. Todas las funciones son compatibles.",
+        "features_differ": "{{count}} de {{total}} funciones se comportan de forma diferente, no están disponibles o no se han verificado.",
+        "show_what_changes": "Mostrar qué cambia",
+        "applies_to_new_sessions": "Se aplica a las sesiones iniciadas a partir de ahora. Las sesiones abiertas conservan el adaptador con el que empezaron.",
+        "not_enabled_in_this_build": "No habilitado en esta compilación: {{backends}}. Consulta la documentación sobre adaptadores de ACP experimentales.",
+        "level_supported": "Compatible",
+        "level_degraded": "Funciona de forma diferente",
+        "level_unavailable": "No disponible",
+        "cap_session_sharing": "Entorno compartido de subagentes",
+        "cap_reasoning_effort": "Esfuerzo de razonamiento",
+        "cap_mcp_tool_search": "Búsqueda de herramientas MCP",
+        "cap_agent_profiles": "Perfiles de agente",
+        "cap_slash_commands": "Comandos de barra",
+        "cap_turn_usage": "Uso por turno",
+        "cap_billing": "Costes y límites",
+        "cap_native_resume": "Reanudar sesión",
+        "cap_registry_model_ids": "Usa el catálogo de modelos de Kiro",
+        "cap_mid_turn_steer": "Redirección a mitad de turno",
+        "confirm_title": "¿Cambiar a {{backend}}?",
+        "confirm_body": "Este adaptador es experimental. {{count}} de {{total}} funciones de Kiro Crew se comportan de forma diferente, no están disponibles o no se han verificado.",
+        "confirm_open_sessions": "Las sesiones abiertas no se ven afectadas y conservan su adaptador actual.",
+        "cancel": "Cancelar",
+        "confirm_switch": "Cambiar adaptador",
+        "confirm_prerequisites": "Ejecute esto primero en el host de la puerta de enlace, en orden.",
+        "not_installed": "Adaptador no instalado",
+        "level_unverified": "Sin verificar",
+        "routing_routed": "Las llamadas a herramientas llegan a la puerta de seguridad de {{productName}}",
+        "routing_indeterminate": "El enrutamiento de llamadas a herramientas no está verificado — las sesiones nuevas se rechazarán",
+        "routing_bypassed": "Las llamadas a herramientas eludirían la puerta de seguridad de {{productName}} — las sesiones nuevas se rechazarán",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "Se permiten herramientas sin control. Las reglas de comandos denegados, el bloqueo de rutas sensibles y el techo de gobernanza no se consultan para las llamadas autoaprobadas de este backend."
       }
     },
     "overviewPage": {
@@ -10413,7 +10458,9 @@
       "stopped": "Detenido",
       "threads": "Hilos",
       "uptime": "Tiempo activo",
-      "working_directory": "Directorio de trabajo"
+      "working_directory": "Directorio de trabajo",
+      "acp_backend": "Adaptador de ACP",
+      "acp_backend_experimental": "{{label}} (experimental)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "Filtro aproximado (coincidencia parcial)",

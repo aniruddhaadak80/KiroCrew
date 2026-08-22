@@ -106,7 +106,9 @@
     "open_command_bar": "打开 Command Bar",
     "focus_mode": "专注模式",
     "focus_mode_title": "专注模式 · Alt+Shift+M",
-    "focus_mode_title_mac": "专注模式 · ⌥⇧M"
+    "focus_mode_title_mac": "专注模式 · ⌥⇧M",
+    "active_harness": "代理运行环境：{{label}}",
+    "active_harness_open_settings": "代理运行环境：{{label}} — 打开 ACP 适配器设置"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4776,7 +4778,13 @@
       "upload_file": "上传文件",
       "use_a_skill": "使用技能",
       "used": "已用",
-      "voice_input": "语音输入"
+      "voice_input": "语音输入",
+      "plan_limit": "套餐限额",
+      "limit_type": "限额类型",
+      "resets": "重置",
+      "rate_limit_allowed": "正常",
+      "rate_limit_warning": "接近限额",
+      "rate_limit_rejected": "已限流"
     },
     "chatPane": {
       "agent_list": "代理列表",
@@ -8683,7 +8691,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "入站 Webhook 令牌、已注册的上下文和运行历史。API 可用，但页面尚未完成。",
         "open_webhooks": "打开 Webhook",
-        "webhooks": "Webhook"
+        "webhooks": "Webhook",
+        "acp_backends": "ACP 适配器",
+        "experimental_acp_backends_claude_code_and_openai": "Claude Code 和 OpenAI Codex 可替代 Kiro CLI。拒绝路径已测试，但尚未观察到成功的会话。"
       }
     },
     "developerPage": {
@@ -9801,6 +9811,41 @@
         "vector_memory": "向量记忆",
         "vector_memory_is_initializing_the_embedding_mode": "向量记忆正在初始化。嵌入模型（约 610MB）会在后台自动下载，旧版记忆也会自动迁移 — 无需任何操作。",
         "verifying_model_integrity": "正在校验模型完整性…"
+      },
+      "acpBackend": {
+        "title": "ACP 适配器",
+        "experimental": "实验性",
+        "all_features_supported": "默认。支持所有功能。",
+        "features_differ": "{{total}} 项功能中有 {{count}} 项行为不同、不可用或尚未验证。",
+        "show_what_changes": "显示变化内容",
+        "applies_to_new_sessions": "适用于从现在开始的会话。已打开的会话将保留其启动时的适配器。",
+        "not_enabled_in_this_build": "此构建中未启用：{{backends}}。请参阅实验性 ACP 适配器文档。",
+        "level_supported": "支持",
+        "level_degraded": "行为不同",
+        "level_unavailable": "不可用",
+        "cap_session_sharing": "共享子代理运行时",
+        "cap_reasoning_effort": "推理强度",
+        "cap_mcp_tool_search": "MCP 工具搜索",
+        "cap_agent_profiles": "代理配置文件",
+        "cap_slash_commands": "斜杠命令",
+        "cap_turn_usage": "每轮用量",
+        "cap_billing": "费用和限额",
+        "cap_native_resume": "会话恢复",
+        "cap_registry_model_ids": "使用 Kiro 模型目录",
+        "cap_mid_turn_steer": "轮次中调整",
+        "confirm_title": "切换到 {{backend}}？",
+        "confirm_body": "此适配器为实验性功能。{{total}} 项 Kiro Crew 功能中有 {{count}} 项行为不同、不可用或尚未验证。",
+        "confirm_open_sessions": "已打开的会话不受影响，将保留其当前适配器。",
+        "cancel": "取消",
+        "confirm_switch": "切换适配器",
+        "confirm_prerequisites": "请先在网关主机上按顺序运行以下命令。",
+        "not_installed": "未安装适配器",
+        "level_unverified": "未验证",
+        "routing_routed": "工具调用会到达 {{productName}} 的安全门控",
+        "routing_indeterminate": "工具调用路由尚未验证 — 新会话将被拒绝",
+        "routing_bypassed": "工具调用会绕过 {{productName}} 的安全门控 — 新会话将被拒绝",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "已允许未门控的工具。此后端自行批准的调用不会咨询拒绝命令规则、敏感路径拦截和治理上限。"
       }
     },
     "overviewPage": {
@@ -10169,7 +10214,9 @@
       "stopped": "已停止",
       "threads": "线程数",
       "uptime": "运行时长",
-      "working_directory": "工作目录"
+      "working_directory": "工作目录",
+      "acp_backend": "ACP 适配器",
+      "acp_backend_experimental": "{{label}}（实验性）"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "模糊筛选（子串匹配）",

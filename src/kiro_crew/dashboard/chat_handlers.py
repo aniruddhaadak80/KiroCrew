@@ -423,7 +423,8 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # queue entry is durable: a visible message with no queue entry (process
         # exit during a cold-store build) is a request that can never resume.
         _refusal = await _crew.ingest(
-            slot, message,
+            slot,
+            message,
             user_meta=_redact_meta(user_meta) if user_meta else None,
         )
         if _refusal:
@@ -432,8 +433,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             # never run — the transcript note it posts is not visible to an API
             # caller, so the refusal has to reach the status line too.
             return web.json_response(
-                {"error": "crew mode is not available for this session",
-                 "code": _refusal},
+                {"error": "crew mode is not available for this session", "code": _refusal},
                 status=409,
             )
         return web.json_response({"ok": True, "slot": slot.key, "crew": True})
@@ -1017,9 +1017,7 @@ def _generate_state(cfg: KiroCrewConfig, slot: Any) -> str:
     if is_incognito_transcript(getattr(slot, "memory_mode", "")):
         return "unavailable"
     turns = count_user_turns_in_records(getattr(slot, "messages", []) or [])
-    if turns < cfg.session_summary.min_user_turns and not getattr(
-        slot, "_disk_older_count", 0
-    ):
+    if turns < cfg.session_summary.min_user_turns and not getattr(slot, "_disk_older_count", 0):
         return "too_few_turns"
     return "ready"
 
@@ -1597,7 +1595,11 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                     if current_mem and disk_msgs:
                         # Spot-check last memory row against its expected disk position.
                         last_mem = current_mem[-1]
-                        disk_at = disk_msgs[len(current_mem) - 1] if len(current_mem) <= len(disk_msgs) else None
+                        disk_at = (
+                            disk_msgs[len(current_mem) - 1]
+                            if len(current_mem) <= len(disk_msgs)
+                            else None
+                        )
                         if disk_at and (
                             last_mem.get("ts", "") != disk_at.get("ts", "")
                             or last_mem.get("role") != disk_at.get("role")
@@ -1608,12 +1610,10 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                     else:
                         # Disk has rows the window does not — reconcile by appending
                         # the missing tail to the slot and returning the union.
-                        fresh = disk_msgs[len(current_mem):]
+                        fresh = disk_msgs[len(current_mem) :]
                         for msg in fresh:
                             role = msg.get("role", "assistant")
-                            cls = msg.get("cls") or (
-                                "msg msg-u" if role == "user" else "msg msg-a"
-                            )
+                            cls = msg.get("cls") or ("msg msg-u" if role == "user" else "msg msg-a")
                             content = msg.get("content", "")
                             if role != "user":
                                 content, _ = redact_exfiltration_urls(content)
@@ -1662,9 +1662,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         history_key = slot_history_key(slot)
         try:
             all_msgs = (
-                await asyncio.to_thread(
-                    state.conversation_log.read_messages_chained, history_key
-                )
+                await asyncio.to_thread(state.conversation_log.read_messages_chained, history_key)
                 if state.conversation_log
                 else []
             )
@@ -1852,8 +1850,10 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 and not is_crew_capable_slot_key(_normalize_slot_key(str(name)))
             ):
                 return web.json_response(
-                    {"error": "this session name cannot run crew mode",
-                     "code": "crew_unsupported_slot"},
+                    {
+                        "error": "this session name cannot run crew mode",
+                        "code": "crew_unsupported_slot",
+                    },
                     status=400,
                 )
             slot = state.get_or_create_slot(
@@ -3247,9 +3247,7 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
             # The app could not record the dismissal. Refuse the close rather
             # than leave a worker running behind a tab the user believes is gone.
             await _restore_slot_nudge_loop(retired_loop)
-            logger.error(
-                "Slot-close hook for app %r failed on %r, close aborted", slot._app, name
-            )
+            logger.error("Slot-close hook for app %r failed on %r, close aborted", slot._app, name)
             _sync_dashboard_slots(state)
             state.push_slots_update()
             return web.json_response(
@@ -3662,6 +3660,12 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
         # The claude backend has no id meaning "let the server choose", so
         # returning to default needs a reset.
         return "" if is_default else model_registry.to_provider_id(model_name, "claude_code")
+    if provider.is_codex_backend:
+        from kiro_crew.acp import codex
+
+        return codex.wire_model_id(model_name, is_default=is_default)
+    if provider.is_spec_adapter:
+        return "" if is_default else model_name
     if is_default:
         # kiro DOES express Auto as a real model id — but only switch to it when
         # this session's backend actually advertised it.
@@ -4039,9 +4043,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response(
-            {"error": "not found", "code": "slot_not_found"}, status=404
-        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     # The session the reload will tear down. ``effective_session_key``, never
     # ``_history_key_for``: a channel- or cron-born slot runs its turns under
     # its linked key, and the dashboard-prefixed spelling names a session that
@@ -4079,9 +4081,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
             # the silent failure this endpoint exists to prevent. Retry once;
             # a second decline means another turn is genuinely racing, which
             # is the turn-in-flight case.
-            reloaded = await _reset_slot_session(
-                state, slot, session_key, skip_if_busy=True
-            )
+            reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
             if not reloaded:
                 return web.json_response(
                     {"error": "a turn is in flight", "code": "turn_in_flight"},
@@ -4095,7 +4095,9 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     # clients dedupe on -- so an explicit broadcast here would deliver the
     # notice twice.
     slot.append(
-        "assistant", _SESSION_RELOAD_NOTICE, "msg msg-a",
+        "assistant",
+        _SESSION_RELOAD_NOTICE,
+        "msg msg-a",
         meta={"kind": SESSION_RELOAD_KIND},
     )
     # Respawn + session/load now rather than on the next message, so the fresh
@@ -4247,9 +4249,7 @@ def _deny_cross_app_slot_access(
         return None  # Dashboard user -- no restriction
     if slot._app and request_app == slot._app:
         return None  # App owns this slot
-    reason = (
-        "app does not own this slot" if slot._app else "app cannot access unscoped slots"
-    )
+    reason = "app does not own this slot" if slot._app else "app cannot access unscoped slots"
     try:
         sel().log_api_access(
             caller=request_app,
@@ -4442,9 +4442,7 @@ async def api_recent_projects(request: web.Request) -> web.Response:
     return web.json_response({"dirs": dirs})
 
 
-async def _reconcile_slot_window(
-    state: DashboardState, slot: "_ChatSlot"
-) -> None:
+async def _reconcile_slot_window(state: DashboardState, slot: "_ChatSlot") -> None:
     """Detect and reconcile stale in-memory window from disk.
 
     A live slot's window can fall behind disk when messages are written to the
@@ -4483,9 +4481,7 @@ async def _reconcile_slot_window(
             state.conversation_log.read_messages_chained, history_key
         )
     except Exception:
-        logger.warning(
-            "reconcile: read_messages_chained failed for %s", history_key, exc_info=True
-        )
+        logger.warning("reconcile: read_messages_chained failed for %s", history_key, exc_info=True)
         return
     disk_total = len(disk_msgs)
     if disk_total <= represented:
@@ -4511,9 +4507,8 @@ async def _reconcile_slot_window(
         last_mem = slot.messages[-1]
         expected_pos = disk_older + len(slot.messages) - 1
         disk_at = disk_msgs[expected_pos]
-        if (
-            last_mem.get("ts", "") != disk_at.get("ts", "")
-            or last_mem.get("role") != disk_at.get("role")
+        if last_mem.get("ts", "") != disk_at.get("ts", "") or last_mem.get("role") != disk_at.get(
+            "role"
         ):
             logger.info(
                 "reconcile: slot %s alignment mismatch at offset %d — skipping "

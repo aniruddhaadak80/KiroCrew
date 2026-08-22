@@ -198,6 +198,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
     LLMEvent,
+    LLMProvider,
 )
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import (
@@ -718,6 +719,25 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
         payload["window_tokens"] = window
     else:
         payload["reset"] = True
+    # Plan rate limit (claude-agent-acp's `_meta["_claude/rateLimit"]`), attached
+    # to this frame rather than given its own event: it rides the same
+    # usage_update the context counts come from, refreshes on the same cadence,
+    # and lands in the same popover. Omitted entirely when the provider reports
+    # none, so the key's PRESENCE is the frontend's "this harness has a quota"
+    # signal — an empty dict would render a header over no rows. The `reset`
+    # branch above does not clear it: a compaction changes the transcript, not
+    # the account's quota.
+    #
+    # Read through the ABC-declared accessor on a positive isinstance check, not
+    # a `hasattr` capability probe (H8): the method exists on every conforming
+    # provider with a None default, so a probe would be testing whether `client`
+    # is a provider at all — which is what the isinstance actually asks. The dict
+    # check then keeps an unspecced test double's Mock return (truthy, and not
+    # JSON-serializable) out of a live WS frame.
+    if isinstance(client, LLMProvider):
+        rate_limit = client.rate_limit_payload()
+        if isinstance(rate_limit, dict) and rate_limit:
+            payload["rate_limit"] = rate_limit
     return payload
 
 

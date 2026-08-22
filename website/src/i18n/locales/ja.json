@@ -106,7 +106,9 @@
     "open_command_bar": "Command Bar を開く",
     "focus_mode": "フォーカスモード",
     "focus_mode_title": "フォーカスモード · Alt+Shift+M",
-    "focus_mode_title_mac": "フォーカスモード · ⌥⇧M"
+    "focus_mode_title_mac": "フォーカスモード · ⌥⇧M",
+    "active_harness": "エージェントハーネス: {{label}}",
+    "active_harness_open_settings": "エージェントハーネス: {{label}} — ACP アダプターの設定を開く"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4776,7 +4778,13 @@
       "upload_file": "ファイルをアップロード",
       "use_a_skill": "スキルを使用",
       "used": "使用済み",
-      "voice_input": "音声入力"
+      "voice_input": "音声入力",
+      "plan_limit": "プラン上限",
+      "limit_type": "上限の種類",
+      "resets": "リセット",
+      "rate_limit_allowed": "正常",
+      "rate_limit_warning": "上限に近い",
+      "rate_limit_rejected": "制限中"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -8683,7 +8691,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "受信 Webhook のトークン、登録済みコンテキスト、実行履歴。API は動作しますが、ページは未完成です。",
         "open_webhooks": "Webhooks を開く",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "acp_backends": "ACP アダプター",
+        "experimental_acp_backends_claude_code_and_openai": "Kiro CLI の代わりとなる Claude Code と OpenAI Codex。拒否パスはテスト済みですが、セッションの成功は確認されていません。"
       }
     },
     "developerPage": {
@@ -9801,6 +9811,41 @@
         "vector_memory": "ベクトルメモリ",
         "vector_memory_is_initializing_the_embedding_mode": "ベクトルメモリが初期化中です。埋め込みモデル（約610MB）はバックグラウンドで自動的にダウンロードされ、レガシーメモリは自動的に移行します — 操作は不要です。",
         "verifying_model_integrity": "モデルの整合性を確認中…"
+      },
+      "acpBackend": {
+        "title": "ACP アダプター",
+        "experimental": "実験的",
+        "all_features_supported": "デフォルト。すべての機能がサポートされています。",
+        "features_differ": "{{total}} 個中 {{count}} 個の機能は動作が異なるか、利用不可、または未検証です。",
+        "show_what_changes": "変更点を表示",
+        "applies_to_new_sessions": "今後開始するセッションに適用されます。開いているセッションは開始時のアダプターを維持します。",
+        "not_enabled_in_this_build": "このビルドでは有効化されていません: {{backends}}。実験的な ACP アダプターのドキュメントを参照してください。",
+        "level_supported": "サポート済み",
+        "level_degraded": "動作が異なる",
+        "level_unavailable": "利用不可",
+        "cap_session_sharing": "共有サブエージェントランタイム",
+        "cap_reasoning_effort": "推論の深さ",
+        "cap_mcp_tool_search": "MCP ツール検索",
+        "cap_agent_profiles": "エージェントプロファイル",
+        "cap_slash_commands": "スラッシュコマンド",
+        "cap_turn_usage": "ターンごとの使用量",
+        "cap_billing": "コストと制限",
+        "cap_native_resume": "セッションの再開",
+        "cap_registry_model_ids": "Kiro モデルカタログを使用",
+        "cap_mid_turn_steer": "ターン中の軌道修正",
+        "confirm_title": "{{backend}} に切り替えますか？",
+        "confirm_body": "このアダプターは実験的です。{{total}} 個中 {{count}} 個の Kiro Crew 機能は動作が異なるか、利用不可、または未検証です。",
+        "confirm_open_sessions": "開いているセッションは影響を受けず、現在のアダプターを維持します。",
+        "cancel": "キャンセル",
+        "confirm_switch": "アダプターを切り替える",
+        "confirm_prerequisites": "最初にゲートウェイホストで次のコマンドを順番に実行してください。",
+        "not_installed": "アダプター未インストール",
+        "level_unverified": "未検証",
+        "routing_routed": "ツール呼び出しは {{productName}} のセキュリティゲートに到達します",
+        "routing_indeterminate": "ツール呼び出しのルーティングは未検証です — 新しいセッションは拒否されます",
+        "routing_bypassed": "ツール呼び出しは {{productName}} のセキュリティゲートを迂回します — 新しいセッションは拒否されます",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "ゲートなしのツールが許可されています。拒否コマンド規則、機密パスのブロック、ガバナンス上限は、このバックエンドの自己承認呼び出しでは参照されません。"
       }
     },
     "overviewPage": {
@@ -10169,7 +10214,9 @@
       "stopped": "停止",
       "threads": "スレッド",
       "uptime": "稼働時間",
-      "working_directory": "作業ディレクトリ"
+      "working_directory": "作業ディレクトリ",
+      "acp_backend": "ACP アダプター",
+      "acp_backend_experimental": "{{label}}（実験的）"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "ファジィフィルタ（部分文字列マッチ）",

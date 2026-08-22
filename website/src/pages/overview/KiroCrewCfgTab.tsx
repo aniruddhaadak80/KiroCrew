@@ -11,6 +11,9 @@ import { useProvider } from '../../providers'
 import type { KiroCrewAgent } from '../../components/AgentSelector'
 
 import { i18nT } from '../../i18n/t'
+import { usePreviewFlag } from '../../hooks/usePreviewFlag'
+import { PREVIEW_ACP_BACKENDS } from '../../utils/previewFlags'
+import { AcpBackendCard } from './AcpBackendCard'
 type KiroCrewAgentCfg = Omit<KiroCrewAgent, 'name'>
 interface WorkspaceCfg { dir: string }
 interface MemoryStoreCfg { description: string; embedding_provider: string }
@@ -147,12 +150,32 @@ export default function KiroCrewCfgTab() {
     },
   })
 
+  // Read before the early returns below — a hook cannot live after one.
+  const acpBackendsPreview = usePreviewFlag(PREVIEW_ACP_BACKENDS)
+
   const save = (path: string, value: unknown) => {
     ++reqId.current
     patchMut.mutate({ path, value })
   }
-
-  if (err) return <Card><ErrorNotice message={err} askAgent /></Card>
+  // A failed config load must NOT hide the adapter card. Any transient failure
+  // reaches here — a gateway restart under an open tab, a dropped connection, an
+  // expired session — and returning only an error card made this tab the one
+  // place that can switch adapters and the one place that would not render. That
+  // matters most in the case where switching back is the remedy: an adapter whose
+  // prerequisites are unmet cannot start a session, and an operator who selected
+  // it needs this control, not a config edit on the host. The card fetches its own
+  // data from /api/acp-backends and reads nothing from this query, so it renders
+  // independently with the error kept visible above it.
+  if (err) {
+    return (
+      <>
+        <Card><ErrorNotice message={err} askAgent /></Card>
+        {acpBackendsPreview && (
+          <AcpBackendCard onSave={(path, value) => save(path, value)} />
+        )}
+      </>
+    )
+  }
   if (!cfg) return <Card><div className="skeleton h-40 rounded" /></Card>
 
   const agents = Object.entries(cfg.agents)
@@ -268,6 +291,18 @@ export default function KiroCrewCfgTab() {
           <CfgNumber key={`poolttl-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.pool_ttl')} path="session.pool_ttl_secs" value={cfg.session.pool_ttl_secs} suffix="s" min={0} max={7200} hint={i18nT('pages.overview.kiroCrewCfgTab.max_age_for_pooled_processes_0_disables_expiry_r')} onSave={save} />
         </div>
       </Card>
+      )}
+
+      {/* Backend selection sits BEFORE Config summary: it changes which backend
+          the rows below describe, so reading it after them would mean re-reading
+          them. Its own save path, since it needs a confirm step the generic
+          Cfg* controls do not have.
+
+          Behind PREVIEW_ACP_BACKENDS: no successful session on a non-kiro
+          backend has been observed yet, so the control stays out of sight until
+          an operator opts in from Developer > Config. */}
+      {acpBackendsPreview && (
+        <AcpBackendCard onSave={(path, value) => save(path, value)} />
       )}
 
       {/* Quick Info */}

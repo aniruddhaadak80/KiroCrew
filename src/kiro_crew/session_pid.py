@@ -226,7 +226,15 @@ def _rewrite_pid_file(path: Path, content: str) -> bool:
 # PIDs before a kill, and as a NEGATIVE gate in the work-orphan sweep: these
 # runtimes are reclaimed by their own tracked-PID sweep, never by the
 # marker-based work sweep (see _is_sweepable_orphan_work).
-_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude")
+#
+# A backend absent from this tuple is never recognised as ours: its tracked
+# entries are pruned instead of reaped (a leaked process), and _kill_pid_tree
+# skips its children. Known gap: a CODEX_ACP_BIN pointing at a script wrapped as
+# ``[node, script]`` matches neither the basename gate nor the cmdline gate unless
+# the script path itself contains "codex". The consequence is a leaked tracking
+# entry, never a wrong kill, because the re-validation is a precondition for
+# killing rather than a licence to.
+_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude", "codex", "goose")
 
 
 def _is_managed_agent_process(pid: int) -> bool:

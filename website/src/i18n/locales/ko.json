@@ -106,7 +106,9 @@
     "open_command_bar": "Command Bar 열기",
     "focus_mode": "집중 모드",
     "focus_mode_title": "집중 모드 · Alt+Shift+M",
-    "focus_mode_title_mac": "집중 모드 · ⌥⇧M"
+    "focus_mode_title_mac": "집중 모드 · ⌥⇧M",
+    "active_harness": "에이전트 하네스: {{label}}",
+    "active_harness_open_settings": "에이전트 하네스: {{label}} — ACP 어댑터 설정 열기"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4776,7 +4778,13 @@
       "upload_file": "파일 업로드",
       "use_a_skill": "스킬 사용",
       "used": "사용됨",
-      "voice_input": "음성 입력"
+      "voice_input": "음성 입력",
+      "plan_limit": "플랜 한도",
+      "limit_type": "한도 유형",
+      "resets": "초기화",
+      "rate_limit_allowed": "정상",
+      "rate_limit_warning": "한도 임박",
+      "rate_limit_rejected": "제한됨"
     },
     "chatPane": {
       "agent_list": "에이전트 목록",
@@ -8683,7 +8691,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "수신 웹훅 토큰, 등록된 컨텍스트, 실행 기록입니다. API는 동작하지만 페이지는 아직 완성되지 않았습니다.",
         "open_webhooks": "Webhooks 열기",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "acp_backends": "ACP 어댑터",
+        "experimental_acp_backends_claude_code_and_openai": "Kiro CLI의 대안인 Claude Code 및 OpenAI Codex. 거부 경로는 테스트되었지만 성공한 세션은 확인되지 않았습니다."
       }
     },
     "developerPage": {
@@ -9801,6 +9811,41 @@
         "vector_memory": "벡터 메모리",
         "vector_memory_is_initializing_the_embedding_mode": "벡터 메모리를 초기화하는 중입니다. 임베딩 모델 (약 610MB)은 백그라운드에서 자동으로 다운로드되고 기존 메모리는 스스로 이전되므로, 따로 할 일은 없습니다.",
         "verifying_model_integrity": "모델 무결성을 확인하는 중…"
+      },
+      "acpBackend": {
+        "title": "ACP 어댑터",
+        "experimental": "실험적",
+        "all_features_supported": "기본값입니다. 모든 기능이 지원됩니다.",
+        "features_differ": "{{total}}개 기능 중 {{count}}개는 다르게 작동하거나 사용할 수 없거나 확인되지 않았습니다.",
+        "show_what_changes": "변경 사항 표시",
+        "applies_to_new_sessions": "지금부터 시작하는 세션에 적용됩니다. 열려 있는 세션은 시작할 때의 어댑터를 유지합니다.",
+        "not_enabled_in_this_build": "이 빌드에서는 활성화되지 않았습니다: {{backends}}. 실험적 ACP 어댑터 문서를 참조하세요.",
+        "level_supported": "지원됨",
+        "level_degraded": "다르게 동작",
+        "level_unavailable": "사용할 수 없음",
+        "cap_session_sharing": "공유 서브에이전트 런타임",
+        "cap_reasoning_effort": "추론 강도",
+        "cap_mcp_tool_search": "MCP 도구 검색",
+        "cap_agent_profiles": "에이전트 프로필",
+        "cap_slash_commands": "슬래시 명령",
+        "cap_turn_usage": "턴별 사용량",
+        "cap_billing": "비용 및 한도",
+        "cap_native_resume": "세션 재개",
+        "cap_registry_model_ids": "Kiro 모델 카탈로그 사용",
+        "cap_mid_turn_steer": "턴 중 조정",
+        "confirm_title": "{{backend}}(으)로 전환하시겠습니까?",
+        "confirm_body": "이 어댑터는 실험적입니다. {{total}}개 Kiro Crew 기능 중 {{count}}개는 다르게 작동하거나 사용할 수 없거나 확인되지 않았습니다.",
+        "confirm_open_sessions": "열려 있는 세션은 영향을 받지 않으며 현재 어댑터를 유지합니다.",
+        "cancel": "취소",
+        "confirm_switch": "어댑터 전환",
+        "confirm_prerequisites": "먼저 게이트웨이 호스트에서 다음 명령을 순서대로 실행하세요.",
+        "not_installed": "어댑터가 설치되지 않음",
+        "level_unverified": "확인되지 않음",
+        "routing_routed": "도구 호출은 {{productName}}의 보안 게이트에 도달합니다",
+        "routing_indeterminate": "도구 호출 라우팅이 확인되지 않았습니다 — 새 세션은 거부됩니다",
+        "routing_bypassed": "도구 호출이 {{productName}}의 보안 게이트를 우회합니다 — 새 세션은 거부됩니다",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "게이트 없는 도구가 허용됩니다. 거부된 명령 규칙, 민감한 경로 차단, 거버넌스 상한은 이 백엔드의 자체 승인 호출에 적용되지 않습니다."
       }
     },
     "overviewPage": {
@@ -10169,7 +10214,9 @@
       "stopped": "중지됨",
       "threads": "스레드",
       "uptime": "가동 시간",
-      "working_directory": "작업 디렉터리"
+      "working_directory": "작업 디렉터리",
+      "acp_backend": "ACP 어댑터",
+      "acp_backend_experimental": "{{label}}(실험적)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "퍼지 필터 (부분 문자열 일치)",

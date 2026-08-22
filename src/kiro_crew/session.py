@@ -846,6 +846,19 @@ class SessionManager:
         await sess.semaphore.acquire()
         return True
 
+    @property
+    def acp_backend(self) -> str:
+        """The harness id a NEW session would start on (``""`` = kiro-cli).
+
+        Reads the config this store already holds rather than loading it again, so
+        a caller on the event loop — the 5-second status push, the usage poll —
+        pays no filesystem stat and no schema revalidation. ``refresh_defaults``
+        is what keeps it current: it replaces ``_cfg`` when the operator switches
+        harness, and this value is deliberately the NEW-session default rather
+        than any live session's backend, matching what the Settings card reports.
+        """
+        return getattr(self._cfg.agent, "acp_backend", "") or ""
+
     def active_providers(self) -> list[LLMProvider]:
         """Return the providers of all currently-active sessions.
 
@@ -1017,10 +1030,10 @@ class SessionManager:
     async def refresh_defaults(self) -> None:
         """Adopt config changes that only affect NEW sessions.
 
-        For settings that are *defaults* — ``agent.model``,
-        ``agent.reasoning_effort`` — the new value must reach the next session
-        without a gateway restart, because the provider factory and ``_cfg``
-        both capture them when they are built.
+        For settings that apply to *new sessions* — ``agent.acp_backend``,
+        ``agent.model``, ``agent.reasoning_effort`` — the new value must reach
+        the next session without a gateway restart, because the provider factory
+        and ``_cfg`` both capture them when they are built.
 
         Unlike :meth:`reload_provider_factory`, this deliberately does NOT touch
         ``_sessions``: a default is by definition not retroactive, and shutting
@@ -1052,7 +1065,9 @@ class SessionManager:
             self._pool_health_task = None
         await self.start_pool(blocking=False)
         logger.info(
-            "Session defaults refreshed: model=%s effort=%r (live sessions untouched)",
+            "New-session config refreshed: backend=%s model=%s effort=%r "
+            "(live sessions untouched)",
+            cfg.agent.acp_backend or "kiro",
             cfg.agent.model,
             cfg.agent.reasoning_effort,
         )

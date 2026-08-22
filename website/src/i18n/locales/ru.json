@@ -106,7 +106,9 @@
     "open_command_bar": "Открыть Command Bar",
     "focus_mode": "Режим фокусировки",
     "focus_mode_title": "Режим фокусировки · Alt+Shift+M",
-    "focus_mode_title_mac": "Режим фокусировки · ⌥⇧M"
+    "focus_mode_title_mac": "Режим фокусировки · ⌥⇧M",
+    "active_harness": "Окружение агента: {{label}}",
+    "active_harness_open_settings": "Окружение агента: {{label}} — открыть настройки Адаптера ACP"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4995,7 +4997,13 @@
       "upload_file": "Загрузить файл",
       "use_a_skill": "Использовать навык",
       "used": "Использовано",
-      "voice_input": "Голосовой ввод"
+      "voice_input": "Голосовой ввод",
+      "plan_limit": "Лимит плана",
+      "limit_type": "Тип лимита",
+      "resets": "Сброс",
+      "rate_limit_allowed": "Норма",
+      "rate_limit_warning": "Близко к лимиту",
+      "rate_limit_rejected": "Ограничено"
     },
     "chatPane": {
       "agent_list": "Список агентов",
@@ -9016,7 +9024,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "Токены входящих вебхуков, зарегистрированные контексты и история запусков. API работает, но страница не доделана.",
         "open_webhooks": "Открыть вебхуки",
-        "webhooks": "Вебхуки"
+        "webhooks": "Вебхуки",
+        "acp_backends": "Адаптеры ACP",
+        "experimental_acp_backends_claude_code_and_openai": "Claude Code и OpenAI Codex как альтернативы Kiro CLI. Пути отказа протестированы; успешный сеанс не наблюдался."
       }
     },
     "developerPage": {
@@ -10155,6 +10165,41 @@
         "vector_memory": "Векторная память",
         "vector_memory_is_initializing_the_embedding_mode": "Векторная память инициализируется. Модель эмбеддингов (~610MB) скачивается автоматически в фоне, а старая память переносится сама — действий не требуется.",
         "verifying_model_integrity": "Проверка целостности модели..."
+      },
+      "acpBackend": {
+        "title": "Адаптер ACP",
+        "experimental": "Экспериментальный",
+        "all_features_supported": "По умолчанию. Все функции поддерживаются.",
+        "features_differ": "{{count}} из {{total}} функций работают иначе, недоступны или не проверены.",
+        "show_what_changes": "Показать, что изменится",
+        "applies_to_new_sessions": "Применяется к сеансам, запущенным с этого момента. Открытые сеансы сохраняют исходный адаптер.",
+        "not_enabled_in_this_build": "Не включено в этой сборке: {{backends}}. См. документацию по экспериментальным адаптерам ACP.",
+        "level_supported": "Поддерживается",
+        "level_degraded": "Работает иначе",
+        "level_unavailable": "Недоступно",
+        "cap_session_sharing": "Общая среда выполнения субагентов",
+        "cap_reasoning_effort": "Глубина рассуждений",
+        "cap_mcp_tool_search": "Поиск инструментов MCP",
+        "cap_agent_profiles": "Профили агентов",
+        "cap_slash_commands": "Слэш-команды",
+        "cap_turn_usage": "Использование за ход",
+        "cap_billing": "Стоимость и лимиты",
+        "cap_native_resume": "Возобновление сеанса",
+        "cap_registry_model_ids": "Использует каталог моделей Kiro",
+        "cap_mid_turn_steer": "Корректировка в течение хода",
+        "confirm_title": "Переключиться на {{backend}}?",
+        "confirm_body": "Этот адаптер экспериментальный. {{count}} из {{total}} функций Kiro Crew работают иначе, недоступны или не проверены.",
+        "confirm_open_sessions": "Открытые сеансы не затрагиваются и сохраняют текущий адаптер.",
+        "cancel": "Отмена",
+        "confirm_switch": "Переключить адаптер",
+        "confirm_prerequisites": "Сначала выполните это на хосте шлюза, в указанном порядке.",
+        "not_installed": "Адаптер не установлен",
+        "level_unverified": "Не проверено",
+        "routing_routed": "Вызовы инструментов достигают шлюза безопасности {{productName}}",
+        "routing_indeterminate": "Маршрутизация вызовов инструментов не проверена — новые сеансы будут отклонены",
+        "routing_bypassed": "Вызовы инструментов обошли бы шлюз безопасности {{productName}} — новые сеансы будут отклонены",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "Неконтролируемые инструменты разрешены. Правила запрещённых команд, блокировка чувствительных путей и потолок управления не применяются к самостоятельно одобренным вызовам этого бэкенда."
       }
     },
     "overviewPage": {
@@ -10535,7 +10580,9 @@
       "stopped": "Остановлено",
       "threads": "Потоки",
       "uptime": "Время работы",
-      "working_directory": "Рабочий каталог"
+      "working_directory": "Рабочий каталог",
+      "acp_backend": "Адаптер ACP",
+      "acp_backend_experimental": "{{label}} (экспериментальный)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "Нечёткий фильтр (поиск подстроки)",
