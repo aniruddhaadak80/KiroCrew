@@ -2425,6 +2425,23 @@ class AcpRuntime:
                 raise AcpRuntimeError(f"cannot project agent {agent!r} onto KAS: {exc}") from exc
         return None
 
+    def _with_kas_managed_servers(
+        self, mcp_servers: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]]:
+        """Session-level Crew servers for KAS. The kiro path never calls this.
+
+        KAS has no ``--agent`` disk load and custom agents omit ``mcpServers``
+        so session injection stays the single owner. With the gateway off the
+        pooled list is empty, and without this merge ``@kirocrew-core`` tools
+        advertise but resolve nowhere.
+        """
+        from kiro_crew.acp import spec_servers
+
+        return spec_servers.merge_session_servers(
+            spec_servers.managed_spec_servers(),
+            list(mcp_servers or []),
+        )
+
     async def _session_start_budget(self) -> float:
         """The session/new + session/load budget, resolved lazily off-loop.
 
@@ -2464,6 +2481,8 @@ class AcpRuntime:
             mcp_servers = await asyncio.to_thread(
                 pooled_session_servers, self._mcp_gateway_overlay, agent or self._agent
             )
+        if self._acp_backend == ACP_BACKEND_KAS:
+            mcp_servers = self._with_kas_managed_servers(mcp_servers)
         # The agent to run: an explicit request, else the runtime default. KAS
         # has no --agent spawn flag, so its default must be BOTH injected (below)
         # and activated (via set_mode after session/new); the kiro default is
@@ -2620,6 +2639,8 @@ class AcpRuntime:
         mcp_servers = await asyncio.to_thread(
             pooled_session_servers, self._mcp_gateway_overlay, active_agent
         )
+        if self._acp_backend == ACP_BACKEND_KAS:
+            mcp_servers = self._with_kas_managed_servers(mcp_servers)
         load_params: dict[str, Any] = {
             "sessionId": resume_sid,
             "cwd": str(cwd if cwd else self._work_dir),

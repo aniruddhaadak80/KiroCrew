@@ -183,6 +183,11 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
   - **kiro-cli**: servers arrive through the `--agent` spec. This seam returns
     the pooled-broker list only; it does not inject managed servers a second
     time (harness parity: an added harness adapts, it does not widen).
+  - **KAS**: no `--agent` flag, and `kas_agents` omits `mcpServers` so the
+    session array stays the single owner. `AcpRuntime` therefore merges Crew's
+    managed servers into `session/new` / `session/load` on the KAS arm only
+    (same `spec_servers` shaping: gate honoured, `opt_in` withheld, user
+    servers never transmitted). The kiro runtime path is unchanged.
   - **Spec adapters** (claude / Codex / a ROUTED registry adapter): they read
     no Kiro Crew config, so `session/new` / `session/load` carry Crew's own
     managed servers (`kirocrew-core`, `kirocrew-cron`, and `kirocrew-computer`

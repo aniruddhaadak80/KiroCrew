@@ -3414,6 +3414,76 @@ class TestAcpRuntimeLoadSession:
         assert METHOD_SET_MODE in methods
 
     @pytest.mark.asyncio
+    async def test_kas_session_new_delivers_managed_core_when_gateway_is_off(self, monkeypatch):
+        """KAS has no --agent disk load and custom agents omit mcpServers.
+
+        Session-level ``mcpServers`` is therefore the only channel. With the
+        gateway off the pooled list is empty, so without this merge a KAS
+        session advertises ``@kirocrew-core`` tools that resolve nowhere.
+        """
+        rt, _, _ = _make_runtime()
+        rt._acp_backend = ACP_BACKEND_KAS
+        sent: list[dict] = []
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_NEW:
+                sent.append(params)
+                return {"sessionId": "sid-kas", "modes": {"availableModes": [{"id": "kirocrew"}]}}
+            return {}
+
+        async def _fake_agents(agent):
+            return [{"id": agent, "prompt": "p", "tools": ["@kirocrew-core"]}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+
+        await rt.create_session(cwd="/work", agent="kirocrew")
+
+        names = {entry["name"] for entry in sent[0]["mcpServers"]}
+        assert "kirocrew-core" in names
+        assert "kirocrew-cron" in names
+
+    @pytest.mark.asyncio
+    async def test_kas_session_load_delivers_the_same_managed_servers(self, monkeypatch):
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        rt._acp_backend = ACP_BACKEND_KAS
+        sent: list[dict] = []
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_LOAD:
+                sent.append(params)
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            return {}
+
+        async def _fake_agents(agent):
+            return [{"id": agent, "prompt": "p", "tools": ["@kirocrew-core"]}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+
+        await rt.load_session("", "sid-kas", cwd="/work", agent="kirocrew")
+
+        names = {entry["name"] for entry in sent[0]["mcpServers"]}
+        assert "kirocrew-core" in names
+
+    @pytest.mark.asyncio
+    async def test_kiro_session_new_stays_empty_when_gateway_is_off(self, monkeypatch):
+        """The kiro path still loads servers from --agent. Do not inject here."""
+        rt, _, _ = _make_runtime()
+        sent: list[dict] = []
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_NEW:
+                sent.append(params)
+                return {"sessionId": "sid-kiro"}
+            return {}
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        await rt.create_session(cwd="/work", agent="kirocrew")
+        assert sent[0]["mcpServers"] == []
+
+    @pytest.mark.asyncio
     async def test_load_session_raises_when_capability_absent(self):
         rt, _, _ = _make_runtime()
         rt._can_load_session = False
