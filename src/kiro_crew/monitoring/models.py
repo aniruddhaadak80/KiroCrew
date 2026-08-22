@@ -1,0 +1,252 @@
+"""Transport-independent monitor state.
+
+The scheduler, provider adapters, and session delivery code exchange these
+small records. They deliberately contain no provider clients or callbacks, so
+they can be persisted and evaluated without starting an agent turn.
+"""
+
+from __future__ import annotations
+
+import math
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields
+from enum import Enum
+from typing import Any
+
+MONITOR_STATE_VERSION = 1
+DEFAULT_MONITOR_RUNTIME_SECS = 14_400
+DEFAULT_MONITOR_AGENT_TURNS = 8
+DEFAULT_MONITOR_TOKENS = 250_000
+DEFAULT_MONITOR_PROVIDER_ERRORS = 3
+DEFAULT_MONITOR_CADENCE_SECS = 300
+
+
+class MonitorDecision(str, Enum):
+    """Effect the monitor controller applies after a probe."""
+
+    NO_CHANGE = "no_change"
+    RECORD_ONLY = "record_only"
+    WAKE_ACTIONABLE = "wake_actionable"
+    STOP_SUCCESS = "stop_success"
+    STOP_BLOCKED = "stop_blocked"
+    RETRY_PROVIDER = "retry_provider"
+    STOP_BUDGET = "stop_budget"
+
+
+class MonitorObservationStatus(str, Enum):
+    """Domain-owned classification of one canonical observation."""
+
+    PENDING = "pending"
+    ACTIONABLE = "actionable"
+    SUCCESS = "success"
+    BLOCKED = "blocked"
+    PROVIDER_ERROR = "provider_error"
+
+
+class ProviderErrorKind(str, Enum):
+    """Provider failures that have different retry safety."""
+
+    TRANSIENT = "transient"
+    RATE_LIMITED = "rate_limited"
+    AUTHENTICATION = "authentication"
+    AUTHORIZATION = "authorization"
+    NOT_FOUND = "not_found"
+
+
+class MonitorOutcome(str, Enum):
+    """Durable terminal result retained after the monitor stops."""
+
+    SUCCESS = "success"
+    BLOCKED = "blocked"
+    BUDGET = "budget"
+    USER_STOP = "user_stop"
+    SESSION_CLOSE = "session_close"
+    TARGET_UNAVAILABLE = "target_unavailable"
+
+
+@dataclass(frozen=True)
+class MonitorBudgets:
+    """Hard bounds for a structured monitor.
+
+    Unlike legacy AutoNudge values, zero never means unlimited here.
+    """
+
+    max_runtime_secs: int = DEFAULT_MONITOR_RUNTIME_SECS
+    max_agent_turns: int = DEFAULT_MONITOR_AGENT_TURNS
+    max_tokens: int = DEFAULT_MONITOR_TOKENS
+    max_provider_errors: int = DEFAULT_MONITOR_PROVIDER_ERRORS
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_runtime_secs",
+            "max_agent_turns",
+            "max_tokens",
+            "max_provider_errors",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass(frozen=True)
+class MonitorObservation:
+    """Small canonical result produced by a typed provider probe."""
+
+    fingerprint: str
+    status: MonitorObservationStatus
+    provider_error: ProviderErrorKind | None = None
+    reason_code: str = ""
+    summary: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, MonitorObservationStatus):
+            raise ValueError("status must be a MonitorObservationStatus")
+        if not isinstance(self.fingerprint, str):
+            raise ValueError("fingerprint must be a string")
+        if not isinstance(self.reason_code, str):
+            raise ValueError("reason_code must be a string")
+        if not isinstance(self.summary, str):
+            raise ValueError("summary must be a string")
+        if self.status is MonitorObservationStatus.PROVIDER_ERROR:
+            if not isinstance(self.provider_error, ProviderErrorKind):
+                raise ValueError("provider_error must be a ProviderErrorKind for a provider error")
+            return
+        if not self.fingerprint:
+            raise ValueError("fingerprint is required for a comparable observation")
+        if self.provider_error is not None:
+            raise ValueError("provider_error is only valid for a provider error observation")
+
+
+@dataclass
+class MonitorState:
+    """Restart-durable state for one structured monitor."""
+
+    kind: str
+    target: str
+    objective: str
+    created_ts: float
+    version: int = MONITOR_STATE_VERSION
+    budgets: MonitorBudgets = field(default_factory=MonitorBudgets)
+    cadence_secs: int = DEFAULT_MONITOR_CADENCE_SECS
+    last_observation: dict[str, object] = field(default_factory=dict)
+    last_fingerprint: str = ""
+    last_observed_at: float = 0.0
+    last_wake_fingerprint: str = ""
+    wake_in_flight: bool = False
+    agent_turns: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    consecutive_provider_errors: int = 0
+    next_probe_at: float = 0.0
+    outcome: MonitorOutcome | None = None
+    stopped_reason: str = ""
+    stopped_at: float = 0.0
+    extra_fields: dict[str, object] = field(default_factory=dict, repr=False)
+    _raw_payload: dict[str, object] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for name in ("kind", "target", "objective"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0:
+            raise ValueError("version must be a positive integer")
+        for name in ("created_ts", "last_observed_at", "next_probe_at", "stopped_at"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a finite non-negative number")
+        for name in (
+            "agent_turns",
+            "input_tokens",
+            "output_tokens",
+            "consecutive_provider_errors",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if not isinstance(self.budgets, MonitorBudgets):
+            raise ValueError("budgets must be MonitorBudgets")
+        if (
+            isinstance(self.cadence_secs, bool)
+            or not isinstance(self.cadence_secs, int)
+            or self.cadence_secs <= 0
+        ):
+            raise ValueError("cadence_secs must be a positive integer")
+        if not isinstance(self.last_observation, dict):
+            raise ValueError("last_observation must be an object")
+        if not isinstance(self.last_fingerprint, str) or not isinstance(
+            self.last_wake_fingerprint, str
+        ):
+            raise ValueError("monitor fingerprints must be strings")
+        if not isinstance(self.wake_in_flight, bool):
+            raise ValueError("wake_in_flight must be a boolean")
+        if self.outcome is not None and not isinstance(self.outcome, MonitorOutcome):
+            raise ValueError("outcome must be a MonitorOutcome")
+        if not isinstance(self.stopped_reason, str):
+            raise ValueError("stopped_reason must be a string")
+        if not isinstance(self.extra_fields, dict):
+            raise ValueError("extra_fields must be an object")
+        if self._raw_payload is not None and not isinstance(self._raw_payload, dict):
+            raise ValueError("_raw_payload must be an object")
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+def monitor_state_from_dict(raw: object) -> MonitorState:
+    """Decode a persisted monitor while ignoring fields owned by newer versions.
+
+    The caller is responsible for deactivating versions it does not implement.
+    Keeping the recognized identity fields makes such records inspectable.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("monitor state must be an object")
+    if raw.get("version", MONITOR_STATE_VERSION) != MONITOR_STATE_VERSION:
+        # A newer version may give familiar fields different semantics. Keep an
+        # inert local view for the loader while retaining the exact raw payload
+        # for a later compatible controller to inspect and rewrite unchanged.
+        values: dict[str, Any] = {
+            key: raw[key]
+            for key in ("kind", "target", "objective", "created_ts", "version")
+            if key in raw
+        }
+        values["budgets"] = MonitorBudgets()
+        values["_raw_payload"] = deepcopy(raw)
+        return MonitorState(**values)
+    allowed = {
+        item.name
+        for item in fields(MonitorState)
+        if item.name not in {"extra_fields", "_raw_payload"}
+    }
+    values = {key: value for key, value in raw.items() if key in allowed}
+    values["extra_fields"] = {key: value for key, value in raw.items() if key not in allowed}
+    budgets = values.get("budgets")
+    if isinstance(budgets, dict):
+        values["budgets"] = MonitorBudgets(**budgets)
+    elif budgets is not None and not isinstance(budgets, MonitorBudgets):
+        raise ValueError("monitor budgets must be an object")
+    outcome = values.get("outcome")
+    if outcome is not None:
+        values["outcome"] = MonitorOutcome(outcome)
+    else:
+        values["outcome"] = None
+    return MonitorState(**values)
+
+
+def monitor_state_to_dict(state: MonitorState) -> dict[str, object]:
+    """Encode known state while preserving fields written by a newer version."""
+    if state._raw_payload is not None:
+        return deepcopy(state._raw_payload)
+    payload = asdict(state)
+    extra = payload.pop("extra_fields")
+    payload.pop("_raw_payload")
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            payload.setdefault(key, value)
+    return payload
