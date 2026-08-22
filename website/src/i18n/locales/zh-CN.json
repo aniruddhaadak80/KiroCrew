@@ -6698,8 +6698,7 @@
       "stat_unknown": "未知",
       "tag_shared": "共享",
       "unsaved_changes": "未保存的改动",
-      "webhook_unbound_reason": "Webhook 令牌目前不携带 Crew 绑定，因此任何令牌都能唤醒任何 Crew。",
-      "webhook_unbound_short": "未绑定到 Crew",
+      "webhook_unbound_short": "没有绑定的 token",
       "wire_what_it_works_with": "它用什么工作"
     },
     "awsConsentGate": {
@@ -6715,6 +6714,20 @@
       "billing_notice": "这是付费 AWS 服务。在你确认之前不会发送任何请求。",
       "confirm_button": "确认并启用",
       "withdraw": "撤销确认"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "无法加载 Webhook，暂时不知道什么会唤醒这个 crew。",
+      "inbound_webhooks_are_switched_off": "入站 webhook 已关闭，任何调用都进不来——包括已绑定的 token。",
+      "last_used_ago": "{{time}}用过",
+      "no_tokens_are_bound_to_this_crew": "没有绑定到这个 crew 的 webhook token。",
+      "off": "已停用",
+      "open_webhooks": "打开 Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "持有这些 token 的外部系统可以以这个 crew 的身份发起一轮工作。到 Webhooks 页面创建或吊销。",
+      "retry": "重试",
+      "signed": "已签名",
+      "unbound_tokens_can_wake_any_crew_other": "另有 {{count}} 个未绑定 crew 的 token，它能唤醒任何 crew，包括这个。",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "能唤醒这个 crew 的 Webhook"
     }
   },
   "hooks": {

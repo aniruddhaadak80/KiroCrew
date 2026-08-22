@@ -6787,8 +6787,7 @@
       "stat_unknown": "Unbekannt",
       "tag_shared": "Geteilt",
       "unsaved_changes": "Nicht gespeicherte Änderungen",
-      "webhook_unbound_reason": "Webhook-Token sind noch nicht an eine Crew gebunden, daher kann jedes Token jede Crew wecken.",
-      "webhook_unbound_short": "Nicht an eine Crew gebunden",
+      "webhook_unbound_short": "Keine Tokens gebunden",
       "wire_what_it_works_with": "Womit sie arbeitet"
     },
     "awsConsentGate": {
@@ -6804,6 +6803,21 @@
       "billing_notice": "Dies ist ein kostenpflichtiger AWS-Dienst. Bis zur Bestaetigung wird keine Anfrage gesendet.",
       "confirm_button": "Bestaetigen und aktivieren",
       "withdraw": "Bestaetigung zuruecknehmen"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhooks konnten nicht geladen werden, daher ist gerade unbekannt, was diese Crew weckt.",
+      "inbound_webhooks_are_switched_off": "Eingehende Webhooks sind abgeschaltet — nichts kann anrufen, gebundene Tokens eingeschlossen.",
+      "last_used_ago": "benutzt {{time}}",
+      "no_tokens_are_bound_to_this_crew": "Keine Webhook-Tokens sind an diese Crew gebunden.",
+      "off": "Aus",
+      "open_webhooks": "Webhooks öffnen",
+      "outside_systems_holding_one_of_these_credentials": "Externe Systeme mit einem dieser Tokens können als diese Crew einen Turn starten. Erstellen und widerrufen auf der Webhooks-Seite.",
+      "retry": "Erneut versuchen",
+      "signed": "Signiert",
+      "unbound_tokens_can_wake_any_crew_one": "Außerdem existiert {{count}} Token ohne Crew-Bindung; es kann jede Crew wecken, diese eingeschlossen.",
+      "unbound_tokens_can_wake_any_crew_other": "Außerdem existieren {{count}} Tokens ohne Crew-Bindung; sie können jede Crew wecken, diese eingeschlossen.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks, die diese Crew wecken"
     }
   },
   "hooks": {

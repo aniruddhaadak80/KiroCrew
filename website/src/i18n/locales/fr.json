@@ -6876,8 +6876,7 @@
       "stat_unknown": "Inconnu",
       "tag_shared": "Partagé",
       "unsaved_changes": "Modifications non enregistrées",
-      "webhook_unbound_reason": "Les jetons de webhook ne sont pas encore liés à un crew, donc n'importe quel jeton peut réveiller n'importe quel crew.",
-      "webhook_unbound_short": "Non lié à un crew",
+      "webhook_unbound_short": "Aucun token lié",
       "wire_what_it_works_with": "Ce qu'il utilise"
     },
     "awsConsentGate": {
@@ -6893,6 +6892,22 @@
       "billing_notice": "Ce service AWS est payant. Aucune requete n'est envoyee avant votre confirmation.",
       "confirm_button": "Confirmer et activer",
       "withdraw": "Retirer la confirmation"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Impossible de charger les webhooks : on ignore pour l’instant ce qui réveille cette crew.",
+      "inbound_webhooks_are_switched_off": "Les webhooks entrants sont désactivés : plus aucun appel ne passe, tokens liés compris.",
+      "last_used_ago": "utilisé {{time}}",
+      "no_tokens_are_bound_to_this_crew": "Aucun token webhook n’est lié à cette crew.",
+      "off": "Désactivé",
+      "open_webhooks": "Ouvrir les Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Les systèmes externes détenant l’un de ces tokens peuvent lancer un tour au nom de cette crew. Création et révocation sur la page Webhooks.",
+      "retry": "Réessayer",
+      "signed": "Signé",
+      "unbound_tokens_can_wake_any_crew_many": "{{count}} tokens sans liaison de crew existent aussi ; ils peuvent réveiller n’importe quelle crew, celle-ci comprise.",
+      "unbound_tokens_can_wake_any_crew_one": "{{count}} token sans liaison de crew existe aussi ; il peut réveiller n’importe quelle crew, celle-ci comprise.",
+      "unbound_tokens_can_wake_any_crew_other": "{{count}} tokens sans liaison de crew existent aussi ; ils peuvent réveiller n’importe quelle crew, celle-ci comprise.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks qui réveillent cette crew"
     }
   },
   "hooks": {

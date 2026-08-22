@@ -2333,9 +2333,23 @@
       "stat_unknown": "Unknown",
       "tag_shared": "Shared",
       "unsaved_changes": "Unsaved changes",
-      "webhook_unbound_reason": "Webhook tokens carry no crew binding yet, so any token can wake any crew.",
-      "webhook_unbound_short": "Not bound to a crew",
+      "webhook_unbound_short": "No tokens bound",
       "wire_what_it_works_with": "What it works with"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Could not load webhooks, so what wakes this crew is unknown right now.",
+      "inbound_webhooks_are_switched_off": "Inbound webhooks are switched off, so nothing can call in — bound tokens included.",
+      "last_used_ago": "used {{time}}",
+      "no_tokens_are_bound_to_this_crew": "No webhook tokens are bound to this crew.",
+      "off": "Off",
+      "open_webhooks": "Open Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Outside systems holding one of these tokens can start a turn as this crew. Create and revoke them on the Webhooks page.",
+      "retry": "Retry",
+      "signed": "Signed",
+      "unbound_tokens_can_wake_any_crew_one": "{{count}} token without a crew binding also exists; it can wake any crew, this one included.",
+      "unbound_tokens_can_wake_any_crew_other": "{{count}} tokens without a crew binding also exist; they can wake any crew, this one included.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks that wake this crew"
     }
   },
   "hooks": {

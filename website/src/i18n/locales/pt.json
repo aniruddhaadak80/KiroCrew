@@ -6876,8 +6876,7 @@
       "stat_unknown": "Desconhecido",
       "tag_shared": "Compartilhado",
       "unsaved_changes": "Alterações não salvas",
-      "webhook_unbound_reason": "Os tokens de webhook ainda não têm vínculo com um crew, então qualquer token pode acionar qualquer crew.",
-      "webhook_unbound_short": "Sem vínculo com um crew",
+      "webhook_unbound_short": "Sem tokens vinculados",
       "wire_what_it_works_with": "Com o que trabalha"
     },
     "awsConsentGate": {
@@ -6893,6 +6892,22 @@
       "billing_notice": "Este e um servico pago da AWS. Ate voce confirmar, nenhuma solicitacao e enviada.",
       "confirm_button": "Confirmar e ativar",
       "withdraw": "Retirar a confirmacao"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Não foi possível carregar os webhooks, então por ora não se sabe o que acorda esta crew.",
+      "inbound_webhooks_are_switched_off": "Webhooks de entrada estão desligados: nada consegue chamar, incluindo tokens vinculados.",
+      "last_used_ago": "usado {{time}}",
+      "no_tokens_are_bound_to_this_crew": "Nenhum token de webhook está vinculado a esta crew.",
+      "off": "Desligado",
+      "open_webhooks": "Abrir Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Sistemas externos com um destes tokens podem iniciar um turno como esta crew. Crie e revogue na página de Webhooks.",
+      "retry": "Tentar novamente",
+      "signed": "Assinado",
+      "unbound_tokens_can_wake_any_crew_many": "Também existem {{count}} tokens sem vínculo de crew; eles podem acordar qualquer crew, esta incluída.",
+      "unbound_tokens_can_wake_any_crew_one": "Também existe {{count}} token sem vínculo de crew; ele pode acordar qualquer crew, esta incluída.",
+      "unbound_tokens_can_wake_any_crew_other": "Também existem {{count}} tokens sem vínculo de crew; eles podem acordar qualquer crew, esta incluída.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks que acordam esta crew"
     }
   },
   "hooks": {

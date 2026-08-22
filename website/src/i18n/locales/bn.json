@@ -6787,8 +6787,7 @@
       "stat_unknown": "অজানা",
       "tag_shared": "ভাগ করা",
       "unsaved_changes": "সংরক্ষিত হয়নি এমন পরিবর্তন",
-      "webhook_unbound_reason": "webhook টোকেন এখনও কোনো Crew-এর সঙ্গে বাঁধা নয়, তাই যেকোনো টোকেন যেকোনো Crew-কে জাগাতে পারে।",
-      "webhook_unbound_short": "কোনো Crew-এর সঙ্গে বাঁধা নয়",
+      "webhook_unbound_short": "কোনো টোকেন বাঁধা নেই",
       "wire_what_it_works_with": "এটি কী ব্যবহার করে"
     },
     "awsConsentGate": {
@@ -6804,6 +6803,21 @@
       "billing_notice": "এটি একটি অর্থপ্রদানকারী AWS পরিষেবা। আপনি নিশ্চিত না করা পর্যন্ত কোনো অনুরোধ পাঠানো হয় না।",
       "confirm_button": "নিশ্চিত করুন এবং সক্রিয় করুন",
       "withdraw": "নিশ্চিতকরণ প্রত্যাহার করুন"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhooks লোড করা যায়নি, তাই এখন জানা নেই কী এই crew-কে জাগায়।",
+      "inbound_webhooks_are_switched_off": "ইনবাউন্ড webhooks বন্ধ — বাঁধা টোকেনসহ কোনো কল ঢুকতে পারবে না।",
+      "last_used_ago": "{{time}} ব্যবহৃত",
+      "no_tokens_are_bound_to_this_crew": "এই crew-এর সাথে কোনো webhook টোকেন বাঁধা নেই।",
+      "off": "বন্ধ",
+      "open_webhooks": "Webhooks খুলুন",
+      "outside_systems_holding_one_of_these_credentials": "এই টোকেনগুলোর একটি থাকা বাইরের সিস্টেম এই crew হিসেবে একটি টার্ন শুরু করতে পারে। তৈরি ও বাতিল Webhooks পেজে।",
+      "retry": "আবার চেষ্টা করুন",
+      "signed": "স্বাক্ষরিত",
+      "unbound_tokens_can_wake_any_crew_one": "crew-বন্ধনহীন {{count}}টি টোকেনও আছে; এটি যেকোনো crew-কে জাগাতে পারে, এটিসহ।",
+      "unbound_tokens_can_wake_any_crew_other": "crew-বন্ধনহীন {{count}}টি টোকেনও আছে; সেগুলো যেকোনো crew-কে জাগাতে পারে, এটিসহ।",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "এই crew-কে জাগানো Webhook"
     }
   },
   "hooks": {

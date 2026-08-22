@@ -6876,8 +6876,7 @@
       "stat_unknown": "Desconocido",
       "tag_shared": "Compartido",
       "unsaved_changes": "Cambios sin guardar",
-      "webhook_unbound_reason": "Los tokens de webhook aún no están vinculados a ningún crew, por lo que cualquier token puede activar cualquier crew.",
-      "webhook_unbound_short": "Sin vincular a un crew",
+      "webhook_unbound_short": "Sin tokens vinculados",
       "wire_what_it_works_with": "Con qué trabaja"
     },
     "awsConsentGate": {
@@ -6893,6 +6892,22 @@
       "billing_notice": "Este es un servicio de AWS de pago. Hasta que lo confirmes, no se envia ninguna solicitud.",
       "confirm_button": "Confirmar y activar",
       "withdraw": "Retirar la confirmacion"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "No se pudieron cargar los webhooks, así que ahora mismo se desconoce qué despierta a esta crew.",
+      "inbound_webhooks_are_switched_off": "Los webhooks entrantes están apagados: nada puede llamar, incluidos los tokens vinculados.",
+      "last_used_ago": "usado {{time}}",
+      "no_tokens_are_bound_to_this_crew": "Ningún token de webhook está vinculado a esta crew.",
+      "off": "Apagado",
+      "open_webhooks": "Abrir Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Los sistemas externos con uno de estos tokens pueden iniciar un turno como esta crew. Créalos y revócalos en la página de Webhooks.",
+      "retry": "Reintentar",
+      "signed": "Firmado",
+      "unbound_tokens_can_wake_any_crew_many": "También existen {{count}} tokens sin vínculo de crew; pueden despertar a cualquier crew, esta incluida.",
+      "unbound_tokens_can_wake_any_crew_one": "También existe {{count}} token sin vínculo de crew; puede despertar a cualquier crew, esta incluida.",
+      "unbound_tokens_can_wake_any_crew_other": "También existen {{count}} tokens sin vínculo de crew; pueden despertar a cualquier crew, esta incluida.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks que despiertan a esta crew"
     }
   },
   "hooks": {

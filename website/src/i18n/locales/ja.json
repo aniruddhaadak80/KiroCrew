@@ -6698,8 +6698,7 @@
       "stat_unknown": "不明",
       "tag_shared": "共有",
       "unsaved_changes": "未保存の変更",
-      "webhook_unbound_reason": "Webhook トークンはまだクルーに紐づいていないため、どのトークンでもどのクルーでも起動できます。",
-      "webhook_unbound_short": "クルーに未紐付け",
+      "webhook_unbound_short": "トークン未紐づけ",
       "wire_what_it_works_with": "何を使うか"
     },
     "awsConsentGate": {
@@ -6715,6 +6714,20 @@
       "billing_notice": "これは有料の AWS サービスです。確認するまでリクエストは送信されません。",
       "confirm_button": "確認して有効化",
       "withdraw": "確認を取り消す"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhook を読み込めなかったため、何がこのクルーを起こすのか今は不明です。",
+      "inbound_webhooks_are_switched_off": "受信 Webhook はオフになっており、紐づけ済みのトークンを含め何も呼び出せません。",
+      "last_used_ago": "{{time}}に使用",
+      "no_tokens_are_bound_to_this_crew": "このクルーに紐づく webhook トークンはありません。",
+      "off": "停止中",
+      "open_webhooks": "Webhooks を開く",
+      "outside_systems_holding_one_of_these_credentials": "これらのトークンを持つ外部システムは、このクルーとしてターンを開始できます。作成と失効は Webhooks ページで。",
+      "retry": "再試行",
+      "signed": "署名必須",
+      "unbound_tokens_can_wake_any_crew_other": "クルー未紐づけのトークンが {{count}} 件あり、このクルーを含む任意のクルーを起こせます。",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "このクルーを起こす Webhook"
     }
   },
   "hooks": {

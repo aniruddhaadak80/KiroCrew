@@ -6965,8 +6965,7 @@
       "stat_unknown": "Неизвестно",
       "tag_shared": "Общее",
       "unsaved_changes": "Несохранённые изменения",
-      "webhook_unbound_reason": "Токены вебхуков пока не привязаны к crew, поэтому любой токен может запустить любую crew.",
-      "webhook_unbound_short": "Не привязан к crew",
+      "webhook_unbound_short": "Нет привязанных токенов",
       "wire_what_it_works_with": "С чем работает"
     },
     "awsConsentGate": {
@@ -6982,6 +6981,23 @@
       "billing_notice": "Это платный сервис AWS. До подтверждения запросы не отправляются.",
       "confirm_button": "Подтвердить и включить",
       "withdraw": "Отозвать подтверждение"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Не удалось загрузить webhooks, поэтому сейчас неизвестно, что будит эту команду.",
+      "inbound_webhooks_are_switched_off": "Входящие webhooks выключены: ни один вызов не пройдёт, включая привязанные токены.",
+      "last_used_ago": "использован {{time}}",
+      "no_tokens_are_bound_to_this_crew": "К этой команде не привязано ни одного webhook-токена.",
+      "off": "Выключен",
+      "open_webhooks": "Открыть Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Внешние системы с одним из этих токенов могут запускать ход от имени этой команды. Создание и отзыв — на странице Webhooks.",
+      "retry": "Повторить",
+      "signed": "С подписью",
+      "unbound_tokens_can_wake_any_crew_few": "Существуют ещё {{count}} токена без привязки к команде; они могут разбудить любую команду, включая эту.",
+      "unbound_tokens_can_wake_any_crew_many": "Существует ещё {{count}} токенов без привязки к команде; они могут разбудить любую команду, включая эту.",
+      "unbound_tokens_can_wake_any_crew_one": "Существует ещё {{count}} токен без привязки к команде; он может разбудить любую команду, включая эту.",
+      "unbound_tokens_can_wake_any_crew_other": "Существуют ещё {{count}} токена без привязки к команде; они могут разбудить любую команду, включая эту.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhook, которые будят эту команду"
     }
   },
   "hooks": {

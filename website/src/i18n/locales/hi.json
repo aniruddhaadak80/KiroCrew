@@ -6787,8 +6787,7 @@
       "stat_unknown": "अज्ञात",
       "tag_shared": "साझा",
       "unsaved_changes": "सहेजे नहीं गए बदलाव",
-      "webhook_unbound_reason": "वेबहुक टोकन अभी किसी Crew से बंधे नहीं हैं, इसलिए कोई भी टोकन किसी भी Crew को जगा सकता है।",
-      "webhook_unbound_short": "किसी Crew से बंधा नहीं",
+      "webhook_unbound_short": "कोई टोकन बंधा नहीं",
       "wire_what_it_works_with": "यह किसके साथ काम करता है"
     },
     "awsConsentGate": {
@@ -6804,6 +6803,21 @@
       "billing_notice": "यह एक सशुल्क AWS सेवा है। पुष्टि होने तक कोई अनुरोध नहीं भेजा जाता।",
       "confirm_button": "पुष्टि करें और चालू करें",
       "withdraw": "पुष्टि वापस लें"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhooks लोड नहीं हो सके, इसलिए अभी पता नहीं कि इस crew को क्या जगाता है।",
+      "inbound_webhooks_are_switched_off": "इनबाउंड webhooks बंद हैं — बंधे टोकन समेत कोई कॉल नहीं आ सकती।",
+      "last_used_ago": "{{time}} इस्तेमाल हुआ",
+      "no_tokens_are_bound_to_this_crew": "इस crew से कोई webhook टोकन बंधा नहीं है।",
+      "off": "बंद",
+      "open_webhooks": "Webhooks खोलें",
+      "outside_systems_holding_one_of_these_credentials": "इनमें से कोई टोकन रखने वाले बाहरी सिस्टम इस crew के रूप में एक टर्न शुरू कर सकते हैं। बनाना और रद्द करना Webhooks पेज पर करें।",
+      "retry": "फिर कोशिश करें",
+      "signed": "हस्ताक्षरित",
+      "unbound_tokens_can_wake_any_crew_one": "बिना crew बंधन वाला {{count}} टोकन भी मौजूद है; वह किसी भी crew को जगा सकता है, यह भी शामिल।",
+      "unbound_tokens_can_wake_any_crew_other": "बिना crew बंधन वाले {{count}} टोकन भी मौजूद हैं; वे किसी भी crew को जगा सकते हैं, यह भी शामिल।",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "इस crew को जगाने वाले Webhook"
     }
   },
   "hooks": {
