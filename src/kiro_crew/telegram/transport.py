@@ -48,6 +48,16 @@ class TelegramInboundMessage(InboundMessage):
     # it via ``getattr(msg, "chat_type", "private")`` so the neutral message
     # stays channel-agnostic.
     chat_type: str = "private"
+    # The sender's Telegram @handle, already narrowed by ``prompt_safe_handle``
+    # so it is safe to interpolate into the prompt. Empty when the account has no
+    # username, which is common — a display name is a nice-to-have, never a
+    # precondition for serving the turn.
+    username: str = ""
+    # Sender of the message this one replies to, or 0. Replying to the bot is how a
+    # Telegram participant addresses it without typing its @handle, so the
+    # activation gate reads this; the comparison against the bot's own id happens in
+    # the dispatcher, the only layer that knows it.
+    reply_to_user_id: int = 0
 
 
 # A dispatch callback consumes a normalized, already-authorized message and
@@ -72,13 +82,55 @@ TELEGRAM_CAPABILITIES = TransportCapabilities(
     edit=True,
     reactions=True,  # setMessageReaction — used for the steer-ack receipt
     files_inbound=True,  # photos/documents ingested via telegram/attachments.py
-    files_outbound=False,
-    rich_blocks=False,
+    # Local image references in a reply are extracted by the shared
+    # messaging/outbound_files.py and uploaded by multipart sendPhoto /
+    # sendMediaGroup, so the agent's chart arrives as a picture instead of a
+    # filesystem path. Rasters only: the extractor decides type from the leading
+    # bytes and refuses anything else.
+    files_outbound=True,
+    # sendRichMessage (Bot API 10.1+) renders structured markdown natively —
+    # tables, headings, code blocks, lists — and the renderer routes every
+    # table-bearing seal through it; inline keyboards carry the interactive half.
+    rich_blocks=True,
     threads=True,
     max_message_chars=TELEGRAM_CHUNK_LIMIT,
     max_buttons=25,
     supports_proactive_send=True,
 )
+
+
+#: Telegram's own username grammar: 5-32 of ``[A-Za-z0-9_]``. Re-derived here
+#: rather than trusted, because this value is interpolated into the prompt.
+_HANDLE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_HANDLE_MAX = 32
+
+
+def prompt_safe_handle(raw: str) -> str:
+    """*raw* as an ``@handle`` safe to interpolate into the prompt, or ``""``.
+
+    The context builder writes the sender as a bare ``[CURRENT USER] {name}``
+    line immediately above ``[CURRENT USER REQUEST — respond to this]``, so a name
+    carrying a newline could forge that boundary and everything after it would
+    read as instructions rather than as a name. Telegram's platform grammar
+    already excludes every character that would let it — but a guard that relies
+    on a remote service continuing to enforce its own documented rule is not a
+    guard, so the grammar is re-checked here.
+
+    Whole-value: a handle that does not match is dropped rather than stripped down
+    to its legal characters. Rewriting it would put a *different* identity in front
+    of the model, which is worse than showing none — the numeric id remains in the
+    session key either way.
+
+    Telegram's ``first_name`` is deliberately NOT a fallback: it is unconstrained
+    free text, so it carries exactly the injection surface this function exists to
+    refuse.
+    """
+    handle = raw.strip().lstrip("@")
+    if not handle or len(handle) > _HANDLE_MAX:
+        return ""
+    if not set(handle) <= _HANDLE_CHARS:
+        return ""
+    return f"@{handle}"
 
 
 def forum_gate_outcome(
@@ -256,6 +308,8 @@ class TelegramTransport(MessagingTransport):
             thread_id=(str(inbound.message_thread_id) if inbound.message_thread_id else None),
             message_id=inbound.message_id,
             chat_type=inbound.chat_type,
+            username=prompt_safe_handle(inbound.username),
+            reply_to_user_id=inbound.reply_to_user_id,
             attachments=list(inbound.attachments),
         )
         if not self.authorize(msg):
