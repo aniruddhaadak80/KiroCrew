@@ -1641,14 +1641,16 @@
           "closed_issues_are_capped_at_the_100_most_recentl": "बंद इश्यू सबसे हाल में अपडेट हुए 100 तक सीमित हैं",
           "issue_one": "{{count}} इश्यू",
           "issue_other": "{{count}} इश्यू",
-          "issues": "इश्यू",
           "loading_the_rest": "बाकी लोड हो रहा है…",
-          "re_fetch_issues_labels_from_github": "GitHub से इश्यू + लेबल फिर से लाएँ",
           "refresh_issues": "इश्यू रीफ़्रेश करें",
-          "search_issues": "इश्यू खोजें…",
-          "search_issues_2": "इश्यू खोजें",
-          "time_since_the_issue_list_was_last_fetched_from": "GitHub से इश्यू सूची पिछली बार लाए जाने के बाद बीता समय",
-          "updated": "अपडेट किया गया"
+          "updated": "अपडेट किया गया",
+          "re_fetch_issues_and_labels_from": "{{provider}} से इश्यू + लेबल फिर से लाएँ",
+          "time_since_issue_list_last_fetched_from": "{{provider}} से इश्यू सूची पिछली बार लाए जाने के बाद बीता समय",
+          "search": "{{label}} खोजो…",
+          "search_2": "{{label}} खोजो",
+          "tracked_items_are_project_scoped": "वर्क आइटम पूरे {{project}} प्रोजेक्ट के होते हैं, इसलिए उसमें मौजूद हर रिपॉज़िटरी यही सूची दिखाती है।",
+          "work_item_one": "{{count}} वर्क आइटम",
+          "work_item_other": "{{count}} वर्क आइटम"
         },
         "labelPalette": {
           "close_label_search": "लेबल खोज बंद करें",
@@ -1872,8 +1874,8 @@
           "search": "{{label}} खोजो…",
           "search_2": "{{label}} खोजो",
           "select_for_bulk": "थोक कार्रवाई के लिए {{subject}} #{{number}} चुनें",
-          "time_since_the_pr_list_was_last_fetched_from_git": "GitHub से PR सूची अंतिम बार लाए जाने के बाद बीता समय",
-          "updated": "अपडेट किया गया"
+          "updated": "अपडेट किया गया",
+          "time_since_list_last_fetched_from": "{{provider}} से {{label}} सूची अंतिम बार लाए जाने के बाद बीता समय"
         },
         "prRunActions": {
           "cancel_run": "{{name}} रन रद्द करें",
@@ -1886,7 +1888,8 @@
           "self_managed_instance": "स्वयं-प्रबंधित इंस्टेंस: {{host}}"
         },
         "readOnlyTag": {
-          "read_only": "केवल पढ़ने के लिए"
+          "read_only": "केवल पढ़ने के लिए",
+          "read_only_repo_needs_triage_or_push_access": "केवल-पढ़ने योग्य रिपॉज़िटरी — ट्राइएज या पुश एक्सेस चाहिए"
         },
         "refLink": {
           "closed": "बंद",
@@ -1945,7 +1948,11 @@
         "session_install_and_sign_in_to": "सेशन।\n        इंस्टॉल करें और साइन इन करें",
         "then": ", फिर",
         "through_your_own": "आपके अपने",
-        "you_contributed_to": "आपने योगदान दिया"
+        "you_contributed_to": "आपने योगदान दिया",
+        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "repositories_in_your_organization": "तुम्हारे संगठन की रिपॉज़िटरी",
+        "no_repositories_in_your_organization_paste_a_url": "तुम्हारे संगठन में कोई रिपॉज़िटरी नहीं है। कनेक्ट करने के लिए नीचे URL पेस्ट करो।",
+        "azure_also_needs_the_devops_extension": "Azure DevOps को अपना CLI एक्सटेंशन भी चाहिए, जिसे नीचे दिए गए कमांड से एक बार इंस्टॉल करो।"
       },
       "connectRepoModal": {
         "close": "बंद करें",
@@ -1963,10 +1970,15 @@
           "crew_sort_status": "स्थिति",
           "crew_sort_name": "नाम",
           "crew_sort_created": "बनाया गया"
+        },
+        "links": {
+          "read_only_here_apply_in_provider": "यहाँ केवल-पढ़ने योग्य — {{provider}} रिपॉज़िटरी को {{productName}} से नहीं बदला जा सकता; परिवर्तन {{provider}} में करो",
+          "tracked_items_work_items": "वर्क आइटम",
+          "tracked_items_issues": "इश्यू"
         }
       },
       "manifest": {
-        "description": "याद रखने वाला इशू ट्रायाज सहायक। GitHub इशू और GitLab इशू को AI-सुझाए लेबल और हर इशू के जाँच नोट्स के साथ ब्राउज़ करो, फ़िल्टर करो और ट्रायाज करो — नतीजे लोकल लेजर में रखे जाते हैं ताकि किसी की दोबारा जाँच न हो।",
+        "description": "याद रखने वाला इशू ट्रायाज सहायक। GitHub इशू, GitLab इशू और Azure DevOps वर्क आइटम को AI-सुझाए लेबल और हर आइटम के जाँच नोट्स के साथ ब्राउज़ करो, फ़िल्टर करो और ट्रायाज करो — नतीजे लोकल लेजर में रखे जाते हैं ताकि किसी की दोबारा जाँच न हो।",
         "display_name": "Issue Radar",
         "highlight_1": "इशू और पुल रिक्वेस्ट के लिए AI सारांश और सुझाए लेबल, हर एक के साथ उसकी वजह",
         "highlight_2": "हर इशू के जाँच नोट्स लोकल लेजर में रखे जाते हैं ताकि किसी की दोबारा जाँच न हो",
@@ -1976,7 +1988,7 @@
         "highlight_6": "हर राइट के लिए रिपो पर ट्रायाज या पुश ऐक्सेस चाहिए; रीड-ओनली कनेक्शन सिर्फ़ सुझाव तक सीमित रहता है",
         "highlight_7": "जिन रिपॉज़िटरी में तुमने हाल में योगदान दिया है उन्हें सामने रखता है, ताकि जोड़ना एक क्लिक भर हो",
         "highlight_8": "इशू, लेबल और मेंबर लोकल में कैश करता है, ज़रूरत पर ताज़ा हो जाते हैं",
-        "highlight_9": "GitHub के साथ काम करता है; गेटवे होस्ट पर प्रमाणित `gh` CLI चाहिए",
+        "highlight_9": "GitHub, GitLab और Azure DevOps के साथ काम करता है; गेटवे होस्ट पर उस प्रोवाइडर के लिए प्रमाणित CLI (`gh`, `glab` या `az`) चाहिए जिसे तुम जोड़ते हो — इंस्टॉल करने के लिए किसी एक प्रोवाइडर की CLI ज़रूरी नहीं है",
         "page_label": "Issue Radar"
       },
       "views": {
@@ -2012,14 +2024,14 @@
           "no_reply": "कोई जवाब नहीं",
           "nothing_needs_attention": "किसी चीज़ को ध्यान की ज़रूरत नहीं",
           "open_issues": "खुले इश्यू",
-          "re_fetch_issues_labels_from_github": "GitHub से इश्यू + लेबल फिर लाएँ",
           "recently_updated": "हाल ही में अपडेट किया गया",
           "refresh_issues": "इश्यू रिफ़्रेश करें",
           "stale": "निष्क्रिय",
           "unanswered": "अनुत्तरित",
           "unassigned": "बिना असाइनी",
           "untriaged": "अनट्राइएज्ड",
-          "untriaged_2": "अनट्राइएज्ड"
+          "untriaged_2": "अनट्राइएज्ड",
+          "re_fetch_issues_and_labels_from": "{{provider}} से इश्यू + लेबल फिर लाएँ"
         },
         "registry": {
           "overview": "अवलोकन",
@@ -2130,7 +2142,6 @@
             "couldn_t_read_this_repo_s_labels_retry_with_the": "इस रिपो के लेबल नहीं पढ़े जा सके — रिफ़्रेश बटन से फिर कोशिश करें।",
             "create": "बनाएँ",
             "create_the_label_on_github": "GitHub पर {{name}} लेबल बनाओ",
-            "create_this_label_on_github": "यह लेबल GitHub पर बनाएँ",
             "created": "बनाया गया",
             "creating": "बनाया जा रहा है…",
             "creating_needs_write_access": "बनाने के लिए राइट एक्सेस चाहिए",
@@ -2139,22 +2150,23 @@
             "looking_for_labels_this_repo_is_missing": "इस रिपो में जो लेबल नहीं हैं, उन्हें खोजा जा रहा है…",
             "none_the_repo_s_taxonomy_already_covers_what_its": "कोई नहीं — रिपो की टैक्सोनॉमी पहले से ही उसके खुले इश्यू की ज़रूरतें पूरी करती है।",
             "propose_labels_this_repo_is_missing_from_its_ope": "इस रिपो के खुले इश्यू से, जो लेबल इसमें नहीं हैं उन्हें प्रस्तावित करें",
-            "re_fetch_this_repo_s_labels_from_github": "इस रिपो के लेबल GitHub से फिर लाएँ",
             "read_only_repo_needs_triage_push_access": "केवल पढ़ने वाला रिपो — triage/push एक्सेस चाहिए",
             "suggest_again": "फिर सुझाएँ",
             "suggest_new_labels": "नए लेबल सुझाएँ",
-            "suggested_new_labels_not_created_until_you_say_s": "सुझाए गए नए लेबल — आपके कहने तक नहीं बनाए जाते"
+            "suggested_new_labels_not_created_until_you_say_s": "सुझाए गए नए लेबल — आपके कहने तक नहीं बनाए जाते",
+            "re_fetch_this_repo_s_labels_from": "इस रिपो के लेबल {{provider}} से फिर लाएँ",
+            "create_this_label_on": "यह लेबल {{provider}} पर बनाओ"
           },
           "untaggedIssueCard": {
             "add": "जोड़ें",
             "add_labels_to": "#{{number}} पर लेबल जोड़ो",
-            "add_these_labels_on_github": "ये लेबल GitHub पर जोड़ें",
             "added": "जोड़ा गया",
             "click_to_remove": "हटाने के लिए क्लिक करें",
             "click_to_remove_2": "{{reason}} — हटाने के लिए क्लिक करो",
             "no_label_fits": "कोई लेबल फ़िट नहीं होता",
             "read_only_repo_needs_triage_or_push_access": "केवल पढ़ने वाला रिपो — triage या push एक्सेस चाहिए",
-            "select_issue": "इश्यू #{{number}} चुनो"
+            "select_issue": "इश्यू #{{number}} चुनो",
+            "add_these_labels_on": "ये लेबल {{provider}} पर जोड़ो"
           }
         },
         "taggingView": {
@@ -2182,7 +2194,7 @@
           "untagged": "अनटैग्ड",
           "untagged_issues": "अनटैग्ड इश्यू",
           "what_you_see_below_is_the_previous_result_not_th": "नीचे आप जो देख रहे हैं वह पिछला परिणाम है, वर्तमान स्थिति नहीं।",
-          "write_every_staged_label_to_github": "हर स्टेज किया गया लेबल GitHub पर लिखें"
+          "write_every_staged_label_to": "सभी स्टेज किए गए लेबल {{provider}} पर लिखो"
         },
         "crews": {
           "desk": {
@@ -2361,10 +2373,11 @@
         "resize_list": "सूची का आकार बदलें",
         "resize_sidebar": "साइडबार का आकार बदलें",
         "select_a": "एक",
-        "select_an_issue_to_see_its_details": "विवरण देखने के लिए एक इश्यू चुनें।",
         "selected_change_hidden_by_filters": "चयनित {{subject}} सक्रिय फ़िल्टर द्वारा छिपा हुआ है।",
         "selected_issue_hidden_by_filters": "चयनित इश्यू सक्रिय फ़िल्टर द्वारा छिपा हुआ है।",
-        "to_see_its_details": "चुनें ताकि उसका विवरण दिखे।"
+        "to_see_its_details": "चुनें ताकि उसका विवरण दिखे।",
+        "select_an_issue_to_see_its_details": "विवरण देखने के लिए एक इश्यू चुनें।",
+        "select_a_work_item_to_see_its_details": "विवरण देखने के लिए कोई वर्क आइटम चुनो।"
       }
     },
     "mdNotebook": {

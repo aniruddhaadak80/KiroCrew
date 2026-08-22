@@ -1671,14 +1671,17 @@
           "issue_many": "{{count}} issue",
           "issue_one": "{{count}} issue",
           "issue_other": "{{count}} issue",
-          "issues": "Issue",
           "loading_the_rest": "Caricamento del resto…",
-          "re_fetch_issues_labels_from_github": "Recupera di nuovo issue ed etichette da GitHub",
           "refresh_issues": "Aggiorna le issue",
-          "search_issues": "Cerca tra le issue…",
-          "search_issues_2": "Cerca tra le issue",
-          "time_since_the_issue_list_was_last_fetched_from": "Tempo trascorso dall'ultimo recupero dell'elenco delle issue da GitHub",
-          "updated": "Aggiornato"
+          "updated": "Aggiornato",
+          "re_fetch_issues_and_labels_from": "Recupera di nuovo issue ed etichette da {{provider}}",
+          "time_since_issue_list_last_fetched_from": "Tempo trascorso dall'ultimo recupero dell'elenco delle issue da {{provider}}",
+          "search": "Cerca {{label}}…",
+          "search_2": "Cerca {{label}}",
+          "tracked_items_are_project_scoped": "Gli elementi di lavoro appartengono all'intero progetto {{project}}, quindi ogni repository mostra questo stesso elenco.",
+          "work_item_many": "{{count}} elementi di lavoro",
+          "work_item_one": "{{count}} elemento di lavoro",
+          "work_item_other": "{{count}} elementi di lavoro"
         },
         "labelPalette": {
           "close_label_search": "Chiudi la ricerca etichette",
@@ -1912,8 +1915,8 @@
           "search": "Cerca {{label}}…",
           "search_2": "Cerca {{label}}",
           "select_for_bulk": "Seleziona {{subject}} #{{number}} per un'azione in blocco",
-          "time_since_the_pr_list_was_last_fetched_from_git": "Tempo trascorso dall'ultimo recupero dell'elenco delle PR da GitHub",
-          "updated": "Aggiornato"
+          "updated": "Aggiornato",
+          "time_since_list_last_fetched_from": "Tempo trascorso dall'ultimo recupero dell'elenco delle {{label}} da {{provider}}"
         },
         "prRunActions": {
           "cancel_run": "Annulla l'esecuzione di {{name}}",
@@ -1926,7 +1929,8 @@
           "self_managed_instance": "Istanza autogestita: {{host}}"
         },
         "readOnlyTag": {
-          "read_only": "Sola lettura"
+          "read_only": "Sola lettura",
+          "read_only_repo_needs_triage_or_push_access": "Repository di sola lettura — richiede accesso triage o push"
         },
         "refLink": {
           "closed": "Chiusa",
@@ -1985,7 +1989,11 @@
         "session_install_and_sign_in_to": "sessione.\n        Installa ed effettua l'accesso a",
         "then": ", poi",
         "through_your_own": "tramite il tuo",
-        "you_contributed_to": "Hai contribuito a"
+        "you_contributed_to": "Hai contribuito a",
+        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "repositories_in_your_organization": "Repository della tua organizzazione",
+        "no_repositories_in_your_organization_paste_a_url": "Nessun repository nella tua organizzazione. Incolla un URL qui sotto per collegarne uno.",
+        "azure_also_needs_the_devops_extension": "Azure DevOps richiede anche la propria estensione della CLI, da installare una volta con il comando qui sotto."
       },
       "connectRepoModal": {
         "close": "Chiudi",
@@ -2003,10 +2011,15 @@
           "crew_sort_status": "Stato",
           "crew_sort_name": "Nome",
           "crew_sort_created": "Creato"
+        },
+        "links": {
+          "read_only_here_apply_in_provider": "Sola lettura qui — i repository {{provider}} non possono essere modificati da {{productName}}; applica la modifica in {{provider}}",
+          "tracked_items_work_items": "Elementi di lavoro",
+          "tracked_items_issues": "Issue"
         }
       },
       "manifest": {
-        "description": "Un assistente per il triage delle issue che si ricorda le cose. Sfoglia, filtra e smista le issue di GitHub e di GitLab con etichette suggerite dall’AI e note di indagine per ogni issue — i risultati restano in un registro locale, così nulla viene indagato due volte.",
+        "description": "Un assistente per il triage delle issue che si ricorda le cose. Sfoglia, filtra e smista le issue di GitHub, le issue di GitLab e i work item di Azure DevOps con etichette suggerite dall’AI e note di indagine per ogni elemento — i risultati restano in un registro locale, così nulla viene indagato due volte.",
         "display_name": "Issue Radar",
         "highlight_1": "Riepiloghi AI ed etichette suggerite per issue e pull request, ognuno con il proprio ragionamento",
         "highlight_2": "Note di indagine per ogni issue conservate in un registro locale, così nulla viene indagato due volte",
@@ -2016,7 +2029,7 @@
         "highlight_6": "Ogni scrittura richiede accesso di triage o di push sul repo; una connessione di sola lettura resta limitata ai suggerimenti",
         "highlight_7": "Mette in evidenza i repository a cui hai contribuito di recente, così collegarne uno è questione di un clic",
         "highlight_8": "Mette in cache in locale issue, etichette e membri, aggiornandoli su richiesta",
-        "highlight_9": "Funziona con GitHub; richiede una CLI `gh` autenticata sull’host del gateway",
+        "highlight_9": "Funziona con GitHub, GitLab e Azure DevOps; richiede sull’host del gateway una CLI autenticata per il provider che colleghi (`gh`, `glab` o `az`) — per l’installazione non serve la CLI di un provider specifico",
         "page_label": "Issue Radar"
       },
       "views": {
@@ -2208,14 +2221,14 @@
           "no_reply": "senza risposta",
           "nothing_needs_attention": "Nulla richiede attenzione",
           "open_issues": "Issue aperte",
-          "re_fetch_issues_labels_from_github": "Recupera di nuovo issue ed etichette da GitHub",
           "recently_updated": "Aggiornati di recente",
           "refresh_issues": "Aggiorna le issue",
           "stale": "Inattive",
           "unanswered": "Senza risposta",
           "unassigned": "Non assegnate",
           "untriaged": "Senza triage",
-          "untriaged_2": "senza triage"
+          "untriaged_2": "senza triage",
+          "re_fetch_issues_and_labels_from": "Recupera di nuovo issue ed etichette da {{provider}}"
         },
         "registry": {
           "overview": "Panoramica",
@@ -2326,7 +2339,6 @@
             "couldn_t_read_this_repo_s_labels_retry_with_the": "Impossibile leggere le etichette di questo repo — riprova con il pulsante di aggiornamento.",
             "create": "Crea",
             "create_the_label_on_github": "Crea l’etichetta {{name}} su GitHub",
-            "create_this_label_on_github": "Crea questa etichetta su GitHub",
             "created": "Creato",
             "creating": "Creazione in corso…",
             "creating_needs_write_access": "la creazione richiede l'accesso in scrittura",
@@ -2335,22 +2347,23 @@
             "looking_for_labels_this_repo_is_missing": "Ricerca delle etichette mancanti in questo repo…",
             "none_the_repo_s_taxonomy_already_covers_what_its": "Nessuna — la tassonomia del repo copre già ciò che serve alle sue issue aperte.",
             "propose_labels_this_repo_is_missing_from_its_ope": "Proponi le etichette mancanti in questo repo, a partire dalle sue issue aperte",
-            "re_fetch_this_repo_s_labels_from_github": "Recupera di nuovo le etichette di questo repo da GitHub",
             "read_only_repo_needs_triage_push_access": "Repo in sola lettura — serve accesso di triage/push",
             "suggest_again": "Suggerisci di nuovo",
             "suggest_new_labels": "Suggerisci nuove etichette",
-            "suggested_new_labels_not_created_until_you_say_s": "Nuove etichette suggerite — non vengono create finché non lo confermi"
+            "suggested_new_labels_not_created_until_you_say_s": "Nuove etichette suggerite — non vengono create finché non lo confermi",
+            "re_fetch_this_repo_s_labels_from": "Recupera di nuovo le etichette di questo repo da {{provider}}",
+            "create_this_label_on": "Crea questa etichetta su {{provider}}"
           },
           "untaggedIssueCard": {
             "add": "Aggiungi",
             "add_labels_to": "Aggiungi etichette a #{{number}}",
-            "add_these_labels_on_github": "Aggiungi queste etichette su GitHub",
             "added": "Aggiunto",
             "click_to_remove": "Clicca per rimuovere",
             "click_to_remove_2": "{{reason}} — clicca per rimuovere",
             "no_label_fits": "nessuna etichetta adatta",
             "read_only_repo_needs_triage_or_push_access": "Repo in sola lettura — serve accesso di triage o push",
-            "select_issue": "Seleziona la issue #{{number}}"
+            "select_issue": "Seleziona la issue #{{number}}",
+            "add_these_labels_on": "Aggiungi queste etichette su {{provider}}"
           }
         },
         "taggingView": {
@@ -2378,7 +2391,7 @@
           "untagged": "Senza tag",
           "untagged_issues": "Issue senza tag",
           "what_you_see_below_is_the_previous_result_not_th": "quello che vedi qui sotto è il risultato precedente, non lo stato attuale.",
-          "write_every_staged_label_to_github": "Scrivi su GitHub tutte le etichette preparate"
+          "write_every_staged_label_to": "Scrivi tutte le etichette preparate su {{provider}}"
         }
       },
       "welcomeCarousel": {
@@ -2403,10 +2416,11 @@
         "resize_list": "Ridimensiona l'elenco",
         "resize_sidebar": "Ridimensiona la barra laterale",
         "select_a": "Seleziona un",
-        "select_an_issue_to_see_its_details": "Seleziona una issue per vederne i dettagli.",
         "selected_change_hidden_by_filters": "L’elemento {{subject}} selezionato è nascosto dai filtri attivi.",
         "selected_issue_hidden_by_filters": "La issue selezionata è nascosta dai filtri attivi.",
-        "to_see_its_details": "per vederne i dettagli."
+        "to_see_its_details": "per vederne i dettagli.",
+        "select_an_issue_to_see_its_details": "Seleziona una issue per vederne i dettagli.",
+        "select_a_work_item_to_see_its_details": "Seleziona un elemento di lavoro per vederne i dettagli."
       }
     },
     "mdNotebook": {

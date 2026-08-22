@@ -292,7 +292,8 @@
       "workspace": {
         "selected_issue_hidden_by_filters": "The selected issue is hidden by the active filters.",
         "selected_change_hidden_by_filters": "The selected {{subject}} is hidden by the active filters.",
-        "clear_filters": "Clear filters"
+        "clear_filters": "Clear filters",
+        "select_a_work_item_to_see_its_details": "Select a work item to see its details."
       },
       "components": {
         "agentSessionButton": {
@@ -330,7 +331,14 @@
         },
         "issueList": {
           "closed_issues_are_capped_at_the_100_most_recentl": "Closed issues are capped at the 100 most recently updated",
-          "loading_the_rest": "Loading the rest…"
+          "loading_the_rest": "Loading the rest…",
+          "re_fetch_issues_and_labels_from": "Re-fetch issues + labels from {{provider}}",
+          "time_since_issue_list_last_fetched_from": "Time since the issue list was last fetched from {{provider}}",
+          "search": "Search {{label}}…",
+          "search_2": "Search {{label}}",
+          "tracked_items_are_project_scoped": "Work items belong to the whole {{project}} project, so every repository in it shows this same list.",
+          "work_item_one": "{{count}} work item",
+          "work_item_other": "{{count}} work items"
         },
         "labelPalette": {
           "no_labels_match_query": "No labels match “{{query}}”."
@@ -373,7 +381,8 @@
           "resolved_by_github_search_across_the_whole_repo": "Resolved by GitHub search across the whole repo — not limited to the 100 most recent",
           "resolved_by_github_search_capped": "Resolved by GitHub search across the whole repo, capped at the {{n}} most recently updated matches",
           "search": "Search {{label}}…",
-          "search_2": "Search {{label}}"
+          "search_2": "Search {{label}}",
+          "time_since_list_last_fetched_from": "Time since the {{label}} list was last fetched from {{provider}}"
         },
         "providerBadge": {
           "self_managed_instance": "Self-managed instance: {{host}}"
@@ -418,6 +427,9 @@
         "reviewButton": {
           "open_ai_code_review_session_for_this": "Open an AI code-review chat session for this {{label}}",
           "resume_ai_code_review_session_for_this": "Resume the AI code-review chat session for this {{label}}"
+        },
+        "readOnlyTag": {
+          "read_only_repo_needs_triage_or_push_access": "Read-only repo — needs triage or push access"
         }
       },
       "connectPanel": {
@@ -425,7 +437,10 @@
         "last_contribution": "Your last contribution: {{when}}",
         "most_recent_activity": "most recent activity",
         "no_contributions_in_the_last_month_paste_a_url_b": "No contributions in the last month — paste a URL below instead.",
-        "select": "Select {{name}}"
+        "select": "Select {{name}}",
+        "repositories_in_your_organization": "Repositories in your organization",
+        "no_repositories_in_your_organization_paste_a_url": "No repositories in your organization. Paste a URL below to connect one.",
+        "azure_also_needs_the_devops_extension": "Azure DevOps also needs its own CLI extension, installed once with the command below."
       },
       "connectRepoModal": {
         "connecting": "Connecting {{done}} of {{total}}…"
@@ -450,7 +465,8 @@
           "unanswered": "Unanswered",
           "unassigned": "Unassigned",
           "untriaged": "Untriaged",
-          "untriaged_2": "untriaged"
+          "untriaged_2": "untriaged",
+          "re_fetch_issues_and_labels_from": "Re-fetch issues + labels from {{provider}}"
         },
         "settings": {
           "repoSettings": {
@@ -504,19 +520,20 @@
             "couldn_t_read_this_repo_s_labels_retry_with_the": "Couldn't read this repo's labels — retry with the refresh button.",
             "create": "Create",
             "create_the_label_on_github": "Create the {{name}} label on GitHub",
-            "create_this_label_on_github": "Create this label on GitHub",
             "creating": "Creating…",
             "read_only_repo_needs_triage_push_access": "Read-only repo — needs triage/push access",
             "suggest_again": "Suggest again",
-            "suggest_new_labels": "Suggest new labels"
+            "suggest_new_labels": "Suggest new labels",
+            "re_fetch_this_repo_s_labels_from": "Re-fetch this repo's labels from {{provider}}",
+            "create_this_label_on": "Create this label on {{provider}}"
           },
           "untaggedIssueCard": {
             "add_labels_to": "Add labels to #{{number}}",
-            "add_these_labels_on_github": "Add these labels on GitHub",
             "click_to_remove": "Click to remove",
             "click_to_remove_2": "{{reason}} — click to remove",
             "read_only_repo_needs_triage_or_push_access": "Read-only repo — needs triage or push access",
-            "select_issue": "Select issue #{{number}}"
+            "select_issue": "Select issue #{{number}}",
+            "add_these_labels_on": "Add these labels on {{provider}}"
           }
         },
         "taggingView": {
@@ -529,7 +546,7 @@
           "select_all": "Select all",
           "suggest_again": "Suggest again ({{n}})",
           "suggest_labels_next": "Suggest labels (next {{n}})",
-          "write_every_staged_label_to_github": "Write every staged label to GitHub"
+          "write_every_staged_label_to": "Write every staged label to {{provider}}"
         },
         "registry": {
           "overview": "Overview",
@@ -700,6 +717,11 @@
           "crew_sort_status": "Status",
           "crew_sort_name": "Name",
           "crew_sort_created": "Created"
+        },
+        "links": {
+          "read_only_here_apply_in_provider": "Read-only here — {{provider}} repositories can't be changed from {{productName}}; apply the change in {{provider}}",
+          "tracked_items_work_items": "Work Items",
+          "tracked_items_issues": "Issues"
         }
       },
       "welcomeCarousel": {

@@ -1643,14 +1643,15 @@
           "clear_search": "검색 지우기",
           "closed_issues_are_capped_at_the_100_most_recentl": "닫힌 이슈는 가장 최근에 업데이트된 100개까지만 표시됩니다",
           "issue_other": "이슈 {{count}}개",
-          "issues": "이슈",
           "loading_the_rest": "나머지를 불러오고 있습니다…",
-          "re_fetch_issues_labels_from_github": "GitHub에서 이슈와 라벨 다시 가져오기",
           "refresh_issues": "이슈 새로 고침",
-          "search_issues": "이슈 검색…",
-          "search_issues_2": "이슈 검색",
-          "time_since_the_issue_list_was_last_fetched_from": "이슈 목록을 GitHub에서 마지막으로 가져온 이후 경과 시간",
-          "updated": "업데이트"
+          "updated": "업데이트",
+          "re_fetch_issues_and_labels_from": "{{provider}}에서 이슈와 라벨 다시 가져오기",
+          "time_since_issue_list_last_fetched_from": "이슈 목록을 {{provider}}에서 마지막으로 가져온 이후 경과 시간",
+          "search": "{{label}} 검색…",
+          "search_2": "{{label}} 검색",
+          "tracked_items_are_project_scoped": "작업 항목은 {{project}} 프로젝트 전체에 속하므로 그 안의 모든 저장소가 같은 목록을 표시합니다.",
+          "work_item_other": "{{count}}개의 작업 항목"
         },
         "labelPalette": {
           "close_label_search": "라벨 검색 닫기",
@@ -1864,8 +1865,8 @@
           "search": "{{label}} 검색…",
           "search_2": "{{label}} 검색",
           "select_for_bulk": "일괄 작업을 위해 {{subject}} #{{number}} 선택",
-          "time_since_the_pr_list_was_last_fetched_from_git": "PR 목록을 GitHub에서 마지막으로 가져온 후 경과한 시간",
-          "updated": "업데이트됨"
+          "updated": "업데이트됨",
+          "time_since_list_last_fetched_from": "{{label}} 목록을 {{provider}}에서 마지막으로 가져온 후 경과한 시간"
         },
         "prRunActions": {
           "cancel_run": "{{name}} 실행 취소",
@@ -1878,7 +1879,8 @@
           "self_managed_instance": "자체 관리 인스턴스: {{host}}"
         },
         "readOnlyTag": {
-          "read_only": "읽기 전용"
+          "read_only": "읽기 전용",
+          "read_only_repo_needs_triage_or_push_access": "읽기 전용 저장소 — 심사 또는 푸시 권한이 필요합니다"
         },
         "refLink": {
           "closed": "닫힘",
@@ -1937,7 +1939,11 @@
         "session_install_and_sign_in_to": "세션.\n 설치하고 로그인하세요:",
         "then": ", 그런 다음",
         "through_your_own": "본인의",
-        "you_contributed_to": "기여한 저장소:"
+        "you_contributed_to": "기여한 저장소:",
+        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "repositories_in_your_organization": "조직의 저장소",
+        "no_repositories_in_your_organization_paste_a_url": "조직에 저장소가 없습니다. 아래에 URL을 붙여넣어 연결하세요.",
+        "azure_also_needs_the_devops_extension": "Azure DevOps에는 전용 CLI 확장도 필요합니다. 아래 명령으로 한 번 설치하세요."
       },
       "connectRepoModal": {
         "close": "닫기",
@@ -1955,10 +1961,15 @@
           "crew_sort_status": "상태",
           "crew_sort_name": "이름",
           "crew_sort_created": "생성됨"
+        },
+        "links": {
+          "read_only_here_apply_in_provider": "여기서는 읽기 전용입니다 — {{provider}} 저장소는 {{productName}}에서 변경할 수 없습니다. {{provider}}에서 변경하세요",
+          "tracked_items_work_items": "작업 항목",
+          "tracked_items_issues": "이슈"
         }
       },
       "manifest": {
-        "description": "기억하는 이슈 트리아지 어시스턴트입니다. AI가 제안하는 레이블과 이슈별 조사 노트로 GitHub 및 GitLab 이슈를 살펴보고 필터링하고 트리아지하세요 — 조사 결과는 로컬 원장에 보관되므로 같은 내용을 다시 조사하지 않습니다.",
+        "description": "기억하는 이슈 트리아지 어시스턴트입니다. AI가 제안하는 레이블과 항목별 조사 노트로 GitHub 이슈, GitLab 이슈, Azure DevOps 작업 항목을 살펴보고 필터링하고 트리아지하세요 — 조사 결과는 로컬 원장에 보관되므로 같은 내용을 다시 조사하지 않습니다.",
         "display_name": "Issue Radar",
         "highlight_1": "이슈와 풀 리퀘스트에 대한 AI 요약과 추천 레이블, 각각의 근거 제공",
         "highlight_2": "이슈별 조사 노트를 로컬 원장에 보관해 같은 내용을 다시 조사하지 않음",
@@ -1968,7 +1979,7 @@
         "highlight_6": "모든 쓰기에는 저장소의 트리아지 또는 푸시 권한이 필요하며, 읽기 전용 연결은 제안만 가능합니다",
         "highlight_7": "최근 기여한 저장소를 보여 주므로 클릭 한 번으로 연결할 수 있습니다",
         "highlight_8": "이슈·레이블·멤버를 로컬에 캐시하고 필요할 때 새로 고침",
-        "highlight_9": "GitHub에서 동작하며, 게이트웨이 호스트에 인증된 `gh` CLI가 필요합니다",
+        "highlight_9": "GitHub, GitLab, Azure DevOps에서 동작하며, 연결하는 제공자에 맞는 인증된 CLI(`gh`, `glab` 또는 `az`)가 게이트웨이 호스트에 필요합니다 — 설치할 때 특정 제공자의 CLI가 반드시 있어야 하는 것은 아닙니다",
         "page_label": "Issue Radar"
       },
       "views": {
@@ -2156,14 +2167,14 @@
           "no_reply": "답변 없음",
           "nothing_needs_attention": "확인이 필요한 항목 없음",
           "open_issues": "열린 이슈",
-          "re_fetch_issues_labels_from_github": "GitHub에서 이슈 + 레이블 다시 가져오기",
           "recently_updated": "최근 업데이트됨",
           "refresh_issues": "이슈 새로 고침",
           "stale": "오래됨",
           "unanswered": "답변 없음",
           "unassigned": "할당 안 됨",
           "untriaged": "트리아지 안 됨",
-          "untriaged_2": "트리아지 안 됨"
+          "untriaged_2": "트리아지 안 됨",
+          "re_fetch_issues_and_labels_from": "{{provider}}에서 이슈 + 레이블 다시 가져오기"
         },
         "registry": {
           "overview": "개요",
@@ -2274,7 +2285,6 @@
             "couldn_t_read_this_repo_s_labels_retry_with_the": "이 저장소의 레이블을 읽지 못했습니다 — 새로 고침 버튼으로 다시 시도하세요.",
             "create": "생성",
             "create_the_label_on_github": "{{name}} 레이블을 GitHub에 생성",
-            "create_this_label_on_github": "이 레이블을 GitHub에 생성",
             "created": "생성됨",
             "creating": "생성 중…",
             "creating_needs_write_access": "생성하려면 쓰기 권한이 필요합니다",
@@ -2283,22 +2293,23 @@
             "looking_for_labels_this_repo_is_missing": "이 저장소에 없는 레이블을 찾는 중…",
             "none_the_repo_s_taxonomy_already_covers_what_its": "없음 — 저장소의 분류 체계가 열린 이슈에 필요한 것을 이미 모두 담고 있습니다.",
             "propose_labels_this_repo_is_missing_from_its_ope": "열린 이슈를 바탕으로 이 저장소에 없는 레이블 제안",
-            "re_fetch_this_repo_s_labels_from_github": "이 저장소의 레이블을 GitHub에서 다시 가져오기",
             "read_only_repo_needs_triage_push_access": "읽기 전용 저장소 — 트리아지·푸시 권한이 필요합니다",
             "suggest_again": "다시 제안",
             "suggest_new_labels": "새 레이블 제안",
-            "suggested_new_labels_not_created_until_you_say_s": "제안된 새 레이블 — 승인하기 전까지는 생성되지 않습니다"
+            "suggested_new_labels_not_created_until_you_say_s": "제안된 새 레이블 — 승인하기 전까지는 생성되지 않습니다",
+            "re_fetch_this_repo_s_labels_from": "이 저장소의 레이블을 {{provider}}에서 다시 가져오기",
+            "create_this_label_on": "{{provider}}에서 이 라벨 만들기"
           },
           "untaggedIssueCard": {
             "add": "레이블 추가",
             "add_labels_to": "#{{number}}에 레이블 추가",
-            "add_these_labels_on_github": "이 레이블을 GitHub에 추가",
             "added": "추가됨",
             "click_to_remove": "클릭하여 제거",
             "click_to_remove_2": "{{reason}} — 클릭하여 제거",
             "no_label_fits": "맞는 레이블 없음",
             "read_only_repo_needs_triage_or_push_access": "읽기 전용 저장소 — 트리아지 또는 푸시 권한이 필요합니다",
-            "select_issue": "이슈 #{{number}} 선택"
+            "select_issue": "이슈 #{{number}} 선택",
+            "add_these_labels_on": "{{provider}}에서 이 라벨 추가"
           }
         },
         "taggingView": {
@@ -2326,7 +2337,7 @@
           "untagged": "태그 없음",
           "untagged_issues": "태그 없는 이슈",
           "what_you_see_below_is_the_previous_result_not_th": "아래에 보이는 내용은 현재 상태가 아니라 이전 결과입니다.",
-          "write_every_staged_label_to_github": "준비된 모든 레이블을 GitHub에 기록"
+          "write_every_staged_label_to": "준비된 라벨을 모두 {{provider}}에 기록"
         }
       },
       "welcomeCarousel": {
@@ -2351,10 +2362,11 @@
         "resize_list": "목록 크기 조절",
         "resize_sidebar": "사이드바 크기 조절",
         "select_a": "선택:",
-        "select_an_issue_to_see_its_details": "세부 정보를 보려면 이슈를 선택하세요.",
         "selected_change_hidden_by_filters": "선택한 {{subject}}은(는) 활성 필터에 의해 숨겨져 있습니다.",
         "selected_issue_hidden_by_filters": "선택한 이슈는 활성 필터에 의해 숨겨져 있습니다.",
-        "to_see_its_details": "세부 정보를 보려면"
+        "to_see_its_details": "세부 정보를 보려면",
+        "select_an_issue_to_see_its_details": "세부 정보를 보려면 이슈를 선택하세요.",
+        "select_a_work_item_to_see_its_details": "작업 항목을 선택하면 세부 정보가 표시됩니다."
       }
     },
     "mdNotebook": {
