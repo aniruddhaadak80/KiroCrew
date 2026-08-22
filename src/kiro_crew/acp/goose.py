@@ -113,11 +113,11 @@ def resolve_argv_cached() -> list[str] | None:
 def missing_adapter_message() -> str:
     """What to tell an operator whose host has no goose binary."""
     return (
-        "goose not found. Install goose (see https://goose-docs.ai), or set "
-        "GOOSE_BIN to the binary's path. Unlike the Claude and Codex adapters "
-        "there is no separate npm package to install: goose serves ACP from its "
-        "own binary via `goose acp`. Then configure a provider with "
-        "`goose configure`."
+        "goose not found. Install goose (see https://goose-docs.ai, or "
+        "`brew install block-goose-cli`), or set GOOSE_BIN to the binary's "
+        "path. Unlike the Claude and Codex adapters there is no separate npm "
+        "package to install: goose serves ACP from its own binary via "
+        "`goose acp`. Then configure a provider with `goose configure`."
     )
 
 

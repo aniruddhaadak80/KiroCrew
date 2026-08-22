@@ -16,12 +16,11 @@ Selectability is deliberately NOT expressed here. It stays in
 answer to "may an operator persist this value", and a descriptor cannot drift
 from it.
 
-Fork divergence: `AGENTS.md` fixes ``agent.provider`` to ``acp`` and lists
-provider registration glue under *Never re-add*. That rule is deliberately left
-standing, and this module contradicts it by design. The rationale, the upstream
-state of the policy question, and what would make the work upstreamable are
-recorded in ``docs/task-specs/2026/08/pluggable-acp-backends/README.md``. Read
-that before concluding this module should not exist.
+``agent.provider`` stays ``enum=["acp"]``. Selection is ``agent.acp_backend``.
+Adapters are operator-installed, never bundled, and discovered through the
+upstream ACP Registry. This module is the descriptor layer for those backends:
+what each can do, which dialect it speaks, and how its tool decisions reach
+Kiro Crew's PreToolUse gate.
 """
 
 from __future__ import annotations

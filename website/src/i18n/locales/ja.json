@@ -108,7 +108,8 @@
     "focus_mode_title": "フォーカスモード · Alt+Shift+M",
     "focus_mode_title_mac": "フォーカスモード · ⌥⇧M",
     "active_harness": "エージェントハーネス: {{label}}",
-    "active_harness_open_settings": "エージェントハーネス: {{label}} — ACP アダプターの設定を開く"
+    "active_harness_open_settings": "エージェントハーネス: {{label}} — ACP アダプターの設定を開く",
+    "harness_new_sessions": "新しいセッション"
   },
   "appSdk": {
     "chatEmbed": {

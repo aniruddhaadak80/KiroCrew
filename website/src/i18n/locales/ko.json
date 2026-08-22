@@ -108,7 +108,8 @@
     "focus_mode_title": "집중 모드 · Alt+Shift+M",
     "focus_mode_title_mac": "집중 모드 · ⌥⇧M",
     "active_harness": "에이전트 하네스: {{label}}",
-    "active_harness_open_settings": "에이전트 하네스: {{label}} — ACP 어댑터 설정 열기"
+    "active_harness_open_settings": "에이전트 하네스: {{label}} — ACP 어댑터 설정 열기",
+    "harness_new_sessions": "새 세션"
   },
   "appSdk": {
     "chatEmbed": {

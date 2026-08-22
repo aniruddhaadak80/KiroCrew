@@ -108,7 +108,8 @@
     "focus_mode_title": "Режим фокусировки · Alt+Shift+M",
     "focus_mode_title_mac": "Режим фокусировки · ⌥⇧M",
     "active_harness": "Окружение агента: {{label}}",
-    "active_harness_open_settings": "Окружение агента: {{label}} — открыть настройки Адаптера ACP"
+    "active_harness_open_settings": "Окружение агента: {{label}} — открыть настройки Адаптера ACP",
+    "harness_new_sessions": "Новые сеансы"
   },
   "appSdk": {
     "chatEmbed": {

@@ -1425,13 +1425,61 @@ def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> st
     return ""
 
 
-def _format_acp_error(error: object, available_models: Sequence[str] | None = None) -> str:
+def _signin_command_for(backend: str = "") -> str:
+    """Return the command an operator runs to authenticate *backend*.
+
+    Empty ``backend`` (the kiro default) keeps ``kiro-cli login`` so the
+    historical kiro/KAS sentence is unchanged. A descriptor with no command
+    returns ``""`` rather than inventing one — a registry adapter's CLI is
+    unknown, and naming ``kiro-cli login`` there is the bug this helper exists
+    to stop.
+    """
+    if not backend:
+        return "kiro-cli login"
+    try:
+        command = acp_backends.descriptor_for(backend).signin_command
+    except acp_backends.UnknownAcpBackend:
+        return ""
+    return command or ""
+
+
+def _session_expired_guidance(backend: str = "") -> str:
+    """Actionable recovery sentence for a session-expired / not-authenticated error.
+
+    Quotes the backend's own ``signin_command`` when one exists. The kiro
+    wording is the historical sentence existing tests pin; do not paraphrase it.
+    """
+    command = _signin_command_for(backend)
+    if command:
+        return (
+            f"Your session has expired. Run `{command}` in your "
+            "terminal to sign back in, then start a new chat. "
+            "Retrying or switching models will not help — this is a "
+            "sign-in issue, not a backend error."
+        )
+    return (
+        "Your session has expired. Sign in with that adapter's own CLI, "
+        "then start a new chat. Retrying or switching models will not "
+        "help — this is a sign-in issue, not a backend error."
+    )
+
+
+def _format_acp_error(
+    error: object,
+    available_models: Sequence[str] | None = None,
+    *,
+    backend: str = "",
+) -> str:
     """Format a JSON-RPC error from the ACP backend into actionable user text.
 
-    The ACP backend (kiro-cli or claude-agent-acp) surfaces upstream Bedrock
+    The ACP backend (kiro-cli or a spec adapter) surfaces upstream provider
     failures as JSON-RPC ``error`` objects with shape
     ``{"code": int, "message": str, "data": str}``.  The ``data`` field
     typically contains the raw provider error string and a request_id.
+
+    *backend* selects which sign-in command the session-expired branch quotes.
+    Default ``""`` is kiro, so existing callers keep the ``kiro-cli login``
+    sentence.
 
     For known failure modes (model unavailable, throttling, auth) we rewrite
     the message into concrete recovery steps.  For everything else we fall
@@ -1538,14 +1586,10 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
         elif _is_session_expired(haystack):
             # Session expiry (401/403, or prose saying as much) — distinct from
             # the Bedrock credential errors above. Retrying or switching models
-            # cannot succeed, so the message must not suggest either.
-            formatted = (
-                "Your session has expired. Run `kiro-cli login` in your "
-                "terminal to sign back in, then start a new chat. "
-                "Retrying or switching models will not help — this is a "
-                "sign-in issue, not a backend error."
-                f"{req_id_suffix}"
-            )
+            # cannot succeed, so the message must not suggest either. The
+            # command is the backend's own: a Codex host must not be sent to
+            # ``kiro-cli login``.
+            formatted = _session_expired_guidance(backend) + req_id_suffix
         elif (
             _RE_5XX_NAMED.search(haystack)
             or _RE_5XX_STATUS.search(haystack)
@@ -1664,7 +1708,12 @@ def _rejected_model_from_error(error: object) -> str | None:
     return m.group(1) if m else None
 
 
-def _raise_acp_error(error: object, available_models: Sequence[str] | None = None) -> None:
+def _raise_acp_error(
+    error: object,
+    available_models: Sequence[str] | None = None,
+    *,
+    backend: str = "",
+) -> None:
     """Format and raise the appropriate AcpError subclass for *error*.
 
     Delegates formatting to ``_format_acp_error`` and raises either
@@ -1673,9 +1722,12 @@ def _raise_acp_error(error: object, available_models: Sequence[str] | None = Non
 
     *available_models* is passed to BOTH the formatter and the transient
     classifier so a model-rejection's wording and its retry verdict are decided
-    from the same evidence.
+    from the same evidence. *backend* is optional and defaults to kiro so the
+    kiro path keeps the historical ``kiro-cli login`` sentence; spec adapters
+    pass their id so the operator is told the command that adapter actually
+    accepts.
     """
-    formatted = _format_acp_error(error, available_models)
+    formatted = _format_acp_error(error, available_models, backend=backend)
     # Detect prompt-busy from the raw error (before formatting rewrites it)
     raw_data = ""
     if isinstance(error, dict):
@@ -2928,11 +2980,10 @@ class AcpClient:
     async def _spawn(self) -> None:
         """Start the ACP backend subprocess with stdio pipes.
 
-        KiroCrew's public core only ever drives the kiro-cli backend. The
-        claude-agent-acp branch below is the dormant protocol seam (see
-        ``ACP_BACKEND_CLAUDE``): the public provider factory never selects it,
-        so it is unreachable here, but an internal companion that re-registers
-        a Claude backend reuses this same client over the seam.
+        Dispatch is by positive backend id (harness-parity H5). kiro-cli is the
+        final ``else`` so adding an adapter cannot change the kiro argv. Claude,
+        Codex, goose, and a launchable registry adapter each resolve their own
+        binary; they are operator-installed, never bundled.
         """
         # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
         # slow storage; the loop must never wait on the kernel here.
@@ -2961,18 +3012,12 @@ class AcpClient:
 
         registry_env: dict[str, str] = {}
         if self._is_claude:
-            # Dormant seam — see method docstring. Binary resolution only; the
-            # ~/.claude registration glue (settings.local.json, the MCP-registry
-            # reader) lived in the deleted cc_agent module and is re-added by the
-            # internal companion, not the public core.
-            #
-            # Per-session settings seed: a companion attaches
-            # _write_claude_local_settings (permissions.defaultMode + the
-            # availableModels allowlist that unlocks the 1M-token window). It
-            # MUST run on the PRIMARY spawn path — not only the rare
-            # model-substitution retry at _new_session_following_substitution —
-            # or a claude session collapses to the 200K default. Guarded via
-            # getattr so the public core (no such method) is byte-identical.
+            # Binary resolution only. The permission seed that makes this
+            # backend ROUTED is ``claude.ensure_routed_settings``, run by
+            # ``tool_gate.enforce`` above — not this getattr. A companion may
+            # attach ``_write_claude_local_settings`` for extras (the
+            # availableModels allowlist that unlocks the 1M-token window); it
+            # is optional and must not be required on the public path.
             _seed = getattr(self, "_write_claude_local_settings", None)
             if callable(_seed):
                 try:
@@ -3092,10 +3137,9 @@ class AcpClient:
         pin_gateway_child_port(env)
         env["PATH"] = augmented_path(env.get("PATH", ""))
         if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
-            # Dormant seam (see _spawn docstring): the adapter's SDK needs a
-            # native Claude binary we don't vendor and does NOT search PATH for
-            # `claude` itself, so point it at one explicitly when the seam is
-            # driven. Only set when unset so an operator override always wins.
+            # The adapter's SDK needs a native Claude binary we don't vendor
+            # and does NOT search PATH for `claude` itself, so point it at one
+            # explicitly. Only set when unset so an operator override always wins.
             claude_exe = _resolve_claude_code_executable()
             if claude_exe:
                 env["CLAUDE_CODE_EXECUTABLE"] = claude_exe
@@ -4593,7 +4637,7 @@ class AcpClient:
                     self._turn_done.set()
                     return
                 if action == "error":
-                    _raise_acp_error(msg.error, self._advertised_model_ids())
+                    _raise_acp_error(msg.error, self._advertised_model_ids(), backend=self.backend)
                 if action == "permission":
                     await self._handle_permission(msg)
                 elif action == "server_request_unknown":
@@ -4711,7 +4755,7 @@ class AcpClient:
                 )
                 return
             if action == "error":
-                _raise_acp_error(msg.error, self._advertised_model_ids())
+                _raise_acp_error(msg.error, self._advertised_model_ids(), backend=self.backend)
             if action == "permission":
                 # Layer-2 evidence that the backend actually asks. The pre-flight
                 # probe reads configuration; this records observed behaviour, so a
@@ -5245,7 +5289,7 @@ class AcpClient:
                 self._turn_done.set()
                 return "".join(output)
             if action == "error":
-                _raise_acp_error(msg.error, self._advertised_model_ids())
+                _raise_acp_error(msg.error, self._advertised_model_ids(), backend=self.backend)
             if action == "permission":
                 await self._handle_permission(msg)
             elif action == "server_request_unknown":

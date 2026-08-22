@@ -6409,7 +6409,41 @@ class DashboardState:
                 "slack_thread_ts": slack_thread_ts,
             }
         )
+        # Live harness, not the configured default: an open chat keeps the
+        # backend it started with, and the model picker must follow that.
+        # Omitted when no provider is bound (a new tab has not spawned yet).
+        live_backend = self._live_slot_acp_backend(slot)
+        if live_backend is not None:
+            payload["acp_backend"] = live_backend
         return payload
+
+    def _live_slot_acp_backend(self, slot: _ChatSlot) -> str | None:
+        """Backend the live provider is driving, or ``None`` if none is bound.
+
+        ``""`` is kiro. Distinguishing omit-vs-empty lets the picker treat a
+        still-open kiro session as kiro after the default harness moved on.
+        """
+        try:
+            from kiro_crew.dashboard.chat_utils import _history_key_for
+
+            sessions = getattr(self, "sessions", None)
+            getter = getattr(sessions, "get_provider", None)
+            if not callable(getter):
+                return None
+            provider = getter(_history_key_for(slot.key))
+        except Exception:
+            return None
+        if provider is None:
+            return None
+        backend = getattr(provider, "backend", None)
+        if isinstance(backend, str):
+            return backend
+        for holder_name in ("client", "_client"):
+            holder = getattr(provider, holder_name, None)
+            nested = getattr(holder, "backend", None) if holder is not None else None
+            if isinstance(nested, str):
+                return nested
+        return ""
 
     def serialize_slots(self, *, include_check_status: bool = False) -> list:
         """Serialize slots, optionally including owner-only provider status.

@@ -16,6 +16,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
+from kiro_crew.acp.backends import Dialect, dialect_of
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import ACP_BACKENDS_AUTO_MODEL
 from kiro_crew.agent import (
@@ -1019,7 +1020,83 @@ def _configured_acp_backend() -> str:
         return ""
 
 
-def _advertised_alt_backend_models(request: web.Request) -> list[dict[str, str]]:
+def _provider_backend(provider: object | None) -> str:
+    """ACP backend a live provider is driving. ``""`` is kiro (H4).
+
+    Reads ``.backend``, then ``.client.backend`` / ``._client.backend``. Absence
+    is kiro: existing test doubles and the first-class path have no attribute.
+    """
+    if provider is None:
+        return ""
+    value = getattr(provider, "backend", None)
+    if isinstance(value, str):
+        return value
+    for holder_name in ("client", "_client"):
+        holder = getattr(provider, holder_name, None)
+        nested = getattr(holder, "backend", None) if holder is not None else None
+        if isinstance(nested, str):
+            return nested
+    return ""
+
+
+def _models_from_provider(provider: object) -> list[dict[str, str]]:
+    """Verbatim advertised rows from one live provider, or ``[]``."""
+    reader = getattr(provider, "available_models", None)
+    if not callable(reader):
+        client = getattr(provider, "client", None)
+        reader = getattr(client, "available_models", None)
+    if not callable(reader):
+        return []
+    try:
+        rows = reader()
+    except Exception:
+        return []
+    models: list[dict[str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        model_id = row.get("modelId") or row.get("model_name") or ""
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        models.append(
+            {
+                "model_name": model_id,
+                "display_name": str(row.get("name") or model_id),
+                "description": str(row.get("description") or ""),
+            }
+        )
+    return models
+
+
+def _models_list_scope(request: web.Request) -> tuple[str, Any]:
+    """Return ``(backend, scoped_provider_or_None)`` for GET /api/models.
+
+    A ``?slot=`` with a live provider uses that session's harness — an open chat
+    must not list the *next* harness's catalog. A slot that has not spawned yet,
+    or a request with no slot (settings / new-session pickers), uses the
+    configured default.
+    """
+    slot = ""
+    try:
+        slot = (request.query.get("slot") or "").strip()
+    except Exception:
+        slot = ""
+    if slot:
+        try:
+            state = request.app.get("state")
+            sessions = getattr(state, "sessions", None)
+            getter = getattr(sessions, "get_provider", None)
+            scoped = getter(_history_key_for(slot)) if callable(getter) else None
+        except Exception:
+            scoped = None
+        if scoped is not None:
+            return _provider_backend(scoped), scoped
+    return _configured_acp_backend(), None
+
+
+def _advertised_alt_backend_models(
+    request: web.Request, *, backend: str | None = None
+) -> list[dict[str, str]]:
     """Models a live session's backend advertised, newest session first.
 
     The ONLY correct source on a non-kiro backend: ids live in that backend's own
@@ -1032,6 +1109,10 @@ def _advertised_alt_backend_models(request: web.Request) -> list[dict[str, str]]
     configuration; an older one may predate a backend switch. Returns the first
     non-empty list rather than merging, since merging two backends' namespaces
     would offer ids the active backend rejects.
+
+    ``backend`` restricts the walk to providers driving that harness. Unfiltered
+    (``None``) keeps the original newest-any-session behaviour for callers that
+    have not named a namespace.
     """
     state = request.app.get("state")
     sessions = getattr(state, "sessions", None)
@@ -1045,33 +1126,48 @@ def _advertised_alt_backend_models(request: web.Request) -> list[dict[str, str]]
         return []
 
     for provider in reversed(providers):
-        reader = getattr(provider, "available_models", None)
-        if not callable(reader):
-            client = getattr(provider, "client", None)
-            reader = getattr(client, "available_models", None)
-        if not callable(reader):
+        if backend is not None and _provider_backend(provider) != backend:
             continue
-        try:
-            rows = reader()
-        except Exception:
-            continue
-        models: list[dict[str, str]] = []
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            model_id = row.get("modelId") or row.get("model_name") or ""
-            if not isinstance(model_id, str) or not model_id:
-                continue
-            models.append(
-                {
-                    "model_name": model_id,
-                    "display_name": str(row.get("name") or model_id),
-                    "description": str(row.get("description") or ""),
-                }
-            )
+        models = _models_from_provider(provider)
         if models:
             return models
     return []
+
+
+def _effort_levels_for(request: web.Request) -> list[str]:
+    """Reasoning-effort levels the relevant harness actually advertised.
+
+    A live adapter session that reported none returns ``[]`` — do not substitute
+    kiro's process-global union. The kiro family (``Dialect.KIRO``, including
+    KAS) still falls through to that union so the first-class path is unchanged.
+    """
+    slot = ""
+    try:
+        slot = (request.query.get("slot") or "").strip()
+    except Exception:
+        slot = ""
+    if slot:
+        try:
+            state = request.app.get("state")
+            sessions = getattr(state, "sessions", None)
+            getter = getattr(sessions, "get_provider", None)
+            provider = getter(_history_key_for(slot)) if callable(getter) else None
+        except Exception:
+            provider = None
+        if provider is None:
+            return []
+        levels_fn = getattr(provider, "get_valid_effort_levels", None)
+        levels = levels_fn() if callable(levels_fn) else []
+        if levels:
+            return list(levels)
+        if dialect_of(_provider_backend(provider)) is not Dialect.KIRO:
+            return []
+        return get_reasoning_effort_ordered()
+
+    backend = _configured_acp_backend()
+    if backend and dialect_of(backend) is not Dialect.KIRO:
+        return []
+    return get_reasoning_effort_ordered()
 
 
 async def api_models(request: web.Request) -> web.Response:
@@ -1092,9 +1188,19 @@ async def api_models(request: web.Request) -> web.Response:
     # that subprocess is both impossible (the binary may be absent) and wrong
     # (its ids are kiro-namespace and the other backend rejects them). The
     # advertised list from a live session is the only correct source there.
-    _alt_backend = await asyncio.to_thread(_configured_acp_backend)
+    #
+    # ``?slot=`` follows the live session when one exists, so an open chat does
+    # not list the *next* harness's catalog after a default-backend save. The
+    # configured default is used only when no live provider is bound (settings,
+    # a new tab that has not spawned yet). Off the loop: the no-provider path
+    # reads config.json.
+    _alt_backend, scope_provider = await asyncio.to_thread(_models_list_scope, request)
     if _alt_backend:
-        advertised = _advertised_alt_backend_models(request)
+        advertised = (
+            _models_from_provider(scope_provider)
+            if scope_provider is not None
+            else _advertised_alt_backend_models(request, backend=_alt_backend)
+        )
         if not advertised:
             # Degraded, NOT a genuine "zero models" answer — no session has
             # advertised yet. Same keep-polling contract as the branches below;
@@ -1303,19 +1409,7 @@ async def api_effort_levels(request: web.Request) -> web.Response:
     a model switch is reflected immediately. Falls back to the process-global
     ordered list (cold start / no live provider / provider without the getter).
     """
-    slot = request.query.get("slot")
-    if slot:
-        try:
-            state: DashboardState = request.app["state"]
-            provider = state.sessions.get_provider(_history_key_for(slot))
-            getter = getattr(provider, "get_valid_effort_levels", None) if provider else None
-            if callable(getter):
-                levels = getter()
-                if levels:
-                    return web.json_response(levels)
-        except (KeyError, AttributeError):
-            pass
-    return web.json_response(get_reasoning_effort_ordered())
+    return web.json_response(await asyncio.to_thread(_effort_levels_for, request))
 
 
 async def api_slash_commands(request: web.Request) -> web.Response:

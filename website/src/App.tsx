@@ -2538,15 +2538,26 @@ export default function App() {
                 <span className={dskValid ? metricColor(dskPct) : 'text-muted'}>{i18nT('app.dsk')} {dskValid ? fmtPercent(dskPct) : '\u2014'}</span>
               </span>)
             }
-            // Harness segment — which agent binary this gateway drives. Sits
-            // next to the credit readout because the two answer one question
-            // together: whose account a turn spends. The icon alone survives
-            // the mobile rung; the label is the gateway's own resolved string,
-            // never a frontend copy of the descriptor table.
+            // Harness segment — which agent binary NEW sessions use. A live
+            // chat keeps the harness it started with, so the label is the
+            // default for the next session, not the open one. The qualifier
+            // is visible only when the selector is reachable; without the
+            // preview flag there is nothing to switch. The icon alone
+            // survives the mobile rung; the label is the gateway's own
+            // resolved string, never a frontend copy of the descriptor table.
             if (harness) {
               const harnessLabel = <>
                 <Bot size={12} />
-                {!isMobile && <span className="text-[11px] whitespace-nowrap">{harness.label}</span>}
+                {!isMobile && (
+                  <span className="flex items-baseline gap-1.5 min-w-0">
+                    <span className="text-[11px] whitespace-nowrap">{harness.label}</span>
+                    {acpBackendsPreview && (
+                      <span className="text-[10px] whitespace-nowrap opacity-80">
+                        {i18nT('app.harness_new_sessions')}
+                      </span>
+                    )}
+                  </span>
+                )}
               </>
               // A real <Link> rather than a click handler, so the adapter card
               // opens in a new tab from the middle button like any other

@@ -245,3 +245,45 @@ describe('model-list liveness (self-heal signal)', () => {
     expect(modelListRefetchInterval({ queryKey: ['available-models', 'other'] })).toBe(false)
   })
 })
+
+describe('AcpAdapter.fetchAvailableModels slot scope', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  it('passes ?slot= through to GET /api/models', async () => {
+    ;(api.models as any).mockResolvedValue([
+      { model_name: 'auto', description: 'a' },
+      { model_name: 'gpt-5.6-sol', description: 'b' },
+    ])
+    await new AcpAdapter().fetchAvailableModels({ slot: 'chat-1' })
+    expect(api.models).toHaveBeenCalledWith({ slot: 'chat-1' })
+  })
+
+  it('does not rewrite the config-namespace cache from a session-scoped fetch', async () => {
+    // Prime the config cache as Codex so a kiro live-slot fetch must not
+    // stamp lastKnown / the picker cache back to kiro.
+    ;(api.models as any).mockResolvedValueOnce({
+      models: [{ model_name: 'gpt-5.2[high]', description: 'x' }],
+      backend: 'codex',
+      serves_auto: false,
+    })
+    const adapter = new AcpAdapter()
+    await adapter.fetchAvailableModels()
+    expect(localStorage.getItem('kc.acp.backend.v1')).toBe('codex')
+    expect(localStorage.getItem('kc.acp.servesAuto.v1')).toBe('0')
+
+    ;(api.models as any).mockResolvedValueOnce([
+      { model_name: 'auto', description: 'a' },
+      { model_name: 'gpt-5.6-sol', description: 'b' },
+    ])
+    const live = await adapter.fetchAvailableModels({ slot: 'chat-kiro' })
+    expect(live.map(m => m.name)).toEqual(['auto', 'gpt-5.6-sol'])
+    expect(localStorage.getItem('kc.acp.backend.v1')).toBe('codex')
+    expect(localStorage.getItem('kc.acp.servesAuto.v1')).toBe('0')
+    const cached = JSON.parse(localStorage.getItem('kc.acp.models.v1') as string)
+    expect(cached.backend).toBe('codex')
+    expect(cached.models.map((m: { name: string }) => m.name)).toEqual(['gpt-5.2[high]'])
+  })
+})

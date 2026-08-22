@@ -108,7 +108,8 @@
     "focus_mode_title": "फ़ोकस मोड · Alt+Shift+M",
     "focus_mode_title_mac": "फ़ोकस मोड · ⌥⇧M",
     "active_harness": "एजेंट हार्नेस: {{label}}",
-    "active_harness_open_settings": "एजेंट हार्नेस: {{label}} — ACP अडैप्टर सेटिंग्स खोलें"
+    "active_harness_open_settings": "एजेंट हार्नेस: {{label}} — ACP अडैप्टर सेटिंग्स खोलें",
+    "harness_new_sessions": "नए सत्र"
   },
   "appSdk": {
     "chatEmbed": {

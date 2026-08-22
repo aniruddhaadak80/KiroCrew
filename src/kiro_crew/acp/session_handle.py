@@ -1684,7 +1684,11 @@ class AcpSessionHandle:
                         # The advertised ids let the shared entitlement
                         # discriminator tell "your plan lacks this model"
                         # (terminal) from a capacity blip (retryable).
-                        _raise_acp_error(msg.error, self._advertised_model_ids())
+                        _raise_acp_error(
+                            msg.error,
+                            self._advertised_model_ids(),
+                            backend=self._runtime.acp_backend,
+                        )
                     return msg
                 # Not our response — buffer (do not drop) for re-injection,
                 # and advance the ingress sequence for EVERY buffered frame:
@@ -2002,7 +2006,11 @@ class AcpSessionHandle:
                         # AcpPromptBusy when the backend reports a concurrent
                         # in-flight prompt. Advertised ids feed the entitlement
                         # discriminator (see _wait_for_response).
-                        _raise_acp_error(msg.error, self._advertised_model_ids())
+                        _raise_acp_error(
+                            msg.error,
+                            self._advertised_model_ids(),
+                            backend=self._runtime.acp_backend,
+                        )
                     result = msg.result or {}
                     reason = ""
                     if isinstance(result, dict):

@@ -15,17 +15,22 @@ from typing import Callable
 
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.codex import Verdict
-from kiro_crew.acp.types import ACP_BACKEND_CODEX
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_GOOSE
 
-#: Adapters whose binary resolution and credential file Kiro Crew owns, so the
-#: doctor can report a real reading rather than a guess.
+#: Adapters whose binary resolution Kiro Crew owns, so the doctor can report a
+#: real reading rather than a guess.
 #:
 #: A named set rather than an identity test (harness-parity H5): an inequality
 #: against one backend hands these branches to every harness added later, which
 #: is how a doctor row starts asserting a resolution ladder that does not exist.
 #: Membership is a deliberate edit — an adapter joins when Kiro Crew actually
 #: gains a ladder for it, not because it resembles one that has one.
-_ADAPTERS_WITH_OWNED_LADDER = frozenset({ACP_BACKEND_CODEX})
+_ADAPTERS_WITH_OWNED_LADDER = frozenset({ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE})
+
+#: Credential-file reading is a narrower set than binary resolution. Claude and
+#: goose authenticate through a vendor CLI Kiro Crew never reads, so a missing
+#: token file is not a doctor issue there — only Codex has a leaf we can stat.
+_ADAPTERS_WITH_OWNED_CREDENTIAL = frozenset({ACP_BACKEND_CODEX})
 
 
 def report(
@@ -68,22 +73,43 @@ def _report_adapter(
     """Whether the adapter binary resolved, and the ladder when it did not."""
     # Positive membership (harness-parity H5). An inequality against one backend
     # would hand this branch to every harness added later; only adapters with a
-    # Kiro-Crew-owned resolution ladder have anything to report here. The claude
-    # adapter's resolution lives in the client's own seam, so its failure
-    # surfaces as that adapter's spawn error rather than a doctor row.
+    # Kiro-Crew-owned resolution ladder have anything to report here.
     if descriptor.id not in _ADAPTERS_WITH_OWNED_LADDER:
         return
-    from kiro_crew.acp import codex
-
-    argv = codex.resolve_argv()
+    argv, missing = _resolve_owned_adapter(descriptor)
     if argv:
         emit(f"  adapter:     ✅ {' '.join(argv)}")
         return
     emit("  adapter:     ❌ not found")
-    for line in codex.missing_adapter_message().split(". "):
+    for line in missing.split(". "):
         if line.strip():
             emit(f"               {line.strip().rstrip('.')}.")
     issues.append(f"{descriptor.label}: ACP adapter not found")
+
+
+def _resolve_owned_adapter(
+    descriptor: acp_backends.BackendDescriptor,
+) -> tuple[list[str] | None, str]:
+    """Dispatch the owned resolver by backend id (harness-parity H5)."""
+    if descriptor.id == ACP_BACKEND_CODEX:
+        from kiro_crew.acp import codex
+
+        return codex.resolve_argv(), codex.missing_adapter_message()
+    if descriptor.id == ACP_BACKEND_CLAUDE:
+        from kiro_crew.acp.client import _resolve_claude_acp_bin
+
+        argv = _resolve_claude_acp_bin()
+        missing = (
+            "claude-agent-acp not found. Install with "
+            f"`{descriptor.install_command}`, or set CLAUDE_AGENT_ACP_BIN "
+            "to its entry script."
+        )
+        return argv, missing
+    if descriptor.id == ACP_BACKEND_GOOSE:
+        from kiro_crew.acp import goose
+
+        return goose.resolve_argv(), goose.missing_adapter_message()
+    return None, ""
 
 
 def _report_signin(
@@ -95,8 +121,9 @@ def _report_signin(
     # Positive membership, same reason as _report_adapter: only an adapter whose
     # credential file Kiro Crew can locate gets a real sign-in reading. Everything
     # else is owned by its vendor CLI, which is the honest answer rather than a
-    # guess dressed as a check.
-    if descriptor.id not in _ADAPTERS_WITH_OWNED_LADDER:
+    # guess dressed as a check. Narrower than the resolution ladder — Claude and
+    # goose resolve a binary we own but authenticate through a CLI we do not read.
+    if descriptor.id not in _ADAPTERS_WITH_OWNED_CREDENTIAL:
         emit(f"  sign-in:     ⏹ owned by the vendor CLI ({descriptor.signin_command})")
         return
     from kiro_crew.acp import codex

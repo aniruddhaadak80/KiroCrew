@@ -108,7 +108,8 @@
     "focus_mode_title": "专注模式 · Alt+Shift+M",
     "focus_mode_title_mac": "专注模式 · ⌥⇧M",
     "active_harness": "代理运行环境：{{label}}",
-    "active_harness_open_settings": "代理运行环境：{{label}} — 打开 ACP 适配器设置"
+    "active_harness_open_settings": "代理运行环境：{{label}} — 打开 ACP 适配器设置",
+    "harness_new_sessions": "新会话"
   },
   "appSdk": {
     "chatEmbed": {

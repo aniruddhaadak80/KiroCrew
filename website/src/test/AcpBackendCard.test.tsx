@@ -137,6 +137,20 @@ describe('AcpBackendCard', () => {
     expect(screen.getByText(/Kiro Agent Service/)).toBeTruthy()
   })
 
+  it('says a switch does not change the open chat', async () => {
+    ;(api.acpBackends as any).mockResolvedValue(payload())
+    renderCard()
+    expect(await screen.findByText(/does not change it mid-session/)).toBeTruthy()
+  })
+
+  it('repeats the mid-session rule in the confirm dialog', async () => {
+    ;(api.acpBackends as any).mockResolvedValue(payload())
+    renderCard()
+    await userEvent.click(await screen.findByRole('radio', { name: 'OpenAI Codex' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog.textContent).toMatch(/does not switch the harness mid-session/)
+  })
+
   it('requires confirmation before switching to an experimental backend', async () => {
     const onSave = vi.fn()
     ;(api.acpBackends as any).mockResolvedValue(payload())

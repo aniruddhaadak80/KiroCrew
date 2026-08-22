@@ -57,8 +57,9 @@
     "focus_mode": "Focus mode",
     "focus_mode_title": "Focus mode · Alt+Shift+M",
     "focus_mode_title_mac": "Focus mode · ⌥⇧M",
-    "active_harness": "Agent harness: {{label}}",
-    "active_harness_open_settings": "Agent harness: {{label}} — open ACP Adapter settings"
+    "active_harness": "New sessions use {{label}}. Open chats keep the harness they started with.",
+    "active_harness_open_settings": "New sessions use {{label}}. Open chats keep the harness they started with. Open ACP Adapter settings.",
+    "harness_new_sessions": "New sessions"
   },
   "appSdk": {
     "chatEmbed": {
@@ -3607,7 +3608,9 @@
         "routing_indeterminate": "Tool-call routing is not verified — new sessions will refuse",
         "routing_bypassed": "Tool calls would bypass {{productName}}'s security gate — new sessions will refuse",
         "routing_reason": "{{reason}}",
-        "ungated_opt_out": "Ungated tools are allowed. Denied-command rules, sensitive-path blocking, and the governance ceiling are not consulted for this backend's self-approved calls."
+        "ungated_opt_out": "Ungated tools are allowed. Denied-command rules, sensitive-path blocking, and the governance ceiling are not consulted for this backend's self-approved calls.",
+        "applies_to_new_sessions": "New chats use this harness. A chat that is already open keeps the one it started with — switching here does not change it mid-session.",
+        "confirm_open_sessions": "This does not switch the harness mid-session. Open chats keep the one they started with until you start a new chat."
       },
       "agentCfgTab": {
         "agent_config_file": "Agent Config ({{file}})",

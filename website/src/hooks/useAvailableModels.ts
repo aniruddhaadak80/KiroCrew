@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { useProvider } from '../providers'
-import { servesAutoModel } from '../providers/adapters/acp'
+import { lastKnownBackend, servesAutoModel } from '../providers/adapters/acp'
 import { modelListRefetchInterval } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
@@ -49,12 +49,28 @@ const EMPTY: ModelInfo[] = []
  * `false` until its panel opens so merely rendering the sidebar does not spawn
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
+ *
+ * `slot` / `backend` scope the cache entry. A live chat passes the session's
+ * harness so the picker does not list the *next* default after a backend save.
+ * Settings and other new-session pickers pass the configured backend (or omit
+ * both, which is the kiro / unknown-config key).
  */
-export function useAvailableModels({ enabled }: { enabled?: boolean } = {}): ModelInfo[] {
+export function useAvailableModels({
+  enabled,
+  slot,
+  backend,
+}: {
+  enabled?: boolean
+  slot?: string
+  backend?: string | null
+} = {}): ModelInfo[] {
   const provider = useProvider()
+  const intendedBackend = backend ?? ''
+  const scope = slot ? `slot:${slot}` : `config:${intendedBackend}`
   const { data } = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels()),
+    queryKey: ['available-models', provider.id, scope],
+    queryFn: async () =>
+      withAutoFirst(await provider.fetchAvailableModels(slot ? { slot } : undefined)),
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
@@ -65,5 +81,9 @@ export function useAvailableModels({ enabled }: { enabled?: boolean } = {}): Mod
   // `fetchAvailableModels` does to avoid fabricating that row is undone here if
   // this is left unconditional, because this branch runs BEFORE any of it.
   if (data) return data
+  // After a default-harness switch the last-known cache is still the previous
+  // namespace. Showing Auto (or that namespace's rows) for the new key is the
+  // flash this placeholder exists to prevent.
+  if (intendedBackend && intendedBackend !== (lastKnownBackend() ?? '')) return EMPTY
   return servesAutoModel() ? PLACEHOLDER : EMPTY
 }

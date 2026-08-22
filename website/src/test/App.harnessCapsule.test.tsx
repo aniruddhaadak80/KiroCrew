@@ -86,7 +86,7 @@ describe('App top bar — harness readout', () => {
   it('names the harness the gateway reported', async () => {
     setHarness({ backend: 'codex', label: 'OpenAI Codex', kiro_credits: false })
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByLabelText('Agent harness: OpenAI Codex')).toBeTruthy()
+    expect(await screen.findByLabelText(/New sessions use OpenAI Codex/)).toBeTruthy()
   })
 
   it('hides the credit segment for a harness that bills its own vendor account', async () => {
@@ -94,7 +94,7 @@ describe('App top bar — harness readout', () => {
     renderWithProviders(<App />, { route: '/chat' })
     // Wait on the harness segment so the status query has certainly resolved —
     // asserting the pill's absence before that would pass for the wrong reason.
-    await screen.findByLabelText('Agent harness: OpenAI Codex')
+    await screen.findByLabelText(/New sessions use OpenAI Codex/)
     expect(screen.queryByLabelText('Kiro credit usage')).toBeNull()
   })
 
@@ -103,7 +103,7 @@ describe('App top bar — harness readout', () => {
     // path would drop the harness segment and take the credit pill with it.
     setHarness({ backend: '', label: 'Kiro CLI', kiro_credits: true })
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByLabelText('Agent harness: Kiro CLI')).toBeTruthy()
+    expect(await screen.findByLabelText(/New sessions use Kiro CLI/)).toBeTruthy()
     expect(await screen.findByLabelText('Kiro credit usage')).toBeTruthy()
   })
 
@@ -113,20 +113,23 @@ describe('App top bar — harness readout', () => {
     setHarness(undefined)
     renderWithProviders(<App />, { route: '/chat' })
     expect(await screen.findByLabelText('Kiro credit usage')).toBeTruthy()
-    expect(screen.queryByLabelText(/^Agent harness:/)).toBeNull()
+    expect(screen.queryByLabelText(/New sessions use /)).toBeNull()
   })
 
   it('links the readout to the adapter card when the selector is reachable', async () => {
     localStorage.setItem(PREVIEW_ACP_BACKENDS, '1')
     setHarness({ backend: 'codex', label: 'OpenAI Codex', kiro_credits: false })
     renderWithProviders(<App />, { route: '/chat' })
-    const link = await screen.findByLabelText('Agent harness: OpenAI Codex — open ACP Adapter settings')
+    const link = await screen.findByLabelText(
+      /New sessions use OpenAI Codex.*Open ACP Adapter settings/,
+    )
     // An <a href>, not a click handler: the adapter card opens in a new tab from
     // the middle button like any other destination. The href must name the
     // card's own anchor — a link that lands on the tab and stops there leaves
     // the operator scrolling for the control they asked for.
     expect(link.tagName).toBe('A')
     expect(link.getAttribute('href')).toBe(ACP_BACKEND_ROUTE)
+    expect(link.textContent).toMatch(/New sessions/)
   })
 
   it('stays a plain readout while the selector is behind its preview flag', async () => {
@@ -135,7 +138,7 @@ describe('App top bar — harness readout', () => {
     // reader the setting does not exist.
     setHarness({ backend: '', label: 'Kiro CLI', kiro_credits: true })
     renderWithProviders(<App />, { route: '/chat' })
-    const readout = await screen.findByLabelText('Agent harness: Kiro CLI')
+    const readout = await screen.findByLabelText(/New sessions use Kiro CLI/)
     expect(readout.tagName).not.toBe('A')
     expect(readout.getAttribute('href')).toBeNull()
   })
@@ -145,6 +148,6 @@ describe('App top bar — harness readout', () => {
     localStorage.setItem('mc-topbar-capsule-collapsed', '1')
     renderWithProviders(<App />, { route: '/chat' })
     await screen.findByTestId('chat-page')
-    expect(screen.queryByLabelText('Agent harness: Claude Code')).toBeNull()
+    expect(screen.queryByLabelText(/New sessions use Claude Code/)).toBeNull()
   })
 })

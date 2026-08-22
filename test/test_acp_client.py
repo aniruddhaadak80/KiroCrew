@@ -38,6 +38,8 @@ from kiro_crew.acp.liveness import (
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_KAS,
     JSONRPC_METHOD_NOT_FOUND,
     AcpPromptStats,
 )
@@ -7861,6 +7863,45 @@ class TestFormatAcpError:
         out = _format_acp_error(err)
         assert "transient error" not in out.lower()
         assert "kiro-cli login" in out.lower()
+
+    def test_session_expired_names_the_backends_own_signin(self):
+        """A Codex/Claude/goose auth failure must not send the operator to kiro-cli.
+
+        ``signin_command`` is the descriptor field the not-authenticated error is
+        documented to quote. Default (kiro) and KAS keep the historical
+        ``kiro-cli login`` sentence so the kiro path is unchanged.
+        """
+        err = {"code": -32603, "message": "Internal error", "data": "not authenticated"}
+        kiro_out = _format_acp_error(err)
+        assert "kiro-cli login" in kiro_out.lower()
+
+        kas_out = _format_acp_error(err, backend=ACP_BACKEND_KAS)
+        assert "kiro-cli login" in kas_out.lower()
+
+        codex_out = _format_acp_error(err, backend=ACP_BACKEND_CODEX)
+        assert "codex login" in codex_out.lower()
+        assert "kiro-cli login" not in codex_out.lower()
+
+        claude_out = _format_acp_error(err, backend=ACP_BACKEND_CLAUDE)
+        assert "`claude`" in claude_out
+        assert "kiro-cli login" not in claude_out.lower()
+
+        goose_out = _format_acp_error(err, backend=ACP_BACKEND_GOOSE)
+        assert "goose configure" in goose_out.lower()
+        assert "kiro-cli login" not in goose_out.lower()
+
+    def test_raise_acp_error_forwards_backend_into_the_signin_sentence(self):
+        """The raise helper is what the live prompt path calls; threading
+        ``backend`` only through the formatter would leave the operator on the
+        kiro-cli sentence when Codex actually failed.
+        """
+        from kiro_crew.acp.client import _raise_acp_error
+
+        err = {"code": -32603, "message": "Internal error", "data": "login required"}
+        with pytest.raises(AcpError) as ei:
+            _raise_acp_error(err, backend=ACP_BACKEND_CODEX)
+        assert "codex login" in str(ei.value).lower()
+        assert "kiro-cli login" not in str(ei.value).lower()
 
 
 class TestIsTransientRawError:

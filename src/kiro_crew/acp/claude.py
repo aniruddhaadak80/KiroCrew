@@ -1,4 +1,4 @@
-"""Claude-backend paths and the tool-gate routing probe.
+"""Claude-backend paths and the tool-gate routing seed.
 
 The claude-agent-acp adapter decides per tool call whether to ask the client for
 permission, and it takes that from ``permissions.defaultMode`` in a per-session
@@ -7,13 +7,11 @@ back over ACP as ``session/request_permission``, which is the only path that
 reaches Kiro Crew's PreToolUse gate. ``auto`` is the SDK's auto-accept mode: the
 adapter approves on its own and the gate is never consulted.
 
-**This module only reads.** It does not write the settings file. In the public
-core the seed is companion-attached (``_write_claude_local_settings`` is reached
-through ``getattr`` and does not exist here), so on an unseeded host the adapter
-falls back to its OWN default mode — a value Kiro Crew neither sets nor knows.
-The probe reports that as INDETERMINATE rather than assuming it is safe, because
-the whole point of the verdict is to distinguish "shown to reach the gate" from
-"probably reaches the gate".
+``ensure_routed_settings`` writes that file when no mode is configured, which
+is what makes the backend ROUTED by construction. It never overwrites an
+explicit mode: a configured bypass stays, the verdict stays BYPASSED, and the
+session refuses unless the named opt-out is on. The routing probe always reads
+the file back rather than trusting that a write happened.
 """
 
 from __future__ import annotations

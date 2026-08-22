@@ -592,6 +592,10 @@ export interface ChatSlot {
    * task-runner slot, or an app/cron-minted session (which can share the
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
+  /** Live ACP harness this slot's provider is driving (``''`` = kiro).
+   *  Omitted when no provider is bound yet. Distinct from `status.harness`,
+   *  which is the default for *new* sessions. */
+  acp_backend?: string
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */

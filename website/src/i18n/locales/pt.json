@@ -108,7 +108,8 @@
     "focus_mode_title": "Modo de foco · Alt+Shift+M",
     "focus_mode_title_mac": "Modo de foco · ⌥⇧M",
     "active_harness": "Harness do agente: {{label}}",
-    "active_harness_open_settings": "Harness do agente: {{label}} — abrir as configurações do Adaptador do ACP"
+    "active_harness_open_settings": "Harness do agente: {{label}} — abrir as configurações do Adaptador do ACP",
+    "harness_new_sessions": "Novas sessões"
   },
   "appSdk": {
     "chatEmbed": {

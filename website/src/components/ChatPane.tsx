@@ -149,7 +149,12 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
-  const availableModels = useAvailableModels()
+  const harnessBackend = useAppSelector((s) => s.dashboard.status?.harness?.backend ?? '')
+  const paneBackend = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.acp_backend)
+  const availableModels = useAvailableModels({
+    slot: slotKey,
+    backend: paneBackend !== undefined ? paneBackend : harnessBackend,
+  })
   const modelDD = useFilteredDropdown(availableModels)
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The degraded flag gates it — a cached list served while

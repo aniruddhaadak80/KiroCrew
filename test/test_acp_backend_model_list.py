@@ -23,8 +23,9 @@ from kiro_crew.dashboard.handlers import agents as agents_handler
 
 
 class _Provider:
-    def __init__(self, rows: list[dict[str, str]]) -> None:
+    def __init__(self, rows: list[dict[str, str]], backend: str = "") -> None:
         self._rows = rows
+        self.backend = backend
 
     def available_models(self) -> list[dict[str, str]]:
         return self._rows
@@ -117,6 +118,35 @@ class TestAdvertisedModels:
         request.app = {}
         assert agents_handler._advertised_alt_backend_models(request) == []
 
+    def test_a_live_kiro_session_is_not_offered_as_codex(self) -> None:
+        """A still-open kiro chat must not stamp its catalog as Codex.
+
+        Newest-first without a backend filter did exactly that after the
+        operator switched the default harness: the live kiro session was the
+        newest non-empty advertisement, so /api/models returned kiro ids
+        under ``backend: "codex"``.
+        """
+        kiro = _Provider([{"modelId": "gpt-5.6-sol"}], backend="")
+        models = agents_handler._advertised_alt_backend_models(
+            _request([kiro]), backend=ACP_BACKEND_CODEX
+        )
+        assert models == []
+
+    def test_newest_matching_backend_wins_over_a_newer_other_harness(self) -> None:
+        old_codex = _Provider([{"modelId": "gpt-5.2[high]"}], backend=ACP_BACKEND_CODEX)
+        new_kiro = _Provider([{"modelId": "claude-opus-4.8"}], backend="")
+        models = agents_handler._advertised_alt_backend_models(
+            _request([old_codex, new_kiro]), backend=ACP_BACKEND_CODEX
+        )
+        assert [m["model_name"] for m in models] == ["gpt-5.2[high]"]
+
+    def test_unfiltered_still_returns_the_newest_non_empty_list(self) -> None:
+        """No backend argument keeps the original newest-first walk."""
+        old = _Provider([{"modelId": "old-model"}], backend=ACP_BACKEND_CODEX)
+        new = _Provider([{"modelId": "new-model"}], backend="")
+        models = agents_handler._advertised_alt_backend_models(_request([old, new]))
+        assert [m["model_name"] for m in models] == ["new-model"]
+
 
 class TestBackendReader:
     def test_fails_closed_to_kiro(self) -> None:
@@ -193,3 +223,72 @@ class TestAutoModelMembership:
         from some negation elsewhere.
         """
         assert "some-future-adapter" not in ACP_BACKENDS_AUTO_MODEL
+
+
+class TestProviderBackend:
+    def test_reads_the_provider_attribute(self) -> None:
+        assert agents_handler._provider_backend(_Provider([], backend=ACP_BACKEND_CODEX)) == (
+            ACP_BACKEND_CODEX
+        )
+
+    def test_reads_through_a_nested_client(self) -> None:
+        nested = _NestedProvider([{"modelId": "x"}])
+        nested.client.backend = ACP_BACKEND_CLAUDE
+        assert agents_handler._provider_backend(nested) == ACP_BACKEND_CLAUDE
+
+    def test_absence_is_kiro(self) -> None:
+        class _Bare:
+            pass
+
+        assert agents_handler._provider_backend(_Bare()) == ""
+        assert agents_handler._provider_backend(None) == ""
+
+
+class TestModelsListScope:
+    def test_a_live_slot_uses_that_session_not_the_configured_default(
+        self, monkeypatch: Any
+    ) -> None:
+        """An open kiro chat must keep listing kiro models after a Codex save."""
+        monkeypatch.setattr(agents_handler, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX)
+        live = _Provider([{"modelId": "gpt-5.6-sol"}], backend="")
+        sessions = MagicMock()
+        sessions.get_provider = MagicMock(return_value=live)
+        request = MagicMock()
+        request.query = {"slot": "chat-1"}
+        request.app = {"state": MagicMock(sessions=sessions)}
+        backend, provider = agents_handler._models_list_scope(request)
+        assert backend == ""
+        assert provider is live
+
+    def test_a_live_adapter_slot_is_not_listed_as_kiro(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(agents_handler, "_configured_acp_backend", lambda: "")
+        live = _Provider([{"modelId": "gpt-5.2[high]"}], backend=ACP_BACKEND_CODEX)
+        sessions = MagicMock()
+        sessions.get_provider = MagicMock(return_value=live)
+        request = MagicMock()
+        request.query = {"slot": "chat-2"}
+        request.app = {"state": MagicMock(sessions=sessions)}
+        backend, provider = agents_handler._models_list_scope(request)
+        assert backend == ACP_BACKEND_CODEX
+        assert provider is live
+
+    def test_a_slot_without_a_live_provider_falls_back_to_config(self, monkeypatch: Any) -> None:
+        """A new tab has not spawned yet; list what the next session will run."""
+        monkeypatch.setattr(agents_handler, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX)
+        sessions = MagicMock()
+        sessions.get_provider = MagicMock(return_value=None)
+        request = MagicMock()
+        request.query = {"slot": "chat-new"}
+        request.app = {"state": MagicMock(sessions=sessions)}
+        backend, provider = agents_handler._models_list_scope(request)
+        assert backend == ACP_BACKEND_CODEX
+        assert provider is None
+
+    def test_no_slot_uses_the_configured_backend(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(agents_handler, "_configured_acp_backend", lambda: ACP_BACKEND_CLAUDE)
+        request = MagicMock()
+        request.query = {}
+        request.app = {}
+        backend, provider = agents_handler._models_list_scope(request)
+        assert backend == ACP_BACKEND_CLAUDE
+        assert provider is None

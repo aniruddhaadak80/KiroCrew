@@ -140,8 +140,9 @@ fail-closed in code while the Settings page and doctor report why.
 
 Selectability is deliberately NOT in the descriptor. It stays in
 `ACP_BACKENDS_SELECTABLE` so there is exactly one answer to "may an operator
-persist this value", and a descriptor cannot drift from it. KAS is fully described
-and still unselectable.
+persist this value", and a descriptor cannot drift from it. KAS is fully
+described and is selectable (cli-fronted via `kiro-cli`); withheld capabilities
+(steer, session sharing) stay fail-closed.
 
 Call sites outside a backend's own dialect adapter ask `supports(backend, CAP_X)`
 or `dialect_of(backend)`; they do not compare ids. The module also exports
@@ -278,9 +279,10 @@ the route move with the card. Two conditions shape it:
 - A dashboard change to `agent.acp_backend` refreshes the captured provider
   factory and drains prewarmed providers immediately. Existing sessions keep
   their original backend; sessions created after the change use the new one.
-  Validated against `ACP_BACKENDS_SELECTABLE`; a known-but-unselectable value
-  (KAS) degrades to the default with a logged reason at startup, so the refusal
-  lands where a human is looking rather than on the operator's first message.
+  Validated against `ACP_BACKENDS_SELECTABLE`; an unknown or unselectable
+  persisted value degrades to Kiro with a logged reason at startup (H3), so the
+  refusal lands where a human is looking rather than on the operator's first
+  message.
 - `agent.acp_backend_allow_ungated_tools` (default `false`) is the single named
   opt-out that lets a session start when its tool calls would not reach the
   PreToolUse gate. See [`security.md`](security.md) § "ACP backend tool-gate

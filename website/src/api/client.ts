@@ -1823,7 +1823,8 @@ export const api = {
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
-  models: () => fetch('/api/models').then(j),
+  models: (opts?: { slot?: string }) =>
+    fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
   // `probe=1` asks the Gateway to walk each adapter's resolution ladder. Only
   // the ACP-backends preview surface calls this, so a client that has not opted
   // in never pays for the filesystem scan.

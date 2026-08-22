@@ -134,7 +134,7 @@ export function servesAutoModel(): boolean {
  *
  *  null (not `''`) on absence: defaulting to kiro would let a fresh browser
  *  serve a kiro-stamped cache while a spec adapter is active. */
-function lastKnownBackend(): string | null {
+export function lastKnownBackend(): string | null {
   try {
     if (typeof localStorage === 'undefined') return null
     return localStorage.getItem(LAST_BACKEND_KEY)
@@ -478,9 +478,10 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(): Promise<ModelInfo[]> {
+  async fetchAvailableModels(opts?: { slot?: string }): Promise<ModelInfo[]> {
+    const sessionScoped = !!opts?.slot
     try {
-      const raw = await api.models()
+      const raw = await api.models(opts)
       // TWO shapes, and the shape itself identifies the namespace. The kiro
       // path answers with a BARE ARRAY; a non-kiro backend answers
       // `{models, backend}`. Reading only the array form treated a perfectly
@@ -494,17 +495,23 @@ export class AcpAdapter implements ProviderAdapter {
       }
       const models: unknown = isBare ? raw : envelope.models
       const backend: string = isBare ? '' : String(envelope.backend ?? '')
-      rememberBackend(backend)
-      // `serves_auto` is only meaningful once a response NAMES a non-kiro
-      // backend. An empty `backend` is kiro, which advertises `auto` as a real row
-      // — that covers the bare array and equally a malformed object body (a
-      // `{error}` from the kiro path carries neither field, and reading its absent
-      // flag as a denial would strip kiro's own Auto fallback).
-      rememberServesAuto(backend === '' ? true : envelope.serves_auto === true)
+      // A session-scoped fetch must not stamp the config-namespace cache: an
+      // open kiro chat listed while the default harness is Codex would
+      // otherwise rewrite lastKnown to kiro and flash kiro ids in Settings.
+      if (!sessionScoped) {
+        rememberBackend(backend)
+        // `serves_auto` is only meaningful once a response NAMES a non-kiro
+        // backend. An empty `backend` is kiro, which advertises `auto` as a real row
+        // — that covers the bare array and equally a malformed object body (a
+        // `{error}` from the kiro path carries neither field, and reading its absent
+        // flag as a denial would strip kiro's own Auto fallback).
+        rememberServesAuto(backend === '' ? true : envelope.serves_auto === true)
+      }
       if (!Array.isArray(models) || models.length === 0) {
         // Empty/unusable success: NOT a live list — keep polling, and serve the
         // last-good list only if it belongs to THIS backend's namespace.
         markModelsDegraded(this.id, true)
+        if (sessionScoped) return []
         return readCachedModels(backend) ?? (servesAutoModel() ? this._defaultModels() : [])
       }
       const result = models.map((m: RawModel) => {
@@ -522,7 +529,9 @@ export class AcpAdapter implements ProviderAdapter {
           rateMultiplier: rowMultiplier(m),
         }
       })
-      writeCachedModels(result, backend) // good live list, stamped with its namespace
+      if (!sessionScoped) {
+        writeCachedModels(result, backend) // good live list, stamped with its namespace
+      }
       markModelsDegraded(this.id, false) // live success → self-heal can stop polling
       return result
     } catch (e) {
@@ -543,6 +552,7 @@ export class AcpAdapter implements ProviderAdapter {
       // adapter would resurrect kiro's ids, which is the very confusion the
       // branch above exists to prevent.
       markModelsDegraded(this.id, true)
+      if (sessionScoped) return []
       const named = backendFromErrorBody(e)
       if (named !== null) rememberBackend(named)
       const affirmed = servesAutoFromErrorBody(e)

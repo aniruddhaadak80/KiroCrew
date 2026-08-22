@@ -71,4 +71,22 @@ describe('useAvailableModels placeholder before the first fetch resolves', () =>
     const { result } = renderHook(() => useAvailableModels(), { wrapper })
     await waitFor(() => expect(result.current.map((m) => m.name)).toEqual(['gpt-5-codex']))
   })
+
+  it('does not flash auto after the default harness moves to an adapter', () => {
+    // lastKnown is still kiro (or absent). Showing Auto here is the first-paint
+    // bug: the operator picks the only row and the adapter rejects it.
+    fetchAvailableModels.mockReturnValue(new Promise(() => {}))
+    const { result } = renderHook(() => useAvailableModels({ backend: 'codex' }), { wrapper })
+    expect(result.current).toEqual([])
+  })
+
+  it('scopes the fetch to a live slot so an open chat keeps its own catalog', async () => {
+    fetchAvailableModels.mockResolvedValue([{ name: 'gpt-5.6-sol', description: 'Kiro' }])
+    const { result } = renderHook(
+      () => useAvailableModels({ slot: 'chat-1', backend: '' }),
+      { wrapper },
+    )
+    await waitFor(() => expect(result.current.map((m) => m.name)).toEqual(['gpt-5.6-sol']))
+    expect(fetchAvailableModels).toHaveBeenCalledWith({ slot: 'chat-1' })
+  })
 })
