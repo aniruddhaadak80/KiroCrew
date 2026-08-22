@@ -1348,7 +1348,8 @@ class AgentConfig:
         metadata=_meta(
             "ACP Backend",
             "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, "
-            "or an operator-installed registry adapter ('claude', 'codex', 'goose'). "
+            "or an operator-installed registry adapter "
+            "('claude', 'codex', 'goose', 'opencode', 'pi'). "
             "An adapter whose tool calls cannot be shown to reach Kiro Crew's gate "
             "is refused at session start unless acp_backend_allow_ungated_tools.",
             # Derived, never restated. A hardcoded list here silently froze at
@@ -7423,21 +7424,19 @@ class KiroCrewConfig:
 
         KiroCrew is KiroACP-only: the sole provider is the ACP adapter driving
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
-        create a per-session subdirectory under ``workspace_root()``.
+        create a per-session subdirectory under ``workspace_root()``, and an
+        optional ``acp_backend`` to pin a dedicated child to a live parent
+        harness (``None`` keeps this snapshot; ``""`` is kiro-cli).
         """
         # Both imports are deferred: importing either package runs code that
         # reaches back into config.loader (acp -> client -> session -> loader).
         from kiro_crew.acp import backends as acp_backends
         from kiro_crew.providers.acp import AcpProvider
 
-        acp_backend = self.agent.acp_backend or ""
-        # Resolved once per factory, not per session: the backend cannot change
-        # under a built factory, and a capability lookup raises on an unknown id
-        # which would otherwise surface at session start rather than here.
-        _registry_model_ids = acp_backends.supports(
-            acp_backend, acp_backends.CAP_REGISTRY_MODEL_IDS
-        )
-        _tool_search_supported = acp_backends.supports(acp_backend, acp_backends.CAP_TOOL_SEARCH)
+        factory_backend = self.agent.acp_backend or ""
+        # Capability lookups follow the effective backend of each call. Dedicated
+        # subagent children pass the live parent harness, which can differ from
+        # this snapshot after a Settings switch.
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -7479,8 +7478,13 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            acp_backend: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
+            # None = factory snapshot. "" is kiro-cli and must pin, not fall back.
+            backend = factory_backend if acp_backend is None else acp_backend
+            registry_model_ids = acp_backends.supports(backend, acp_backends.CAP_REGISTRY_MODEL_IDS)
+            tool_search_supported = acp_backends.supports(backend, acp_backends.CAP_TOOL_SEARCH)
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
             # Canonical crew identity for the session (keys per-agent watchdog
             # windows on the handle) — one shared resolution rule, see
@@ -7526,7 +7530,7 @@ class KiroCrewConfig:
             # a backend whose ids are not model_registry keys must receive the
             # value untouched, since translating it would either fold it onto an
             # unrelated kiro model or drop it.
-            if _registry_model_ids:
+            if registry_model_ids:
                 m = model_registry.to_acp_id(m) if m else m
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
@@ -7554,12 +7558,12 @@ class KiroCrewConfig:
                 session_key=session_key,
                 channel_id=channel_id,
                 extra_env=extra_env,
-                acp_backend=acp_backend,
+                acp_backend=backend,
                 effort_per_model=_eff_per_model,
                 # None means "do not write the overlay at all", which is the
                 # correct request for a backend that does not read kiro-cli's
                 # cli.json. Passing False would write an explicit disable.
-                tool_search=(tool_search if _tool_search_supported else None),
+                tool_search=(tool_search if tool_search_supported else None),
                 tool_search_min_pct=tool_search_min_pct,
                 tool_search_min_tokens=tool_search_min_tokens,
                 mcp_gateway_overlay=_gw_overlay,

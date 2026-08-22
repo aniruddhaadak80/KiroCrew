@@ -24,8 +24,12 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_STEER,
+    METHOD_SESSION_STEER,
 )
 
 ALL_BACKENDS = sorted(ACP_BACKENDS_KNOWN)
@@ -68,6 +72,9 @@ def test_kiro_and_kas_share_the_kiro_dialect(tmp_path: Any) -> None:
 def test_both_adapters_are_spec_dialect(tmp_path: Any) -> None:
     assert _client(ACP_BACKEND_CLAUDE, tmp_path)._is_spec_adapter
     assert _client(ACP_BACKEND_CODEX, tmp_path)._is_spec_adapter
+    assert _client(ACP_BACKEND_GOOSE, tmp_path)._is_spec_adapter
+    assert _client(ACP_BACKEND_OPENCODE, tmp_path)._is_spec_adapter
+    assert _client(ACP_BACKEND_PI, tmp_path)._is_spec_adapter
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -76,14 +83,71 @@ def test_supports_steer_is_declared_not_inferred(backend: str, tmp_path: Any) ->
     assert client.supports_steer is backends.supports(backend, CAP_MID_TURN_STEER)
 
 
-def test_unverified_kas_steer_fails_closed(tmp_path: Any) -> None:
-    """Only verified support enables the private mid-turn steer extension."""
+def test_kas_steer_is_verified(tmp_path: Any) -> None:
+    """KAS shares kiro-cli's ``_session/steer``; spec adapters do not."""
     assert _client(ACP_BACKEND_KIRO, tmp_path).supports_steer
-    assert not _client(ACP_BACKEND_KAS, tmp_path).supports_steer
+    assert _client(ACP_BACKEND_KAS, tmp_path).supports_steer
+    assert ACP_BACKEND_KAS in ACP_BACKENDS_STEER
     assert not _client(ACP_BACKEND_CLAUDE, tmp_path).supports_steer
+    assert not _client(ACP_BACKEND_GOOSE, tmp_path).supports_steer
+    assert not _client(ACP_BACKEND_OPENCODE, tmp_path).supports_steer
+    assert not _client(ACP_BACKEND_PI, tmp_path).supports_steer
+    for backend in (
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+    ):
+        assert backend not in ACP_BACKENDS_STEER
 
 
-@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_GOOSE])
+@pytest.mark.asyncio
+async def test_kas_steer_sends_the_measured_method(tmp_path: Any) -> None:
+    """KAS steer writes ``_session/steer`` and does not await a response."""
+    client = _client(ACP_BACKEND_KAS, tmp_path)
+    client._session_id = "kas-session"
+    client._send_request = AsyncMock(return_value=7)
+    assert await client.steer("focus on the tests") is True
+    client._send_request.assert_awaited_once_with(
+        METHOD_SESSION_STEER,
+        {
+            "sessionId": "kas-session",
+            "message": "<user_message>\nfocus on the tests\n</user_message>",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+    ],
+)
+@pytest.mark.asyncio
+async def test_spec_adapter_steer_refuses_without_sending(backend: str, tmp_path: Any) -> None:
+    """A missing ``_session/steer`` is a typed refusal, not a hang."""
+    client = _client(backend, tmp_path)
+    client._session_id = "adapter-session"
+    client._send_request = AsyncMock(return_value=1)
+    assert await client.steer("correct the task") is False
+    client._send_request.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+    ],
+)
 @pytest.mark.asyncio
 async def test_spec_backends_set_model_via_config_option(backend: str, tmp_path: Any) -> None:
     client = _client(backend, tmp_path)

@@ -15,7 +15,13 @@ from typing import Callable
 
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.codex import Verdict
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_GOOSE
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
+)
 
 #: Adapters whose binary resolution Kiro Crew owns, so the doctor can report a
 #: real reading rather than a guess.
@@ -25,11 +31,20 @@ from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKE
 #: is how a doctor row starts asserting a resolution ladder that does not exist.
 #: Membership is a deliberate edit — an adapter joins when Kiro Crew actually
 #: gains a ladder for it, not because it resembles one that has one.
-_ADAPTERS_WITH_OWNED_LADDER = frozenset({ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE})
+_ADAPTERS_WITH_OWNED_LADDER = frozenset(
+    {
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+    }
+)
 
-#: Credential-file reading is a narrower set than binary resolution. Claude and
-#: goose authenticate through a vendor CLI Kiro Crew never reads, so a missing
-#: token file is not a doctor issue there — only Codex has a leaf we can stat.
+#: Credential-file reading is a narrower set than binary resolution. Claude,
+#: goose, OpenCode and pi authenticate through a vendor CLI Kiro Crew never
+#: reads, so a missing token file is not a doctor issue there — only Codex has
+#: a leaf we can stat.
 _ADAPTERS_WITH_OWNED_CREDENTIAL = frozenset({ACP_BACKEND_CODEX})
 
 
@@ -109,6 +124,14 @@ def _resolve_owned_adapter(
         from kiro_crew.acp import goose
 
         return goose.resolve_argv(), goose.missing_adapter_message()
+    if descriptor.id == ACP_BACKEND_OPENCODE:
+        from kiro_crew.acp import opencode
+
+        return opencode.resolve_argv(), opencode.missing_adapter_message()
+    if descriptor.id == ACP_BACKEND_PI:
+        from kiro_crew.acp import pi
+
+        return pi.resolve_argv(), pi.missing_adapter_message()
     return None, ""
 
 
@@ -121,8 +144,9 @@ def _report_signin(
     # Positive membership, same reason as _report_adapter: only an adapter whose
     # credential file Kiro Crew can locate gets a real sign-in reading. Everything
     # else is owned by its vendor CLI, which is the honest answer rather than a
-    # guess dressed as a check. Narrower than the resolution ladder — Claude and
-    # goose resolve a binary we own but authenticate through a CLI we do not read.
+    # guess dressed as a check. Narrower than the resolution ladder — Claude,
+    # goose, OpenCode and pi resolve a binary we own but authenticate through a
+    # CLI we do not read.
     if descriptor.id not in _ADAPTERS_WITH_OWNED_CREDENTIAL:
         emit(f"  sign-in:     ⏹ owned by the vendor CLI ({descriptor.signin_command})")
         return
@@ -200,6 +224,10 @@ def _report_capabilities(backend: str, emit: Callable[[str], None]) -> None:
     emit(f"  capabilities: ⏹ {len(rows)} differ from kiro-cli or are unverified")
     for row in rows:
         emit(f"               - {row}")
+    if backend == ACP_BACKEND_PI:
+        emit("  crew mcp:    ⏹ delivered on session/new; official pi-acp may")
+        emit("               not forward those tools to the model, so spawn")
+        emit("               and Crew tools can stay inert until it does.")
 
 
 __all__ = ["report"]

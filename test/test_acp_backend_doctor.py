@@ -19,6 +19,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
 )
 
 
@@ -273,6 +275,71 @@ class TestGooseRows:
         text, _ = _run(ACP_BACKEND_GOOSE, tmp_path)
         assert "owned by the vendor CLI" in text
         assert "goose configure" in text
+
+    def test_tool_gate_is_routed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.acp.goose.resolve_argv", lambda: ["/usr/local/bin/goose", "acp"]
+        )
+        text, issues = _run(ACP_BACKEND_GOOSE, tmp_path)
+        assert "tool gate:   ✅" in text
+        assert not any("bypass" in i for i in issues)
+
+
+class TestOpenCodeRows:
+    def test_a_missing_adapter_is_an_issue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("kiro_crew.acp.opencode.resolve_argv", lambda: None)
+        text, issues = _run(ACP_BACKEND_OPENCODE, tmp_path)
+        assert "adapter:     ❌" in text
+        assert "npm install" not in text
+        assert any("adapter not found" in i for i in issues)
+
+    def test_a_resolved_adapter_is_not_an_issue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.acp.opencode.resolve_argv",
+            lambda: ["/usr/local/bin/opencode", "acp"],
+        )
+        text, issues = _run(ACP_BACKEND_OPENCODE, tmp_path)
+        assert "/usr/local/bin/opencode" in text
+        assert not any("adapter" in i for i in issues)
+
+    def test_sign_in_is_reported_as_vendor_owned(self, tmp_path: Path) -> None:
+        text, _ = _run(ACP_BACKEND_OPENCODE, tmp_path)
+        assert "owned by the vendor CLI" in text
+        assert "opencode auth login" in text
+
+
+class TestPiRows:
+    def test_a_missing_adapter_is_an_issue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("kiro_crew.acp.pi.resolve_argv", lambda: None)
+        text, issues = _run(ACP_BACKEND_PI, tmp_path)
+        assert "adapter:     ❌" in text
+        assert "pi-acp" in text
+        assert any("adapter not found" in i for i in issues)
+
+    def test_a_resolved_adapter_is_not_an_issue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("kiro_crew.acp.pi.resolve_argv", lambda: ["/usr/local/bin/pi-acp"])
+        text, issues = _run(ACP_BACKEND_PI, tmp_path)
+        assert "/usr/local/bin/pi-acp" in text
+        assert not any("adapter" in i for i in issues)
+
+    def test_sign_in_is_reported_as_vendor_owned(self, tmp_path: Path) -> None:
+        text, _ = _run(ACP_BACKEND_PI, tmp_path)
+        assert "owned by the vendor CLI" in text
+        assert "owned by the vendor CLI (pi)" in text
+
+    def test_crew_mcp_forwarding_is_a_note_not_an_issue(self, tmp_path: Path) -> None:
+        text, issues = _run(ACP_BACKEND_PI, tmp_path)
+        assert "crew mcp:" in text
+        assert "may" in text and "not forward" in text
+        assert not any("forward" in i for i in issues)
 
 
 class TestCapabilityNotes:

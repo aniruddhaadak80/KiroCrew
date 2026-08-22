@@ -35,6 +35,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_KIRO_CREDITS,
 )
 
@@ -78,7 +80,11 @@ class Routing(str, Enum):
     routes filesystem and terminal work back to the client over ``fs/*`` and
     ``terminal/*`` and asks per tool call. The strongest form, because the gate
     adjudicates the operation rather than a request to be told about it, and
-    there is nothing to seed or probe.
+    there is nothing to seed or probe. Unused while those client methods stay
+    unadvertised.
+    PERMISSION_REQUEST: the adapter's ACP path sends ``session/request_permission``
+    for privileged tools even when the client does not serve ``fs/*``. The gate
+    sees the request, not the bytes. Used for goose, OpenCode, and pi.
     UNVERIFIED: Kiro Crew has NOT established how (or whether) this adapter can
     be made to ask. The default for anything discovered through the registry.
     Always resolves INDETERMINATE, so it refuses unless the operator sets the one
@@ -92,6 +98,7 @@ class Routing(str, Enum):
     SESSION_CONFIG = "session_config"
     EXTERNAL_POLICY = "external_policy"
     CLIENT_DELEGATED = "client_delegated"
+    PERMISSION_REQUEST = "permission_request"
     UNVERIFIED = "unverified"
 
 
@@ -242,7 +249,7 @@ _GOOSE = BackendDescriptor(
     label="goose",
     experimental=True,
     dialect=Dialect.SPEC,
-    routing=Routing.UNVERIFIED,
+    routing=Routing.PERMISSION_REQUEST,
     signin_command="goose configure",
     # goose ships its ACP server in the goose binary itself (`goose acp`), so
     # there is no separate adapter package to install — unlike the npx-distributed
@@ -329,6 +336,60 @@ _CODEX = BackendDescriptor(
     },
 )
 
+_OPENCODE = BackendDescriptor(
+    id=ACP_BACKEND_OPENCODE,
+    label="OpenCode",
+    experimental=True,
+    dialect=Dialect.SPEC,
+    routing=Routing.PERMISSION_REQUEST,
+    signin_command="opencode auth login",
+    install_command="",
+    registry_id="opencode",
+    credential_leaves=(),
+    process_markers=("opencode",),
+    permission_config_id="",
+    permission_config_value="",
+    capabilities={
+        CAP_SESSION_SHARING: Level.UNAVAILABLE,
+        CAP_REASONING_EFFORT: Level.UNVERIFIED,
+        CAP_TOOL_SEARCH: Level.UNAVAILABLE,
+        CAP_AGENT_PROFILES: Level.DEGRADED,
+        CAP_SLASH_COMMANDS: Level.DEGRADED,
+        CAP_TURN_USAGE: Level.UNVERIFIED,
+        CAP_BILLING: Level.UNAVAILABLE,
+        CAP_NATIVE_RESUME: Level.UNVERIFIED,
+        CAP_REGISTRY_MODEL_IDS: Level.UNAVAILABLE,
+        CAP_MID_TURN_STEER: Level.UNAVAILABLE,
+    },
+)
+
+_PI = BackendDescriptor(
+    id=ACP_BACKEND_PI,
+    label="pi",
+    experimental=True,
+    dialect=Dialect.SPEC,
+    routing=Routing.PERMISSION_REQUEST,
+    signin_command="pi",
+    install_command="npm install -g pi-acp",
+    registry_id="pi-acp",
+    credential_leaves=(),
+    process_markers=("pi-acp", "pi"),
+    permission_config_id="",
+    permission_config_value="",
+    capabilities={
+        CAP_SESSION_SHARING: Level.UNAVAILABLE,
+        CAP_REASONING_EFFORT: Level.UNAVAILABLE,
+        CAP_TOOL_SEARCH: Level.UNAVAILABLE,
+        CAP_AGENT_PROFILES: Level.DEGRADED,
+        CAP_SLASH_COMMANDS: Level.DEGRADED,
+        CAP_TURN_USAGE: Level.UNVERIFIED,
+        CAP_BILLING: Level.UNAVAILABLE,
+        CAP_NATIVE_RESUME: Level.UNVERIFIED,
+        CAP_REGISTRY_MODEL_IDS: Level.UNAVAILABLE,
+        CAP_MID_TURN_STEER: Level.UNAVAILABLE,
+    },
+)
+
 _KAS = BackendDescriptor(
     id=ACP_BACKEND_KAS,
     label="Kiro Agent Service",
@@ -362,12 +423,13 @@ _KAS = BackendDescriptor(
         # of this row read SUPPORTED because it measured the start arm instead of
         # the advertised capability.
         CAP_SESSION_SHARING: Level.UNAVAILABLE,
-        # Measured, and the reason KAS refuses a custom agent: KAS advertises
-        # only its own built-in modes, and Crew's agent would have to arrive
-        # through _meta.kiro.customAgents on session/new, which is not wired up.
-        # Substituting KAS's default mode for the requested agent would be a
-        # privilege escalation for restricted app and subagent agents.
-        CAP_AGENT_PROFILES: Level.UNAVAILABLE,
+        # Wired: AcpRuntime.create_session / load_session send
+        # ``_meta.kiro.customAgents`` from ``build_kas_custom_agents`` and
+        # activate the injected mode via session/set_mode. DEGRADED because
+        # hooks / slashCommand / toolsSettings have no slot on that wire
+        # schema. Translation failure fails closed (no privilege-escalation
+        # onto KAS's default mode).
+        CAP_AGENT_PROFILES: Level.DEGRADED,
         # These paths currently inherit the kiro runtime arm, but have not been
         # independently measured against KAS. Do not present inheritance as
         # backend evidence.
@@ -376,13 +438,23 @@ _KAS = BackendDescriptor(
         CAP_SLASH_COMMANDS: Level.UNVERIFIED,
         CAP_TURN_USAGE: Level.UNVERIFIED,
         CAP_BILLING: Level.UNVERIFIED,
+        # Handshake ``loadSession`` has not been captured on a live KAS
+        # process. AcpRuntime.load_session is KAS-aware (re-injects custom
+        # agents) and is handshake-gated, but KAS teardown maps to session
+        # delete, so keep / spawn_continue stay fail-closed. Do not mark
+        # SUPPORTED from the kiro-cli front alone.
         CAP_NATIVE_RESUME: Level.UNVERIFIED,
         CAP_REGISTRY_MODEL_IDS: Level.UNVERIFIED,
-        CAP_MID_TURN_STEER: Level.UNVERIFIED,
+        # Measured: default spawn is kiro-cli's ACP surface (same
+        # ``_session/steer``), and KAS emits the steering_* lifecycle
+        # frames Crew already maps. See ACP_BACKENDS_STEER.
+        CAP_MID_TURN_STEER: Level.SUPPORTED,
     },
 )
 
-_BY_ID: dict[str, BackendDescriptor] = {d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _KAS, _GOOSE)}
+_BY_ID: dict[str, BackendDescriptor] = {
+    d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _KAS, _GOOSE, _OPENCODE, _PI)
+}
 
 
 def canonical_backend_id(backend: str) -> str:

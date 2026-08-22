@@ -316,6 +316,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "bypass_stateless",
         "bypass_cwd",
         "bypass_env",
+        "bypass_backend",
         "disabled",
         "other",
     }
@@ -858,6 +859,49 @@ class SessionManager:
         than any live session's backend, matching what the Settings card reports.
         """
         return getattr(self._cfg.agent, "acp_backend", "") or ""
+
+    def live_harness(self, session_key: str) -> tuple[str | None, list[str]]:
+        """The backend and advertised model ids of a LIVE session.
+
+        ``None`` backend means there is no parent to inherit from (no session,
+        or a mock whose ``backend`` is not a string). An empty-string backend
+        is kiro-cli and must be distinguished from that absence — dedicated
+        children pin ``acp_backend=""`` so a Settings switch cannot redirect
+        them onto an adapter.
+
+        Advertised ids come from the same ``available_models`` surface the
+        picker reads. Empty means entitlement unknown, which
+        ``resolve_usable_model`` already treats as inherit-for-auto / trust a
+        concrete pin.
+        """
+        if not session_key:
+            return None, []
+        provider = self.get_provider(session_key)
+        if provider is None:
+            return None, []
+        client = getattr(provider, "client", None) or getattr(provider, "_client", None)
+        backend = getattr(client, "backend", None) if client is not None else None
+        if not isinstance(backend, str):
+            backend = getattr(provider, "backend", None)
+        if not isinstance(backend, str):
+            return None, []
+        raw: object = None
+        models = getattr(provider, "available_models", None)
+        if callable(models):
+            try:
+                raw = models()
+            except Exception:
+                raw = None
+        elif models is not None:
+            raw = models
+        elif client is not None:
+            client_models = getattr(client, "available_models", None)
+            if callable(client_models):
+                try:
+                    raw = client_models()
+                except Exception:
+                    raw = None
+        return backend, advertised_model_ids(raw)
 
     def active_providers(self) -> list[LLMProvider]:
         """Return the providers of all currently-active sessions.
@@ -2701,6 +2745,14 @@ class SessionManager:
             pool_decision = "bypass_cwd"
         elif extra_env:
             pool_decision = "bypass_env"
+        elif (
+            "acp_backend" in extra_factory_kwargs
+            and extra_factory_kwargs["acp_backend"] != self.acp_backend
+        ):
+            # The warm pool was spawned under the factory snapshot. A dedicated
+            # child that pins the live parent harness must not claim a process
+            # for a different backend.
+            pool_decision = "bypass_backend"
         else:
             pool_decision = ""
         pooled = None if pool_decision else await self._drain_and_claim(agent)
@@ -2746,9 +2798,7 @@ class SessionManager:
                         )
                         return _crew, _load_watchdog_settings(_crew)
 
-                    _claim_crew, _claim_wd = await asyncio.to_thread(
-                        _resolve_claim_watchdog
-                    )
+                    _claim_crew, _claim_wd = await asyncio.to_thread(_resolve_claim_watchdog)
                     provider.client.rekey(
                         key,
                         channel_id,
@@ -2850,9 +2900,7 @@ class SessionManager:
                 is_cc_now = (
                     ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider)
                 ) or _is_claude_backend(provider)
-                current_provider = (
-                    PROVIDER_LABEL_CLAUDE if is_cc_now else _provider_label(provider)
-                )
+                current_provider = PROVIDER_LABEL_CLAUDE if is_cc_now else _provider_label(provider)
                 if detect_provider_switch(self._session_map, key, current_provider):
                     resume_sid = None
                     _provider_switched = True
@@ -2867,8 +2915,29 @@ class SessionManager:
                 )
 
                 if isinstance(provider, AcpProvider):
-                    provider.client.set_resume_session_id(resume_sid)
-                    logger.info("Attempting session/load for %s (sid=%s)", key, resume_sid)
+                    from kiro_crew.acp.backends import (
+                        CAP_NATIVE_RESUME,
+                        Level,
+                        descriptor_for,
+                        level as cap_level,
+                    )
+
+                    backend = provider.client.backend
+                    if cap_level(backend, CAP_NATIVE_RESUME) is Level.UNAVAILABLE:
+                        # goose handshake has no resume/fork. Skip the load
+                        # that cannot work and replay Crew's transcript the
+                        # same way a provider switch does — do not start a
+                        # blank child that looks like a resume.
+                        logger.info(
+                            "Skipping session/load for %s: native resume is " "unavailable on %s",
+                            key,
+                            descriptor_for(backend).label,
+                        )
+                        resume_sid = None
+                        _provider_switched = True
+                    else:
+                        provider.client.set_resume_session_id(resume_sid)
+                        logger.info("Attempting session/load for %s (sid=%s)", key, resume_sid)
                 elif ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
                     provider.set_resume_session_id(resume_sid)
                     logger.info("CC resume for %s (sid=%s)", key, resume_sid)
@@ -2991,9 +3060,7 @@ class SessionManager:
                         approval_policy=approval_policy,
                         agent=agent or "",
                     )
-                    _replay_needed = (
-                        getattr(provider, "_history_replay_needed", False) is True
-                    )
+                    _replay_needed = getattr(provider, "_history_replay_needed", False) is True
                     if _provider_switched or _replay_needed:
                         # provider_switch_replay OR F2 load-recovery fell back to
                         # a fresh native session (stale lock never cleared):

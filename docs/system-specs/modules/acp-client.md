@@ -26,7 +26,7 @@ tree, which rode eight of the eleven. Converted sites:
 | `_is_kiro` | `session/set_mode` (the only site that hard-raises), the kiro session-file `_meta`, the transcript JSONL seek, advertised-model entitlement pre-checks, the `cli.json` effort and Tool Search overlays |
 | `_is_spec_adapter` | integer `protocolVersion`, model via `set_config_option`, `mcpServers` carried in session params, the reduced stdio key set, the spec-adapter capability set |
 | `CAP_SESSION_SHARING` | `AcpProvider.start()`'s runtime-vs-client arm AND `is_session_sharing_eligible` — `start()` reads the property so the two cannot disagree; `AcpRuntime.spawn()` raises for a backend without the capability |
-| `CAP_MID_TURN_STEER` | `supports_steer` |
+| `CAP_MID_TURN_STEER` | `supports_steer` — members are kiro-cli and KAS. `steer()` returns False without sending `_session/steer` on any other harness. `steer_run` then queues follow-up and names the harness rather than hanging. |
 | backend id | `wrap_argv(is_kiro_cli=...)` — names the BINARY, not the dialect: the flag drives macOS delegation to kiro-cli's own internal sandbox, and KAS speaks kiro's dialect but is a Node process with no such sandbox to defer to |
 
 **Spec-adapter client capabilities.** `ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER` is
@@ -44,6 +44,29 @@ override, then `codex-acp` via mise and the augmented PATH. There is deliberatel
 starting an ACP server, so that fallback spawns an ordinary chat turn against the
 operator's subscription and then fails as a handshake timeout. Only success is
 memoised, so installing the adapter needs no gateway restart.
+
+**goose / OpenCode / pi resolution.** Each has its own resolver and a positive
+`_spawn` arm; none of them widen the kiro fall-through.
+
+- goose (`acp/goose.py`): `GOOSE_BIN`, then `mise which goose`, then the
+  augmented PATH. Argv is `[bin, "acp"]`. goose serves ACP from its own
+  binary; there is no npm adapter. Routing is `PERMISSION_REQUEST` — privileged
+  tools arrive as `session/request_permission`. File I/O stays in-process
+  because we do not advertise `fs/*`.
+- OpenCode (`acp/opencode.py`): `OPENCODE_BIN`, then mise, then PATH. Argv is
+  `[bin, "acp"]`. Binary distribution; `install_command` is empty. The ACP path
+  sends `session/request_permission`, which is what makes it ROUTED. Operator
+  config `permission: allow` / `--auto` can bypass that — Kiro Crew does **not**
+  seed OpenCode settings (`SEEDED_SETTINGS` / `claude.ensure_routed_settings`
+  stay Claude-only).
+- pi (`acp/pi.py`): `PI_ACP_BIN`, then mise, then PATH for the `pi-acp` binary.
+  Argv is `[bin]` only — there is no `pi acp` subcommand, and launching that
+  would not start an ACP server. Persist `pi`; the registry spelling `pi-acp`
+  canonicalises onto it. Official `pi-acp` accepts `mcpServers` on
+  `session/new` but may not wire them through to the pi agent. Crew still
+  delivers `kirocrew-core` / `kirocrew-cron` when ROUTED (same contract as
+  other spec adapters); those tools may stay inert until the adapter forwards
+  MCP. Do not treat Crew MCP as verified on Pi.
 
 ## Backend Selection (per-backend subprocess)
 
@@ -188,13 +211,18 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
     managed servers into `session/new` / `session/load` on the KAS arm only
     (same `spec_servers` shaping: gate honoured, `opt_in` withheld, user
     servers never transmitted). The kiro runtime path is unchanged.
-  - **Spec adapters** (claude / Codex / a ROUTED registry adapter): they read
+  - **Spec adapters** (claude / Codex / goose / OpenCode / pi / a ROUTED
+    registry adapter): they read
     no Kiro Crew config, so `session/new` / `session/load` carry Crew's own
     managed servers (`kirocrew-core`, `kirocrew-cron`, and `kirocrew-computer`
     when its spec gate is open) via `acp/spec_servers.py`. User-configured
     servers are never transmitted — their `env` routinely holds secrets.
-    Delivery requires a `ROUTED` verdict: an UNVERIFIED adapter (goose today)
-    starts without Crew's control plane. Each delivered entry is pinned with
+    Delivery requires a `ROUTED` verdict. goose, OpenCode, and pi are
+    `PERMISSION_REQUEST` and therefore receive Crew servers without the
+    ungated-tools opt-out. An UNVERIFIED registry adapter still starts without
+    Crew's control plane. Official `pi-acp` may accept the `mcpServers` array
+    without forwarding it to the pi agent — Crew still delivers; the tools may
+    stay inert until the adapter wires MCP through. Each delivered entry is pinned with
     `KIROCREW_SESSION_KEY` / `KIROCREW_BOUND_PORT` because adapter-spawned
     stdio children often inherit only the declared env; without that pin
     `workflow_run` misses the loopback and `ask_question` cannot attribute
@@ -258,6 +286,13 @@ attempts `session/load` instead of `session/new`:
 
 The resume ID is consumed on attempt (no retry loop). After successful load,
 `client.resumed` returns `True` — callers use this to skip thread history injection.
+A harness whose `CAP_NATIVE_RESUME` is `UNAVAILABLE` (goose: handshake has no
+resume/fork) never sends `session/load`, even if `agentCapabilities.loadSession`
+is true. Regular chat then replays Crew's transcript the same way a provider
+switch does. `spawn_continue` / `keep` still fail closed on `resume_failed`
+so a follow-up cannot run on a blank child. OpenCode, pi, and KAS stay
+`UNVERIFIED` — handshake-gated load is attempted when advertised; KAS
+teardown still maps to session delete, so sharing stays fail-closed.
 
 Step 3 (`set_mode`) is **conditional**: sent for all kiro-cli backend agents.
 Skipped for claude-agent-acp backend (which does not support set_mode).

@@ -3,8 +3,11 @@
 A *harness* is the agent process Kiro Crew drives over ACP. Kiro Crew has one
 first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled `""`) — and a
 growing set of adapted ones: the `ACP_BACKEND_CLAUDE` and `ACP_BACKEND_CODEX`
-registry adapters, goose (`ACP_BACKEND_GOOSE`), `KAS` (`ACP_BACKEND_KAS`), and
-whatever a bring-your-own (BYO) adapter registers next.
+registry adapters, goose (`ACP_BACKEND_GOOSE`), OpenCode
+(`ACP_BACKEND_OPENCODE`), pi (`ACP_BACKEND_PI`), `KAS` (`ACP_BACKEND_KAS`), and
+whatever a bring-your-own (BYO) adapter registers next. They ADAPT: none of
+them widen the Kiro spawn path, inherit steer, native session sharing, or the
+internal-sandbox seatbelt waiver.
 
 *Parity* here does not mean equal treatment. It means the opposite, stated
 precisely: **an added harness may only adapt itself to the seams the Kiro
@@ -67,10 +70,13 @@ harness is treated as Kiro.
 | H7 | `is_kiro_cli` is a positive Kiro test at every call site. It drives a macOS delegation in which `sandbox.wrap_argv` skips Kiro Crew's own seatbelt because `kiro-cli`'s internal sandbox cannot nest inside it. Passed for a harness with no internal sandbox, it hands isolation to a layer that never starts. This one fails open into an unconfined agent process, which is why it is the only Group B row that is also a security invariant. A spawn site may grant membership explicitly or pass `None` to defer to `_spawns_kiro_cli`'s argv-basename test — both are positive Kiro tests, and the deferral is what classifies a backend whose spawn SHAPE varies (cli-fronted KAS launches `kiro-cli` itself, whose internal sandbox does start and covers its children; the direct Node shape reads as not-kiro and keeps the seatbelt). | `test_harness_parity.py::test_is_kiro_cli_is_positive` | `acp/runtime.py` (`AcpRuntime.spawn`), `acp/client.py` (`AcpClient.ensure_ready`), `sandbox.py` (`wrap_argv`, `_spawns_kiro_cli`) |
 | H8 | New harness identifiers live in `acp/types.py` and are added to `ACP_BACKENDS_KNOWN`; every capability set is a subset of it (the check DISCOVERS the sets from the module, so one added and forgotten is still covered); and `AcpProvider.__init__` rejects anything outside it. `ACP_BACKEND_KIRO` is the empty string, so a value that falls through every identity check spawns `kiro-cli` under a foreign label. | `test_harness_parity.py::test_capability_sets_are_subsets_of_known_backends`, `::test_unknown_backend_rejected_at_construction` | `acp/types.py` (`ACP_BACKENDS_KNOWN`), `providers/acp.py` (`AcpProvider.__init__`) |
 
-`ACP_BACKENDS_STEER` is `{ACP_BACKEND_KIRO}` only. KAS is not a member until
-steer is independently measured — a behavior change versus older main, fail-closed
-on purpose. `test/test_harness_parity.py` pins
-`ACP_BACKEND_KAS not in ACP_BACKENDS_STEER`.
+`ACP_BACKENDS_STEER` is `{ACP_BACKEND_KIRO, ACP_BACKEND_KAS}`. KAS is a member
+because the default spawn is `kiro-cli acp --agent-engine v3` (kiro-cli's ACP
+surface, same `_session/steer` method) and KAS emits the matching lifecycle
+frames (`steering_queued` / `steering_injected` / `steering_cleared`) that
+Crew already maps. Spec adapters stay out. `test/test_harness_parity.py` and
+`test/test_acp_backend_dialect_parity.py` pin the membership plus the
+measured contract (method sent, missing method refuses without hanging).
 
 ## Group C: the Kiro path keeps its own machinery
 

@@ -14,12 +14,14 @@ from unittest.mock import patch
 
 import pytest
 
-from kiro_crew.acp import backends, goose
+from kiro_crew.acp import backends, goose, opencode, pi
 from kiro_crew.acp._dispatch import parse_usage_cost
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_CLIENT_CAPABILITIES,
     ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
 )
@@ -66,6 +68,80 @@ class TestGooseResolver:
         assert "goose acp" in message
 
 
+class TestOpenCodeResolver:
+    def test_argv_is_the_binary_plus_the_acp_subcommand(self, tmp_path: Path) -> None:
+        fake = tmp_path / "opencode"
+        fake.write_text("#!/bin/sh\n")
+        fake.chmod(0o755)
+        with patch.dict("os.environ", {"OPENCODE_BIN": str(fake)}):
+            argv = opencode.resolve_argv()
+        assert argv == [str(fake), "acp"]
+
+    def test_a_non_executable_hit_is_skipped(self, tmp_path: Path) -> None:
+        fake = tmp_path / "opencode"
+        fake.write_text("not executable")
+        fake.chmod(0o644)
+        with patch.dict("os.environ", {"OPENCODE_BIN": str(fake)}, clear=False):
+            with patch("kiro_crew.acp.client._mise_which", return_value=None):
+                with patch("kiro_crew.acp.client._ordered_path_matches", return_value=[]):
+                    assert opencode.resolve_argv() is None
+
+    def test_a_stale_override_falls_through_rather_than_spawning_it(self, tmp_path: Path) -> None:
+        with patch.dict("os.environ", {"OPENCODE_BIN": str(tmp_path / "absent")}):
+            with patch("kiro_crew.acp.client._mise_which", return_value=None):
+                with patch("kiro_crew.acp.client._ordered_path_matches", return_value=[]):
+                    assert opencode.resolve_argv() is None
+
+    def test_a_failed_resolution_is_not_cached(self) -> None:
+        opencode._argv_cache = opencode._UNRESOLVED
+        with patch.object(opencode, "resolve_argv", return_value=None):
+            assert opencode.resolve_argv_cached() is None
+        assert opencode._argv_cache is opencode._UNRESOLVED
+
+    def test_the_missing_message_names_opencode_acp_and_not_an_npm_package(self) -> None:
+        message = opencode.missing_adapter_message()
+        assert "npm install" not in message
+        assert "opencode acp" in message
+
+
+class TestPiResolver:
+    def test_argv_is_the_binary_only_with_no_acp_subcommand(self, tmp_path: Path) -> None:
+        """``pi acp`` is not an ACP server; the adapter is the ``pi-acp`` binary."""
+        fake = tmp_path / "pi-acp"
+        fake.write_text("#!/bin/sh\n")
+        fake.chmod(0o755)
+        with patch.dict("os.environ", {"PI_ACP_BIN": str(fake)}):
+            argv = pi.resolve_argv()
+        assert argv == [str(fake)]
+        assert "acp" not in argv
+
+    def test_a_non_executable_hit_is_skipped(self, tmp_path: Path) -> None:
+        fake = tmp_path / "pi-acp"
+        fake.write_text("not executable")
+        fake.chmod(0o644)
+        with patch.dict("os.environ", {"PI_ACP_BIN": str(fake)}, clear=False):
+            with patch("kiro_crew.acp.client._mise_which", return_value=None):
+                with patch("kiro_crew.acp.client._ordered_path_matches", return_value=[]):
+                    assert pi.resolve_argv() is None
+
+    def test_a_stale_override_falls_through_rather_than_spawning_it(self, tmp_path: Path) -> None:
+        with patch.dict("os.environ", {"PI_ACP_BIN": str(tmp_path / "absent")}):
+            with patch("kiro_crew.acp.client._mise_which", return_value=None):
+                with patch("kiro_crew.acp.client._ordered_path_matches", return_value=[]):
+                    assert pi.resolve_argv() is None
+
+    def test_a_failed_resolution_is_not_cached(self) -> None:
+        pi._argv_cache = pi._UNRESOLVED
+        with patch.object(pi, "resolve_argv", return_value=None):
+            assert pi.resolve_argv_cached() is None
+        assert pi._argv_cache is pi._UNRESOLVED
+
+    def test_the_missing_message_names_pi_acp_and_its_npm_package(self) -> None:
+        message = pi.missing_adapter_message()
+        assert "pi-acp" in message
+        assert "npm install" in message
+
+
 class TestSpawnResolvesEachBackendsOwnArgv:
     """The bug this exists for: codex and goose silently launching kiro-cli."""
 
@@ -74,6 +150,8 @@ class TestSpawnResolvesEachBackendsOwnArgv:
         [
             (ACP_BACKEND_CODEX, "kiro_crew.acp.codex", "resolve_argv_cached"),
             (ACP_BACKEND_GOOSE, "kiro_crew.acp.goose", "resolve_argv_cached"),
+            (ACP_BACKEND_OPENCODE, "kiro_crew.acp.opencode", "resolve_argv_cached"),
+            (ACP_BACKEND_PI, "kiro_crew.acp.pi", "resolve_argv_cached"),
         ],
     )
     def test_each_adapter_has_a_resolver_the_spawn_can_call(
@@ -103,6 +181,8 @@ class TestSpawnResolvesEachBackendsOwnArgv:
         source = inspect.getsource(AcpClient._spawn)
         assert "ACP_BACKEND_CODEX" in source
         assert "ACP_BACKEND_GOOSE" in source
+        assert "ACP_BACKEND_OPENCODE" in source
+        assert "ACP_BACKEND_PI" in source
         assert "resolve_argv_cached" in source
 
     def test_kiro_remains_the_final_fallthrough(self) -> None:

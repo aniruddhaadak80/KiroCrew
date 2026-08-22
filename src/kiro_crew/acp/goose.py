@@ -12,10 +12,9 @@ so there is no interpreter whose version could silently mismatch.
 Contrast with the codex module's warning about ``codex acp``: for the Codex CLI the
 ``acp`` subcommand does NOT serve the protocol and burns a billed turn instead. For
 goose it genuinely is the ACP server — the goose docs describe the client running
-``goose acp`` over stdio. The shipped binary contains ACP filesystem and terminal
-method names, but Kiro Crew does not yet implement those server-to-client callbacks.
-The backend therefore remains fail-closed under
-:data:`~kiro_crew.acp.backends.Routing.UNVERIFIED`.
+``goose acp`` over stdio. The shipped binary contains ACP filesystem and terminal method names, but Kiro
+Crew does not advertise those client methods. Privileged tools still go through
+``session/request_permission``, which is :data:`~kiro_crew.acp.backends.Routing.PERMISSION_REQUEST`.
 """
 
 from __future__ import annotations

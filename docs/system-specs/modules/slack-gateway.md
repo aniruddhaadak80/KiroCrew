@@ -175,6 +175,11 @@ Each channel can have its own activation mode controlling when the bot responds:
 #### Slash Command (`events.py`)
 
 Command name configurable via `slack.command` in config (default: `kirocrew`).
+Slack sessions use the same ACP client as the dashboard. On a spec adapter,
+slash text is injected as a prompt (DEGRADED; no `session/set_mode`), approvals
+go through `session/request_permission`, and a mid-turn message waits on the
+session semaphore rather than `_session/steer`. Crew MCP tools are delivered
+when ROUTED; they stay inert if the adapter does not forward `mcpServers` (Pi).
 
 | Command | Handler | Purpose |
 |---------|---------|---------|

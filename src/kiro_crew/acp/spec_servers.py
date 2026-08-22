@@ -1,7 +1,8 @@
 """Shaping Kiro Crew's own MCP servers for a public-ACP-spec adapter.
 
 kiro-cli receives Crew's servers through its ``--agent`` spec, which it reads off
-disk. A spec adapter (claude-agent-acp, codex-acp, ``goose acp``) reads no Kiro
+disk. A spec adapter (claude-agent-acp, codex-acp, ``goose acp``,
+``opencode acp``, ``pi-acp``) reads no Kiro
 Crew config at all, so the only channel is the ``mcpServers`` array on
 ``session/new`` / ``session/load``. Without it the crew is present but INERT: no
 memory, no cron, no spawn, no artifacts, no learn — a bare vendor agent with Kiro

@@ -16,6 +16,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SELECTABLE,
 )
@@ -182,6 +184,44 @@ class TestDescriptorPayload:
         monkeypatch.setattr(goose_mod, "resolve_argv_cached", boom)
         assert handler._probe_installed(ACP_BACKEND_GOOSE) == "unknown"
 
+    def test_opencode_probe_answers_through_the_spawn_resolver(self, monkeypatch) -> None:
+        import kiro_crew.acp.opencode as opencode_mod
+
+        monkeypatch.setattr(
+            opencode_mod, "resolve_argv_cached", lambda: ["/usr/bin/opencode", "acp"]
+        )
+        assert handler._probe_installed(ACP_BACKEND_OPENCODE) == "installed"
+
+        monkeypatch.setattr(opencode_mod, "resolve_argv_cached", lambda: None)
+        assert handler._probe_installed(ACP_BACKEND_OPENCODE) == "missing"
+
+    def test_opencode_probe_never_says_missing_on_a_failed_check(self, monkeypatch) -> None:
+        import kiro_crew.acp.opencode as opencode_mod
+
+        def boom() -> list[str]:
+            raise OSError("PATH unreadable")
+
+        monkeypatch.setattr(opencode_mod, "resolve_argv_cached", boom)
+        assert handler._probe_installed(ACP_BACKEND_OPENCODE) == "unknown"
+
+    def test_pi_probe_answers_through_the_spawn_resolver(self, monkeypatch) -> None:
+        import kiro_crew.acp.pi as pi_mod
+
+        monkeypatch.setattr(pi_mod, "resolve_argv_cached", lambda: ["/usr/bin/pi-acp"])
+        assert handler._probe_installed(ACP_BACKEND_PI) == "installed"
+
+        monkeypatch.setattr(pi_mod, "resolve_argv_cached", lambda: None)
+        assert handler._probe_installed(ACP_BACKEND_PI) == "missing"
+
+    def test_pi_probe_never_says_missing_on_a_failed_check(self, monkeypatch) -> None:
+        import kiro_crew.acp.pi as pi_mod
+
+        def boom() -> list[str]:
+            raise OSError("PATH unreadable")
+
+        monkeypatch.setattr(pi_mod, "resolve_argv_cached", boom)
+        assert handler._probe_installed(ACP_BACKEND_PI) == "unknown"
+
     def test_install_command_is_present_for_adapter_backends(self) -> None:
         """An adapter the operator must install has to say how.
 
@@ -214,9 +254,24 @@ class TestDescriptorPayload:
         for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
             assert handler._descriptor_payload(backend)["install_command"] == ""
 
+    def test_binary_distributed_adapters_carry_no_install_command(self) -> None:
+        """goose and OpenCode ship as their own binaries, like a host install."""
+        for backend in (ACP_BACKEND_GOOSE, ACP_BACKEND_OPENCODE):
+            assert handler._descriptor_payload(backend)["install_command"] == ""
+
+    def test_pi_install_command_names_the_npm_adapter(self) -> None:
+        assert handler._descriptor_payload(ACP_BACKEND_PI)["install_command"] == (
+            "npm install -g pi-acp"
+        )
+
     def test_signin_commands_are_backend_specific(self) -> None:
         assert handler._descriptor_payload(ACP_BACKEND_CODEX)["signin_command"] == "codex login"
         assert handler._descriptor_payload(ACP_BACKEND_KIRO)["signin_command"] == "kiro-cli login"
+        assert (
+            handler._descriptor_payload(ACP_BACKEND_OPENCODE)["signin_command"]
+            == "opencode auth login"
+        )
+        assert handler._descriptor_payload(ACP_BACKEND_PI)["signin_command"] == "pi"
 
     def test_both_adapters_report_the_spec_dialect(self) -> None:
         assert handler._descriptor_payload(ACP_BACKEND_CLAUDE)["dialect"] == "spec"

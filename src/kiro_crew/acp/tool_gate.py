@@ -79,6 +79,17 @@ def resolve_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
         # the gate adjudicates the operation, not a notification about it.
         return (Verdict.ROUTED, "the adapter delegates file and terminal work")
 
+    if descriptor.routing is acp_backends.Routing.PERMISSION_REQUEST:
+        # goose / OpenCode / pi send session/request_permission for privileged
+        # tools on the ACP path. We do not advertise fs/* or terminal/*, so file
+        # I/O stays in the adapter; the permission frame is still what reaches
+        # HookManager.on_tool_call. Structural, like CLIENT_DELEGATED, without
+        # claiming we serve those client methods.
+        return (
+            Verdict.ROUTED,
+            "the adapter asks per privileged tool via session/request_permission",
+        )
+
     if descriptor.routing is acp_backends.Routing.UNVERIFIED:
         # Everything discovered through the registry lands here until someone
         # establishes how it can be made to ask. INDETERMINATE, never BYPASSED:

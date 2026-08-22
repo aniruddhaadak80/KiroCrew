@@ -44,6 +44,11 @@ METHOD_SESSION_UPDATE = "session/update"
 METHOD_METADATA = "_kiro.dev/metadata"
 METHOD_COMMANDS_EXECUTE = "_kiro.dev/commands/execute"
 METHOD_SESSION_LOAD = "session/load"
+#: Mid-turn steer. kiro-cli and KAS (kiro-cli-fronted, plus KAS's own
+#: ``steering_*`` lifecycle echoes) implement this extension. Spec adapters
+#: do not — callers must read ``supports_steer`` and degrade to follow-up
+#: rather than sending a method the adapter cannot answer.
+METHOD_SESSION_STEER = "_session/steer"
 # kiro-cli extension: evict a session from the multiplexed process, freeing its
 # transcript/context + reaping its MCP children. Without this the shared
 # kiro-cli process retains every session's state for its whole lifetime, so RSS
@@ -127,6 +132,10 @@ ACP_BACKEND_CODEX = "codex"
 # so Kiro Crew's PreToolUse gate sees the operations themselves, not just a
 # request to be told about them afterwards.
 ACP_BACKEND_GOOSE = "goose"
+# OpenCode through its own ``opencode acp`` server (binary distribution).
+ACP_BACKEND_OPENCODE = "opencode"
+# pi through the registry ``pi-acp`` adapter (npx / global ``pi-acp``).
+ACP_BACKEND_PI = "pi"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -140,6 +149,8 @@ ACP_BACKENDS_KNOWN = frozenset(
         ACP_BACKEND_KAS,
         ACP_BACKEND_CODEX,
         ACP_BACKEND_GOOSE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
     }
 )
 # What an operator may actually persist in ``agent.acp_backend``, which is a
@@ -150,9 +161,8 @@ ACP_BACKENDS_KNOWN = frozenset(
 #
 # Membership means an operator may persist the value. Routing is a separate
 # axis on the descriptor: ``Routing.UNVERIFIED`` still refuses at session start
-# unless the operator sets the one named opt-out. Goose is selectable and
-# unverified at once; collapsing those would make the picker look like a
-# guarantee that the gate is armed.
+# unless the operator sets the one named opt-out. Collapsing those would make
+# the picker look like a guarantee that the gate is armed.
 #
 # Each backend now resolves its OWN spawn argv — ``AcpClient._spawn`` dispatches on
 # a positive backend id per adapter, with kiro remaining the trailing fall-through.
@@ -173,11 +183,9 @@ ACP_BACKENDS_KNOWN = frozenset(
 #           ``filterEscalatingDefaultMode`` cannot discard it. Read from the
 #           installed adapter, not observed as a permission prompt — and the SDK
 #           marks those functions ``@alpha``, so a release could move this.
-#   goose   the shipped 1.46.0 binary carries fs/read_text_file,
-#           fs/write_text_file, the four terminal/* methods and
-#           session/request_permission, plus a goose::acp::fs::acp_read_text_file
-#           symbol — so it delegates rather than acting in-process. Structural,
-#           needing no seed or probe, but likewise never observed in flight.
+#   goose   session/request_permission for privileged tools. File I/O stays
+#           in-process because we do not advertise fs/*; permission still
+#           applies. OpenCode and pi use the same permission-request routing.
 ACP_BACKENDS_SELECTABLE = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -185,6 +193,8 @@ ACP_BACKENDS_SELECTABLE = frozenset(
         ACP_BACKEND_CODEX,
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_GOOSE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
     }
 )
 
@@ -207,10 +217,13 @@ ACP_BACKENDS_SELECTABLE = frozenset(
 # session) and is not a member.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO})
 
-# Backends verified to implement the ``_session/steer`` extension. KAS speaks
-# the Kiro dialect but has not been measured for this extension, so it remains
-# fail-closed until verified.
-ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO})
+# Backends verified to implement the ``_session/steer`` extension. KAS is a
+# member because (1) the default spawn is ``kiro-cli acp --agent-engine v3``,
+# which is kiro-cli's ACP surface (the same method), and (2) KAS emits the
+# matching lifecycle frames Crew already maps (``steering_queued`` /
+# ``steering_injected`` / ``steering_cleared`` on ``session_info_update``).
+# Spec adapters are not members and must not inherit this from a negation.
+ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips
@@ -287,6 +300,8 @@ PROVIDER_LABEL_CLAUDE = "claude_code"
 PROVIDER_LABEL_KAS = "kas"
 PROVIDER_LABEL_CODEX = "codex"
 PROVIDER_LABEL_GOOSE = "goose"
+PROVIDER_LABEL_OPENCODE = "opencode"
+PROVIDER_LABEL_PI = "pi"
 
 # Labels of backends that speak the public ACP spec rather than kiro's dialect.
 # They read no Kiro Crew agent config, so anything kiro-cli would have loaded from
@@ -294,7 +309,13 @@ PROVIDER_LABEL_GOOSE = "goose"
 # the prompt instead. Keyed on the LABEL because the consumers are context
 # builders that receive a provider_type string, not a live client.
 SPEC_ADAPTER_PROVIDER_LABELS = frozenset(
-    {PROVIDER_LABEL_CLAUDE, PROVIDER_LABEL_CODEX, PROVIDER_LABEL_GOOSE}
+    {
+        PROVIDER_LABEL_CLAUDE,
+        PROVIDER_LABEL_CODEX,
+        PROVIDER_LABEL_GOOSE,
+        PROVIDER_LABEL_OPENCODE,
+        PROVIDER_LABEL_PI,
+    }
 )
 REGISTRY_PROVIDER_LABEL_PREFIX = "acp:"
 
@@ -316,6 +337,8 @@ PROVIDER_LABELS_BY_BACKEND = {
     ACP_BACKEND_KAS: PROVIDER_LABEL_KAS,
     ACP_BACKEND_CODEX: PROVIDER_LABEL_CODEX,
     ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
+    ACP_BACKEND_OPENCODE: PROVIDER_LABEL_OPENCODE,
+    ACP_BACKEND_PI: PROVIDER_LABEL_PI,
 }
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top

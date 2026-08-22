@@ -1740,7 +1740,9 @@ class TestRelease:
         mgr.release("nonexistent")  # should not raise
 
     @pytest.mark.asyncio
-    async def test_stray_release_after_reset_does_not_over_permit_the_replacement(self, cfg, caplog):
+    async def test_stray_release_after_reset_does_not_over_permit_the_replacement(
+        self, cfg, caplog
+    ):
         """A failure-handling caller that still holds session A's semaphore may
         call ``reset(key)`` (as ``record_failure`` does) before its own
         ``finally`` reaches ``release(key)``. ``reset`` pops the session object
@@ -1761,7 +1763,9 @@ class TestRelease:
         await mgr.reset("A")  # e.g. record_failure's circuit-breaker path
         assert "A" not in mgr._sessions  # session-1 discarded; semaphore never released
 
-        await mgr.get_or_create("A")  # a concurrent caller 2: registers session-2, holds ITS semaphore
+        await mgr.get_or_create(
+            "A"
+        )  # a concurrent caller 2: registers session-2, holds ITS semaphore
         session_2 = mgr._sessions["A"]
         assert session_2.semaphore.locked()
         mgr.release("A")  # caller 2's OWN legitimate finally, already run
@@ -3791,6 +3795,74 @@ class TestGetOrCreatePoolClaim:
             mgr.release("dashboard:slot2")
         assert is_new is True
         assert mgr.has_session("dashboard:slot2")
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_foreign_backend_does_not_claim_the_pool(self, cfg):
+        """A dedicated child pinned to goose must not inherit a kiro pool process."""
+        from kiro_crew.acp.types import ACP_BACKEND_GOOSE
+        from kiro_crew.providers.acp import AcpProvider
+
+        cfg.session.pool_size = 1
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._pool_size = 1
+        mgr._pool_agent = "kirocrew"
+
+        mock_pooled = AsyncMock(spec=AcpProvider)
+        mock_pooled.start = AsyncMock()
+        mock_pooled.shutdown = AsyncMock()
+        mock_pooled.context_usage_pct = lambda: 0.0
+        mock_pooled.is_process_alive = lambda: True
+        mock_pooled.client = AsyncMock()
+        mock_pooled.client._model = "claude-opus-4"
+        mock_pooled.client._agent = "kirocrew"
+        mock_pooled.client._session_id = None
+        mock_pooled.client.rekey = lambda *a, **kw: None
+        mock_pooled.client.resumed = False
+
+        mgr._warm_pool.put_nowait((mock_pooled, time.monotonic()))
+        with patch.object(mgr, "_record_pool_decision") as record:
+            provider, is_new, _ = await mgr.get_or_create(
+                "dashboard:slot1", agent="kirocrew", acp_backend=ACP_BACKEND_GOOSE
+            )
+        mgr.release("dashboard:slot1")
+        assert provider is not mock_pooled
+        assert is_new is True
+        assert mgr._warm_pool.qsize() == 1
+        record.assert_called_once()
+        assert record.call_args.args[0] == "bypass_backend"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_matching_backend_override_still_claims_the_pool(self, cfg):
+        """Pinning the factory snapshot (kiro ``""``) is not a foreign harness."""
+        from kiro_crew.acp.types import ACP_BACKEND_KIRO
+        from kiro_crew.providers.acp import AcpProvider
+
+        cfg.session.pool_size = 1
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._pool_size = 1
+        mgr._pool_agent = "kirocrew"
+
+        mock_pooled = AsyncMock(spec=AcpProvider)
+        mock_pooled.start = AsyncMock()
+        mock_pooled.shutdown = AsyncMock()
+        mock_pooled.context_usage_pct = lambda: 0.0
+        mock_pooled.is_process_alive = lambda: True
+        mock_pooled.client = AsyncMock()
+        mock_pooled.client._model = "claude-opus-4"
+        mock_pooled.client._agent = "kirocrew"
+        mock_pooled.client._session_id = None
+        mock_pooled.client.rekey = lambda *a, **kw: None
+        mock_pooled.client.resumed = False
+
+        mgr._warm_pool.put_nowait((mock_pooled, time.monotonic()))
+        provider, is_new, _ = await mgr.get_or_create(
+            "dashboard:slot1", agent="kirocrew", acp_backend=ACP_BACKEND_KIRO
+        )
+        mgr.release("dashboard:slot1")
+        assert provider is mock_pooled
+        assert is_new is True
         await mgr.close_all()
 
 

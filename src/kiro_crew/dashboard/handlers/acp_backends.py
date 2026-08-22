@@ -20,6 +20,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
 )
 from kiro_crew.dashboard.handlers.kiro_prerequisite import _is_dashboard_owner
 
@@ -63,6 +65,14 @@ def _probe_installed(backend: str) -> str:
             from kiro_crew.acp import goose
 
             return "installed" if goose.resolve_argv_cached() else "missing"
+        if backend == ACP_BACKEND_OPENCODE:
+            from kiro_crew.acp import opencode
+
+            return "installed" if opencode.resolve_argv_cached() else "missing"
+        if backend == ACP_BACKEND_PI:
+            from kiro_crew.acp import pi
+
+            return "installed" if pi.resolve_argv_cached() else "missing"
     except Exception:
         logger.debug("Install probe failed for %s", backend, exc_info=True)
         return "unknown"

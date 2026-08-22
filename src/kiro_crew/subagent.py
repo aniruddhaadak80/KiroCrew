@@ -15,7 +15,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -441,6 +441,100 @@ def _resolve_injection_timeout() -> float:
 INJECTION_TIMEOUT = _resolve_injection_timeout()
 
 
+def parent_live_harness(sessions: object, session_key: str) -> tuple[str | None, list[str]]:
+    """Read ``live_harness`` only when the store returns a real ``(backend, ids)``.
+
+    Unit-test stubs pass a ``MagicMock`` SessionManager. Calling the auto-
+    generated ``live_harness`` returns another mock, which unpacks as an
+    empty iterable. Treat that as no parent so cron / test stubs keep the
+    factory snapshot instead of crashing the spawn.
+    """
+    reader = getattr(sessions, "live_harness", None)
+    if not callable(reader):
+        return None, []
+    result = reader(session_key)
+    if not isinstance(result, tuple) or len(result) != 2:
+        return None, []
+    backend, advertised = result
+    if backend is not None and not isinstance(backend, str):
+        return None, []
+    if not isinstance(advertised, (list, tuple)):
+        return backend, []
+    return backend, [item for item in advertised if isinstance(item, str)]
+
+
+def _harness_label(provider: Any) -> str:
+    """Operator-facing harness name for a typed refusal, or ``this harness``."""
+    client = getattr(provider, "client", None) or getattr(provider, "_client", None)
+    backend = getattr(client, "backend", None) if client is not None else None
+    if not isinstance(backend, str):
+        backend = getattr(provider, "backend", None)
+    if not isinstance(backend, str):
+        return "this harness"
+    try:
+        from kiro_crew.acp.backends import descriptor_for
+
+        return descriptor_for(backend).label
+    except Exception:
+        return backend or "this harness"
+
+
+def _resume_failed_message(client: Any, conversation_key: str) -> str:
+    """Fail-closed spawn_continue text; names a harness with no native resume."""
+    inner = getattr(client, "client", None) or getattr(client, "_client", None)
+    backend = getattr(inner, "backend", None) if inner is not None else None
+    if not isinstance(backend, str):
+        backend = getattr(client, "backend", None)
+    reason = (
+        "session/load did not restore conversation "
+        f"{conversation_key} — refusing to execute the follow-up without "
+        "its prior context. The conversation may be locked by a live "
+        "process or its files corrupt; re-spawn with a fresh task "
+        "carrying a summary."
+    )
+    if isinstance(backend, str):
+        try:
+            from kiro_crew.acp.backends import CAP_NATIVE_RESUME, Level, descriptor_for
+            from kiro_crew.acp.backends import level as cap_level
+
+            if cap_level(backend, CAP_NATIVE_RESUME) is Level.UNAVAILABLE:
+                label = descriptor_for(backend).label
+                reason = (
+                    f"{label} does not support native resume (session/load) "
+                    f"for conversation {conversation_key} — refusing to "
+                    "execute the follow-up without its prior context. "
+                    "Re-spawn with a fresh task carrying a summary."
+                )
+        except Exception:
+            pass
+    return f"resume_failed: {reason}"
+
+
+def dedicated_child_factory_kwargs(
+    *,
+    parent_backend: str | None,
+    advertised: Sequence[str],
+    preferred_model: str,
+) -> dict[str, Any]:
+    """Factory kwargs that keep a dedicated child on the parent's harness.
+
+    When there is no live parent, returns ``{}`` so cron / parentless spawns
+    keep using the factory snapshot. When there is a parent, ``acp_backend``
+    is always set (including ``""`` for kiro). A preferred model is sent only
+    when ``resolve_usable_model`` says the parent advertised it — otherwise
+    the child inherits the session default rather than a kiro id or ``"auto"``.
+    """
+    if parent_backend is None:
+        return {}
+    from kiro_crew.acp.client import resolve_usable_model
+
+    kwargs: dict[str, Any] = {"acp_backend": parent_backend}
+    resolved = resolve_usable_model(preferred_model, advertised)
+    if resolved:
+        kwargs["model"] = resolved
+    return kwargs
+
+
 def _subagent_default_model() -> str:
     """Explicit sub-agent model pin (``agent.role_models['subagent']``), or ``""``.
 
@@ -536,7 +630,9 @@ def _digest_hold_secs() -> float:
 DIGEST_HOLD_SECS = _digest_hold_secs()
 
 
-def _timeout_context(info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0) -> str:
+def _timeout_context(
+    info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0
+) -> str:
     """Build a human-readable context string for timeout errors.
 
     ``turn_limit`` is the resolved effective turn cap (per-spawn override →
@@ -695,9 +791,7 @@ def _proc_subtree_counts(pid: Optional[int]) -> tuple[Optional[int], Optional[in
     return (procs, stubs)
 
 
-def _attributed_count(
-    total: Optional[int], sharers: int, previous: Optional[int]
-) -> Optional[int]:
+def _attributed_count(total: Optional[int], sharers: int, previous: Optional[int]) -> Optional[int]:
     """One co-tenant's share of a subtree *total*, or *previous* if unmeasured.
 
     Counts follow the same per-sharer split as the RSS/CPU attribution (see
@@ -3633,14 +3727,16 @@ class SubagentManager:
         """
         if not key.startswith("subagent:"):
             return False
-        conv_id = key[len("subagent:"):]
+        conv_id = key[len("subagent:") :]
         try:
             state = read_state(conv_id) or {}
         except Exception:
             return False
         return bool(state.get("keep"))
 
-    def _promote_conversation(self, conv_id: str, conv_key: str, last_used: float | None = None) -> None:
+    def _promote_conversation(
+        self, conv_id: str, conv_key: str, last_used: float | None = None
+    ) -> None:
         """Single choke point for promoting a conversation's retention (#1115).
 
         Writes all three retention surfaces together so they cannot drift:
@@ -3676,15 +3772,19 @@ class SubagentManager:
                 if not state.get("keep"):
                     continue
                 conv_key = str(state.get("conversation_key") or "") or f"subagent:{d.name}"
-                conv_id = conv_key[len("subagent:"):]
+                conv_id = conv_key[len("subagent:") :]
                 sid = str(state.get("session_id") or "")
                 last_used = float(state.get("updated_at") or state.get("started") or 0.0)
-                out.append((
-                    conv_id, conv_key, sid,
-                    str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
-                    str(state.get("cwd") or ""),
-                    last_used,
-                ))
+                out.append(
+                    (
+                        conv_id,
+                        conv_key,
+                        sid,
+                        str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
+                        str(state.get("cwd") or ""),
+                        last_used,
+                    )
+                )
             except Exception:
                 logger.debug("registry rebuild: skipping %s", d, exc_info=True)
         return out
@@ -3959,6 +4059,19 @@ class SubagentManager:
                     f"not registered within {_STEER_STARTUP_WAIT_SECS}s — "
                     "retry in a few seconds"
                 )
+        if not getattr(provider, "supports_steer", False):
+            # Spec adapters (and any harness not in ACP_BACKENDS_STEER) have
+            # no ``_session/steer``. Sending the method looks like success
+            # (fire-and-forget) and then hangs or no-ops. Queue as follow_up
+            # so the correction is not dropped and the reason names the
+            # harness.
+            label = _harness_label(provider)
+            ok, detail = await self.follow_up_run(agent_id, message)
+            if ok:
+                return True, (
+                    f"follow_up: {label} does not implement mid-turn steer " "(_session/steer)"
+                )
+            return ok, detail
         try:
             ok = await provider.steer(message)
         except Exception as exc:  # pragma: no cover - provider-specific
@@ -4046,15 +4159,11 @@ class SubagentManager:
         task = asyncio.create_task(self._deliver_followups(info))
         self._followup_watchers[run_id] = task
 
-        def _done(
-            t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info
-        ) -> None:
+        def _done(t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info) -> None:
             self._followup_watchers.pop(_id, None)
             _info._followup_watcher = False
             if not t.cancelled() and t.exception() is not None:
-                logger.warning(
-                    "follow_up watcher for %s failed", _id, exc_info=t.exception()
-                )
+                logger.warning("follow_up watcher for %s failed", _id, exc_info=t.exception())
                 return
             if (
                 not t.cancelled()
@@ -4122,7 +4231,7 @@ class SubagentManager:
             # sweep, so the messages vanished with no event. The slice keeps
             # anything queued while we were announcing (the done-callback
             # re-arms for it).
-            info.pending_followups = info.pending_followups[len(dropped):]
+            info.pending_followups = info.pending_followups[len(dropped) :]
             return
         # SNAPSHOT, do not drain: messages stay in ``pending_followups`` until
         # their outcome is SETTLED (dispatched, or their failure announced).
@@ -4137,12 +4246,10 @@ class SubagentManager:
             return
 
         def _settle() -> None:
-            info.pending_followups = info.pending_followups[len(messages):]
+            info.pending_followups = info.pending_followups[len(messages) :]
 
         if info.user_stopped:
-            logger.info(
-                "follow_up for %s suppressed — the user stopped the run", info.id
-            )
+            logger.info("follow_up for %s suppressed — the user stopped the run", info.id)
             self._audit_followup(info, "followup_suppressed")
             _settle()
             await self._announce_followup_failure(
@@ -4171,9 +4278,7 @@ class SubagentManager:
                 break
             await asyncio.sleep(self._FOLLOWUP_BUSY_RETRY_SECS)
         if err:
-            logger.warning(
-                "follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0]
-            )
+            logger.warning("follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0])
             self._audit_followup(info, "followup_failed")
             _settle()
             # continue_conversation's typed failures are already done
@@ -4181,9 +4286,7 @@ class SubagentManager:
             if child is not None:
                 await self._announce_followup_failure(info, "", failure_info=child)
             else:
-                await self._announce_followup_failure(
-                    info, f"follow_up dispatch failed: {err}"
-                )
+                await self._announce_followup_failure(info, f"follow_up dispatch failed: {err}")
         else:
             self._audit_followup(info, "followup_dispatched")
             _settle()
@@ -4211,9 +4314,8 @@ class SubagentManager:
         label_msgs = messages if messages is not None else info.pending_followups
         synthetic = failure_info or SubagentInfo(
             id=uuid.uuid4().hex[:8],
-            task=f"[follow_up of run {info.id}] " + _redact(
-                "; ".join(m[:120] for m in label_msgs) or "queued follow-up"
-            ),
+            task=f"[follow_up of run {info.id}] "
+            + _redact("; ".join(m[:120] for m in label_msgs) or "queued follow-up"),
             done=True,
             parent_session_key=info.parent_session_key,
             error=reason,
@@ -4221,9 +4323,7 @@ class SubagentManager:
         try:
             await self._on_done(synthetic)
         except Exception:
-            logger.warning(
-                "follow_up failure announce for %s failed", info.id, exc_info=True
-            )
+            logger.warning("follow_up failure announce for %s failed", info.id, exc_info=True)
 
     def _audit_followup(self, info: SubagentInfo, outcome: str) -> None:
         try:
@@ -4247,9 +4347,7 @@ class SubagentManager:
         busy = self._conversation_busy(conv_key)
         if busy is not None:
             return False, f"conversation_busy: run {busy.id} is in flight"
-        provider_label = (
-            self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
-        )
+        provider_label = self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         sid = self._sessions.forget_conversation(conv_key)
         self._conversations.pop(conv_key, None)
         # Demote the persisted source of truth too (#1115): with the disk
@@ -4757,7 +4855,9 @@ class SubagentManager:
             try:
                 await asyncio.to_thread(mark_delivered, agent_id)
             except Exception:
-                logger.debug("Failed to mark drained subagent %s delivered", agent_id, exc_info=True)
+                logger.debug(
+                    "Failed to mark drained subagent %s delivered", agent_id, exc_info=True
+                )
 
     def _settle_digest_holds(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
@@ -5345,7 +5445,15 @@ class SubagentManager:
         # that role is unpinned the helper returns "" so we omit the kwarg and
         # keep deferring to the provider's configured default, exactly as before.
         eff_model = info.model or _subagent_default_model()
-        if eff_model:
+        parent_backend, advertised = parent_live_harness(self._sessions, info.parent_session_key)
+        child_kw = dedicated_child_factory_kwargs(
+            parent_backend=parent_backend,
+            advertised=advertised,
+            preferred_model=eff_model,
+        )
+        if parent_backend is not None:
+            extra_kwargs.update(child_kw)
+        elif eff_model:
             extra_kwargs["model"] = eff_model
         # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
         # -> chat default). Passed as an override so it wins over the factory's
@@ -5383,7 +5491,7 @@ class SubagentManager:
         # dedicated process path so the override in extra_kwargs actually reaches
         # get_or_create -> the provider factory; otherwise a configured sub-agent
         # model/effort would silently no-op on the default (session-sharing) path.
-        if eff_model or eff_effort:
+        if extra_kwargs.get("model") or extra_kwargs.get("reasoning_effort_override"):
             use_session_sharing = False
         if use_session_sharing:
             try:
@@ -5425,13 +5533,7 @@ class SubagentManager:
             # to (re-spawn with a summary). conversation_key is only set by
             # continue_conversation, so first spawns are unaffected.
             if info.conversation_key and not _resumed:
-                raise RuntimeError(
-                    "resume_failed: session/load did not restore conversation "
-                    f"{info.conversation_key} — refusing to execute the "
-                    "follow-up without its prior context. The conversation "
-                    "may be locked by a live process or its files corrupt; "
-                    "re-spawn with a fresh task carrying a summary."
-                )
+                raise RuntimeError(_resume_failed_message(client, info.conversation_key))
             # Detect CC provider to skip permission event loop
             is_cc = self._is_cc_provider(client)
         # Intentionally check info.agent (not resolved `agent`) so only
@@ -5721,9 +5823,7 @@ class SubagentManager:
                                 error="child_escalation_limit",
                             )
                         except Exception:
-                            logger.exception(
-                                "failed to reject escalation-limit trigger request"
-                            )
+                            logger.exception("failed to reject escalation-limit trigger request")
                         info.result = result_text or "_Partial output._"
                         info.error = f"child_escalation_limit:{child_escalation_limit}"
                         info.done = True
@@ -5826,9 +5926,7 @@ class SubagentManager:
                                 approved = bool(await approve_cb(event))
                             elif _child_fallback is not None:
                                 approved = bool(
-                                    await _child_fallback(
-                                        event, info.parent_session_key
-                                    )
+                                    await _child_fallback(event, info.parent_session_key)
                                 )
                         except Exception:
                             logger.exception("child approval callback failed")

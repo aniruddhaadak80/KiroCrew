@@ -219,14 +219,10 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400
-        )
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     task = str(body.get("task", "") or "").strip()
     if not task:
-        return web.json_response(
-            {"error": "task is required", "code": "task_required"}, status=400
-        )
+        return web.json_response({"error": "task is required", "code": "task_required"}, status=400)
     parent_session = str(body.get("parent_session", "") or "")
     agent = str(body.get("agent", "") or "")
     model = str(body.get("model", "") or "")
@@ -259,19 +255,11 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         )
     if info.done and info.error:
         if info.error.startswith("conversation_busy"):
-            return web.json_response(
-                {"error": info.error, "code": "conversation_busy"}, status=409
-            )
+            return web.json_response({"error": info.error, "code": "conversation_busy"}, status=409)
         if info.error.startswith("conversation_gone"):
-            return web.json_response(
-                {"error": info.error, "code": "conversation_gone"}, status=404
-            )
-        return web.json_response(
-            {"error": info.error, "code": "spawn_rejected"}, status=400
-        )
-    return web.json_response(
-        {"id": info.id, "conversation": conv_id, "status": "spawned"}
-    )
+            return web.json_response({"error": info.error, "code": "conversation_gone"}, status=404)
+        return web.json_response({"error": info.error, "code": "spawn_rejected"}, status=400)
+    return web.json_response({"id": info.id, "conversation": conv_id, "status": "spawned"})
 
 
 async def api_spawn_steer(request: web.Request) -> web.Response:
@@ -291,9 +279,7 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400
-        )
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     message = str(body.get("message", "") or "").strip()
     if not message:
         return web.json_response(
@@ -311,13 +297,9 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
         ok, detail = await state.subagents.steer_run(agent_id, message)
     if not ok:
         if detail == "not_found":
-            return web.json_response(
-                {"error": detail, "code": "not_found"}, status=404
-            )
+            return web.json_response({"error": detail, "code": "not_found"}, status=404)
         if detail.startswith("not_running"):
-            return web.json_response(
-                {"error": detail, "code": "not_running"}, status=409
-            )
+            return web.json_response({"error": detail, "code": "not_running"}, status=409)
         if detail.startswith("session_starting"):
             # Transient: the run is alive but its session has not registered
             # yet (#1113). 503 + Retry-After tells clients to retry, unlike
@@ -327,12 +309,15 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
                 status=503,
                 headers={"Retry-After": "5"},
             )
-        return web.json_response(
-            {"error": detail, "code": "steer_failed"}, status=502
-        )
-    return web.json_response(
-        {"id": agent_id, "status": "follow_up_queued" if mode == "follow_up" else "steered"}
-    )
+        return web.json_response({"error": detail, "code": "steer_failed"}, status=502)
+    queued = mode == "follow_up" or detail.startswith("follow_up")
+    payload: dict[str, str] = {
+        "id": agent_id,
+        "status": "follow_up_queued" if queued else "steered",
+    }
+    if queued and detail.startswith("follow_up"):
+        payload["reason"] = detail
+    return web.json_response(payload)
 
 
 async def api_spawn_release(request: web.Request) -> web.Response:
@@ -351,12 +336,8 @@ async def api_spawn_release(request: web.Request) -> web.Response:
     ok, detail = state.subagents.release_conversation(conv_id)
     if not ok:
         if detail.startswith("conversation_busy"):
-            return web.json_response(
-                {"error": detail, "code": "conversation_busy"}, status=409
-            )
-        return web.json_response(
-            {"error": detail, "code": "conversation_gone"}, status=404
-        )
+            return web.json_response({"error": detail, "code": "conversation_busy"}, status=409)
+        return web.json_response({"error": detail, "code": "conversation_gone"}, status=404)
     return web.json_response({"conversation": conv_id, "status": "released"})
 
 
@@ -414,7 +395,9 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     ids = body.get("ids")
     if not ids or not isinstance(ids, list):
-        return web.json_response({"error": "'ids' array required", "code": "ids_required"}, status=400)
+        return web.json_response(
+            {"error": "'ids' array required", "code": "ids_required"}, status=400
+        )
     parent_session = str(body.get("parent_session", "") or "")
     slot_name = dashboard_slot_key(parent_session)
     if not slot_name:
@@ -1867,9 +1850,7 @@ async def api_slack_profile(request: web.Request) -> web.Response:
     return web.json_response({"profile": profile})
 
 
-def _deny_non_owner_browser_request(
-    request: web.Request, operation: str
-) -> web.Response | None:
+def _deny_non_owner_browser_request(request: web.Request, operation: str) -> web.Response | None:
     """Require the dashboard owner on browser MUTATION endpoints. 403 or None.
 
     The caller must be the configured owner (``is_owner_dashboard_request``):
@@ -1932,8 +1913,7 @@ def _deny_non_owner_browser_request(
         error="browser mutations require the dashboard owner",
     )
     return web.json_response(
-        {"error": "dashboard user required",
-         "code": "dashboard_user_required"},
+        {"error": "dashboard user required", "code": "dashboard_user_required"},
         status=403,
     )
 
@@ -2039,7 +2019,9 @@ async def api_browser_command(request: web.Request) -> web.Response:
     if not isinstance(session_key, str) or not session_key:
         # No addressable panel -> answer like the no-panel case (503) so the tool
         # falls back to playwright-cli rather than surfacing a hard error.
-        return web.json_response({"error": "no-native-panel", "code": "no_native_panel"}, status=503)
+        return web.json_response(
+            {"error": "no-native-panel", "code": "no_native_panel"}, status=503
+        )
     bus = get_command_bus()
     logger.debug("browser-cmdbus: submit op=%s session=%s", op, session_key)
     try:
@@ -2049,7 +2031,9 @@ async def api_browser_command(request: web.Request) -> web.Response:
             "browser-cmdbus: no native panel registered for session=%s -> 503 (client falls back to playwright-cli)",
             session_key,
         )
-        return web.json_response({"error": "no-native-panel", "code": "no_native_panel"}, status=503)
+        return web.json_response(
+            {"error": "no-native-panel", "code": "no_native_panel"}, status=503
+        )
     except QueueFullError:
         return web.json_response({"error": "queue-full", "code": "queue_full"}, status=429)
     except asyncio.TimeoutError:
@@ -2149,7 +2133,9 @@ async def api_browser_command_result(request: web.Request) -> web.Response:
     bus = get_command_bus()
     matched = await bus.complete(command_id, ok, result=result, error=error)
     if not matched:
-        return web.json_response({"error": "unknown-command", "code": "unknown_command"}, status=404)
+        return web.json_response(
+            {"error": "unknown-command", "code": "unknown_command"}, status=404
+        )
     return web.json_response({"ok": True})
 
 
@@ -2262,9 +2248,7 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
     # keeps an unknown value out of the background task entirely, so the operator
     # gets a 400 instead of an error they have to go re-read the status to find.
     if engine not in browser_cli_install.BROWSER_ENGINES:
-        return web.json_response(
-            {"error": "unknown engine", "code": "unknown_engine"}, status=400
-        )
+        return web.json_response({"error": "unknown engine", "code": "unknown_engine"}, status=400)
     task = getattr(state, "_browser_install_task", None)
     if task and not task.done():
         # 409, NOT a folded success. Folding is right for the CLI install, which
@@ -2718,9 +2702,11 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
         _state = request.app.get("state")
         if _state is not None:
             await ensure_channel_folder(
-                    _state, "slack", _folder_name,
-                    relabel="session_folder" in staged,
-                )
+                _state,
+                "slack",
+                _folder_name,
+                relabel="session_folder" in staged,
+            )
 
     _sel().log_api_access(
         caller=caller,
@@ -3037,9 +3023,11 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
         _state = request.app.get("state")
         if _state is not None:
             await ensure_channel_folder(
-                    _state, "discord", _folder_name,
-                    relabel="session_folder" in staged,
-                )
+                _state,
+                "discord",
+                _folder_name,
+                relabel="session_folder" in staged,
+            )
 
     _sel().log_api_access(
         caller=caller,
@@ -3053,8 +3041,7 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates)
-            or bool(staged.keys() - LIVE_RELOAD_FIELDS),
+            "restart_required": bool(env_updates) or bool(staged.keys() - LIVE_RELOAD_FIELDS),
             "verify_warning": verify_warning,
         }
     )
@@ -3354,9 +3341,11 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
         _state = request.app.get("state")
         if _state is not None:
             await ensure_channel_folder(
-                    _state, "telegram", _folder_name,
-                    relabel="session_folder" in staged,
-                )
+                _state,
+                "telegram",
+                _folder_name,
+                relabel="session_folder" in staged,
+            )
     if env_updates:
         # Off-loop: on Windows the owner-only lockdown shells out to icacls,
         # which must not block the event loop.
@@ -3382,8 +3371,7 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates)
-            or bool(staged.keys() - LIVE_RELOAD_FIELDS),
+            "restart_required": bool(env_updates) or bool(staged.keys() - LIVE_RELOAD_FIELDS),
             "verify_warning": verify_warning,
         }
     )
@@ -3642,7 +3630,9 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
             _state = request.app.get("state")
             if _state is not None:
                 await ensure_channel_folder(
-                    _state, "teams", _folder_name,
+                    _state,
+                    "teams",
+                    _folder_name,
                     relabel="session_folder" in changes,
                 )
         if env_updates:
@@ -3665,8 +3655,7 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates)
-            or bool(set(applied) - LIVE_RELOAD_FIELDS),
+            "restart_required": bool(env_updates) or bool(set(applied) - LIVE_RELOAD_FIELDS),
             "verify_warning": "",
         }
     )
@@ -3853,7 +3842,9 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
             _state = request.app.get("state")
             if _state is not None:
                 await ensure_channel_folder(
-                    _state, "webex", _folder_name,
+                    _state,
+                    "webex",
+                    _folder_name,
                     relabel="session_folder" in changes,
                 )
         if env_updates:
@@ -3876,8 +3867,7 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates)
-            or bool(set(applied) - LIVE_RELOAD_FIELDS),
+            "restart_required": bool(env_updates) or bool(set(applied) - LIVE_RELOAD_FIELDS),
             "verify_warning": verify_warning,
         }
     )
@@ -4004,9 +3994,7 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
     if not is_direct_local_request(request):
         message = "read-only from remote sessions (local machine only)"
         _audit_denial(message)
-        return web.json_response(
-            {"error": message, "code": "remote_read_only"}, status=403
-        )
+        return web.json_response({"error": message, "code": "remote_read_only"}, status=403)
 
     try:
         body = await request.json()
@@ -4067,9 +4055,7 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
         except Exception:
             message = "config.json is corrupt"
             _audit_denial(message)
-            return web.json_response(
-                {"error": message, "code": "config_corrupt"}, status=500
-            )
+            return web.json_response({"error": message, "code": "config_corrupt"}, status=500)
         if not isinstance(data.get("imessage"), dict):
             data["imessage"] = {}
         imessage_cfg = data["imessage"]
@@ -4104,7 +4090,9 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
             _state = request.app.get("state")
             if _state is not None:
                 await ensure_channel_folder(
-                    _state, "imessage", _folder_name,
+                    _state,
+                    "imessage",
+                    _folder_name,
                     relabel="session_folder" in changes,
                 )
 
@@ -4388,9 +4376,11 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
         _state = request.app.get("state")
         if _state is not None:
             await ensure_channel_folder(
-                    _state, "wecom", _folder_name,
-                    relabel="session_folder" in staged,
-                )
+                _state,
+                "wecom",
+                _folder_name,
+                relabel="session_folder" in staged,
+            )
     if env_updates:
         # Off-loop: on Windows the owner-only lockdown shells out to icacls,
         # which must not block the event loop.
@@ -4415,8 +4405,7 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates)
-            or bool(staged.keys() - LIVE_RELOAD_FIELDS),
+            "restart_required": bool(env_updates) or bool(staged.keys() - LIVE_RELOAD_FIELDS),
             "verify_warning": "",
         }
     )

@@ -87,6 +87,7 @@ from kiro_crew.acp.types import (
     METHOD_COMMANDS_EXECUTE,
     METHOD_PROMPT,
     METHOD_REQUEST_PERMISSION,
+    METHOD_SESSION_STEER,
     METHOD_SET_CONFIG_OPTION,
     METHOD_SET_MODE,
     METHOD_SET_MODEL,
@@ -1147,11 +1148,11 @@ class AcpSessionHandle:
         or no active session.
         """
         text = (message or "").strip()
-        if not text or not self._session_id:
+        if not text or not self._session_id or not self.supports_steer:
             return False
         wrapped = f"<user_message>\n{text}\n</user_message>"
         await self._runtime.send_request(
-            "_session/steer",
+            METHOD_SESSION_STEER,
             {"sessionId": self._session_id, "message": wrapped},
         )
         # Stamped HERE, at the innermost write, because this is the one point

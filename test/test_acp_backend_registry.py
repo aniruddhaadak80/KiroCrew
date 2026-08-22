@@ -19,8 +19,11 @@ from kiro_crew.acp.backends import (
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SELECTABLE,
 )
@@ -109,11 +112,17 @@ def test_dialects() -> None:
     assert backends.dialect_of(ACP_BACKEND_KAS) is Dialect.KIRO
     assert backends.dialect_of(ACP_BACKEND_CLAUDE) is Dialect.SPEC
     assert backends.dialect_of(ACP_BACKEND_CODEX) is Dialect.SPEC
+    assert backends.dialect_of(ACP_BACKEND_GOOSE) is Dialect.SPEC
+    assert backends.dialect_of(ACP_BACKEND_OPENCODE) is Dialect.SPEC
+    assert backends.dialect_of(ACP_BACKEND_PI) is Dialect.SPEC
 
     assert not backends.is_spec_dialect(ACP_BACKEND_KIRO)
     assert not backends.is_spec_dialect(ACP_BACKEND_KAS)
     assert backends.is_spec_dialect(ACP_BACKEND_CLAUDE)
     assert backends.is_spec_dialect(ACP_BACKEND_CODEX)
+    assert backends.is_spec_dialect(ACP_BACKEND_GOOSE)
+    assert backends.is_spec_dialect(ACP_BACKEND_OPENCODE)
+    assert backends.is_spec_dialect(ACP_BACKEND_PI)
 
 
 def test_session_sharing_matches_the_advertised_set_not_the_runtime_arm() -> None:
@@ -140,14 +149,15 @@ def test_session_sharing_matches_the_advertised_set_not_the_runtime_arm() -> Non
 
 def test_kas_distinguishes_measured_absence_from_unverified_inheritance() -> None:
     """KAS must not turn a shared code path into a verified backend claim."""
-    measured_unavailable = {
-        backends.CAP_AGENT_PROFILES,
-        backends.CAP_SESSION_SHARING,
+    measured = {
+        backends.CAP_SESSION_SHARING: Level.UNAVAILABLE,
+        backends.CAP_AGENT_PROFILES: Level.DEGRADED,
+        backends.CAP_MID_TURN_STEER: Level.SUPPORTED,
     }
     for capability in ALL_CAPABILITIES:
         level = backends.level(ACP_BACKEND_KAS, capability)
-        if capability in measured_unavailable:
-            assert level is Level.UNAVAILABLE
+        if capability in measured:
+            assert level is measured[capability]
         else:
             assert level is Level.UNVERIFIED
 
@@ -204,6 +214,9 @@ def test_routing_records_how_each_backend_reaches_the_gate() -> None:
     assert backends.descriptor_for(ACP_BACKEND_KAS).routing is Routing.AGENT_SPEC
     assert backends.descriptor_for(ACP_BACKEND_CLAUDE).routing is Routing.SEEDED_SETTINGS
     assert backends.descriptor_for(ACP_BACKEND_CODEX).routing is Routing.SESSION_CONFIG
+    assert backends.descriptor_for(ACP_BACKEND_GOOSE).routing is Routing.PERMISSION_REQUEST
+    assert backends.descriptor_for(ACP_BACKEND_OPENCODE).routing is Routing.PERMISSION_REQUEST
+    assert backends.descriptor_for(ACP_BACKEND_PI).routing is Routing.PERMISSION_REQUEST
 
 
 def test_session_config_routing_names_an_option_and_an_exact_value() -> None:
@@ -247,17 +260,17 @@ class TestCachedRegistryAdapters:
         from kiro_crew.acp import registry
 
         adapter = registry.RegistryAdapter(
-            id="pi-acp",
-            name="Pi ACP",
+            id="example-acp",
+            name="Example ACP",
             version="1.0.0",
             description="",
             repository="",
             license="MIT",
             icon="",
             kind="npx",
-            package="pi-acp@1.0.0",
+            package="example-acp@1.0.0",
             args=("--acp",),
-            env=(("PI_MODE", "acp"),),
+            env=(("EXAMPLE_MODE", "acp"),),
         )
         monkeypatch.setattr(registry, "cached", lambda: {adapter.id: adapter})
 
@@ -294,6 +307,32 @@ class TestCachedRegistryAdapters:
         assert "codex-acp" not in selectable_ids()
         assert "codex" in selectable_ids()
 
+    def test_hand_written_pi_is_not_a_second_unverified_path(self, monkeypatch) -> None:
+        """``pi-acp`` is the registry spelling of the hand-written ``pi`` backend."""
+        from kiro_crew.acp import registry
+        from kiro_crew.acp.backends import Routing, descriptor_for, selectable_ids
+
+        adapter = registry.RegistryAdapter(
+            id="pi-acp",
+            name="Pi ACP",
+            version="1.0.0",
+            description="",
+            repository="",
+            license="MIT",
+            icon="",
+            kind="npx",
+            package="pi-acp@1.0.0",
+            args=(),
+            env=(),
+        )
+        monkeypatch.setattr(registry, "cached", lambda: {adapter.id: adapter})
+
+        descriptor = descriptor_for(adapter.id)
+        assert descriptor.id == ACP_BACKEND_PI
+        assert descriptor.routing is Routing.PERMISSION_REQUEST
+        assert "pi-acp" not in selectable_ids()
+        assert ACP_BACKEND_PI in selectable_ids()
+
 
 def test_canonical_backend_id_maps_registry_ids() -> None:
     from kiro_crew.acp.backends import canonical_backend_id
@@ -302,4 +341,6 @@ def test_canonical_backend_id_maps_registry_ids() -> None:
     assert canonical_backend_id("codex-acp") == ACP_BACKEND_CODEX
     assert canonical_backend_id("claude-acp") == ACP_BACKEND_CLAUDE
     assert canonical_backend_id("codex") == ACP_BACKEND_CODEX
-    assert canonical_backend_id("pi-acp") == "pi-acp"
+    assert canonical_backend_id("pi-acp") == ACP_BACKEND_PI
+    assert canonical_backend_id("opencode") == ACP_BACKEND_OPENCODE
+    assert canonical_backend_id("example-acp") == "example-acp"

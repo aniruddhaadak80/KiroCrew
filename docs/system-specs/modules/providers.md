@@ -76,7 +76,9 @@ The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess
 and speaks JSON-RPC 2.0 over stdio.
 
 **Backend selection:** `AcpProvider`/`AcpClient` take an `acp_backend`
-parameter (`""` → kiro-cli; `"claude"` / `ACP_BACKEND_CLAUDE` → `claude-agent-acp`).
+parameter (`""` → kiro-cli; `"claude"` / `"codex"` / `"goose"` / `"opencode"` /
+`"pi"` / `"kas"`). OpenCode and pi persist those ids; the registry spelling
+`pi-acp` canonicalises onto `pi`.
 The public factory still exposes one `LLMProvider`; `agent.acp_backend` selects
 which adapter that provider drives. Binary-resolution and config-isolation
 details live in [`acp-client.md`](acp-client.md). Do not re-add a second
@@ -125,13 +127,19 @@ command, credential leaves, process markers, and a capability map.
 | Field | Purpose |
 |---|---|
 | `dialect` | `KIRO` (date `protocolVersion`, `set_mode`, `set_model`, empty `mcpServers`) or `SPEC` (integer version, no `set_mode`, `set_config_option`, `mcpServers` in session params) |
-| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS`, `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, or fail-closed `UNVERIFIED` |
+| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS`, `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, `PERMISSION_REQUEST` (goose / OpenCode / pi: privileged tools arrive as `session/request_permission`), or fail-closed `UNVERIFIED` |
 | `permission_config_id` / `permission_config_value` | The ACP v1 session config option and the exact value a `SESSION_CONFIG` backend must accept before its first prompt (codex-acp: `mode` = `read-only`); empty for every other routing |
 | `capabilities` | Per-capability `SUPPORTED` / `DEGRADED` / `UNAVAILABLE` / `UNVERIFIED` |
 
 `supports()` answers `False` for `DEGRADED`, `UNAVAILABLE`, and `UNVERIFIED`, so a
 code gate never treats partial or unmeasured behavior as working. Disclosure
 surfaces read `level()` to preserve the distinction.
+
+`create_provider_factory` accepts a per-call `acp_backend` override
+(`None` = the factory snapshot, `""` = kiro-cli). Dedicated subagent children
+use it to stay on the live parent harness. Capability lookups (registry model
+ids, tool search) follow the effective backend of that call, not the snapshot. The
+warm pool is bypassed when the override differs from `SessionManager.acp_backend`.
 
 **A descriptor records evidence, not inheritance.** KAS uses the Kiro dialect,
 but capabilities not independently measured against KAS are `UNVERIFIED` rather
@@ -141,8 +149,9 @@ fail-closed in code while the Settings page and doctor report why.
 Selectability is deliberately NOT in the descriptor. It stays in
 `ACP_BACKENDS_SELECTABLE` so there is exactly one answer to "may an operator
 persist this value", and a descriptor cannot drift from it. KAS is fully
-described and is selectable (cli-fronted via `kiro-cli`); withheld capabilities
-(steer, session sharing) stay fail-closed.
+described and is selectable (cli-fronted via `kiro-cli`). Mid-turn steer is
+measured and granted (`ACP_BACKENDS_STEER`); session sharing stays fail-closed
+until keep-aware teardown lands. Spec-adapter steer degrades to follow-up.
 
 Call sites outside a backend's own dialect adapter ask `supports(backend, CAP_X)`
 or `dialect_of(backend)`; they do not compare ids. The module also exports
@@ -154,9 +163,14 @@ inferences that previously meant "kiro" are converted — see
 
 Shipped modules: `acp/codex.py` (paths, resolution ladder, approval-policy probe,
 MCP shaping, model-id translation), `acp/claude.py` (permission-mode probe and
-seeding), `acp/tool_gate.py` (routing verdicts and enforcement),
-`acp/spec_agent_guard.py` (agent-profile fail-closed guard), `acp/doctor.py`
-(doctor rows).
+seeding), `acp/goose.py` / `acp/opencode.py` / `acp/pi.py` (owned resolution
+ladders; `PERMISSION_REQUEST` routing), `acp/tool_gate.py` (routing verdicts and
+enforcement), `acp/spec_agent_guard.py` (agent-profile fail-closed guard),
+`acp/doctor.py` (doctor rows). Selectable spec adapters that route through
+`session/request_permission` (goose, OpenCode, pi) start without the ungated-tools
+opt-out and receive Crew MCP on `session/new` when ROUTED. OpenCode is not
+settings-seeded. Pi may leave delivered Crew servers inert until `pi-acp`
+forwards MCP.
 
 ### Model list surface (`GET /api/models`)
 

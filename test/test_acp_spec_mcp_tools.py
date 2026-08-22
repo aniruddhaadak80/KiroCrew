@@ -21,6 +21,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     EVENT_TOOL_CALL,
 )
 from kiro_crew.mcp_tools import build_tool_list
@@ -61,9 +63,26 @@ class TestRoutedAdaptersReceiveCoreTools:
         }
         assert "kirocrew-core" in names
 
-    def test_goose_stays_unverified_and_receives_no_crew_servers(self, tmp_path) -> None:
-        """SELECTABLE is not ROUTED. Crew's control plane stays withheld."""
-        assert _client(ACP_BACKEND_GOOSE, tmp_path)._spec_session_mcp_servers() == []
+    def test_goose_is_routed_and_receives_crew_servers(self, tmp_path) -> None:
+        """PERMISSION_REQUEST is ROUTED, so Crew's control plane is delivered."""
+        names = {
+            e["name"] for e in _client(ACP_BACKEND_GOOSE, tmp_path)._spec_session_mcp_servers()
+        }
+        assert "kirocrew-core" in names
+        assert "kirocrew-cron" in names
+
+    def test_opencode_is_routed_and_receives_crew_servers(self, tmp_path) -> None:
+        names = {
+            e["name"] for e in _client(ACP_BACKEND_OPENCODE, tmp_path)._spec_session_mcp_servers()
+        }
+        assert "kirocrew-core" in names
+        assert "kirocrew-cron" in names
+
+    def test_pi_is_routed_and_receives_crew_servers(self, tmp_path) -> None:
+        """We still deliver when ROUTED. The adapter may leave them inert."""
+        names = {e["name"] for e in _client(ACP_BACKEND_PI, tmp_path)._spec_session_mcp_servers()}
+        assert "kirocrew-core" in names
+        assert "kirocrew-cron" in names
 
     def test_kiro_does_not_pay_this_seam(self, tmp_path) -> None:
         assert _client(ACP_BACKEND_KIRO, tmp_path)._spec_session_mcp_servers() == []

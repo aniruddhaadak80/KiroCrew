@@ -131,6 +131,15 @@ from the live `kirocrew` binary, strips stale remote-transport fields (`url`,
 gateway is actually running under while preserving the user's own env keys.
 User customizations such as `autoApprove` are preserved.
 
+**Spec adapters** (claude / Codex / goose / OpenCode / pi) do not read that
+agent file. When the tool-gate verdict is `ROUTED`, `acp/spec_servers.py`
+delivers `kirocrew-core` and `kirocrew-cron` (and `kirocrew-computer` when its
+gate is open) on `session/new`. goose, OpenCode, and pi are
+`PERMISSION_REQUEST` and therefore receive those servers without the
+ungated-tools opt-out. User MCP is never put on the wire. Official `pi-acp`
+accepts the `mcpServers` array but may not forward it to the pi agent — Crew
+still delivers; the tools may stay inert until the adapter wires MCP through.
+
 An entry may also carry a **`spec_gate`** — a predicate consulted at spec
 EMISSION time. `kirocrew-computer` is the one row that has one, and the
 distinction it draws is the difference between a capability that advertises no
@@ -518,7 +527,10 @@ CLI commands and their MCP twins:
 `kiro_crew.mcp_tools.build_tool_list()`, which is what `mcp_core._list_tools`
 answers `tools/list` from):
 
-- **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`,
+- **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`
+  (`spawn_steer` interrupt mode degrades to follow-up on a harness without
+  `_session/steer` and reports `follow_up_queued`; `spawn_continue` fail-closes
+  with `resume_failed` when native resume is unavailable),
   `spawn_release`, `spawn_sub_agents`, `wait`
 - **Messaging and notification:** `send_message`, `send_notification`,
   `delete_message`, `file_send`, `read_slack_profile`

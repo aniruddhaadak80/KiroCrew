@@ -59,6 +59,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_GOOSE,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
@@ -94,6 +96,7 @@ from kiro_crew.acp.types import (
     METHOD_PROMPT,
     METHOD_REQUEST_PERMISSION,
     METHOD_SESSION_LOAD,
+    METHOD_SESSION_STEER,
     METHOD_SESSION_NEW,
     METHOD_SESSION_UPDATE,
     METHOD_SET_MODE,
@@ -2450,7 +2453,7 @@ class AcpClient:
         ``--agent`` spec — so the kiro path stays byte-identical and pays nothing
         here (harness parity: an added harness adapts, it does not widen).
 
-        Without this a claude/codex/goose session has NO Crew tools at all: no
+        Without this a spec-adapter session has NO Crew tools at all: no
         memory, no cron, no spawn, no artifacts. The adapter reads no Kiro Crew
         config, so ``session/new`` is the only channel.
 
@@ -3064,6 +3067,20 @@ class AcpClient:
             if not goose_argv:
                 raise AcpError(goose_backend.missing_adapter_message())
             argv = goose_argv
+        elif self.backend == ACP_BACKEND_OPENCODE:
+            from kiro_crew.acp import opencode as opencode_backend
+
+            opencode_argv = await asyncio.to_thread(opencode_backend.resolve_argv_cached)
+            if not opencode_argv:
+                raise AcpError(opencode_backend.missing_adapter_message())
+            argv = opencode_argv
+        elif self.backend == ACP_BACKEND_PI:
+            from kiro_crew.acp import pi as pi_backend
+
+            pi_argv = await asyncio.to_thread(pi_backend.resolve_argv_cached)
+            if not pi_argv:
+                raise AcpError(pi_backend.missing_adapter_message())
+            argv = pi_argv
         elif self.backend not in acp_backends.known_ids():
             from kiro_crew.acp import registry
 
@@ -3665,7 +3682,21 @@ class AcpClient:
         resume_sid = self._resume_session_id
         self._resume_session_id = None  # consume — no retry loop
 
-        if resume_sid and self._can_load_session:
+        if (
+            resume_sid
+            and acp_backends.level(self.backend, acp_backends.CAP_NATIVE_RESUME)
+            is acp_backends.Level.UNAVAILABLE
+        ):
+            # goose (and any adapter whose handshake has no resume/fork): a
+            # session/load that cannot work must not silently fall through to
+            # session/new. Callers that need prior context (spawn_continue)
+            # fail closed on ``resumed is False``.
+            logger.info(
+                "Skipping session/load for %s: native resume is unavailable on %s",
+                resume_sid,
+                acp_backends.descriptor_for(self.backend).label,
+            )
+        elif resume_sid and self._can_load_session:
             # Kiro's dialect requires its local transcript path. Public-spec
             # adapters own their session stores and resume by opaque session id,
             # so checking ~/.kiro would incorrectly suppress a real resume.
@@ -5204,11 +5235,11 @@ class AcpClient:
         False for an empty message or when there is no active session.
         """
         text = (message or "").strip()
-        if not text or not self._session_id:
+        if not text or not self._session_id or not self.supports_steer:
             return False
         wrapped = f"<user_message>\n{text}\n</user_message>"
         await self._send_request(
-            "_session/steer", {"sessionId": self._session_id, "message": wrapped}
+            METHOD_SESSION_STEER, {"sessionId": self._session_id, "message": wrapped}
         )
         # See AcpSessionHandle.steer for why the stamp is taken at the write.
         self._last_steer_monotonic = time.monotonic()

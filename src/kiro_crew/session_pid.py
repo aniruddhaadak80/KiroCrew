@@ -234,7 +234,15 @@ def _rewrite_pid_file(path: Path, content: str) -> bool:
 # the script path itself contains "codex". The consequence is a leaked tracking
 # entry, never a wrong kill, because the re-validation is a precondition for
 # killing rather than a licence to.
-_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude", "codex", "goose")
+_MANAGED_AGENT_MARKERS: tuple[str, ...] = (
+    "kiro-cli",
+    "claude",
+    "codex",
+    "goose",
+    "opencode",
+    "pi-acp",
+    "pi",
+)
 
 
 def _is_managed_agent_process(pid: int) -> bool:

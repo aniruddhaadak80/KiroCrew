@@ -1,19 +1,33 @@
 # Experimental ACP adapters
 
-Kiro Crew normally drives `kiro-cli`. Two other agents can serve your turns
-instead, so an existing Claude or ChatGPT subscription does the work:
+Kiro Crew normally drives `kiro-cli`. Other agents can serve your turns
+instead, so an existing vendor subscription does the work:
 
 | Adapter | `agent.acp_backend` | Sign-in | Status |
 |---|---|---|---|
 | Kiro CLI | `""` (default) | `kiro-cli login` | Supported |
 | OpenAI Codex | `codex` | `codex login` | **Experimental**, selectable |
 | Claude Code | `claude` | the Claude CLI | **Experimental**, selectable |
-| goose | `goose` | `goose configure` | **Experimental**, selectable |
+| goose | `goose` | `goose configure` | **Experimental**, selectable, routed |
+| OpenCode | `opencode` | `opencode auth login` | **Experimental**, selectable, routed |
+| pi | `pi` (registry alias `pi-acp`) | `pi` | **Experimental**, selectable, routed |
 
-Selectable means the value may be persisted. It is not a claim that tool calls
-already reach Kiro Crew's security gate. Codex and Claude are gated before the
-first prompt. goose is selectable and **refused** until Kiro Crew implements
-`fs/*` and `terminal/*`, unless `agent.acp_backend_allow_ungated_tools` is on.
+Selectable means the value may be persisted. Codex and Claude are gated before
+the first prompt. goose, OpenCode, and pi send `session/request_permission` for
+privileged tools, so sessions start without the ungated-tools opt-out. Kiro Crew
+does not implement `fs/*` or `terminal/*`. OpenCode operator config
+`permission: allow` / `--auto` can bypass the adapter's own prompts — Kiro Crew
+does not seed OpenCode settings. Pi may accept Crew MCP on `session/new` without
+forwarding it to the pi agent; those tools can stay inert. Doctor reports that
+as a capability note, not an install failure. Do not treat spawn or Crew tools
+as verified on Pi until the adapter forwards MCP.
+
+Mid-turn steer (`_session/steer`) is kiro-cli and KAS only. On a spec adapter
+the dashboard queues the message, Slack waits for the current turn, and
+`spawn_steer` degrades to follow-up with a reason that names the harness.
+goose cannot native-resume (`session/load`); `spawn_continue` fail-closes
+instead of starting a blank child. Regular chat replays Crew's transcript
+the same way a provider switch does.
 
 **Sign-in is not part of selectability.** Kiro Crew assumes the adapter is already
 authenticated and never handles a credential, so a host that has not signed in
@@ -22,19 +36,21 @@ withheld.
 
 > **Selectable and launchable, but no session has been driven end to end.** Each
 > adapter now resolves its own binary — `codex-acp` and `claude-agent-acp` through
-> their npm entry scripts, goose through `goose acp` on its own binary — so
+> their npm entry scripts, goose through `goose acp`, OpenCode through
+> `opencode acp`, pi through the `pi-acp` binary (not `pi acp`) — so
 > selecting one no longer silently starts kiro-cli. What has *not* happened is a
-> full turn on any of them: each needs a credential this host does not have. So
-> treat the rows below as what Kiro Crew knows and can launch, not as a promise
-> that a turn completes.
+> full turn on every one of them: each needs a credential this host may not
+> have. Treat the rows below as what Kiro Crew knows and can launch, not as a
+> promise that a turn completes.
 
 Each one clears the governability bar differently, which is why it is established
 per adapter rather than assumed:
 
-- **goose** serves ACP from its own `goose acp` binary, but Kiro Crew does not
-  yet implement the filesystem and terminal callbacks its delegation model needs.
-  It therefore fails closed unless the operator explicitly enables
-  `agent.acp_backend_allow_ungated_tools`.
+- **goose**, **OpenCode**, and **pi** ask per privileged tool via
+  `session/request_permission`. File I/O stays in the adapter because Kiro Crew
+  does not advertise `fs/*`. That is enough to start without the opt-out.
+  OpenCode is not settings-seeded. Crew MCP is delivered to all three when
+  ROUTED; on Pi the adapter may leave those servers inert until it forwards MCP.
 - **Codex** is gated by ACP v1 session config `mode=read-only`, applied after
   `session/new` / `session/load`. The session is refused if the adapter does not
   advertise that value or the write fails.
@@ -71,9 +87,10 @@ lists dozens, and nothing in the ACP handshake reveals whether a given one route
 its tool calls or simply executes locally and reports afterwards — those two look
 identical on the wire until it is too late. So an unverified adapter resolves as
 *indeterminate* and refuses to start rather than running with the deny rules,
-sensitive-path block and governance ceiling silently inert. `pi-acp` is the
-concrete example: it states that it performs no ACP filesystem or terminal
-delegation and reads, writes and executes locally.
+sensitive-path block and governance ceiling silently inert. A registry adapter
+that is not one of the hand-described backends (for example `example-acp`) is
+that case. `pi` is hand-described and routed; do not treat the registry spelling
+`pi-acp` as a second unverified path.
 
 You can override that with `agent.acp_backend_allow_ungated_tools`, which is the
 single named opt-out. It is off by default and should stay off: with it on, the
