@@ -11930,7 +11930,17 @@
         "scope_session": "Sessão",
         "shadowed_by": "Substituído por {{scope}}",
         "overrides": "Substitui {{scope}}",
-        "workspace_named": "Espaço de trabalho {{name}}"
+        "workspace_named": "Espaço de trabalho {{name}}",
+        "usage_hint": "Referencie uma variável como {{token}} numa mensagem, num cron ou no prompt de uma crew.",
+        "remove_variable_confirm": "Confirmar a remoção de {{name}}",
+        "bulk_edit": "Edição em massa",
+        "bulk_label": "Um NOME=valor por linha",
+        "bulk_apply": "Aplicar",
+        "bulk_cancel": "Cancelar",
+        "bulk_replaces_scope": "Aplicar substitui este escopo: um nome ausente do texto é removido.",
+        "from_file_note": "Também definidas pelo arquivo deste espaço de trabalho em {{dir}}. Edite esse arquivo para alterá-las.",
+        "overridden_by_panel": "substituído acima",
+        "scope_workspace_file": "Arquivo do espaço de trabalho"
       }
     },
     "settingsPage": {
@@ -12344,7 +12354,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "Armazene chaves de API e credenciais com segurança"
-    },
+      },
       "variables": {
         "label": "Variáveis de ambiente",
         "description": "Valores reutilizáveis que são inseridos nas mensagens do agente"

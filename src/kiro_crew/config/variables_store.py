@@ -54,6 +54,7 @@ import copy
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,22 @@ _CONTAINER = {SCOPE_WORKSPACE: "workspaces", SCOPE_CREW: "crews"}
 
 _STORE_DIR = "variables"
 _STORE_NAME = "variables.json"
+
+# Per-workspace dotenv files live in a subdirectory of the store dir, so they are
+# covered by the SAME `security.py` fence entry -- the agent can neither read nor
+# write them. That containment is the whole reason these files are here rather than
+# in the workspace working directory, which is the tree the agent actively edits: a
+# file the agent can write is a file the agent can use to choose what gets
+# substituted into its own next prompt. Fencing one filename inside the working
+# directory would not do -- `.env.local` is an ordinary project file, so refusing it
+# would break an agent scaffolding any framework that ships one.
+_WORKSPACE_ENV_DIR = "workspaces"
+_WORKSPACE_ENV_SUFFIX = ".env"
+
+# A workspace name becomes a FILENAME here, so it is constrained rather than
+# sanitized: a name that cannot be spelled safely gets no file at all. Rejecting is
+# safe because the workspace still resolves -- it simply has no file layer.
+_SAFE_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 # mtime-keyed read cache. KiroCrewConfig.load() applies the store on every call and
 # load() runs on the event loop, so an uncached read meant a file read plus a JSON
@@ -148,6 +165,81 @@ def store_path() -> Path:
     from kiro_crew.config.loader import config_path
 
     return config_path().parent / _STORE_DIR / _STORE_NAME
+
+
+def workspace_env_dir() -> Path:
+    """Directory holding the per-workspace dotenv files.
+
+    Inside ``store_path().parent`` so it inherits that directory's fence entry rather
+    than needing one of its own -- a second entry is a second thing to keep in step
+    with ``security.py``, and the one that gets forgotten is the one that matters.
+    """
+    return store_path().parent / _WORKSPACE_ENV_DIR
+
+
+def workspace_env_path(name: str) -> Path | None:
+    """Path of *name*'s dotenv file, or ``None`` when the name cannot be a filename.
+
+    Two independent guards, because either alone has a known bypass. The pattern
+    rejects the obvious traversal spellings and anything exotic enough to behave
+    differently across filesystems; the containment check then re-derives the resolved
+    path and refuses it if it escaped anyway, which catches what the pattern cannot
+    see -- a case-folding or Unicode-normalising filesystem, or a symlinked
+    ``workspaces`` directory pointing somewhere else entirely.
+
+    ``None`` is not an error: the workspace still resolves from the JSON store and
+    simply has no file layer. Refusing to name a file is always safe; guessing a
+    sanitized name for the operator is not, because two distinct workspaces could
+    sanitize onto one file and silently share their variables.
+    """
+    if not _SAFE_WORKSPACE_RE.match(name or ""):
+        return None
+    base = workspace_env_dir()
+    candidate = base / f"{name}{_WORKSPACE_ENV_SUFFIX}"
+    try:
+        resolved = candidate.resolve()
+        if resolved.parent != base.resolve():
+            logger.warning(
+                "workspace variables file for %r resolves outside %s; ignoring it.",
+                name,
+                _WORKSPACE_ENV_DIR,
+            )
+            return None
+    except OSError:
+        return None
+    return candidate
+
+
+def workspace_env_values(name: str) -> dict[str, str]:
+    """Pairs from *name*'s dotenv file. Never raises; an unreadable file yields none.
+
+    TOLERANT by design, unlike the bulk-edit endpoint that shares the parser. Nobody
+    is watching when this runs, so one malformed line must not blank a whole
+    workspace's variables -- the good pairs load and the rest are logged with their
+    line numbers. The unresolved ``{{token}}`` that results is this feature's visible
+    failure mode, the same reason ``expand`` leaves an unknown name in place.
+    """
+    path = workspace_env_path(name)
+    if path is None:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "workspace variables file %s is unreadable (%s); resolving none from it.",
+            path.name,
+            exc.__class__.__name__,
+        )
+        return {}
+
+    from kiro_crew.variables import parse_dotenv
+
+    pairs, problems = parse_dotenv(text)
+    for lineno, reason in problems:
+        logger.warning("%s line %d: %s", path.name, lineno, reason)
+    return pairs
 
 
 def read_store() -> dict[str, Any]:

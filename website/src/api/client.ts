@@ -1513,6 +1513,17 @@ export interface VariablesView {
    * by Crew" when nothing shadows it there.
    */
   active_workspace?: string
+  /**
+   * Pairs a workspace's dotenv file supplies, keyed by workspace name.
+   *
+   * READ-ONLY: this endpoint does not write those files. Reported so the panel can
+   * show them — a file-defined key that a panel key shadows would otherwise look
+   * like the panel edit had no effect, and a value the operator cannot see is a
+   * value they cannot debug.
+   */
+  workspace_files?: Record<string, Record<string, string>>
+  /** Directory holding those files, so the panel can name where to edit them. */
+  workspace_file_dir?: string
 }
 
 /**
@@ -1543,6 +1554,16 @@ export interface VariablesWrite {
    */
   set?: Record<string, string>
   delete?: string[]
+  /**
+   * A whole scope as dotenv text, applied server-side as a per-key diff: every pair
+   * in the text is set, and every stored key ABSENT from it is deleted.
+   *
+   * Mutually exclusive with `set`/`delete` — they describe the scope two different
+   * ways, so applying both would make the result depend on which ran last. The text
+   * is parsed by the backend rather than here, so one parser stays authoritative
+   * over what a stored value may contain.
+   */
+  bulk?: string
 }
 
 export interface WebhooksView {
