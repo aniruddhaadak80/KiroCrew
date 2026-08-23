@@ -5825,17 +5825,19 @@ async def _run_chat(
                 if event.tool_call_id:
                     _pending_tools[event.tool_call_id] = _raw
                     # Forgery gate: record the directive-tool name ONLY
-                    # from the trusted _meta.kiro identity and ONLY for a genuine
-                    # call served by KiroCrew's OWN core MCP server — never the
-                    # title, and never another (possibly third-party) MCP server
-                    # that merely exposes a tool named e.g. "monitor_start". A
-                    # shell tool has no mcp_server_name and canonical tool_name
-                    # "execute_bash", so it can never register here. Recorded at
-                    # EVENT_TOOL_CALL only (the UPDATE refinement rewrites titles).
-                    if event.mcp_server_name == session_directive.CORE_MCP_SERVER:
-                        _cannon = session_directive.match_tool(event.tool_name)
-                        if _cannon:
-                            _pending_dir_tool[event.tool_call_id] = _cannon
+                    # from the trusted _meta.kiro identity — never the title.
+                    # The single shared predicate (also used by the messaging
+                    # TurnDriver) requires Kiro Crew's OWN core MCP server and a
+                    # canonical directive-tool name; a shell tool (no
+                    # mcp_server_name, canonical tool_name "execute_bash") or a
+                    # third-party server exposing a same-named tool can never
+                    # register here. Recorded at EVENT_TOOL_CALL only (the
+                    # UPDATE refinement rewrites titles).
+                    _cannon = session_directive.directive_tool_for(
+                        event.mcp_server_name, event.tool_name
+                    )
+                    if _cannon:
+                        _pending_dir_tool[event.tool_call_id] = _cannon
                 # If this tool call belongs to a native sub-agent (mapped via
                 # _kiro.dev/session/update), stream it onto that sub-agent's card.
                 _nat_card = _native_tc_card.get(event.tool_call_id) if event.tool_call_id else None
