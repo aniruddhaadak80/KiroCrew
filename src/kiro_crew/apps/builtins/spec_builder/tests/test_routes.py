@@ -126,7 +126,12 @@ def test_register_routes_wires_expected_set(tmp_path, monkeypatch):
     # paths directly on the router (the external app's AppRoute-list contract
     # was converted during the port). mypy flags asserting a None return
     # (func-returns-value), so just call it.
+    startup_before = list(app.on_startup)
     routes.register_routes(app)
+
+    assert list(app.on_startup) == startup_before, (
+        "Spec Builder filesystem recovery would block socket readiness"
+    )
 
     wired = {
         (r.method, r.resource.canonical)
@@ -147,9 +152,31 @@ def test_register_routes_wires_expected_set(tmp_path, monkeypatch):
         ("POST", f"{_BASE}/specs/{{name}}/handoff"),
         ("POST", f"{_BASE}/specs/{{name}}/execute"),
         ("POST", f"{_BASE}/specs/{{name}}/stop"),
+        # Direct authority over the artifacts: record a phase approval, run one
+        # task, and the label / archive / duplicate lifecycle.
+        ("POST", f"{_BASE}/specs/{{name}}/approve"),
+        ("POST", f"{_BASE}/specs/{{name}}/task"),
+        ("POST", f"{_BASE}/specs/{{name}}/title"),
+        ("POST", f"{_BASE}/specs/{{name}}/archive"),
+        ("POST", f"{_BASE}/specs/{{name}}/duplicate"),
         ("DELETE", f"{_BASE}/specs/{{name}}"),
     }
     assert expected <= wired
+
+
+@pytest.mark.asyncio
+async def test_duplicate_recovery_runs_once_on_first_enabled_request(tmp_path, monkeypatch):
+    recovered: list[str] = []
+    monkeypatch.setattr(routes, "is_app_enabled", lambda _name: True)
+    monkeypatch.setattr(
+        routes, "_recover_abandoned_reservations", lambda: recovered.append("recovered")
+    )
+
+    async with _make_client(monkeypatch, tmp_path) as client:
+        assert (await client.get(f"{_BASE}/settings")).status == 200
+        assert (await client.get(f"{_BASE}/specs")).status == 200
+
+    assert recovered == ["recovered"]
 
 
 def test_slot_key_prefix_renamed():
@@ -772,8 +799,8 @@ def test_list_handler_offloads_folder_discovery():
         assert inline not in src, f"{inline} still called inline in the list handler"
 
 
-def test_collect_spec_documents_returns_the_detail_triple(tmp_path):
-    """Non-vacuous: the bundled collector actually produces phase + docs + state."""
+def test_collect_spec_documents_returns_the_detail_bundle(tmp_path):
+    """The bundled collector produces phase, docs, state and task metadata."""
 
     spec_dir = tmp_path / "spec"
     spec_dir.mkdir()
@@ -781,10 +808,16 @@ def test_collect_spec_documents_returns_the_detail_triple(tmp_path):
     (spec_dir / "design.md").write_text("# design")
     (spec_dir / ".spec-state.json").write_text(json.dumps({"blocking": "waiting on you"}))
 
-    phase, files, state = routes._collect_spec_documents(spec_dir)
+    phase, files, state, meta = routes._collect_spec_documents(spec_dir)
     assert phase == "design"                      # newest present phase file wins
     assert files["requirements.md"] == "# reqs"
     assert state is not None and state["blocking"] == "waiting on you"
+    # The hash is of the file AS STORED because it binds a phase approval to the
+    # exact document reviewed.
+    assert meta["docs"]["requirements.md"]["hash"] == routes._sha256_text("# reqs")
+    assert set(meta["docs"]["requirements.md"]) == {"hash"}
+    # No tasks.md here, so the list is empty rather than absent.
+    assert meta["tasks"] == [] and meta["task_progress"] == {"done": 0, "total": 0}
 
 
 # (2) deleting a spec must tear down its worker slot
@@ -909,6 +942,435 @@ def test_load_index_releases_a_reservation_left_by_a_dead_process(tmp_path, monk
     )
 
 
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="atomic no-replace directory publication is unavailable",
+)
+def test_duplicate_publication_never_replaces_a_destination_created_concurrently(
+    tmp_path, monkeypatch
+):
+    """The destination's creation and the publish syscall are one arbitration.
+
+    An existence check followed by ordinary rename loses this race on POSIX:
+    rename replaces an empty directory, including its identity and metadata.
+    """
+    stage = tmp_path / ".copy.stage"
+    stage.mkdir()
+    (stage / "requirements.md").write_text("# staged")
+    target = tmp_path / "copy"
+    target_identity: list[tuple[int, int]] = []
+    real_rename = routes.rename_noreplace
+
+    def _writer_wins_before_the_syscall(*args, **kwargs):
+        target.mkdir(mode=0o700)
+        stat = target.stat()
+        target_identity.append((stat.st_dev, stat.st_ino))
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "rename_noreplace", _writer_wins_before_the_syscall)
+
+    assert routes._publish_staged_copy(stage, target) == "conflict"
+    after = target.stat()
+    assert (after.st_dev, after.st_ino) == target_identity[0]
+    assert stage.is_dir(), "the losing staged copy replaced the concurrent destination"
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PIN_DIR,
+    reason="descriptor-pinned duplicate writes are unavailable",
+)
+def test_duplicate_doc_creation_refuses_an_ancestor_swapped_after_validation(
+    tmp_path, monkeypatch
+):
+    """The opened directory, not its raceable pathname, owns authorization."""
+    project = tmp_path / "project"
+    spec_dir = project / "copy"
+    spec_dir.mkdir(parents=True)
+    external_parent = tmp_path / "external"
+    external_spec = external_parent / "copy"
+    external_spec.mkdir(parents=True)
+    original_project = tmp_path / "original-project"
+    real_verified = routes._verified_spec_dir
+    swapped = False
+
+    def _verify_then_swap(path):
+        nonlocal swapped
+        verified = real_verified(path)
+        if path == spec_dir and verified is not None and not swapped:
+            project.rename(original_project)
+            project.symlink_to(external_parent, target_is_directory=True)
+            swapped = True
+        return verified
+
+    monkeypatch.setattr(routes, "_verified_spec_dir", _verify_then_swap)
+
+    result, identity = routes._create_spec_doc(spec_dir, "requirements.md", "# copied")
+
+    assert result == "unsafe_dir"
+    assert identity is None
+    assert not (external_spec / "requirements.md").exists()
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PIN_DIR,
+    reason="descriptor-pinned duplicate cleanup is unavailable",
+)
+def test_duplicate_rollback_refuses_an_ancestor_swapped_after_validation(
+    tmp_path, monkeypatch
+):
+    """A redirected path cannot make rollback unlink an external matching inode."""
+    project = tmp_path / "project"
+    spec_dir = project / "copy"
+    spec_dir.mkdir(parents=True)
+    external_parent = tmp_path / "external"
+    external_spec = external_parent / "copy"
+    external_spec.mkdir(parents=True)
+    external_doc = external_spec / "requirements.md"
+    external_doc.write_text("# external")
+    stat = external_doc.stat()
+    identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    original_project = tmp_path / "original-project"
+    real_verified = routes._verified_spec_dir
+    swapped = False
+
+    def _verify_then_swap(path):
+        nonlocal swapped
+        verified = real_verified(path)
+        if path == spec_dir and verified is not None and not swapped:
+            project.rename(original_project)
+            project.symlink_to(external_parent, target_is_directory=True)
+            swapped = True
+        return verified
+
+    monkeypatch.setattr(routes, "_verified_spec_dir", _verify_then_swap)
+
+    routes._rollback_staged_docs(spec_dir, {"requirements.md": identity})
+
+    assert external_doc.read_text() == "# external"
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PIN_DIR,
+    reason="descriptor-pinned duplicate cleanup is unavailable",
+)
+def test_duplicate_cleanup_leaves_the_empty_stage_instead_of_racing_replacement(tmp_path):
+    """POSIX has no inode-bound rmdir, so safe cleanup stops at an empty stage."""
+    stage = tmp_path / ".copy.duplicate-deadbeef"
+    stage.mkdir()
+
+    routes._rollback_staged_docs(stage, {})
+
+    assert stage.is_dir()
+    assert not any(stage.iterdir())
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PIN_DIR,
+    reason="descriptor-pinned duplicate staging is unavailable",
+)
+def test_duplicate_marker_failure_does_not_remove_a_redirected_stage(
+    tmp_path, monkeypatch
+):
+    """Marker unwind cannot follow a swapped ancestor into an external tree."""
+    project = tmp_path / "project"
+    project.mkdir()
+    external_parent = tmp_path / "external"
+    external_parent.mkdir()
+    token = "d" * 32
+    stage = project / f".copy.duplicate-{token}"
+    external_stage = external_parent / stage.name
+    external_stage.mkdir()
+    target = project / "copy"
+    original_project = tmp_path / "original-project"
+
+    def _swap_then_refuse(_stage_fd, _duplicate_token):
+        project.rename(original_project)
+        project.symlink_to(external_parent, target_is_directory=True)
+        return False
+
+    monkeypatch.setattr(routes, "_write_duplicate_marker_at", _swap_then_refuse)
+
+    result, created = routes._write_and_publish_duplicate(
+        stage, target, {"requirements.md": "# copied"}, token
+    )
+
+    assert result == "write_failed"
+    assert created == {}
+    assert external_stage.is_dir()
+    assert (original_project / stage.name).is_dir()
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate recovery requires atomic no-replace directory publication",
+)
+def test_startup_recovery_publishes_a_complete_duplicate_staged_by_a_dead_process(
+    tmp_path, monkeypatch
+):
+    """A crash after all documents are staged must not hide the copy forever.
+
+    Custom ``base_path`` roots are not part of folder discovery, so dropping the
+    reservation would strand the files while their name remains unusable.
+    """
+    _redirect_state(monkeypatch, tmp_path)
+    token = "d" * 32
+    target = tmp_path / "custom" / "copy"
+    stage = target.parent / f".copy.duplicate-{token}"
+    stage.mkdir(parents=True)
+    (stage / routes._DUPLICATE_MARKER).write_text(token)
+    documents = {"requirements.md": "# copied", "design.md": ""}
+    for fname, text in documents.items():
+        (stage / fname).write_text(text)
+    routes._save_index(
+        {
+            "copy": {
+                "working_dir": str(tmp_path),
+                "spec_dir": str(target),
+                "status": "planning",
+                "slot_key": "spec-builder-copy-deadbeef",
+                routes._DUPLICATING: {
+                    "owner": "1234:deadbeef",
+                    "at": 1.0,
+                    "token": token,
+                    "stage_dir": str(stage),
+                    "documents": {
+                        fname: routes._sha256_text(text) for fname, text in documents.items()
+                    },
+                },
+            }
+        }
+    )
+
+    routes._recover_abandoned_reservations()
+    loaded = routes._load_index()
+
+    assert "copy" in loaded
+    assert routes._DUPLICATING not in loaded["copy"]
+    assert not stage.exists()
+    assert (target / "requirements.md").read_text() == "# copied"
+    assert (target / "design.md").read_text() == ""
+
+
+def test_startup_recovery_preserves_a_spec_with_unproven_duplicate_metadata(
+    tmp_path, monkeypatch
+):
+    """Untrusted reservation metadata is not proof that the entry is disposable."""
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir = tmp_path / "custom" / "real-spec"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "requirements.md").write_text("# keep me")
+    token = "d" * 32
+    routes._save_index(
+        {
+            "real-spec": {
+                "working_dir": str(tmp_path),
+                "spec_dir": str(spec_dir),
+                "status": "planning",
+                "slot_key": "spec-builder-real-spec-deadbeef",
+                "approvals": {"requirements": {"hash": "a" * 64}},
+                routes._DUPLICATING: {
+                    "owner": "1234:deadbeef",
+                    "at": 1.0,
+                    "token": token,
+                    "stage_dir": str(spec_dir.parent / f".real-spec.duplicate-{token}"),
+                    "documents": {
+                        "requirements.md": routes._sha256_text("# keep me"),
+                    },
+                },
+            }
+        }
+    )
+
+    routes._recover_abandoned_reservations()
+    loaded = routes._load_index()
+
+    assert "real-spec" in loaded
+    assert routes._DUPLICATING not in loaded["real-spec"]
+    assert loaded["real-spec"]["approvals"] == {"requirements": {"hash": "a" * 64}}
+    assert (spec_dir / "requirements.md").read_text() == "# keep me"
+
+
+def test_startup_recovery_preserves_an_unproven_reservation_with_no_files(
+    tmp_path, monkeypatch
+):
+    """Well-shaped metadata alone cannot prove that recovery may delete a spec."""
+    _redirect_state(monkeypatch, tmp_path)
+    token = "d" * 32
+    target = tmp_path / "offline" / "copy"
+    stage = target.parent / f".copy.duplicate-{token}"
+    approvals = {"requirements": {"hash": "a" * 64}}
+    routes._save_index(
+        {
+            "copy": {
+                "working_dir": str(tmp_path),
+                "spec_dir": str(target),
+                "status": "planning",
+                "slot_key": "spec-builder-copy-deadbeef",
+                "approvals": approvals,
+                routes._DUPLICATING: {
+                    "owner": "1234:deadbeef",
+                    "at": 1.0,
+                    "token": token,
+                    "stage_dir": str(stage),
+                    "documents": {
+                        "requirements.md": routes._sha256_text("# copied"),
+                    },
+                },
+            }
+        }
+    )
+
+    routes._recover_abandoned_reservations()
+    loaded = routes._load_index()
+
+    assert "copy" in loaded
+    assert routes._DUPLICATING not in loaded["copy"]
+    assert loaded["copy"]["approvals"] == approvals
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate recovery requires atomic no-replace directory publication",
+)
+def test_startup_recovery_preserves_entry_when_publish_loses_target_race(
+    tmp_path, monkeypatch
+):
+    """A concurrently created target is user data, not proof of a failed copy."""
+    _redirect_state(monkeypatch, tmp_path)
+    token = "d" * 32
+    target = tmp_path / "custom" / "copy"
+    stage = target.parent / f".copy.duplicate-{token}"
+    stage.mkdir(parents=True)
+    (stage / routes._DUPLICATE_MARKER).write_text(token)
+    (stage / "requirements.md").write_text("# copied")
+    approvals = {"requirements": {"hash": "a" * 64}}
+    routes._save_index(
+        {
+            "copy": {
+                "working_dir": str(tmp_path),
+                "spec_dir": str(target),
+                "status": "planning",
+                "slot_key": "spec-builder-copy-deadbeef",
+                "approvals": approvals,
+                routes._DUPLICATING: {
+                    "owner": "1234:deadbeef",
+                    "at": 1.0,
+                    "token": token,
+                    "stage_dir": str(stage),
+                    "documents": {
+                        "requirements.md": routes._sha256_text("# copied"),
+                    },
+                },
+            }
+        }
+    )
+
+    def _concurrent_writer_wins(stage_dir, target_dir):
+        target_dir.mkdir()
+        (target_dir / "requirements.md").write_text("# external")
+        return "conflict"
+
+    monkeypatch.setattr(routes, "_publish_staged_copy", _concurrent_writer_wins)
+
+    routes._recover_abandoned_reservations()
+    loaded = routes._load_index()
+
+    assert "copy" in loaded
+    assert routes._DUPLICATING not in loaded["copy"]
+    assert loaded["copy"]["approvals"] == approvals
+    assert (target / "requirements.md").read_text() == "# external"
+    assert stage.is_dir()
+    assert not any(stage.iterdir())
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate recovery requires atomic no-replace directory publication",
+)
+def test_startup_recovery_keeps_a_duplicate_published_by_a_dead_process(
+    tmp_path, monkeypatch
+):
+    """The exact post-rename/pre-index crash window keeps the visible copy."""
+    _redirect_state(monkeypatch, tmp_path)
+    token = "d" * 32
+    target = tmp_path / "custom" / "copy"
+    target.mkdir(parents=True)
+    (target / routes._DUPLICATE_MARKER).write_text(token)
+    (target / "requirements.md").write_text("# copied")
+    stage = target.parent / f".copy.duplicate-{token}"
+    routes._save_index(
+        {
+            "copy": {
+                "working_dir": str(tmp_path),
+                "spec_dir": str(target),
+                "status": "planning",
+                "slot_key": "spec-builder-copy-deadbeef",
+                routes._DUPLICATING: {
+                    "owner": "1234:deadbeef",
+                    "at": 1.0,
+                    "token": token,
+                    "stage_dir": str(stage),
+                    "documents": {
+                        "requirements.md": routes._sha256_text("# copied"),
+                    },
+                },
+            }
+        }
+    )
+
+    routes._recover_abandoned_reservations()
+    loaded = routes._load_index()
+
+    assert "copy" in loaded
+    assert routes._DUPLICATING not in loaded["copy"]
+    assert (target / "requirements.md").read_text() == "# copied"
+
+
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate recovery requires atomic no-replace directory publication",
+)
+def test_startup_recovery_discards_an_incomplete_duplicate_stage_from_a_dead_process(
+    tmp_path, monkeypatch
+):
+    """A marker-provenanced partial stage is transaction residue, not user data."""
+    _redirect_state(monkeypatch, tmp_path)
+    token = "d" * 32
+    target = tmp_path / "custom" / "copy"
+    stage = target.parent / f".copy.duplicate-{token}"
+    stage.mkdir(parents=True)
+    (stage / routes._DUPLICATE_MARKER).write_text(token)
+    (stage / "requirements.md").write_text("# only the first document landed")
+    documents = {
+        "requirements.md": routes._sha256_text("# only the first document landed"),
+        "design.md": routes._sha256_text("# never written"),
+    }
+    routes._save_index(
+        {
+            "copy": {
+                "working_dir": str(tmp_path),
+                "spec_dir": str(target),
+                "status": "planning",
+                "slot_key": "spec-builder-copy-deadbeef",
+                routes._DUPLICATING: {
+                    "owner": "1234:deadbeef",
+                    "at": 1.0,
+                    "token": token,
+                    "stage_dir": str(stage),
+                    "documents": documents,
+                },
+            }
+        }
+    )
+
+    routes._recover_abandoned_reservations()
+    loaded = routes._load_index()
+
+    assert "copy" not in loaded
+    assert stage.is_dir()
+    assert not any(stage.iterdir()), "the abandoned transaction left hidden copied documents"
+
+
 def test_load_index_releases_a_legacy_bare_timestamp_reservation(tmp_path, monkeypatch):
     """An index written by an older build stores the marker as a bare float, which
     carries no owner. It cannot have come from THIS process, so it is foreign and
@@ -994,9 +1456,10 @@ async def test_touch_spec_returns_the_fresh_entry(tmp_path, monkeypatch):
 
 
 def test_no_handler_writes_the_index_from_a_stale_snapshot():
-    """Source guard for the CLASS, not the two reported instances. Every handler
+    """Source guard for the CLASS, not the reported instances. Every handler
     awaits somewhere, so none of them may call _save_index directly: the only
-    sanctioned writers are the re-reading mutator and the discovery loader."""
+    sanctioned writers are the re-reading mutator, startup recovery, and the
+    discovery loader."""
 
     src = inspect.getsource(routes)
     writers = [
@@ -1004,8 +1467,8 @@ def test_no_handler_writes_the_index_from_a_stale_snapshot():
         for ln in src.splitlines()
         if "_save_index(" in ln and not ln.strip().startswith(("#", "*", "def _save_index"))
     ]
-    # _mutate_index and _load_index_with_discovery hold the only write sites.
-    assert len(writers) == 2, f"unexpected _save_index call sites: {writers}"
+    # Each sanctioned writer holds _INDEX_LOCK around its read-modify-write.
+    assert len(writers) == 3, f"unexpected _save_index call sites: {writers}"
     for handler in (
         routes._handle_create,
         routes._handle_message,
@@ -1170,6 +1633,62 @@ def test_prepare_handoff_reports_tasks_and_clears_a_stale_sentinel(tmp_path):
     assert sentinel.endswith(routes._STOP_FILE)
 
     (spec_dir / "tasks.md").write_text("- [ ] task")
+    assert routes._prepare_handoff(spec_dir)[0] is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        "   \n\n\t\n",
+        "# Tasks\n\nProse with no checkbox at all.\n",
+        "- [x] done\n- [X] also done\n",
+        "- [ x] not an empty box\n",
+        "-[ ] no space after the marker\n",
+    ],
+)
+def test_open_task_predicate_rejects_a_plan_with_nothing_to_do(body):
+    """A tasks.md the autonomous prompt cannot act on: the prompt tells the agent
+    to work through each UNCHECKED task, so an empty file, prose, or an
+    all-checked list leaves the run with no work."""
+    assert routes._has_open_task(body) is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "- [ ] task",
+        "* [ ] star marker",
+        "+ [ ] plus marker",
+        "1. [ ] ordered marker",
+        "2) [ ] paren-ordered marker",
+        "- [] bare brackets",
+        "  - [ ] indented under a heading",
+        "\t- [ ] tab-indented",
+        "- [x] done first\n- [ ] then this one is open\n",
+    ],
+)
+def test_open_task_predicate_accepts_the_marker_styles_a_model_writes(body):
+    """The list is model-written and its marker style varies between runs, so the
+    gate accepts every Markdown checkbox spelling rather than only ``- [ ]``."""
+    assert routes._has_open_task(body) is True
+
+
+def test_prepare_handoff_refuses_a_tasks_file_with_no_open_task(tmp_path):
+    """The reported gap: the gate stat-ed tasks.md and accepted it on existence
+    alone, so a zero-byte or all-checked plan armed an autonomous loop that had
+    nothing to act on while the spec still read as a finished Tasks phase."""
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+    tasks = spec_dir / "tasks.md"
+
+    tasks.write_text("")
+    assert routes._prepare_handoff(spec_dir)[0] is False, "empty tasks.md armed a run"
+
+    tasks.write_text("- [x] everything already done\n")
+    assert routes._prepare_handoff(spec_dir)[0] is False, "all-checked tasks.md armed a run"
+
+    tasks.write_text("- [x] done\n- [ ] still open\n")
     assert routes._prepare_handoff(spec_dir)[0] is True
 
 
@@ -1367,6 +1886,7 @@ async def test_detail_payload_reports_live_running_state(tmp_path, monkeypatch):
     """The reported defect: the detail payload carried `status` but not `running`,
     so the selected spec's working indicator, document skeleton and fast 2.5s poll
     were all permanently off — the one place they matter."""
+    monkeypatch.setattr(routes, "_CAN_PUBLISH_DIR_NOREPLACE", False)
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "live"
     spec_dir.mkdir(parents=True)
@@ -1400,6 +1920,7 @@ async def test_detail_payload_reports_live_running_state(tmp_path, monkeypatch):
         await client.close()
 
     assert body["running"] is True, "detail payload omits the live running flag"
+    assert body["duplicate_supported"] is False
 
 
 # ── GPT round-9 findings (#518) ──────────────────────────────────────────────
@@ -1749,12 +2270,14 @@ def test_no_handler_reads_the_index_on_the_event_loop():
         "_aload_index",
         "_mutate_index",
         "_load_index_with_discovery",
+        "_recover_abandoned_reservations",
         "_load_index",
         "_prepare_handoff",
         "_write_stop_sentinel_for_spec",
     }
     for off_loop in (
         "_load_index_with_discovery",
+        "_recover_abandoned_reservations",
         "_prepare_handoff",
         "_write_stop_sentinel_for_spec",
     ):
@@ -4964,7 +5487,20 @@ async def test_claim_refuses_a_different_creation(tmp_path, monkeypatch):
     assert reason == routes._CLAIM_GONE
     assert routes._load_index()["s"].get("status") != "executing"
 
+    # Delete publishes its reservation before tearing down the slot. A handoff
+    # queued behind that boundary must not claim the hidden entry while teardown
+    # is in flight.
+    deleting = routes._load_index()
+    deleting["s"][routes._DELETING] = {"owner": routes._PROCESS_ID, "at": time.time()}
+    routes._save_index(deleting)
+    reason, _entry = await routes._claim_execution(
+        "s", expect_spec_dir=spec_dir, expect_slot_key="spec-builder-s-new", live_running=False
+    )
+    assert reason == routes._CLAIM_GONE
+
     # A live turn on the slot counts as taken even when the index says planning.
+    deleting["s"].pop(routes._DELETING)
+    routes._save_index(deleting)
     reason, _entry = await routes._claim_execution(
         "s", expect_spec_dir=spec_dir, expect_slot_key="spec-builder-s-new", live_running=True
     )
@@ -7143,3 +7679,1299 @@ def test_every_handler_that_returns_settings_redacts_it():
         "these handlers return agent-writable settings without _redact, so a "
         f"credential in the file reaches the dashboard raw: {offenders}"
     )
+
+
+# ── direct authority over the artifacts ──────────────────────────────────────
+# Before these endpoints the user could only ASK the agent to change anything:
+# a typo cost a model turn, an approval was a chat message that left no trace,
+# and the task list could only be handed over whole. Each test below pins the
+# guard that makes the new write path safe rather than merely present.
+
+
+def _seed_spec(tmp_path, name="live", *, files=None, extra=None):
+    """Seed one spec on disk and in the index. Returns (spec_dir, working_dir)."""
+    working_dir = tmp_path / "wd"
+    spec_dir = working_dir / ".kiro" / "specs" / name
+    spec_dir.mkdir(parents=True)
+    for fname, text in (files or {}).items():
+        (spec_dir / fname).write_text(text)
+    entry = {
+        "spec_dir": str(spec_dir),
+        "working_dir": str(working_dir),
+        "spec_type": "feature",
+        "status": "planning",
+        "slot_key": routes._slot_key(name),
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    entry.update(extra or {})
+    routes._save_index({name: entry})
+    return spec_dir, working_dir
+
+
+class _IdleSlot:
+    """A slot of OUR app that is not mid-turn."""
+
+    running = False
+    messages: list = []
+    _app = routes.APP_NAME
+    project = ""
+    _titled = False
+    title = ""
+
+    def __init__(self, key):
+        self.key = key
+        self.dispatched: list[str] = []
+
+
+def _state_for(*names):
+    """A fake gateway state serving an idle slot per spec name."""
+    slots = {routes._slot_key(n): _IdleSlot(routes._slot_key(n)) for n in names}
+
+    class _State:
+        def get_slot(self, key):
+            return slots.get(key)
+
+        def get_or_create_slot(self, name, app=""):
+            key = routes._slot_key(name)
+            slots.setdefault(key, _IdleSlot(key))
+            return slots[key]
+
+    return _State(), slots
+
+
+# ── gap 1: documents are reviewable through their redacted rendering ─────────
+
+
+def test_read_spec_files_returns_only_the_raw_hash_for_a_redacted_document(
+    tmp_path, monkeypatch
+):
+    """The browser gets safe rendering plus the hash needed for approval."""
+    monkeypatch.setattr(routes, "_redact", lambda t: t.replace("sk-secret", "[redacted]"))
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+    (spec_dir / "requirements.md").write_text("token is sk-secret")
+    (spec_dir / "design.md").write_text("nothing sensitive")
+
+    files, docs, tasks = routes._read_spec_files(spec_dir)
+
+    assert files["requirements.md"] == "token is [redacted]"
+    # The hash is of the file AS STORED, never of the redacted copy: an approval
+    # binds to the real version that was reviewed.
+    assert docs["requirements.md"] == {
+        "hash": routes._sha256_text("token is sk-secret")
+    }
+    assert set(docs["design.md"]) == {"hash"}
+    assert tasks == []
+
+
+def test_duplicate_doc_create_only_succeeds_while_the_file_is_absent(tmp_path):
+    """O_EXCL makes an external writer the winner rather than its victim."""
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+
+    result, identity = routes._create_spec_doc(spec_dir, "design.md", "# fresh")
+    assert result == "" and identity is not None
+    assert (spec_dir / "design.md").read_text() == "# fresh"
+
+    result, identity = routes._create_spec_doc(spec_dir, "design.md", "# second")
+    assert result == "conflict" and identity is None
+    assert (spec_dir / "design.md").read_text() == "# fresh"
+
+
+def test_duplicate_doc_create_refuses_a_spec_directory_swapped_for_a_symlink(tmp_path):
+    """Same attack the sentinel writers refuse: an agent replaces its own indexed
+    directory with a symlink, and a path-based write then lands user-authored text
+    somewhere else entirely."""
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    attacker = tmp_path / "attacker-spec"
+    os.symlink(real, attacker)
+
+    assert routes._create_spec_doc(attacker, "design.md", "# text")[0] == "unsafe_dir"
+    assert not (real / "design.md").exists()
+
+
+def test_duplicate_doc_create_retries_short_writes(tmp_path, monkeypatch):
+    """A successful save means the complete UTF-8 payload reached the temporary
+    file; a regular-file write is allowed to accept only a prefix."""
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+    real_write = routes.os.write
+    writes: list[int] = []
+
+    def _short_write(fd, data):
+        chunk = data[:2]
+        writes.append(len(chunk))
+        return real_write(fd, chunk)
+
+    monkeypatch.setattr(routes.os, "write", _short_write)
+    content = "complete payload"
+
+    assert routes._create_spec_doc(spec_dir, "design.md", content)[0] == ""
+    assert (spec_dir / "design.md").read_text() == content
+    assert len(writes) > 1
+
+
+# ── gap 2: approval is recorded against the version approved ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_approve_records_the_version_and_the_user(tmp_path, monkeypatch):
+    """Approval used to be nothing but a chat message: the server never knew a
+    phase had been signed off, by whom, or against which text."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# reviewed"})
+    digest = routes._sha256_text("# reviewed")
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/approve", json={"phase": "requirements", "hash": digest}
+        )
+        assert resp.status == 200, await resp.json()
+        detail = await (await client.get(f"{_BASE}/specs/live")).json()
+    finally:
+        await client.close()
+
+    stored = routes._load_index()["live"]["approvals"]["requirements"]
+    assert stored["hash"] == digest and stored["user"] == "tester" and stored["at"] > 0
+    assert detail["approvals"]["requirements"]["stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_approve_refuses_a_hash_that_is_not_the_current_document(tmp_path, monkeypatch):
+    """Approving a version nobody has seen records nothing meaningful, so the
+    claim is checked against the file rather than trusted."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# actually on disk"})
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/approve",
+            json={"phase": "requirements", "hash": routes._sha256_text("# something else")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "doc_changed"
+    assert "approvals" not in routes._load_index()["live"]
+
+
+@pytest.mark.asyncio
+async def test_approve_refuses_a_same_path_spec_recreated_during_hash_read(tmp_path, monkeypatch):
+    """A directory path is reusable; the per-creation slot key is the identity."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# reviewed"})
+    old_key = routes._load_index()["live"]["slot_key"]
+    real_read = routes._read_spec_text
+    replaced = False
+
+    def _replace_identity(spec_dir, fname):
+        nonlocal replaced
+        text = real_read(spec_dir, fname)
+        if fname == "requirements.md" and not replaced:
+            replaced = True
+            index = routes._load_index()
+            index["live"]["slot_key"] = old_key + "-replacement"
+            routes._save_index(index)
+        return text
+
+    monkeypatch.setattr(routes, "_read_spec_text", _replace_identity)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/approve",
+            json={"phase": "requirements", "hash": routes._sha256_text("# reviewed")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "stale_client"
+    assert "approvals" not in routes._load_index()["live"]
+
+
+def test_approvals_report_stale_once_the_document_moves(tmp_path):
+    """Why the approved VERSION is recorded rather than a bare flag: a document the
+    agent rewrote after sign-off must stop reading as approved."""
+    approved = routes._sha256_text("# as reviewed")
+    record = {"requirements": {"hash": approved, "at": 5.0, "user": "tester"}}
+
+    unchanged = routes._normalize_approvals(record, {"requirements.md": {"hash": approved}})
+    assert unchanged["requirements"]["stale"] is False
+
+    moved = routes._normalize_approvals(
+        record, {"requirements.md": {"hash": routes._sha256_text("# rewritten since")}}
+    )
+    assert moved["requirements"]["stale"] is True
+
+    # The document disappearing is also stale: nothing is left that it describes.
+    assert routes._normalize_approvals(record, {})["requirements"]["stale"] is True
+
+
+def test_approvals_from_the_index_are_normalized_not_trusted():
+    """The index is reachable by the agent (it runs shell commands as the user),
+    exactly like every other index field this module scrubs on egress. A forged
+    or malformed record must not reach the browser as-is."""
+    junk = {
+        "requirements": {"hash": "not-a-digest", "at": "soon", "user": "x"},
+        "design": "not even a dict",
+        "tasks": {"hash": "0" * 64},          # not an approvable phase
+        "../evil": {"hash": "0" * 64},
+    }
+    out = routes._normalize_approvals(junk, {})
+    assert out == {}, out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["tasks", "new", "", "../requirements"])
+async def test_approve_rejects_a_phase_outside_the_approvable_two(phase, tmp_path, monkeypatch):
+    """There is no "approve tasks" step: approving the task list IS the handoff."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# r"})
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/approve", json={"phase": phase, "hash": "0" * 64}
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 400 and body["code"] == "invalid_phase"
+
+
+# ── gap 3: one task at a time, addressed by position AND text ────────────────
+
+
+def test_parse_tasks_enumerates_hashes_and_derives_progress():
+    text = (
+        "# Tasks\n\n"
+        "- [x] wire the endpoint\n"
+        "- [ ] add the tests\n"
+        "1. [ ] update the docs\n"
+        "- [ ]\n"                      # no text: not something a user can run
+        "just prose\n"
+    )
+    tasks = routes._parse_tasks(text)
+
+    assert [t["index"] for t in tasks] == [0, 1, 2]
+    assert [t["done"] for t in tasks] == [True, False, False]
+    assert [t["text"] for t in tasks] == ["wire the endpoint", "add the tests", "update the docs"]
+    assert tasks[1]["hash"] == routes._sha256_text("add the tests")
+    # The gate's predicate reads the same parse, so the two cannot disagree.
+    assert routes._has_open_task(text) is True
+
+
+@pytest.mark.asyncio
+async def test_task_run_dispatches_one_scoped_turn(tmp_path, monkeypatch):
+    """Deliberately a single turn and NOT an autonudge loop: the whole-list handoff
+    arms a loop that keeps going, while running one task must end where the user
+    expects it to."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, working_dir = _seed_spec(
+        tmp_path, files={"tasks.md": "- [x] done already\n- [ ] add the tests\n"}
+    )
+    state, slots = _state_for("live")
+    sent: list[str] = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        detail = await (await client.get(f"{_BASE}/specs/live")).json()
+        target = detail["tasks"][1]
+        resp = await client.post(
+            f"{_BASE}/specs/live/task", json={"index": target["index"], "hash": target["hash"]}
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 200, body
+    assert detail["task_progress"] == {"done": 1, "total": 2}
+    assert len(sent) == 1
+    # Names the task by TEXT, and tells the agent to stop rather than continue.
+    assert "add the tests" in sent[0]
+    assert "Do NOT continue" in sent[0]
+    assert str(spec_dir / "tasks.md") in sent[0] and str(working_dir) in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_task_run_revalidates_the_task_after_slot_setup(tmp_path, monkeypatch):
+    """An IDE edit during the awaited slot setup must win over the stale click."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _ = _seed_spec(tmp_path, files={"tasks.md": "- [ ] original task\n"})
+    state, slots = _state_for("live")
+    sent: list[str] = []
+
+    async def _setup_then_edit(_state, _name, _meta):
+        (spec_dir / "tasks.md").write_text("- [ ] replacement task\n")
+        return slots[routes._slot_key("live")]
+
+    monkeypatch.setattr(routes, "_ensure_worker_slot", _setup_then_edit)
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": 0, "hash": routes._sha256_text("original task")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "task_changed"
+    assert sent == [], "dispatched the snapshot captured before slot setup"
+
+
+@pytest.mark.asyncio
+async def test_task_run_refuses_a_task_whose_text_moved(tmp_path, monkeypatch):
+    """The reason position alone is not an identity: the agent rewrites tasks.md
+    between polls, so a click on "task 2" could otherwise dispatch whatever ended
+    up second."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] the list was reordered\n"})
+    state, _ = _state_for("live")
+    sent: list[str] = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": 0, "hash": routes._sha256_text("what the user actually clicked")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "task_changed"
+    assert sent == [], "dispatched a task the user did not choose"
+
+
+@pytest.mark.asyncio
+async def test_task_run_uses_the_same_redacted_identity_the_detail_endpoint_serves(
+    tmp_path, monkeypatch
+):
+    """Reloading produces a runnable raw identity and a redacted task label."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] rotate sk-secret\n"})
+    state, _ = _state_for("live")
+    sent: list[str] = []
+    monkeypatch.setattr(routes, "_redact", lambda text: text.replace("sk-secret", "[redacted]"))
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        detail = await (await client.get(f"{_BASE}/specs/live")).json()
+        task = detail["tasks"][0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": task["index"], "hash": task["hash"]},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 200, body
+    assert len(sent) == 1 and "rotate [redacted]" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_task_run_hashes_raw_text_when_redaction_hides_a_change(tmp_path, monkeypatch):
+    """A stale click must not survive when only a redacted credential changes."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _ = _seed_spec(tmp_path, files={"tasks.md": "- [ ] rotate secret-old\n"})
+    state, _ = _state_for("live")
+    sent: list[str] = []
+    monkeypatch.setattr(
+        routes,
+        "_redact",
+        lambda text: re.sub(r"secret-(?:old|new)", "[redacted]", text),
+    )
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        detail = await (await client.get(f"{_BASE}/specs/live")).json()
+        task = detail["tasks"][0]
+        (spec_dir / "tasks.md").write_text("- [ ] rotate secret-new\n")
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": task["index"], "hash": task["hash"]},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert task["text"] == "rotate [redacted]"
+    assert resp.status == 409 and body["code"] == "task_changed"
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_task_run_is_refused_while_the_whole_list_is_building(tmp_path, monkeypatch):
+    """A loop already working the list and a single-task turn write the same files
+    and check off the same boxes, so they must not overlap."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(
+        tmp_path, files={"tasks.md": "- [ ] add the tests\n"}, extra={"status": "executing"}
+    )
+    state, _ = _state_for("live")
+    sent: list[str] = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+    monkeypatch.setattr(routes, "_effective_status", _always_executing)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": 0, "hash": routes._sha256_text("add the tests")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "already_executing"
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_task_run_refuses_a_handoff_that_claims_during_slot_setup(tmp_path, monkeypatch):
+    """The handoff owns the spec as soon as its index claim lands, before its
+    nudge loop or first turn makes the slot look busy."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
+    state, _ = _state_for("live")
+    real_ensure = routes._ensure_worker_slot
+    sent: list[str] = []
+
+    async def _ensure_after_handoff_claim(*args, **kwargs):
+        slot = await real_ensure(*args, **kwargs)
+        await routes._touch_spec(
+            "live",
+            status="executing",
+            exec_arming_at=time.time(),
+        )
+        return slot
+
+    monkeypatch.setattr(routes, "_ensure_worker_slot", _ensure_after_handoff_claim)
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: sent.append("sent"))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": 0, "hash": routes._sha256_text("add the tests")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "already_executing"
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_runs_dispatch_only_once(tmp_path, monkeypatch):
+    """Two requests may pass the early status check before either owns the slot."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
+    state, slots = _state_for("live")
+    slot = slots[routes._slot_key("live")]
+    real_ensure = routes._ensure_worker_slot
+    first_waiting = asyncio.Event()
+    release = asyncio.Event()
+    arrivals = 0
+    sent: list[str] = []
+
+    async def _held_ensure(*args, **kwargs):
+        nonlocal arrivals
+        resolved = await real_ensure(*args, **kwargs)
+        arrivals += 1
+        if arrivals == 1:
+            first_waiting.set()
+        await release.wait()
+        return resolved
+
+    def _mark_running(_state, _slot, message):
+        sent.append(message)
+        slot.running = True
+
+    monkeypatch.setattr(routes, "_ensure_worker_slot", _held_ensure)
+    monkeypatch.setattr(routes, "_dispatch_turn", _mark_running)
+    body = {"index": 0, "hash": routes._sha256_text("add the tests")}
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        first = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
+        second = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
+        await asyncio.wait_for(first_waiting.wait(), timeout=5)
+        release.set()
+        responses = await asyncio.gather(first, second)
+        payloads = [await response.json() for response in responses]
+    finally:
+        release.set()
+        await client.close()
+
+    assert sorted(response.status for response in responses) == [200, 409]
+    assert any(payload.get("code") == "agent_running" for payload in payloads)
+    assert arrivals == 1, "the losing request materialized the slot before checking the winner"
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_slot_materialization_serializes_delete_capture(tmp_path, monkeypatch):
+    """Delete cannot capture no slot while a task is about to restore that slot."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
+    state, slots = _state_for()
+    ensure_waiting = asyncio.Event()
+    release_ensure = asyncio.Event()
+    delete_waiting = asyncio.Event()
+    mark_entered = asyncio.Event()
+    real_lock = routes._spec_execution_lock
+    real_mark = routes._mark_deleting
+    lock_calls = 0
+    captured: list[object] = []
+    order: list[str] = []
+
+    async def _held_slot_materialization(_state, _name, _meta):
+        ensure_waiting.set()
+        await release_ensure.wait()
+        key = routes._slot_key("live")
+        slots[key] = _IdleSlot(key)
+        return slots[key]
+
+    def _watched_lock(request, name):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            delete_waiting.set()
+        return real_lock(request, name)
+
+    async def _watched_mark(*args, **kwargs):
+        mark_entered.set()
+        order.append("reserve-delete")
+        return await real_mark(*args, **kwargs)
+
+    async def _remove_loop(*args, **kwargs):
+        return None
+
+    async def _capture_teardown(*args, **kwargs):
+        captured.append(kwargs.get("only_slot"))
+        return True
+
+    monkeypatch.setattr(routes, "_ensure_worker_slot", _held_slot_materialization)
+    monkeypatch.setattr(routes, "_spec_execution_lock", _watched_lock)
+    monkeypatch.setattr(routes, "_mark_deleting", _watched_mark)
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: order.append("dispatch-task"))
+    monkeypatch.setattr(routes, "_remove_nudge_loop", _remove_loop)
+    monkeypatch.setattr(routes, "_teardown_worker_slot", _capture_teardown)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        body = {"index": 0, "hash": routes._sha256_text("add the tests")}
+        task_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
+        await asyncio.wait_for(ensure_waiting.wait(), timeout=5)
+        delete_request = asyncio.create_task(client.delete(f"{_BASE}/specs/live"))
+        await asyncio.wait_for(delete_waiting.wait(), timeout=5)
+        assert not mark_entered.is_set(), "Delete captured the runtime during slot restore"
+        release_ensure.set()
+        task_response, delete_response = await asyncio.gather(task_request, delete_request)
+    finally:
+        release_ensure.set()
+        await client.close()
+
+    assert task_response.status == 200 and delete_response.status == 200
+    assert order == ["dispatch-task", "reserve-delete"]
+    assert captured == [slots[routes._slot_key("live")]], "Delete missed the restored slot"
+
+
+@pytest.mark.asyncio
+async def test_task_final_snapshot_serializes_the_whole_plan_claim(tmp_path, monkeypatch):
+    """Execute cannot claim the spec while a task's final disk snapshot awaits."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
+    state, slots = _state_for("live")
+    slot = slots[routes._slot_key("live")]
+    release_snapshot = asyncio.Event()
+    snapshot_waiting = asyncio.Event()
+    execute_waiting = asyncio.Event()
+    claim_entered = asyncio.Event()
+    real_to_thread = routes.asyncio.to_thread
+    real_lock = routes._spec_execution_lock
+    real_claim = routes._claim_execution
+    snapshot_calls = 0
+    lock_calls = 0
+    sent: list[str] = []
+
+    async def _held_final_snapshot(func, *args, **kwargs):
+        nonlocal snapshot_calls
+        if getattr(func, "__name__", "") == "_task_snapshot":
+            snapshot_calls += 1
+            if snapshot_calls == 2:
+                snapshot_waiting.set()
+                await release_snapshot.wait()
+        return await real_to_thread(func, *args, **kwargs)
+
+    def _watched_lock(request, name):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            execute_waiting.set()
+        return real_lock(request, name)
+
+    async def _watched_claim(*args, **kwargs):
+        claim_entered.set()
+        return await real_claim(*args, **kwargs)
+
+    def _mark_running(_state, _slot, message):
+        sent.append(message)
+        slot.running = True
+
+    monkeypatch.setattr(routes.asyncio, "to_thread", _held_final_snapshot)
+    monkeypatch.setattr(routes, "_spec_execution_lock", _watched_lock)
+    monkeypatch.setattr(routes, "_claim_execution", _watched_claim)
+    monkeypatch.setattr(routes, "_dispatch_turn", _mark_running)
+    monkeypatch.setattr(routes, "_autonudge_instance", lambda: object())
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        body = {"index": 0, "hash": routes._sha256_text("add the tests")}
+        task_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
+        await asyncio.wait_for(snapshot_waiting.wait(), timeout=5)
+        execute_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/execute"))
+        await asyncio.wait_for(execute_waiting.wait(), timeout=5)
+        assert not claim_entered.is_set(), "Execute crossed the task's final snapshot"
+        release_snapshot.set()
+        task_response, execute_response = await asyncio.gather(task_request, execute_request)
+        execute_body = await execute_response.json()
+    finally:
+        release_snapshot.set()
+        slot.running = False
+        await client.close()
+
+    assert task_response.status == 200
+    assert execute_response.status == 409 and execute_body["code"] == "already_executing"
+    assert claim_entered.is_set() and len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_final_snapshot_serializes_delete_reservation(tmp_path, monkeypatch):
+    """Delete reserves teardown only after a final task snapshot has dispatched."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
+    state, _ = _state_for("live")
+    release_snapshot = asyncio.Event()
+    snapshot_waiting = asyncio.Event()
+    delete_waiting = asyncio.Event()
+    mark_entered = asyncio.Event()
+    real_to_thread = routes.asyncio.to_thread
+    real_lock = routes._spec_execution_lock
+    real_mark = routes._mark_deleting
+    snapshot_calls = 0
+    lock_calls = 0
+    order: list[str] = []
+
+    async def _held_final_snapshot(func, *args, **kwargs):
+        nonlocal snapshot_calls
+        if getattr(func, "__name__", "") == "_task_snapshot":
+            snapshot_calls += 1
+            if snapshot_calls == 2:
+                snapshot_waiting.set()
+                await release_snapshot.wait()
+        return await real_to_thread(func, *args, **kwargs)
+
+    def _watched_lock(request, name):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            delete_waiting.set()
+        return real_lock(request, name)
+
+    async def _watched_mark(*args, **kwargs):
+        mark_entered.set()
+        order.append("reserve-delete")
+        return await real_mark(*args, **kwargs)
+
+    async def _remove_loop(*args, **kwargs):
+        return None
+
+    async def _teardown(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(routes.asyncio, "to_thread", _held_final_snapshot)
+    monkeypatch.setattr(routes, "_spec_execution_lock", _watched_lock)
+    monkeypatch.setattr(routes, "_mark_deleting", _watched_mark)
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: order.append("dispatch-task"))
+    monkeypatch.setattr(routes, "_remove_nudge_loop", _remove_loop)
+    monkeypatch.setattr(routes, "_teardown_worker_slot", _teardown)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        body = {"index": 0, "hash": routes._sha256_text("add the tests")}
+        task_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
+        await asyncio.wait_for(snapshot_waiting.wait(), timeout=5)
+        delete_request = asyncio.create_task(client.delete(f"{_BASE}/specs/live"))
+        await asyncio.wait_for(delete_waiting.wait(), timeout=5)
+        assert not mark_entered.is_set(), "Delete crossed the task's final snapshot"
+        release_snapshot.set()
+        task_response, delete_response = await asyncio.gather(task_request, delete_request)
+    finally:
+        release_snapshot.set()
+        await client.close()
+
+    assert task_response.status == 200 and delete_response.status == 200
+    assert order == ["dispatch-task", "reserve-delete"]
+
+
+@pytest.mark.asyncio
+async def test_task_run_refuses_between_orchestration_stages(tmp_path, monkeypatch):
+    """A staged plan owns the slot even when no individual turn task is live."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
+    state, slots = _state_for("live")
+    slots[routes._slot_key("live")]._in_stage_execution = True
+    sent: list[str] = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: sent.append("sent"))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": 0, "hash": routes._sha256_text("add the tests")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "agent_running"
+    assert sent == []
+
+
+async def _always_executing(name, meta, slot):
+    return "executing"
+
+
+@pytest.mark.asyncio
+async def test_task_run_refuses_a_task_already_checked_off(tmp_path, monkeypatch):
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"tasks.md": "- [x] already finished\n"})
+    state, _ = _state_for("live")
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/task",
+            json={"index": 0, "hash": routes._sha256_text("already finished")},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "task_done"
+
+
+# ── gap 5: label, archive, duplicate ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_title_relabels_without_touching_the_identity(tmp_path, monkeypatch):
+    """A rename of the LABEL only. The name is simultaneously the on-disk directory,
+    the git branch and the chat slot key -- and _owns_slot_key requires the key to
+    ENCODE the name -- so renaming the identity would move a directory the IDE and
+    CLI also read and orphan the spec's transcript, which is exactly what
+    delete-and-recreate loses."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _ = _seed_spec(tmp_path)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(f"{_BASE}/specs/live/title", json={"title": "Checkout rewrite"})
+        assert resp.status == 200, await resp.json()
+    finally:
+        await client.close()
+
+    entry = routes._load_index()["live"]
+    assert entry["title"] == "Checkout rewrite"
+    assert entry["spec_dir"] == str(spec_dir), "the directory moved"
+    assert entry["slot_key"] == routes._slot_key("live"), "the transcript was orphaned"
+    assert spec_dir.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_archive_marks_the_spec_without_deleting_it(tmp_path, monkeypatch):
+    """The non-destructive counterpart to delete: documents, transcript and index
+    entry all stay. Delete used to be the only way out of the rail, so tidying up
+    and destroying the work were the same action."""
+    client = _make_client(monkeypatch, tmp_path)
+    spec_dir, _ = _seed_spec(tmp_path, files={"requirements.md": "# keep me"})
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        assert (await client.post(f"{_BASE}/specs/live/archive", json={"archived": True})).status == 200
+
+        listed = await (await client.get(f"{_BASE}/specs")).json()
+        # Still reachable directly, and still on disk.
+        detail = await (await client.get(f"{_BASE}/specs/live")).json()
+
+        assert (await client.post(f"{_BASE}/specs/live/archive", json={"archived": False})).status == 200
+        restored = await (await client.get(f"{_BASE}/specs")).json()
+    finally:
+        await client.close()
+
+    assert [(s["name"], s["archived"]) for s in listed["specs"]] == [("live", True)]
+    assert detail["archived"] is True
+    assert (spec_dir / "requirements.md").read_text() == "# keep me"
+    assert [s["name"] for s in restored["specs"]] == ["live"]
+
+
+@pytest.mark.asyncio
+async def test_archive_is_refused_while_the_spec_is_building(tmp_path, monkeypatch):
+    """Archiving a running spec would hide a loop that keeps editing files, leaving
+    the user no surface to stop it from."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, extra={"status": "executing"})
+    monkeypatch.setattr(routes, "_effective_status", _always_executing)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(f"{_BASE}/specs/live/archive", json={"archived": True})
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "spec_executing"
+    assert routes._load_index()["live"].get("archived") is not True
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate publication requires atomic no-replace directory publication",
+)
+async def test_duplicate_copies_the_documents_into_a_fresh_spec(tmp_path, monkeypatch):
+    """The recovery path rename cannot serve: a spec whose NAME is wrong once it
+    already has a branch or history. The copy takes the documents and nothing
+    else, so it gets its own slot key and therefore its own conversation."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# reqs", "design.md": "# design"})
+    state, _ = _state_for("live")
+    sent: list[str] = []
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(f"{_BASE}/specs/live/duplicate", json={"new_name": "live-copy"})
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 201, body
+    copy_dir = Path(body["spec_dir"])
+    assert copy_dir.name == "live-copy"
+    assert (copy_dir / "requirements.md").read_text() == "# reqs"
+    assert (copy_dir / "design.md").read_text() == "# design"
+    assert not (copy_dir / routes._DUPLICATE_MARKER).exists()
+
+    index = routes._load_index()
+    assert index["live"]["spec_dir"] != index["live-copy"]["spec_dir"]
+    assert index["live-copy"]["slot_key"] != index["live"]["slot_key"], "shared a transcript"
+    # A duplicate never inherits a worktree: branching off someone's repo is not a
+    # copy operation, and it is an opt-in at create time.
+    assert index["live-copy"]["worktree_branch"] == ""
+    # The fresh conversation is told what it is looking at, and told not to rewrite it.
+    assert len(sent) == 1 and "copy of 'live'" in sent[0] and "Do NOT rewrite" in sent[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate publication requires atomic no-replace directory publication",
+)
+async def test_duplicate_preserves_an_existing_empty_document(tmp_path, monkeypatch):
+    """An empty phase file is data, not the same thing as a missing document."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# reqs", "design.md": ""})
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: None)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(f"{_BASE}/specs/live/duplicate", json={"new_name": "live-copy"})
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 201, body
+    copy_dir = Path(body["spec_dir"])
+    assert (copy_dir / "requirements.md").read_text() == "# reqs"
+    assert (copy_dir / "design.md").is_file()
+    assert (copy_dir / "design.md").read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_duplicate_refuses_a_name_already_in_use(tmp_path, monkeypatch):
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# reqs"})
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        same = await client.post(f"{_BASE}/specs/live/duplicate", json={"new_name": "live"})
+        same_body = await same.json()
+        bad = await client.post(f"{_BASE}/specs/live/duplicate", json={"new_name": "../escape"})
+        bad_body = await bad.json()
+    finally:
+        await client.close()
+
+    assert same.status == 409 and same_body["code"] == "spec_exists"
+    assert bad.status == 400 and bad_body["code"] == "invalid_name"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_refuses_a_spec_with_no_documents_yet(tmp_path, monkeypatch):
+    """Nothing to copy is a refusal, not an empty spec created as a side effect."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(f"{_BASE}/specs/live/duplicate", json={"new_name": "empty-copy"})
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "nothing_to_copy"
+    assert "empty-copy" not in routes._load_index()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate publication requires atomic no-replace directory publication",
+)
+async def test_duplicate_reserves_its_name_before_populating_the_destination(tmp_path, monkeypatch):
+    """A concurrent create must not win the destination index entry while the
+    duplicate is already copying documents into that same directory."""
+    client = _make_client(monkeypatch, tmp_path)
+    _, working_dir = _seed_spec(tmp_path, files={"requirements.md": "# copied"})
+    state, _ = _state_for("live")
+    real_create = routes._create_spec_doc
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    def _held_save(*args, **kwargs):
+        save_started.set()
+        assert release_save.wait(5), "concurrent create never reached arbitration"
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "_create_spec_doc", _held_save)
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args, **_kwargs: None)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        duplicate_request = asyncio.create_task(
+            client.post(f"{_BASE}/specs/live/duplicate", json={"new_name": "shared-name"})
+        )
+        assert await asyncio.to_thread(save_started.wait, 5)
+        create = await client.post(
+            f"{_BASE}/specs",
+            json={
+                "name": "shared-name",
+                "working_dir": str(working_dir),
+                "spec_type": "feature",
+                "description": "concurrent create",
+                "use_worktree": False,
+            },
+        )
+        create_body = await create.json()
+        release_save.set()
+        duplicate = await duplicate_request
+        duplicate_body = await duplicate.json()
+    finally:
+        release_save.set()
+        await client.close()
+
+    assert create.status == 409 and create_body["code"] == "spec_exists"
+    assert duplicate.status == 201, duplicate_body
+    copy_dir = Path(duplicate_body["spec_dir"])
+    assert (copy_dir / "requirements.md").read_text() == "# copied"
+    assert routes._load_index()["shared-name"]["spec_dir"] == str(copy_dir)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_refuses_when_the_destination_changes_after_reservation(
+    tmp_path, monkeypatch
+):
+    """The index reservation and copied files must always name one directory."""
+    client = _make_client(monkeypatch, tmp_path)
+    _, working_dir = _seed_spec(tmp_path, files={"requirements.md": "# copied"})
+    moved_base = tmp_path / "moved-specs"
+    moved_base.mkdir()
+    state, _ = _state_for("live")
+    real_mutate = routes._mutate_index
+    moved = False
+
+    async def _move_settings_after_reservation(fn):
+        nonlocal moved
+        changed = await real_mutate(fn)
+        if changed and not moved and "live-copy" in routes._load_index():
+            moved = True
+            routes._save_settings({"base_path": str(moved_base), "model": ""})
+        return changed
+
+    monkeypatch.setattr(routes, "_mutate_index", _move_settings_after_reservation)
+    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args, **_kwargs: None)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/duplicate", json={"new_name": "live-copy"}
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409 and body["code"] == "spec_destination_changed"
+    assert "live-copy" not in routes._load_index()
+    assert not (moved_base / "live-copy").exists()
+    assert not (working_dir / ".kiro" / "specs" / "live-copy").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate publication requires atomic no-replace directory publication",
+)
+async def test_duplicate_rolls_back_only_files_it_created_after_a_partial_failure(
+    tmp_path, monkeypatch
+):
+    """A failed copy must not become discoverable as an incomplete spec."""
+    client = _make_client(monkeypatch, tmp_path)
+    _, working_dir = _seed_spec(
+        tmp_path,
+        files={"requirements.md": "# copied", "design.md": "# fails"},
+    )
+    state, _ = _state_for("live")
+    real_create = routes._create_spec_doc
+    calls = 0
+
+    def _fail_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return "write_failed", None
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "_create_spec_doc", _fail_second)
+
+    await client.start_server()
+    try:
+        client.app["state"] = state
+        resp = await client.post(
+            f"{_BASE}/specs/live/duplicate", json={"new_name": "partial-copy"}
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    target = working_dir / ".kiro" / "specs" / "partial-copy"
+    assert resp.status == 400 and body["code"] == "doc_write_failed"
+    assert "partial-copy" not in routes._load_index()
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate publication requires atomic no-replace directory publication",
+)
+async def test_duplicate_preserves_a_published_copy_when_index_finalization_fails(
+    tmp_path, monkeypatch
+):
+    """A post-rename failure remains recoverable instead of poisoning retries."""
+    client = _make_client(monkeypatch, tmp_path)
+    _, working_dir = _seed_spec(tmp_path, files={"requirements.md": "# copied"})
+    real_mutate = routes._mutate_index
+
+    async def _fail_finish(fn):
+        if getattr(fn, "__name__", "") == "_finish":
+            return False
+        return await real_mutate(fn)
+
+    monkeypatch.setattr(routes, "_mutate_index", _fail_finish)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/duplicate", json={"new_name": "recoverable-copy"}
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    target = working_dir / ".kiro" / "specs" / "recoverable-copy"
+    assert resp.status == 409 and body["code"] == "spec_changed_during_create"
+    assert (target / "requirements.md").read_text() == "# copied"
+    assert (target / routes._DUPLICATE_MARKER).is_file()
+    assert routes._DUPLICATING in routes._load_index()["recoverable-copy"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not routes._CAN_PUBLISH_DIR_NOREPLACE,
+    reason="duplicate publication requires atomic no-replace directory publication",
+)
+async def test_duplicate_keeps_its_committed_copy_when_slot_setup_is_refused(
+    tmp_path, monkeypatch
+):
+    """Session arbitration must not delete a copy already committed to the index."""
+    client = _make_client(monkeypatch, tmp_path)
+    _, working_dir = _seed_spec(tmp_path, files={"requirements.md": "# copied"})
+
+    async def _refuse_slot(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(routes, "_ensure_worker_slot", _refuse_slot)
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await client.post(
+            f"{_BASE}/specs/live/duplicate", json={"new_name": "committed-copy"}
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    target = working_dir / ".kiro" / "specs" / "committed-copy"
+    assert resp.status == 409 and body["code"] == "slot_owned_by_another_app"
+    assert (target / "requirements.md").read_text() == "# copied"
+    assert "committed-copy" in routes._load_index()
+
+
+# ── shared guards for the new mutations ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("post", "approve", {"phase": "requirements", "hash": "0" * 64}),
+        ("post", "task", {"index": 0, "hash": "0" * 64}),
+        ("post", "title", {"title": "t"}),
+        ("post", "archive", {"archived": True}),
+        ("post", "duplicate", {"new_name": "a-copy"}),
+    ],
+)
+async def test_new_mutations_refuse_a_stale_client_identity(
+    method, path, body, tmp_path, monkeypatch
+):
+    """Every mutation carries the identity the CLIENT rendered, so a stale tab
+    cannot drive a same-name spec that was deleted and recreated elsewhere. The
+    per-creation slot key is the decisive field: two specs can share a directory
+    across a delete + re-import, but never a key."""
+    client = _make_client(monkeypatch, tmp_path)
+    _seed_spec(tmp_path, files={"requirements.md": "# r", "tasks.md": "- [ ] t\n"})
+
+    await client.start_server()
+    try:
+        client.app["state"] = _state_for("live")[0]
+        resp = await getattr(client, method)(
+            f"{_BASE}/specs/live/{path}",
+            json={**body, "spec_dir": "/somewhere/else", "slot_key": "spec-builder-live-deadbeef"},
+        )
+        payload = await resp.json()
+    finally:
+        await client.close()
+
+    assert resp.status == 409, payload
+    assert payload["code"] == "stale_client"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "approve"),
+        ("post", "task"),
+        ("post", "title"),
+        ("post", "archive"),
+        ("post", "duplicate"),
+    ],
+)
+async def test_new_mutations_require_authentication(method, path, tmp_path, monkeypatch):
+    """No auth middleware, so request['user'] is unset: every new write must 401
+    rather than fall through to the filesystem."""
+    _redirect_state(monkeypatch, tmp_path)
+    app = web.Application()          # deliberately WITHOUT _auth_mw
+    routes.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        resp = await getattr(client, method)(f"{_BASE}/specs/live/{path}", json={})
+        assert resp.status == 401
+
+
+def test_new_mutations_do_not_write_the_index_from_a_stale_snapshot():
+    """Extends the existing class guard to the new handlers: each awaits (a body
+    read at minimum), so none of them may call _save_index directly."""
+    for handler in (
+        routes._handle_approve,
+        routes._handle_run_task,
+        routes._handle_title,
+        routes._handle_archive,
+        routes._handle_duplicate,
+    ):
+        assert "_save_index(" not in inspect.getsource(handler), (
+            f"{handler.__name__} writes the index directly; it must go through _mutate_index"
+        )
+
+
+def test_document_and_task_reads_stay_off_the_event_loop():
+    """Source guard, same reason the detail handler has one: these handlers read
+    and write caller-supplied paths, and the detail endpoint beside them is polled
+    every 2.5s. Blocking filesystem work must ride a worker thread."""
+    for handler, blocking in (
+        (routes._handle_approve, "_current_hash"),
+        (routes._handle_run_task, "_tasks"),
+        (routes._handle_duplicate, "_copy"),
+    ):
+        src = inspect.getsource(handler)
+        # Matched on the two tokens rather than one formatted call string: the
+        # arguments wrap, so pinning the exact whitespace would fail on a reformat
+        # while saying nothing about whether the work is still offloaded.
+        assert "asyncio.to_thread(" in src and blocking in src, (
+            f"{handler.__name__} may be doing filesystem work inline"
+        )

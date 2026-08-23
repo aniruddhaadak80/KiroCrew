@@ -20,6 +20,7 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -38,6 +39,7 @@ from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
+from kiro_crew.platform_compat import RENAME_NOREPLACE_AVAILABLE, rename_noreplace
 
 try:
     from kiro_crew.security import (
@@ -75,8 +77,9 @@ except Exception:  # pragma: no cover - constant always present in prod
     CHAT_TURN_TIMEOUT = 1800  # type: ignore[assignment]
 
 try:
-    from kiro_crew.hooks import safe_read_file_bytes_nolink
+    from kiro_crew.hooks import _fd_real_path, safe_read_file_bytes_nolink
 except Exception:  # pragma: no cover - hooks always present in prod
+    _fd_real_path = None  # type: ignore[assignment]
     safe_read_file_bytes_nolink = None  # type: ignore[assignment]
 
 try:
@@ -169,6 +172,40 @@ _MAX_SPEC_BYTES = 1 << 20
 # ── enablement gate ──────────────────────────────────────────────────────────
 
 
+_DuplicateRecoveryState = dict[str, asyncio.Task[None] | None]
+_DUPLICATE_RECOVERY_STATE: web.AppKey[_DuplicateRecoveryState] = web.AppKey(
+    "spec_builder_duplicate_recovery", dict
+)
+_SpecExecutionLocks = dict[str, asyncio.Lock]
+_SPEC_EXECUTION_LOCKS: web.AppKey[_SpecExecutionLocks] = web.AppKey(
+    "spec_builder_execution_locks", dict
+)
+
+
+def _spec_execution_lock(request: web.Request, name: str) -> asyncio.Lock:
+    """Serialize the final dispatch boundary for one spec.
+
+    Task-file validation awaits a worker thread. Execute and Delete must not claim
+    the same spec during that gap: Execute would start an overlapping run, while
+    Delete could tear down the slot the task is about to dispatch into. Handlers
+    share one aiohttp event loop, so publishing a lazily-created lock in the
+    per-Application mapping has no suspension point and is atomic with respect to
+    the other request handlers.
+    """
+    locks = request.app.get(_SPEC_EXECUTION_LOCKS)
+    if locks is None:
+        # Direct handler callers (including focused tests and embedders) may not
+        # have gone through register_routes. Production registration always
+        # publishes this before the Application is frozen.
+        locks = {}
+        request.app[_SPEC_EXECUTION_LOCKS] = locks
+    lock = locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[name] = lock
+    return lock
+
+
 def _require_enabled(handler):
     """Deny requests when Spec Builder is disabled (deny-by-default). Routes are
     registered once at gateway startup, so a default-disabled / opt-in app would
@@ -179,6 +216,10 @@ def _require_enabled(handler):
     async def _wrapped(request: web.Request) -> web.Response:
         if not await asyncio.to_thread(is_app_enabled, APP_NAME):
             return web.json_response({"code": "app_disabled", "error": "spec-builder is disabled"}, status=403)
+        # Handlers own the 401 response, but an unauthenticated probe must not
+        # trigger filesystem work before that gate runs.
+        if request.get("user") is not None:
+            await _ensure_duplicate_recovery(request.app)
         return await handler(request)
 
     return _wrapped
@@ -350,7 +391,6 @@ def _save_settings(settings: dict) -> None:
 #: both -- so one lock keeps a concurrent pair from interleaving either write.
 _INDEX_LOCK = threading.Lock()
 
-
 #: Cap on remembered deletions. Bounded so the file cannot grow without limit on
 #: an instance that creates and deletes specs repeatedly; the oldest entries fall
 #: off first, and a fallen-off directory becomes discoverable again (the same
@@ -462,6 +502,11 @@ def _load_index() -> dict:
     and until then the entry is simply visible again. A reservation this process
     still owns is left strictly alone, which is what keeps an in-flight delete's
     own concurrent reads from cancelling its reservation underneath it.
+
+    Duplicate recovery is deliberately NOT part of this read path. It renames or
+    removes files and must run once at app startup under the index lock, rather
+    than repeating those side effects on every list/detail poll until some later
+    mutation happens to persist the cleaned reservation.
     """
     try:
         data = json.loads(_index_path().read_text())
@@ -477,7 +522,11 @@ def _load_index() -> dict:
     if len(clean) != len(data):
         logger.warning("spec index had %d malformed entries — ignoring them",
                        len(data) - len(clean))
-    stale = [k for k, v in clean.items() if _DELETING in v and not _reservation_is_ours(v)]
+    stale = [
+        k
+        for k, v in clean.items()
+        if _DELETING in v and not _reservation_is_ours(v, _DELETING)
+    ]
     for k in stale:
         clean[k].pop(_DELETING, None)
     if stale:
@@ -575,6 +624,18 @@ async def _mutate_index(mutate: Callable[[dict], bool]) -> bool:
 #: cannot slip into the window. Hidden from the list while set.
 _DELETING = "deleting"
 
+#: Set on a destination entry before duplicate starts writing its files. Keeping
+#: the entry in the index reserves the name against a concurrent create, while
+#: list/detail/mutation paths hide the not-yet-complete copy.
+_DUPLICATING = "duplicating"
+
+#: Provenance marker carried inside a duplicate's hidden staging directory.
+#: The directory is renamed into place only after every document is durable, so
+#: this marker lets a restarted gateway distinguish its complete publication
+#: from an unrelated directory at the same path.
+_DUPLICATE_MARKER = ".kirocrew-duplicate"
+_DUPLICATE_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+
 #: Identity of THIS gateway process, stamped into a delete reservation so
 #: ``_load_index`` can tell a reservation this process still owns from one left
 #: behind by a process that is gone.
@@ -588,14 +649,14 @@ _DELETING = "deleting"
 _PROCESS_ID = f"{os.getpid()}:{uuid.uuid4().hex}"
 
 
-def _reservation_is_ours(meta: dict) -> bool:
-    """True when a delete reservation belongs to a request in THIS process.
+def _reservation_is_ours(meta: dict, field: str = _DELETING) -> bool:
+    """True when a reservation belongs to a request in THIS process.
 
     A pre-existing reservation from an older build stores a bare timestamp rather
     than a mapping; it has no owner, so it reads as foreign -- which is the right
     answer, because this process demonstrably did not write it.
     """
-    held = meta.get(_DELETING)
+    held = meta.get(field)
     return isinstance(held, dict) and held.get("owner") == _PROCESS_ID
 
 
@@ -662,7 +723,7 @@ async def _touch_spec(
         meta = index.get(name)
         if meta is None:
             return False
-        if meta.get(_DELETING):
+        if meta.get(_DELETING) or meta.get(_DUPLICATING):
             return False
         if expect_spec_dir is not None and str(meta.get("spec_dir", "")) != expect_spec_dir:
             return False
@@ -767,10 +828,16 @@ def _contained(child: Path, root: Path) -> bool:
 #: ``os.replace(..., src_dir_fd=, dst_dir_fd=)`` call works (verified on Linux).
 _CAN_PIN_DIR = (
     hasattr(os, "O_DIRECTORY")
+    and os.mkdir in os.supports_dir_fd
     and os.open in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
     and os.rename in os.supports_dir_fd
 )
+
+# Publishing a complete staging directory must be one atomic no-replace step.
+# A separate existence check plus os.rename() is not equivalent: another writer
+# can create an empty destination in between and POSIX rename then replaces it.
+_CAN_PUBLISH_DIR_NOREPLACE = _CAN_PIN_DIR and RENAME_NOREPLACE_AVAILABLE
 
 _BROWSE_SKIP = {"node_modules", "__pycache__", "venv", "env"}
 #: Cap on subdirectories returned by one browse call. A directory with tens of
@@ -878,6 +945,95 @@ def _new_slot_key(name: str) -> str:
 
 _PHASE_FILES = [("tasks", "tasks.md"), ("design", "design.md"), ("requirements", "requirements.md")]
 
+#: ONE task line in ``tasks.md``: a bullet or ordered marker, then a checkbox,
+#: then the task text. Group 1 is the box body (empty/blank = open, ``x``/``X`` =
+#: done) and group 2 is the text. Accepts the ``-``/``*``/``+`` and ``1.``/``1)``
+#: markers Markdown allows, and a bare ``[]`` alongside ``[ ]``, because the list
+#: is model-written and its marker style varies between runs.
+#:
+#: Deliberately the ONLY task-line pattern in this module. The handoff gate needs
+#: "is there an open task", the detail endpoint needs the enumerated list, and the
+#: per-task endpoint needs to address one of them; expressing those as separate
+#: regexes would let the gate and the list disagree about what a task even is,
+#: and the per-task run would then target a line the gate never counted.
+_TASK_LINE_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\[([ \t]?|[xX])\][ \t]*(.*)$", re.MULTILINE)
+
+#: Documents the user may edit through the app. The spec directory also holds
+#: ``.spec-state.json`` (agent-authored) and the STOP sentinel (a control), and
+#: neither is a document a person should be able to PUT arbitrary text into.
+_EDITABLE_DOCS = frozenset(f for _phase, f in _PHASE_FILES)
+
+#: Phases whose approval the app records. Matches ``ADVANCE`` in the SPA: there is
+#: no "approve tasks" step, because approving the task list IS the handoff.
+_APPROVABLE_PHASES = ("requirements", "design")
+
+#: Cap on tasks enumerated for one spec. A model-written list is normally tens of
+#: lines; the bound stops a pathological file from inflating every detail poll.
+_MAX_TASKS = 300
+
+
+def _sha256_text(text: str) -> str:
+    """Content hash used as an edit/approval fingerprint.
+
+    Hex-encoded SHA-256 of the UTF-8 bytes. Two uses, both about a document
+    changing under someone: an editor sends back the hash it loaded so a save
+    that would overwrite an agent's newer write is refused, and an approval
+    records the hash it approved so the UI can say the document has moved since.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _parse_tasks(text: str) -> list[dict]:
+    """Enumerate ``tasks.md``'s checklist as addressable tasks.
+
+    Each task carries its ``index`` (position among task lines, which is what the
+    UI renders and what the run endpoint addresses) and a ``hash`` of its text.
+    BOTH are required to act on one: an index alone is a moving target because the
+    agent rewrites this file between polls, so a click on "task 3" could dispatch
+    whatever ended up third. The hash pins the identity the user actually saw, and
+    a mismatch is refused rather than guessed at.
+
+    The hash is derived from the RAW task body while only ``text`` is redacted for
+    egress. Hashing the redacted rendering would collapse different credentials to
+    the same identity, allowing an agent edit hidden by redaction to survive the
+    stale-click check.
+
+    ``tasks.md`` stays the source of truth -- there is no sidecar task store. That
+    file is the interop contract with the Kiro IDE and CLI, which read and write
+    the same three documents, so a spec built here has to remain a spec they can
+    open. Progress is therefore DERIVED by re-parsing checkboxes rather than
+    tracked separately, and an agent (or a person) checking a box by hand shows up
+    without anything having to be told.
+    """
+    tasks: list[dict] = []
+    for match in _TASK_LINE_RE.finditer(text or ""):
+        body = (match.group(2) or "").strip()
+        if not body:
+            # A checkbox with no text is not something a user can be asked to run.
+            continue
+        tasks.append(
+            {
+                "index": len(tasks),
+                "text": _redact(body)[:_MAX_FIELD],
+                "done": match.group(1).strip().lower() == "x",
+                "hash": _sha256_text(body),
+            }
+        )
+        if len(tasks) >= _MAX_TASKS:
+            break
+    return tasks
+
+
+def _has_open_task(text: str) -> bool:
+    """True when ``tasks.md`` holds at least one UNCHECKED task.
+
+    The predicate behind the handoff gate. Existence is not a plan: the prompt the
+    gate arms tells the agent to work through each unchecked task in order, so a
+    zero-byte, prose-only or fully-checked file gave the autonomous loop nothing to
+    act on while still reading as a finished Tasks phase.
+    """
+    return any(not t["done"] for t in _parse_tasks(text))
+
 
 def _spec_file(spec_dir: Path, fname: str) -> Path | None:
     """Resolve ``spec_dir/fname`` for reading, or ``None`` if it isn't safe.
@@ -939,7 +1095,7 @@ def _read_spec_text(spec_dir: Path, fname: str) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
-def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
+def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None, dict]:
     """Gather everything the detail endpoint needs off the filesystem.
 
     BLOCKING — call via ``asyncio.to_thread``. Bundled into one function so the
@@ -948,7 +1104,7 @@ def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
     documents, and read + normalize the agent-authored state file.
     """
     phase = _derive_phase(spec_dir)
-    files = _read_spec_files(spec_dir)
+    files, docs, tasks = _read_spec_files(spec_dir)
     state: dict | None = None
     raw_text = _read_spec_text(spec_dir, ".spec-state.json")
     if raw_text is not None:
@@ -956,7 +1112,15 @@ def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
             state = _normalize_spec_state(json.loads(raw_text))
         except json.JSONDecodeError:
             state = None
-    return phase, files, state
+    # The task list is parsed from the SAME raw tasks.md text already read for the
+    # document response. _parse_tasks redacts only the label it returns, preserving
+    # the raw identity hash without adding another filesystem read to each poll.
+    meta = {
+        "docs": docs,
+        "tasks": tasks,
+        "task_progress": {"done": sum(1 for t in tasks if t["done"]), "total": len(tasks)},
+    }
+    return phase, files, state, meta
 
 
 def _verified_spec_dir(spec_dir: Path) -> Path | None:
@@ -986,6 +1150,485 @@ def _verified_spec_dir(spec_dir: Path) -> Path | None:
         return spec_dir
     except OSError:
         return None
+
+
+def _open_verified_dir(spec_dir: Path) -> tuple[Path, int] | None:
+    """Open *spec_dir* and prove the descriptor still names that exact path.
+
+    ``O_NOFOLLOW`` covers only the final component. An agent can replace an
+    ancestor with a symlink after pathname validation but before ``os.open``;
+    descriptor-relative writes would then be pinned safely to the wrong tree.
+    Resolving the opened descriptor closes that window because all subsequent
+    mutations use the same descriptor whose identity was authorized here.
+    """
+    real_dir = _verified_spec_dir(spec_dir)
+    if real_dir is None or not _CAN_PIN_DIR or _fd_real_path is None:
+        return None
+    try:
+        dir_fd = os.open(
+            real_dir,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError:
+        return None
+    try:
+        opened_path = _fd_real_path(dir_fd)
+        expected = os.path.normcase(str(real_dir))
+        if opened_path is None or os.path.normcase(os.path.normpath(opened_path)) != expected:
+            os.close(dir_fd)
+            return None
+        return real_dir, dir_fd
+    except (OSError, ValueError):
+        os.close(dir_fd)
+        return None
+
+
+def _create_open_verified_dir(spec_dir: Path) -> tuple[Path, int] | None:
+    """Create one child through its verified parent and return the opened child."""
+    if not spec_dir.is_absolute() or spec_dir.name in {"", ".", ".."}:
+        return None
+    opened_parent = _open_verified_dir(spec_dir.parent)
+    if opened_parent is None:
+        return None
+    _real_parent, parent_fd = opened_parent
+    dir_fd = -1
+    try:
+        os.mkdir(spec_dir.name, 0o700, dir_fd=parent_fd)
+        dir_fd = os.open(
+            spec_dir.name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        opened_path = _fd_real_path(dir_fd) if _fd_real_path is not None else None
+        expected = os.path.normcase(str(spec_dir))
+        if opened_path is None or os.path.normcase(os.path.normpath(opened_path)) != expected:
+            os.close(dir_fd)
+            return None
+        return spec_dir, dir_fd
+    except OSError:
+        if dir_fd >= 0:
+            os.close(dir_fd)
+        return None
+    finally:
+        os.close(parent_fd)
+
+
+def _create_spec_doc(
+    spec_dir: Path, fname: str, text: str
+) -> tuple[str, tuple[int, int, int, int] | None]:
+    """Create one absent spec document and return a rollback identity.
+
+    Duplication owns an empty destination, so ``O_EXCL`` gives it a real atomic
+    boundary: an IDE or agent that creates the same file first wins and is never
+    overwritten. The returned stat tuple lets failure cleanup remove only the
+    exact file this call created; a file replaced or modified by another writer
+    is left alone.
+
+    BLOCKING -- call via ``asyncio.to_thread``.
+    """
+    if fname not in _EDITABLE_DOCS:
+        return "not_editable", None
+    encoded = text.encode("utf-8")
+    if len(encoded) > _MAX_SPEC_BYTES:
+        return "too_large", None
+    if not _CAN_PIN_DIR:
+        return "unsupported_platform", None
+    opened_dir = _open_verified_dir(spec_dir)
+    if opened_dir is None:
+        return "unsafe_dir", None
+    _real_dir, dir_fd = opened_dir
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(fname, flags, 0o600, dir_fd=dir_fd)
+        try:
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError("document write made no progress")
+                remaining = remaining[written:]
+            os.fsync(fd)
+            stat = os.fstat(fd)
+            return "", (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            # Return the exact partial inode to the duplicate transaction. Its
+            # rollback removes it only if no other writer replaced or modified it.
+            try:
+                stat = os.fstat(fd)
+                identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                identity = None
+            return "write_failed", identity
+        finally:
+            os.close(fd)
+            fd = -1
+    except FileExistsError:
+        return "conflict", None
+    except OSError:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return "write_failed", None
+    finally:
+        os.close(dir_fd)
+
+
+def _rollback_staged_docs(
+    spec_dir: Path, created: dict[str, tuple[int, int, int, int]]
+) -> None:
+    """Remove unchanged files created by a failed duplicate.
+
+    Cleanup deliberately leaves the empty hidden stage directory. POSIX has no
+    portable inode-bound rmdir, so removing it by name would reopen a race where
+    an attacker swaps in a different directory after descriptor validation.
+    """
+    opened_dir = _open_verified_dir(spec_dir)
+    if opened_dir is None:
+        return
+    _, dir_fd = opened_dir
+    try:
+        for fname, identity in created.items():
+            try:
+                stat = os.stat(fname, dir_fd=dir_fd, follow_symlinks=False)
+                current = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                if current == identity:
+                    os.unlink(fname, dir_fd=dir_fd)
+            except OSError:
+                continue
+    finally:
+        os.close(dir_fd)
+
+
+def _write_duplicate_marker_at(dir_fd: int, token: str) -> bool:
+    """Create the provenance marker relative to an already verified directory."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(_DUPLICATE_MARKER, flags, 0o600, dir_fd=dir_fd)
+        remaining = memoryview(token.encode("ascii"))
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                return False
+            remaining = remaining[written:]
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _write_duplicate_marker(stage_dir: Path, token: str) -> bool:
+    """Create the provenance marker in a descriptor-pinned staging directory."""
+    opened_dir = _open_verified_dir(stage_dir)
+    if opened_dir is None:
+        return False
+    _real_dir, dir_fd = opened_dir
+    try:
+        return _write_duplicate_marker_at(dir_fd, token)
+    finally:
+        os.close(dir_fd)
+
+
+def _duplicate_marker_matches(spec_dir: Path, token: str) -> bool:
+    """Read a duplicate provenance marker without following directory links."""
+    opened_dir = _open_verified_dir(spec_dir)
+    if opened_dir is None:
+        return False
+    _real_dir, dir_fd = opened_dir
+    fd = -1
+    try:
+        fd = os.open(
+            _DUPLICATE_MARKER,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=dir_fd,
+        )
+        return os.read(fd, 256).decode("ascii", errors="strict") == token
+    except (OSError, UnicodeError):
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)
+
+
+def _remove_duplicate_marker(spec_dir: Path) -> None:
+    """Remove a staging marker from the pinned directory, if it is still there."""
+    opened_dir = _open_verified_dir(spec_dir)
+    if opened_dir is None:
+        return
+    _real_dir, dir_fd = opened_dir
+    try:
+        os.unlink(_DUPLICATE_MARKER, dir_fd=dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _duplicate_manifest_is_valid(documents: object) -> bool:
+    """True when recovery metadata names only complete document digests."""
+    if not isinstance(documents, dict) or not documents:
+        return False
+    for fname, digest in documents.items():
+        if fname not in _EDITABLE_DOCS or not isinstance(digest, str) or len(digest) != 64:
+            return False
+        if _SHA256_RE.fullmatch(digest) is None:
+            return False
+    return True
+
+
+def _duplicate_documents_match(spec_dir: Path, documents: object) -> bool:
+    """True when a staging directory contains the complete reserved payload."""
+    if not _duplicate_manifest_is_valid(documents):
+        return False
+    assert isinstance(documents, dict)
+    for fname, digest in documents.items():
+        text = _read_spec_text(spec_dir, fname)
+        if text is None or _sha256_text(text) != digest:
+            return False
+    return True
+
+
+def _discard_duplicate_stage(stage_dir: Path, token: str, documents: object) -> None:
+    """Remove only files owned by a marker-provenanced duplicate transaction.
+
+    The empty stage remains because directory removal cannot be bound to its
+    already-open inode across the final pathname-based rmdir syscall.
+    """
+    if not _duplicate_marker_matches(stage_dir, token) or not isinstance(documents, dict):
+        return
+    names = list(documents)
+    if not names or any(name not in _EDITABLE_DOCS for name in names):
+        return
+    opened_dir = _open_verified_dir(stage_dir)
+    if opened_dir is None:
+        return
+    _, dir_fd = opened_dir
+    try:
+        for fname in names:
+            try:
+                os.unlink(fname, dir_fd=dir_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(_DUPLICATE_MARKER, dir_fd=dir_fd)
+        except OSError:
+            pass
+    finally:
+        os.close(dir_fd)
+
+
+def _publish_staged_copy(stage_dir: Path, target_dir: Path) -> str:
+    """Atomically publish a sibling staging directory without replacement."""
+    if not _CAN_PUBLISH_DIR_NOREPLACE or stage_dir.parent != target_dir.parent:
+        return "unsupported_platform"
+    real_stage = _verified_spec_dir(stage_dir)
+    real_parent = _safe_dir(str(stage_dir.parent))
+    if real_stage is None or real_parent is None or real_stage.parent != real_parent:
+        return "unsafe_dir"
+    opened_parent = _open_verified_dir(real_parent)
+    if opened_parent is None:
+        return "unsafe_dir"
+    _real_parent, parent_fd = opened_parent
+    try:
+        try:
+            rename_noreplace(
+                stage_dir.name,
+                target_dir.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            return "conflict"
+        except NotImplementedError:
+            return "unsupported_platform"
+        except OSError:
+            return "write_failed"
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            # The atomic rename already completed. Treating a filesystem that
+            # rejects directory fsync as failure would orphan the published copy.
+            logger.debug("duplicate parent directory fsync unavailable", exc_info=True)
+        return ""
+    finally:
+        os.close(parent_fd)
+
+
+def _recover_abandoned_copy(name: str, meta: dict) -> bool | None:
+    """Recover a proven duplicate, or return ``None`` when provenance is absent.
+
+    ``False`` means structurally valid reservation metadata proves this entry was
+    an unpublished duplicate and can be discarded. ``None`` means the untrusted
+    metadata does not prove that; callers must preserve the entry and clear only
+    the reservation marker.
+    """
+    held = meta.get(_DUPLICATING)
+    if not isinstance(held, dict):
+        return None
+    owner = held.get("owner")
+    reserved_at = held.get("at")
+    token = held.get("token")
+    stage_raw = held.get("stage_dir")
+    documents = held.get("documents")
+    target_raw = meta.get("spec_dir")
+    slot_key = meta.get("slot_key")
+    if (
+        not isinstance(owner, str)
+        or not owner
+        or not isinstance(reserved_at, (int, float))
+        or not isinstance(token, str)
+        or not token
+        or not isinstance(stage_raw, str)
+        or not stage_raw
+        or not isinstance(target_raw, str)
+        or not target_raw
+        or not isinstance(slot_key, str)
+        or not _owns_slot_key(name, slot_key)
+        or not _duplicate_manifest_is_valid(documents)
+    ):
+        return None
+    if _DUPLICATE_TOKEN_RE.fullmatch(token) is None:
+        return None
+    target_dir = Path(target_raw)
+    stage_dir = Path(stage_raw)
+    expected_stage = target_dir.parent / f".{name}.duplicate-{token}"
+    if (
+        not target_dir.is_absolute()
+        or target_dir.name != name
+        or stage_dir != expected_stage
+        or stage_dir.parent != target_dir.parent
+    ):
+        return None
+    # A marker at the target means the all-or-nothing rename completed. Preserve
+    # the visible copy even if another writer legitimately changed it afterwards.
+    if _duplicate_marker_matches(target_dir, token):
+        return True
+    # Before publication a genuine duplicate has no target directory. Any target
+    # without our marker is user data (or a concurrent writer's winning create),
+    # never transaction residue that recovery may delete from the index.
+    if target_dir.exists():
+        return None
+    if not _duplicate_marker_matches(stage_dir, token):
+        return None
+    if not _duplicate_documents_match(stage_dir, documents):
+        _discard_duplicate_stage(stage_dir, token, documents)
+        return False
+    publish_result = _publish_staged_copy(stage_dir, target_dir)
+    if publish_result == "":
+        return True
+    _discard_duplicate_stage(stage_dir, token, documents)
+    if publish_result == "conflict" or target_dir.exists():
+        return None
+    return False
+
+
+def _recover_abandoned_reservations() -> None:
+    """Recover duplicate transactions once and persist their terminal state.
+
+    BLOCKING -- first enabled use runs this through ``asyncio.to_thread``.
+    The index lock serializes the filesystem recovery with every index mutation,
+    and the cleaned index is saved in the same critical section so a later poll
+    never repeats a rename/unlink transaction that startup already resolved.
+    """
+    with _INDEX_LOCK:
+        index = _load_index()
+        abandoned = [
+            name
+            for name, meta in index.items()
+            if _DUPLICATING in meta and not _reservation_is_ours(meta, _DUPLICATING)
+        ]
+        if not abandoned:
+            return
+        recovered = 0
+        for name in abandoned:
+            outcome = _recover_abandoned_copy(name, index[name])
+            if outcome is True:
+                index[name].pop(_DUPLICATING, None)
+                recovered += 1
+            elif outcome is False:
+                index.pop(name, None)
+            else:
+                # Malformed/unproven metadata is not authority to delete a real
+                # spec record, its approvals, or its conversation linkage.
+                index[name].pop(_DUPLICATING, None)
+        _save_index(index)
+        _refresh_slot_keys(index)
+    logger.info(
+        "spec index: recovered %d and released %d duplicate reservation(s) "
+        "abandoned by an earlier process",
+        recovered,
+        len(abandoned) - recovered,
+    )
+
+
+async def _recover_abandoned_reservations_on_first_use() -> None:
+    """Run recovery off-loop without making an abandoned copy disable the app."""
+    try:
+        await asyncio.to_thread(_recover_abandoned_reservations)
+    except Exception:
+        # A reservation remains hidden and keeps its name reserved when recovery
+        # cannot prove a safe terminal state. Retry on the next gateway process,
+        # rather than failing every poll or taking unrelated app routes down.
+        logger.exception("spec index: abandoned duplicate recovery failed")
+
+
+async def _ensure_duplicate_recovery(app: web.Application) -> None:
+    """Recover once on first enabled use, after the gateway is already ready."""
+    recovery = app[_DUPLICATE_RECOVERY_STATE]
+    task = recovery["task"]
+    if task is None:
+        # Request handlers for one Application share an event loop. There is no
+        # await between checking and publishing the task, so concurrent first
+        # requests cannot start two filesystem transactions.
+        task = asyncio.create_task(_recover_abandoned_reservations_on_first_use())
+        recovery["task"] = task
+    await task
+
+
+def _write_and_publish_duplicate(
+    stage_dir: Path, target_dir: Path, docs: dict[str, str | None], token: str
+) -> tuple[str, dict[str, tuple[int, int, int, int]]]:
+    """Populate a hidden sibling directory, then atomically publish it. BLOCKING."""
+    created: dict[str, tuple[int, int, int, int]] = {}
+    if not _CAN_PUBLISH_DIR_NOREPLACE:
+        return "unsupported_platform", created
+    opened_stage = _create_open_verified_dir(stage_dir)
+    if opened_stage is None:
+        return "write_failed", created
+    _, stage_fd = opened_stage
+    try:
+        marker_written = _write_duplicate_marker_at(stage_fd, token)
+        if not marker_written:
+            try:
+                os.unlink(_DUPLICATE_MARKER, dir_fd=stage_fd)
+            except OSError:
+                pass
+            failure = "unsupported_platform" if not _CAN_PIN_DIR else "write_failed"
+            return failure, created
+    finally:
+        os.close(stage_fd)
+    for fname, text in docs.items():
+        if text is None:
+            continue
+        result, identity = _create_spec_doc(stage_dir, fname, text)
+        if identity is not None:
+            created[fname] = identity
+        if result:
+            _remove_duplicate_marker(stage_dir)
+            _rollback_staged_docs(stage_dir, created)
+            return result, created
+    result = _publish_staged_copy(stage_dir, target_dir)
+    if result:
+        _remove_duplicate_marker(stage_dir)
+        _rollback_staged_docs(stage_dir, created)
+    return result, created
 
 
 def _write_stop_sentinel(spec_dir: Path) -> bool:
@@ -1184,8 +1827,16 @@ def _prepare_handoff(
     # refuses a symlink, a realpath that escapes the spec dir, and a sensitive
     # target; the extra is_file() keeps the "not written yet" case honest.
     tasks = _spec_file(spec_dir, "tasks.md")
-    ready = tasks is not None and tasks.is_file()
-    return ready, sentinel
+    if tasks is None or not tasks.is_file():
+        return False, sentinel
+    # Existence is not a plan. The prompt this gate arms tells the agent to work
+    # through each UNCHECKED task in order, so a zero-byte or half-written
+    # tasks.md gave the autonomous loop nothing to act on while still reading as
+    # a finished Tasks phase. Read through _read_spec_text rather than by name:
+    # it validates the descriptor it read, and the agent writes into this very
+    # directory, so the inode can change after the is_file() above.
+    text = _read_spec_text(spec_dir, "tasks.md")
+    return bool(text and _has_open_task(text)), sentinel
 
 
 async def _restore_worker_transcript(state: Any, name: str, *, adopt_closed: bool) -> None:
@@ -1450,6 +2101,49 @@ def _numeric(value: object) -> float:
 
 #: Outcomes of _claim_execution, so the caller can tell "someone else is already
 #: building" from "the spec is gone" without re-reading the index.
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _normalize_approvals(raw: Any, docs: dict) -> dict:
+    """Project the stored approval record onto its schema and mark what has moved.
+
+    Returns ``{phase: {"hash", "at", "user", "stale"}}`` for the phases in
+    ``_APPROVABLE_PHASES`` only.
+
+    ``stale`` is DERIVED here, never stored: it compares the hash that was approved
+    against the document's hash right now, so a document the agent rewrote after
+    sign-off reports itself as changed instead of continuing to look approved. A
+    phase whose document has since disappeared is also stale -- there is nothing
+    left that the approval describes.
+
+    Normalized on read because this record lives in the app's index, and the index
+    is reachable by the agent (it runs shell commands as the user), exactly like
+    every other index field this module scrubs on the way out. Which is also the
+    honest limit of what this is: a record of a human review, not an attestation
+    that cannot be forged. It earns its place against the previous behaviour --
+    where approval was a chat message and left no trace at all -- not against a
+    threat model where the agent is hostile.
+    """
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for phase in _APPROVABLE_PHASES:
+        entry = raw.get(phase)
+        if not isinstance(entry, dict):
+            continue
+        approved_hash = str(entry.get("hash", ""))
+        if not _SHA256_RE.match(approved_hash):
+            continue
+        current = str((docs.get(phase + ".md") or {}).get("hash", ""))
+        out[phase] = {
+            "hash": approved_hash,
+            "at": _numeric(entry.get("at")),
+            "user": _clean_str(entry.get("user")),
+            "stale": current != approved_hash,
+        }
+    return out
+
+
 _CLAIM_OK = ""
 _CLAIM_TAKEN = "taken"
 _CLAIM_GONE = "gone"
@@ -1480,7 +2174,12 @@ async def _claim_execution(
 
     def _apply(index: dict) -> bool:
         meta = index.get(name)
-        if meta is None or str(meta.get("spec_dir", "")) != expect_spec_dir:
+        if (
+            meta is None
+            or meta.get(_DELETING)
+            or meta.get(_DUPLICATING)
+            or str(meta.get("spec_dir", "")) != expect_spec_dir
+        ):
             return False
         actual_key = str(meta.get("slot_key", ""))
         if expect_slot_key and actual_key and actual_key != expect_slot_key:
@@ -1851,12 +2550,29 @@ def _derive_phase(spec_dir: Path) -> str:
     return "new"
 
 
-def _read_spec_files(spec_dir: Path) -> dict:
-    out: dict[str, str | None] = {}
+def _read_spec_files(spec_dir: Path) -> tuple[dict, dict, list[dict]]:
+    """Read the documents once, returning ``(files, docs, tasks)``.
+
+    ``files`` is what the browser renders: the text with credentials REDACTED.
+    ``docs`` carries the ON-DISK hash used to bind approvals to the version that
+    was reviewed. ``tasks`` carries redacted labels but raw-text identity hashes.
+    Documents remain read-only here because the agent and IDE write the same files
+    without participating in a dashboard lock; no portable compare-and-swap can
+    prevent a direct write between a hash check and replace.
+    """
+    files: dict[str, str | None] = {}
+    docs: dict[str, dict] = {}
+    tasks: list[dict] = []
     for _phase, fname in _PHASE_FILES:
         text = _read_spec_text(spec_dir, fname)
-        out[fname] = _redact(text) if text is not None else None
-    return out
+        if text is None:
+            files[fname] = None
+            continue
+        files[fname] = _redact(text)
+        docs[fname] = {"hash": _sha256_text(text)}
+        if fname == "tasks.md":
+            tasks = _parse_tasks(text)
+    return files, docs, tasks
 
 
 # ── validation / auth ────────────────────────────────────────────────────────
@@ -1964,6 +2680,44 @@ def _exec_prompt(name: str, spec_dir: Path, working_dir: str) -> str:
         f"mark its checkbox [x] in tasks.md, run the relevant build/tests to verify, "
         f"then continue. Stop when all tasks are checked or you hit a blocker that needs "
         f"me, and summarize what was done and what remains."
+    )
+
+
+def _task_prompt(name: str, spec_dir: Path, working_dir: str, task_text: str) -> str:
+    """Instruction for running ONE task from the list.
+
+    Deliberately scoped and deliberately NOT an autonudge loop: the whole-list
+    handoff arms a loop that keeps going, while this dispatches a single turn and
+    stops. Running one task is how a user takes a plan for a walk without handing
+    over the whole thing, so it must end where the user expects it to.
+
+    Names the task by its TEXT rather than an index, because the model reads
+    tasks.md itself and the numbering it sees can differ from the UI's -- indexes
+    identify the task on the wire, the text identifies it to the agent.
+    """
+    return (
+        f"SINGLE TASK from spec '{name}'. Work ONLY on this one task from "
+        f"{spec_dir / 'tasks.md'}, operating inside {working_dir} (your shell already "
+        f"starts there — no cd needed):\n\n{task_text}\n\n"
+        f"Mark its checkbox [x] in tasks.md when it is genuinely done, run the "
+        f"relevant build/tests to verify, then STOP and summarize. Do NOT continue "
+        f"to the following tasks — I am running these one at a time."
+    )
+
+
+def _duplicate_prompt(name: str, source: str, spec_dir: Path) -> str:
+    """Orientation for a duplicated spec's fresh conversation.
+
+    A duplicate copies the documents but NOT the transcript -- the new spec gets
+    its own slot key, so it cannot inherit the original's history. Without a first
+    turn the agent would come to the conversation knowing nothing about documents
+    that are already on disk, so this tells it what it is looking at and, notably,
+    tells it not to start rewriting them.
+    """
+    return (
+        f"Spec '{name}' is a copy of '{source}'. Its documents are already written "
+        f"at {spec_dir} — read them before doing anything else. Do NOT rewrite or "
+        f"regenerate them; wait for me to say what should change in this copy."
     )
 
 
@@ -2540,14 +3294,26 @@ def _discover_folder_specs(index: dict) -> bool:
 
 
 def _prepare_spec_dir(
-    working_dir: str, safe_wd: Path, name: str, import_existing: bool
+    working_dir: str,
+    safe_wd: Path,
+    name: str,
+    import_existing: bool,
+    *,
+    create: bool = True,
+    expected_dir: Path | None = None,
 ) -> tuple[Path, str]:
     """Resolve + validate + create the spec directory. BLOCKING -- one hop.
 
     Returns ``(spec_dir, refusal)``; ``refusal`` is ``""`` on success, else
-    ``"escape"``, ``"existing:<files>"`` or ``"mkdir:<reason>"``.
+    ``"escape"``, ``"moved"``, ``"existing:<files>"`` or ``"mkdir:<reason>"``.
     """
     spec_dir = _resolve_spec_dir(working_dir, name)
+    # Duplication reserves this exact path before any files are copied. Refuse
+    # if a concurrent settings change resolves the destination elsewhere.
+    if expected_dir is not None and os.path.normcase(str(spec_dir)) != os.path.normcase(
+        str(expected_dir)
+    ):
+        return spec_dir, "moved"
     # The spec dir must land under its declared root -- either the settings
     # base_path or the validated working dir (which is the WORKTREE when one was
     # just created). _NAME_RE already forbids '.' and '/', so this can only fail
@@ -2574,10 +3340,11 @@ def _prepare_spec_dir(
         existing = [f for _p, f in _PHASE_FILES if (spec_dir / f).is_file()]
         if existing:
             return spec_dir, "existing:" + ", ".join(sorted(existing))
-    try:
-        spec_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return spec_dir, f"mkdir:{exc}"
+    if create:
+        try:
+            spec_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return spec_dir, f"mkdir:{exc}"
     return spec_dir, ""
 
 
@@ -2607,7 +3374,7 @@ async def _handle_list(request: web.Request) -> web.Response:
     for name, meta in index.items():
         # A delete in flight keeps its entry so the name stays reserved (see
         # _mark_deleting); it is not a spec the user still has.
-        if isinstance(meta, dict) and meta.get(_DELETING):
+        if isinstance(meta, dict) and (meta.get(_DELETING) or meta.get(_DUPLICATING)):
             continue
         spec_dir = Path(meta.get("spec_dir", ""))
         slot = state.get_slot(_slot_key(name)) if (state := request.app.get("state")) else None
@@ -2621,6 +3388,9 @@ async def _handle_list(request: web.Request) -> web.Response:
                 "working_dir": _redact(str(meta.get("working_dir", ""))),
                 "spec_dir": _redact(str(spec_dir)),
                 "spec_type": _redact(str(meta.get("spec_type", "feature"))),
+                # Optional display label; the rail falls back to the name.
+                "title": _clean_str(meta.get("title")),
+                "archived": meta.get("archived") is True,
                 # Reconciled, not raw: a capped nudge loop that ran out of cycles
                 # leaves "executing" in the index forever (see _effective_status).
                 "status": await _effective_status(name, meta, slot),
@@ -2905,7 +3675,7 @@ async def _handle_get(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     index = await _aload_index()
     meta = index.get(name)
-    if not meta:
+    if not meta or meta.get(_DELETING) or meta.get(_DUPLICATING):
         return web.json_response({"code": "not_found", "error": "not found"}, status=404)
     spec_dir = Path(meta["spec_dir"])
 
@@ -2921,7 +3691,7 @@ async def _handle_get(request: web.Request) -> web.Response:
     # and reading .spec-state.json. The UI polls this endpoint every 2.5s while a
     # build runs, so doing it inline froze the gateway's event loop — chat
     # streaming and heartbeats included — for the duration of every poll.
-    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, spec_dir)
+    phase, files, spec_state, doc_meta = await asyncio.to_thread(_collect_spec_documents, spec_dir)
 
     # Live context counters from the worker slot's transcript. The slot is
     # CREATED here if it does not exist yet (see _ensure_worker_slot): a spec
@@ -2983,6 +3753,27 @@ async def _handle_get(request: web.Request) -> web.Response:
             "running": bool(getattr(slot, "running", False)) if slot is not None else False,
             "phase": phase,
             "files": files,
+            # Per-document raw hash, used to bind approval to the exact stored
+            # revision even when the rendered text required redaction.
+            "docs": doc_meta["docs"],
+            # tasks.md's checklist, enumerated and individually addressable, plus
+            # derived progress. Both come from re-parsing the markdown -- there is
+            # no separate task store to drift out of sync with the file the IDE and
+            # CLI also read.
+            "tasks": doc_meta["tasks"],
+            "task_progress": doc_meta["task_progress"],
+            # A recorded human review per phase, with `stale` set when the document
+            # moved after sign-off. Approval used to be a chat message and left
+            # nothing behind at all.
+            "approvals": _normalize_approvals(meta.get("approvals"), doc_meta["docs"]),
+            # Display label. The NAME stays the immutable identity (directory, git
+            # branch, slot key); this is the only part a rename may touch.
+            "title": _clean_str(meta.get("title")),
+            "archived": meta.get("archived") is True,
+            # Duplicate's crash-safe transaction needs descriptor-relative
+            # filesystem operations. Keep an unsupported platform honest in the
+            # UI instead of presenting an action the route must fail closed.
+            "duplicate_supported": _CAN_PUBLISH_DIR_NOREPLACE,
             "state": spec_state,
             "context": {
                 "worktree_branch": _redact(str(meta.get("worktree_branch", ""))),
@@ -3125,7 +3916,11 @@ async def _handle_handoff(request: web.Request) -> web.Response:
     )
     if not has_tasks:
         return web.json_response(
-            {"code": "tasks_missing", "error": "tasks.md does not exist yet — finish the Tasks phase first"}, status=409
+            {
+                "code": "tasks_missing",
+                "error": "tasks.md has no unchecked tasks yet — finish the Tasks phase first",
+            },
+            status=409
         )
     # Reread AFTER the await as well: a delete+recreate can land during the thread
     # hop, and a stale request would then capture the REPLACEMENT's slot while its
@@ -3182,22 +3977,30 @@ async def _handle_handoff(request: web.Request) -> web.Response:
     # a timer with no execution state -- and the restored timer ran something Pause
     # could not stop, because Pause keys off that state.
     captured_slot_key = str(meta.get("slot_key", ""))
-    live_slot = state.get_slot(_slot_key(name)) if state is not None else None
-    try:
-        claim, committed = await _claim_execution(
-            name,
-            expect_spec_dir=str(spec_dir),
-            expect_slot_key=captured_slot_key,
-            live_running=bool(getattr(live_slot, "running", False)),
-        )
-    except Exception:
-        # Nothing has been created yet, so there is nothing to unwind -- but the
-        # run must not proceed on an unrecorded state, because Pause keys off it.
-        logger.warning("could not claim execution for %s", name, exc_info=True)
-        return web.json_response(
-            {"code": "exec_state_write_failed", "error": "could not record execution state; the run was not started"},
-            status=500,
-        )
+    async with _spec_execution_lock(request, name):
+        # A per-task request holds this same lock across its final tasks.md read
+        # and synchronous dispatch. Resolve the slot only after acquiring it, so
+        # a task that won the lock is visible here through its published task.
+        live_slot = state.get_slot(_slot_key(name)) if state is not None else None
+        try:
+            claim, committed = await _claim_execution(
+                name,
+                expect_spec_dir=str(spec_dir),
+                expect_slot_key=captured_slot_key,
+                live_running=_slot_is_writing(live_slot),
+            )
+        except Exception:
+            # Nothing has been created yet, so there is nothing to unwind -- but
+            # the run must not proceed on an unrecorded state, because Pause keys
+            # off it.
+            logger.warning("could not claim execution for %s", name, exc_info=True)
+            return web.json_response(
+                {
+                    "code": "exec_state_write_failed",
+                    "error": "could not record execution state; the run was not started",
+                },
+                status=500,
+            )
     if claim == _CLAIM_TAKEN:
         return web.json_response(
             {"code": "already_executing", "error": "this spec is already building; pause it before starting again"},
@@ -3391,6 +4194,569 @@ def _client_identity_mismatch(
     return bool(claim.slot_key) and bool(actual_slot_key) and claim.slot_key != actual_slot_key
 
 
+async def _pinned_entry(request: web.Request, name: str, body: dict) -> dict | web.Response:
+    """Resolve the spec FRESH, pinned to the identity the client rendered.
+
+    The shared prologue for every mutation added below, factored out because the
+    pinning argument is subtle and six copies of it would drift: the body read is
+    an await, so the entry has to be re-read after it, and the client's captured
+    ``spec_dir`` + ``slot_key`` are what make a stale tab detectable. Both fields
+    stay optional, so an older client is treated as unpinned rather than refused --
+    the same contract ``_client_claim`` documents.
+    """
+    claimed_dir = str(body.get("spec_dir", "") or "").strip()
+    claimed_key = str(body.get("slot_key", "") or "").strip()
+    fresh = await _touch_spec(
+        name, expect_spec_dir=claimed_dir or None, expect_slot_key=claimed_key or None
+    )
+    if fresh is None:
+        return web.json_response({"code": "stale_client", "error": _STALE_CLIENT_ERROR}, status=409)
+    return fresh
+
+
+def _slot_is_writing(slot: Any) -> bool:
+    """True once a slot has published an in-flight agent turn."""
+    task = getattr(slot, "task", None)
+    return bool(
+        getattr(slot, "running", False)
+        or getattr(slot, "_in_stage_execution", False)
+        or (task is not None and not task.done())
+    )
+
+
+def _agent_is_writing(request: web.Request, name: str) -> bool:
+    """True while this spec's agent turn is in flight.
+
+    Both the editor and the per-task run refuse in that window. The agent writes
+    the spec documents itself, so accepting a save mid-turn means one of the two
+    writes silently wins -- and the compare-and-swap hash cannot help, because the
+    editor's base hash was valid when the turn STARTED. Refusing is the honest
+    answer: the user is told to wait rather than told the save succeeded.
+    """
+    state = request.app.get("state")
+    if state is None:
+        return False
+    slot = state.get_slot(_slot_key(name))
+    return _slot_is_writing(slot)
+
+
+async def _handle_approve(request: web.Request) -> web.Response:
+    """Record a human approval of one phase, against the version approved.
+
+    Records rather than enforces, and the distinction is deliberate. Enforcing
+    would mean refusing the agent's write to ``design.md`` until requirements is
+    approved, and the agent writes through its OWN file tools rather than this
+    app's API -- so the app cannot enforce that without owning the agent's
+    filesystem access, and a gate that can be walked around is worse than an
+    honest record. What this fixes is that approval used to be a chat message and
+    nothing else: the server never knew a phase had been approved, by whom, or
+    against which text.
+    """
+    if denied := _require_auth(request):
+        return denied
+    name = request.match_info["name"]
+    body = await _read_json(request)
+    if isinstance(body, web.Response):
+        return body
+    phase = str(body.get("phase", "")).strip()
+    if phase not in _APPROVABLE_PHASES:
+        return web.json_response(
+            {"code": "invalid_phase", "error": f"phase must be one of {list(_APPROVABLE_PHASES)}"}, status=400
+        )
+    claimed_hash = str(body.get("hash", "") or "")
+    if not _SHA256_RE.match(claimed_hash):
+        return web.json_response({"code": "invalid_hash", "error": "hash must be a sha256 hex digest"}, status=400)
+    fresh = await _pinned_entry(request, name, body)
+    if isinstance(fresh, web.Response):
+        return fresh
+    spec_dir = Path(str(fresh.get("spec_dir", "")))
+    captured_slot_key = str(fresh.get("slot_key", ""))
+    fname = phase + ".md"
+
+    def _current_hash() -> str:
+        text = _read_spec_text(spec_dir, fname)
+        return _sha256_text(text) if text is not None else ""
+
+    actual = await asyncio.to_thread(_current_hash)
+    if actual != claimed_hash:
+        # Approving a version you have not seen records nothing meaningful, so the
+        # client is sent back to re-read rather than having its claim trusted.
+        return web.json_response(
+            {
+                "code": "doc_changed",
+                "error": f"{fname} changed since you reviewed it — reload before approving",
+                "current_hash": actual,
+            },
+            status=409,
+        )
+    user = str(request.get("user") or "")
+    record = {"hash": claimed_hash, "at": time.time(), "user": user[:_MAX_FIELD]}
+
+    def _record(index: dict) -> bool:
+        meta = index.get(name)
+        if meta is None or meta.get(_DELETING):
+            return False
+        if str(meta.get("spec_dir", "")) != str(spec_dir):
+            return False
+        if captured_slot_key and str(meta.get("slot_key", "")) != captured_slot_key:
+            return False
+        # Merged INSIDE the lock rather than by reading the dict out, editing it and
+        # stamping it back: the read-modify-write would drop a second phase's
+        # approval that landed in between, and this is the one field where losing a
+        # record silently defeats the point of having it.
+        existing = meta.get("approvals")
+        approvals = dict(existing) if isinstance(existing, dict) else {}
+        approvals[phase] = record
+        meta["approvals"] = approvals
+        meta["updated_at"] = time.time()
+        return True
+
+    if not await _mutate_index(_record):
+        return web.json_response({"code": "stale_client", "error": _STALE_CLIENT_ERROR}, status=409)
+    _audit("spec_phase_approve", f"{name}/{phase}")
+    return web.json_response({"ok": True, "phase": phase, "hash": claimed_hash})
+
+
+async def _handle_run_task(request: web.Request) -> web.Response:
+    """Run ONE task from tasks.md as a single turn.
+
+    The whole-list handoff arms an autonudge loop over every unchecked task, which
+    is the only granularity the app had: there was no way to run one task, and no
+    way to see which task a run was on. This dispatches a single scoped turn and
+    stops, and progress stays derived from the file's checkboxes.
+    """
+    if denied := _require_auth(request):
+        return denied
+    name = request.match_info["name"]
+    body = await _read_json(request)
+    if isinstance(body, web.Response):
+        return body
+    raw_index = body.get("index")
+    if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index < 0:
+        return web.json_response({"code": "invalid_index", "error": "index must be a non-negative integer"}, status=400)
+    claimed_hash = str(body.get("hash", "") or "")
+    if not _SHA256_RE.match(claimed_hash):
+        return web.json_response({"code": "invalid_hash", "error": "hash must be a sha256 hex digest"}, status=400)
+    fresh = await _pinned_entry(request, name, body)
+    if isinstance(fresh, web.Response):
+        return fresh
+    state = request.app.get("state")
+    # An autonudge loop already working the whole list would collide with a
+    # single-task turn: both write the same files and both check boxes off.
+    if await _effective_status(name, fresh, state.get_slot(_slot_key(name)) if state else None) == "executing":
+        return web.json_response(
+            {"code": "already_executing", "error": "this spec is already building — pause it first"}, status=409
+        )
+    if _agent_is_writing(request, name):
+        return web.json_response(
+            {"code": "agent_running", "error": "the agent is busy right now — wait for the turn to finish"}, status=409
+        )
+    spec_dir = Path(str(fresh.get("spec_dir", "")))
+
+    def _task_snapshot() -> tuple[dict | None, str]:
+        tasks = _parse_tasks(_read_spec_text(spec_dir, "tasks.md") or "")
+        if raw_index >= len(tasks):
+            return None, "task_not_found"
+        candidate = tasks[raw_index]
+        # Position AND text must both still match. The agent rewrites tasks.md
+        # between polls, so an index alone is a moving target and a click on
+        # "task 3" could otherwise dispatch whatever ended up third.
+        if candidate["hash"] != claimed_hash:
+            return None, "task_changed"
+        if candidate["done"]:
+            return None, "task_done"
+        return candidate, ""
+
+    def _task_conflict(code: str) -> web.Response:
+        errors = {
+            "task_not_found": "that task is no longer in the list — reload",
+            "task_changed": "that task changed since the list was rendered — reload and pick it again",
+            "task_done": "that task is already checked off",
+        }
+        return web.json_response({"code": code, "error": errors[code]}, status=409)
+
+    task, task_error = await asyncio.to_thread(_task_snapshot)
+    if task_error:
+        return _task_conflict(task_error)
+    # Hold the same per-spec lock that Execute uses to claim execution and Delete
+    # uses to reserve teardown BEFORE materializing the worker slot. If Delete
+    # captured "no slot" while _ensure_worker_slot awaited and this request then
+    # restored one, Delete's identity-pinned teardown would deliberately leave the
+    # new slot behind as an orphan. Re-pin first under the lock; after that Delete
+    # either already owns the entry and no slot is created, or waits until the task
+    # publishes its slot/turn and can capture that exact runtime.
+    async with _spec_execution_lock(request, name):
+        before_slot = await _touch_spec(
+            name,
+            expect_spec_dir=str(spec_dir),
+            expect_slot_key=str(fresh.get("slot_key", "")) or None,
+        )
+        if before_slot is None:
+            return web.json_response({"code": "stale_client", "error": _STALE_CLIENT_ERROR}, status=409)
+        current_slot = state.get_slot(_slot_key(name)) if state else None
+        if await _effective_status(name, before_slot, current_slot) == "executing":
+            return web.json_response(
+                {"code": "already_executing", "error": "this spec is already building — pause it first"},
+                status=409,
+            )
+        if _agent_is_writing(request, name):
+            return web.json_response(
+                {"code": "agent_running", "error": "the agent is busy right now — wait for the turn to finish"},
+                status=409,
+            )
+        slot = await _ensure_worker_slot(state, name, before_slot)
+        if slot is None:
+            return web.json_response(
+                {"code": "slot_owned_by_another_app", "error": "this spec's chat session is owned by another app"},
+                status=409,
+            )
+        # Slot setup awaits, so re-pin the creation before using the materialized
+        # slot. Delete cannot cross the lock, while other identity mutations still
+        # fail this check.
+        final_fresh = await _touch_spec(
+            name,
+            expect_spec_dir=str(spec_dir),
+            expect_slot_key=str(fresh.get("slot_key", "")) or None,
+        )
+        if final_fresh is None:
+            return web.json_response({"code": "stale_client", "error": _STALE_CLIENT_ERROR}, status=409)
+        if await _effective_status(name, final_fresh, slot) == "executing":
+            return web.json_response(
+                {"code": "already_executing", "error": "this spec is already building — pause it first"},
+                status=409,
+            )
+        if _agent_is_writing(request, name):
+            return web.json_response(
+                {"code": "agent_running", "error": "the agent is busy right now — wait for the turn to finish"},
+                status=409,
+            )
+        # Slot setup and status reconciliation both await. The IDE can edit
+        # tasks.md during either window, so the earlier snapshot is no longer safe
+        # to dispatch. Execute and Delete cannot cross this final awaited reread,
+        # and _dispatch_turn publishes slot.task synchronously before the lock is
+        # released.
+        task, task_error = await asyncio.to_thread(_task_snapshot)
+        if task_error:
+            return _task_conflict(task_error)
+        assert task is not None
+        if _agent_is_writing(request, name):
+            return web.json_response(
+                {"code": "agent_running", "error": "the agent is busy right now — wait for the turn to finish"},
+                status=409,
+            )
+        _dispatch_turn(
+            state,
+            slot,
+            _task_prompt(name, spec_dir, str(final_fresh.get("working_dir", "")), task["text"]),
+        )
+    _audit("spec_task_run", f"{name}#{raw_index}")
+    return web.json_response({"ok": True, "index": raw_index})
+
+
+async def _handle_title(request: web.Request) -> web.Response:
+    """Set a spec's display label.
+
+    A rename, but of the LABEL only -- and that limit is the design, not a
+    shortcut. The name is simultaneously the on-disk directory under
+    ``.kiro/specs/``, the ``spec/<name>`` git branch, and the chat slot key, and
+    ``_owns_slot_key`` requires the key to ENCODE the indexed name. So renaming the
+    identity would move a directory the IDE and CLI also read, rewrite a branch
+    that may already have commits, and orphan the spec's transcript, which is the
+    very thing delete-and-recreate loses. A label fixes what users actually hit --
+    a spec misnamed at the New Spec screen -- and costs none of that.
+    """
+    if denied := _require_auth(request):
+        return denied
+    name = request.match_info["name"]
+    body = await _read_json(request)
+    if isinstance(body, web.Response):
+        return body
+    if "title" not in body:
+        return web.json_response({"code": "title_required", "error": "title required"}, status=400)
+    title = str(body.get("title") or "").strip()[:120]
+    fresh = await _pinned_entry(request, name, body)
+    if isinstance(fresh, web.Response):
+        return fresh
+    # "" clears the label and the UI falls back to the name, so an empty title is
+    # a reset rather than an error.
+    if await _touch_spec(
+        name,
+        expect_spec_dir=str(fresh.get("spec_dir", "")),
+        expect_slot_key=str(fresh.get("slot_key", "")) or None,
+        title=title,
+    ) is None:
+        return web.json_response({"code": "stale_client", "error": _STALE_CLIENT_ERROR}, status=409)
+    _audit("spec_title", name)
+    return web.json_response({"ok": True, "title": title})
+
+
+async def _handle_archive(request: web.Request) -> web.Response:
+    """Move a spec out of the working set, or bring it back.
+
+    The non-destructive counterpart to delete: documents, transcript and index
+    entry all stay, so an archived spec is recoverable by definition. Delete was
+    the only lifecycle operation besides create, which meant tidying up a finished
+    spec and destroying it were the same act.
+    """
+    if denied := _require_auth(request):
+        return denied
+    name = request.match_info["name"]
+    body = await _read_json(request)
+    if isinstance(body, web.Response):
+        return body
+    archived = body.get("archived")
+    if not isinstance(archived, bool):
+        return web.json_response({"code": "archived_required", "error": "archived must be a boolean"}, status=400)
+    fresh = await _pinned_entry(request, name, body)
+    if isinstance(fresh, web.Response):
+        return fresh
+    state = request.app.get("state")
+    if archived and await _effective_status(
+        name, fresh, state.get_slot(_slot_key(name)) if state else None
+    ) == "executing":
+        # Archiving a running spec would hide a loop that keeps editing files, so
+        # the user would have no surface left to stop it from.
+        return web.json_response(
+            {"code": "spec_executing", "error": "pause this spec before archiving it"}, status=409
+        )
+    if await _touch_spec(
+        name,
+        expect_spec_dir=str(fresh.get("spec_dir", "")),
+        expect_slot_key=str(fresh.get("slot_key", "")) or None,
+        archived=archived,
+    ) is None:
+        return web.json_response({"code": "stale_client", "error": _STALE_CLIENT_ERROR}, status=409)
+    _audit("spec_archive" if archived else "spec_unarchive", name)
+    return web.json_response({"ok": True, "archived": archived})
+
+
+async def _handle_duplicate(request: web.Request) -> web.Response:
+    """Copy a spec's documents into a new spec.
+
+    The recovery path for the case rename cannot serve: a spec whose NAME is wrong
+    after it already has a branch or history. The copy takes the documents and
+    nothing else -- new name, new directory, new slot key, so a fresh conversation
+    rather than a replayed one. No worktree either; that is an opt-in at create
+    time and silently branching off someone's repo is not a copy operation.
+    """
+    if denied := _require_auth(request):
+        return denied
+    name = request.match_info["name"]
+    body = await _read_json(request)
+    if isinstance(body, web.Response):
+        return body
+    new_name = str(body.get("new_name", "")).strip()
+    if not _usable_name(new_name):
+        return web.json_response(
+            {
+                "code": "invalid_name",
+                "error": (
+                    "new_name must be 1-64 chars: letters, digits, '-' or '_', "
+                    "and must not look like a credential"
+                ),
+            },
+            status=400,
+        )
+    fresh = await _pinned_entry(request, name, body)
+    if isinstance(fresh, web.Response):
+        return fresh
+    if new_name == name:
+        return web.json_response({"code": "spec_exists", "error": "that is the same name"}, status=409)
+    working_dir = str(fresh.get("working_dir", ""))
+    safe_wd = await asyncio.to_thread(_safe_dir, working_dir)
+    if safe_wd is None:
+        return web.json_response(
+            {"code": "working_dir_not_a_directory", "error": "this spec's project folder is no longer usable"}, status=400
+        )
+    source_dir = Path(str(fresh.get("spec_dir", "")))
+
+    def _copy() -> tuple[Path, str, dict]:
+        """Read the source documents, then validate the destination. ONE hop."""
+        payload = {f: _read_spec_text(source_dir, f) for _p, f in _PHASE_FILES}
+        target, refusal = _prepare_spec_dir(
+            str(safe_wd), safe_wd, new_name, False, create=False
+        )
+        return target, refusal, payload
+
+    target_dir, refusal, docs = await asyncio.to_thread(_copy)
+    if refusal:
+        kind = refusal.partition(":")[0]
+        if kind == "existing":
+            return web.json_response(
+                {"code": "spec_files_exist", "error": f"'{new_name}' already has spec files on disk"}, status=409
+            )
+        if kind == "escape":
+            _audit("spec_path_escape_denied", f"{new_name} -> {target_dir}")
+            return web.json_response(
+                {"code": "spec_path_outside_root", "error": "resolved spec path is outside its root"}, status=400
+            )
+        return web.json_response(
+            {"code": "spec_dir_creation_failed", "error": "cannot create the copy's directory"}, status=400
+        )
+    if not any(text is not None for text in docs.values()):
+        return web.json_response(
+            {"code": "nothing_to_copy", "error": "this spec has no documents to copy yet"}, status=409
+        )
+
+    slot_key = _new_slot_key(new_name)
+    duplicate_token = uuid.uuid4().hex
+    stage_dir = target_dir.parent / f".{new_name}.duplicate-{duplicate_token}"
+    document_hashes = {
+        fname: _sha256_text(text) for fname, text in docs.items() if text is not None
+    }
+    now = time.time()
+    entry = {
+        "working_dir": str(safe_wd),
+        "spec_dir": str(target_dir),
+        # Validated, not carried over blind: spec_type comes off the agent-writable
+        # index, and an unknown value would flow into the copy's own payload.
+        "spec_type": (
+            st if (st := str(fresh.get("spec_type", "feature"))) in _VALID_TYPES else "feature"
+        ),
+        "status": "planning",
+        "slot_key": slot_key,
+        "worktree_branch": "",
+        "repo_root": "",
+        "title": _clean_str(fresh.get("title")),
+        "created_at": now,
+        "updated_at": now,
+        _DUPLICATING: {
+            "owner": _PROCESS_ID,
+            "at": now,
+            "token": duplicate_token,
+            "stage_dir": str(stage_dir),
+            "documents": document_hashes,
+        },
+    }
+
+    def _insert(index: dict) -> bool:
+        if new_name in index:
+            return False
+        index[new_name] = entry
+        return True
+
+    if not await _mutate_index(_insert):
+        return web.json_response(
+            {"code": "spec_exists", "error": f"a spec named '{new_name}' already exists"}, status=409
+        )
+
+    async def _release_reservation() -> None:
+        def _pop(index: dict) -> bool:
+            meta = index.get(new_name)
+            if (
+                meta is None
+                or str(meta.get("slot_key", "")) != slot_key
+                or not _reservation_is_ours(meta, _DUPLICATING)
+            ):
+                return False
+            del index[new_name]
+            return True
+
+        await _mutate_index(_pop)
+
+    # The name is reserved before the directory is created or populated. Re-run
+    # the validation after arbitration so an external writer that placed files
+    # in the meantime is still refused rather than overwritten.
+    reserved_target_dir = target_dir
+    target_dir, refusal = await asyncio.to_thread(
+        _prepare_spec_dir,
+        str(safe_wd),
+        safe_wd,
+        new_name,
+        False,
+        create=False,
+        expected_dir=reserved_target_dir,
+    )
+    if refusal:
+        await _release_reservation()
+        kind = refusal.partition(":")[0]
+        if kind == "moved":
+            return web.json_response(
+                {
+                    "code": "spec_destination_changed",
+                    "error": "the copy destination changed while it was being created; retry",
+                },
+                status=409,
+            )
+        if kind == "existing":
+            return web.json_response(
+                {"code": "spec_files_exist", "error": f"'{new_name}' already has spec files on disk"}, status=409
+            )
+        if kind == "escape":
+            _audit("spec_path_escape_denied", f"{new_name} -> {target_dir}")
+            return web.json_response(
+                {"code": "spec_path_outside_root", "error": "resolved spec path is outside its root"}, status=400
+            )
+        return web.json_response(
+            {"code": "spec_dir_creation_failed", "error": "cannot create the copy's directory"}, status=400
+        )
+
+    failure, _created = await asyncio.to_thread(
+        _write_and_publish_duplicate,
+        stage_dir,
+        target_dir,
+        docs,
+        duplicate_token,
+    )
+    if failure:
+        await _release_reservation()
+        _audit("spec_duplicate_failed", f"{name} -> {new_name}", outcome="failure")
+        if failure == "unsupported_platform":
+            return web.json_response(
+                {"code": "doc_write_unsupported", "error": "duplicating is not available on this platform"}, status=501
+            )
+        return web.json_response({"code": "doc_write_failed", "error": "could not write the copy"}, status=400)
+
+    await asyncio.to_thread(_forget_deleted, str(target_dir))
+
+    def _finish(index: dict) -> bool:
+        meta = index.get(new_name)
+        if (
+            meta is None
+            or str(meta.get("slot_key", "")) != slot_key
+            or not _reservation_is_ours(meta, _DUPLICATING)
+        ):
+            return False
+        meta.pop(_DUPLICATING, None)
+        meta["updated_at"] = time.time()
+        return True
+
+    if not await _mutate_index(_finish):
+        # Publication is already atomic and visible. Preserve the complete,
+        # marker-provenanced copy so a surviving reservation can recover it on
+        # restart; deleting its contents would leave a destination name that no
+        # future no-replace publication could win.
+        return web.json_response(
+            {
+                "code": "spec_changed_during_create",
+                "error": "the copy was published but its reservation changed; reopen or import the existing copy",
+            },
+            status=409,
+        )
+    await asyncio.to_thread(_remove_duplicate_marker, target_dir)
+    entry.pop(_DUPLICATING, None)
+    # adopt_closed=False for the same reason create passes it: a name reused after
+    # a delete must not hand the fresh agent the deleted spec's transcript.
+    slot = await _ensure_worker_slot(request.app.get("state"), new_name, entry, adopt_closed=False)
+    if slot is None:
+        # The index and documents are committed before session arbitration.
+        # Retain both so the published copy stays discoverable and recoverable.
+        return web.json_response(
+            {"code": "slot_owned_by_another_app", "error": f"a chat session named '{new_name}' is owned by another app"},
+            status=409,
+        )
+    try:
+        slot.title = f"Spec: {new_name}"
+        slot._titled = True
+        if (state := request.app.get("state")) is not None and hasattr(state, "push_slot_title"):
+            state.push_slot_title(slot.key, slot.title)
+    except Exception:
+        logger.debug("title set failed", exc_info=True)
+    _dispatch_turn(request.app.get("state"), slot, _duplicate_prompt(new_name, name, target_dir))
+    _audit("spec_duplicate", f"{name} -> {new_name}")
+    return web.json_response({"name": new_name, "spec_dir": str(target_dir)}, status=201)
+
+
 async def _handle_stop_execution(request: web.Request) -> web.Response:
     if denied := _require_auth(request):
         return denied
@@ -3484,9 +4850,14 @@ async def _handle_delete(request: web.Request) -> web.Response:
     # key that only the ORIGINAL name may own, leaving the conversation unreachable.
     # Marking keeps the entry (hidden from the list), so the name cannot be taken and
     # a rollback restores the original with its key intact.
-    if not await _mark_deleting(
-        name, expect_spec_dir=doomed_dir, expect_slot_key=doomed_slot_key
-    ):
+    # A task request holds this lock across its final document validation and
+    # dispatch. Wait for that boundary before reserving teardown, after which
+    # _DELETING makes every task re-pin fail closed.
+    async with _spec_execution_lock(request, name):
+        marked_deleting = await _mark_deleting(
+            name, expect_spec_dir=doomed_dir, expect_slot_key=doomed_slot_key
+        )
+    if not marked_deleting:
         await asyncio.to_thread(_forget_deleted, doomed_dir)
         return web.json_response({"code": "not_found", "error": "not found"}, status=404)
     # RESERVED -- only now capture the runtime. Capturing before the reservation left
@@ -3595,6 +4966,12 @@ def register_routes(app: web.Application) -> None:
     (``_save_index`` / ``_save_settings``) mkdirs on its own worker thread.
     """
     base = f"/api/apps/{APP_NAME}"
+    # Mutable per-Application state lets the first enabled request publish one
+    # recovery task without mutating a frozen aiohttp Application. Registration
+    # itself stays filesystem-free so gateway readiness never depends on this app.
+    recovery: _DuplicateRecoveryState = {"task": None}
+    app[_DUPLICATE_RECOVERY_STATE] = recovery
+    app[_SPEC_EXECUTION_LOCKS] = {}
     app.router.add_get(f"{base}/settings", _require_enabled(_handle_get_settings))
     app.router.add_put(f"{base}/settings", _require_enabled(_handle_put_settings))
     # POST alias: the SPA page uses POST for settings writes.
@@ -3611,5 +4988,13 @@ def register_routes(app: web.Application) -> None:
     # Alias: the SPA page calls this "execute".
     app.router.add_post(f"{base}/specs/{{name}}/execute", _require_enabled(_handle_handoff))
     app.router.add_post(f"{base}/specs/{{name}}/stop", _require_enabled(_handle_stop_execution))
+    # Direct authority over the artifacts, rather than only the ability to ask the
+    # agent for a change: record a phase approval, run one task, and manage the
+    # label / archive / duplicate lifecycle.
+    app.router.add_post(f"{base}/specs/{{name}}/approve", _require_enabled(_handle_approve))
+    app.router.add_post(f"{base}/specs/{{name}}/task", _require_enabled(_handle_run_task))
+    app.router.add_post(f"{base}/specs/{{name}}/title", _require_enabled(_handle_title))
+    app.router.add_post(f"{base}/specs/{{name}}/archive", _require_enabled(_handle_archive))
+    app.router.add_post(f"{base}/specs/{{name}}/duplicate", _require_enabled(_handle_duplicate))
     app.router.add_delete(f"{base}/specs/{{name}}", _require_enabled(_handle_delete))
     logger.info("spec-builder: registered app routes under %s", base)
