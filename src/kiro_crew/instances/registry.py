@@ -79,7 +79,13 @@ _SSM_RUN_AS_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _TTL_RE = re.compile(TTL_PATTERN)
 _DEFAULT_SSM_RUN_AS = "ec2-user"
 
-_DEFAULT_REMOTE_PORT = 7777
+# The port a stock gateway binds, so "add a remote that has not been
+# reconfigured" needs no edit. It was 7777 — an earlier default dashboard port —
+# which left the Add form pre-filling a port no stock remote listens on (#1972).
+# Correcting it was only safe once the local forward stopped mirroring this
+# value: while it mirrored, filling in the port a stock remote actually binds
+# landed the user on a guaranteed local-port collision.
+DEFAULT_REMOTE_PORT = 5476
 _DEFAULT_TTL = "20h"
 
 # Supported connection transports. "ssh" is the original/default transport
@@ -150,7 +156,7 @@ class Instance:
     id: str
     name: str
     ssh_host: str = ""
-    remote_port: int = _DEFAULT_REMOTE_PORT
+    remote_port: int = DEFAULT_REMOTE_PORT
     local_port: int = _UNALLOCATED_PORT
     ttl: str = _DEFAULT_TTL
     remote_bin: str = ""
@@ -259,7 +265,7 @@ class Instance:
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
             ssh_host=str(data.get("ssh_host", "")),
-            remote_port=_as_int(data.get("remote_port"), _DEFAULT_REMOTE_PORT),
+            remote_port=_as_int(data.get("remote_port"), DEFAULT_REMOTE_PORT),
             local_port=_as_int(data.get("local_port"), _UNALLOCATED_PORT),
             ttl=str(data.get("ttl", _DEFAULT_TTL)),
             remote_bin=str(data.get("remote_bin", "")),
@@ -378,7 +384,7 @@ class InstancesRegistry:
         *,
         name: str,
         ssh_host: str = "",
-        remote_port: int = _DEFAULT_REMOTE_PORT,
+        remote_port: int = DEFAULT_REMOTE_PORT,
         local_port: int = _UNALLOCATED_PORT,
         ttl: str = _DEFAULT_TTL,
         remote_bin: str = "",
