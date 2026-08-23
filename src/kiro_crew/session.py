@@ -2924,10 +2924,11 @@ class SessionManager:
 
                     backend = provider.client.backend
                     if cap_level(backend, CAP_NATIVE_RESUME) is Level.UNAVAILABLE:
-                        # goose handshake has no resume/fork. Skip the load
-                        # that cannot work and replay Crew's transcript the
-                        # same way a provider switch does — do not start a
-                        # blank child that looks like a resume.
+                        # goose CAP_NATIVE_RESUME is UNAVAILABLE: 1.47's
+                        # load RPC can succeed, but transcript restore is
+                        # unmeasured. Skip load and replay Crew's transcript
+                        # the same way a provider switch does — do not start
+                        # a blank child that looks like a resume.
                         logger.info(
                             "Skipping session/load for %s: native resume is " "unavailable on %s",
                             key,

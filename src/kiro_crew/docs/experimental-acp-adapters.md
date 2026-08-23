@@ -13,8 +13,11 @@ instead, so an existing vendor subscription does the work:
 | pi | `pi` (registry alias `pi-acp`) | `pi` | **Experimental**, selectable, routed |
 
 Selectable means the value may be persisted. Codex and Claude are gated before
-the first prompt. goose and pi send `session/request_permission` for privileged
-tools. OpenCode is seeded with project `permission: "ask"` in the session
+the first prompt. goose's own default session mode is `auto` (auto-approve);
+Kiro Crew has no such permission mode, so after `session/new` it pins
+`approve` (ask before every tool call) and refuses if that pin fails. pi
+sends `session/request_permission` for privileged tools. OpenCode is seeded
+with project `permission: "ask"` in the session
 `work_dir` (never `~/.config/opencode`); an explicit `allow` is left alone and
 the session refuses unless the ungated-tools opt-out is on. All three start
 without that opt-out when ROUTED. Kiro Crew does not implement `fs/*` or
@@ -27,9 +30,10 @@ Mid-turn steer (`_session/steer`) is kiro-cli and KAS only. On a spec adapter
 the dashboard and Slack queue the message as a follow-up (Slack does not wait
 on the session semaphore), and `spawn_steer` degrades to follow-up with a
 reason that names the harness.
-goose cannot native-resume (`session/load`); `spawn_continue` fail-closes
-instead of starting a blank child. Regular chat replays Crew's transcript
-the same way a provider switch does.
+Crew treats goose native resume as unavailable. 1.47's `session/load` RPC
+can succeed, but transcript restore is unmeasured, so `spawn_continue`
+fail-closes instead of starting a blank child. Regular chat replays
+Crew's transcript the same way a provider switch does.
 
 **Sign-in is not part of selectability.** Kiro Crew assumes the adapter is already
 authenticated and never handles a credential, so a host that has not signed in
@@ -48,11 +52,13 @@ withheld.
 Each one clears the governability bar differently, which is why it is established
 per adapter rather than assumed:
 
-- **goose** and **pi** ask per privileged tool via
-  `session/request_permission`. **OpenCode** is seeded with `permission: "ask"`
-  in the session work_dir so those permission frames actually fire (its own
-  default is permissive). File I/O stays in the adapter because Kiro Crew
-  does not advertise `fs/*`. That is enough to start without the opt-out.
+- **goose** asks per privileged tool only after Crew pins session mode
+  `approve`. Its default `auto` auto-approves tools — Kiro Crew has no
+  equivalent permission mode. **pi** asks via `session/request_permission`.
+  **OpenCode** is seeded with `permission: "ask"` in the session work_dir
+  so those permission frames actually fire (its own default is permissive).
+  File I/O stays in the adapter because Kiro Crew does not advertise `fs/*`.
+  That is enough to start without the opt-out.
   Crew MCP is delivered to all three when ROUTED; on Pi the adapter may leave
   those servers inert until it forwards MCP.
 - **Codex** is gated by ACP v1 session config `mode=read-only`, applied after

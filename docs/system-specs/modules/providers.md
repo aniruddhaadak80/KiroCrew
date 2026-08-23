@@ -127,7 +127,7 @@ command, credential leaves, process markers, and a capability map.
 | Field | Purpose |
 |---|---|
 | `dialect` | `KIRO` (date `protocolVersion`, `set_mode`, `set_model`, empty `mcpServers`) or `SPEC` (integer version, no `set_mode`, `set_config_option`, `mcpServers` in session params) |
-| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS` (Claude `permissions.defaultMode`; OpenCode project `permission: ask`), `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, `PERMISSION_REQUEST` (goose / pi: privileged tools arrive as `session/request_permission`), or fail-closed `UNVERIFIED` |
+| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS` (Claude `permissions.defaultMode`; OpenCode project `permission: ask`), `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, `PERMISSION_REQUEST` (pi: privileged tools arrive as `session/request_permission`; goose: same, but only after the client pins session mode `approve` — goose defaults to `auto`, which auto-approves tools, and Kiro Crew has no such permission mode), or fail-closed `UNVERIFIED` |
 | `permission_config_id` / `permission_config_value` | The ACP v1 session config option and the exact value a `SESSION_CONFIG` backend must accept before its first prompt (codex-acp: `mode` = `read-only`); empty for every other routing |
 | `capabilities` | Per-capability `SUPPORTED` / `DEGRADED` / `UNAVAILABLE` / `UNVERIFIED` |
 
@@ -164,7 +164,9 @@ inferences that previously meant "kiro" are converted — see
 Shipped modules: `acp/codex.py` (paths, resolution ladder, approval-policy probe,
 MCP shaping, model-id translation), `acp/claude.py` (permission-mode probe and
 seeding), `acp/goose.py` / `acp/pi.py` (owned resolution ladders;
-`PERMISSION_REQUEST` routing), `acp/opencode.py` (owned resolution plus
+`PERMISSION_REQUEST` routing; goose also pins `session/set_mode` to
+`approve` because its default `auto` auto-approves tools),
+`acp/opencode.py` (owned resolution plus
 `SEEDED_SETTINGS` `permission: ask` seed), `acp/tool_gate.py` (routing verdicts
 and enforcement), `acp/spec_agent_guard.py` (agent-profile fail-closed guard),
 `acp/doctor.py` (doctor rows). Selectable spec adapters that resolve ROUTED

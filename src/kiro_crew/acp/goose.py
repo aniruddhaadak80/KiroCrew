@@ -125,10 +125,45 @@ def signin_hint() -> str:
     return "Configure a provider with `goose configure`."
 
 
+# goose 1.47+ advertises ACP session modes. ``auto`` means "Automatically
+# approve tool calls" — Kiro Crew has no such permission mode. Privileged
+# tools must arrive as session/request_permission so PreToolUse runs.
+# ``approve`` is "Ask before every tool call". ``smart_approve`` still
+# auto-approves non-sensitive tools, so it is also a bypass of Crew's gate.
+MODE_APPROVE = "approve"
+MODE_BYPASS = frozenset({"auto", "smart_approve"})
+
+
+def mode_bypasses_gate(mode_id: str) -> bool:
+    """True when this goose mode would approve tools without asking Crew."""
+    return mode_id in MODE_BYPASS
+
+
+def permission_mode_issue(available_ids: list[str], *, advertised: bool) -> str:
+    """Why goose cannot be pinned to ``approve``, or empty if it can.
+
+    An omitted modes list (``advertised=False``) is unknown: the client still
+    attempts ``session/set_mode``. A present list that lacks ``approve`` is a
+    refuse — there is no Crew-shaped mode to pin.
+    """
+    if advertised and MODE_APPROVE not in available_ids:
+        return (
+            "goose advertised session modes but not "
+            f"{MODE_APPROVE!r} (have {available_ids or 'none'}); "
+            "its default auto mode auto-approves tools and Kiro Crew has no "
+            "equivalent permission mode"
+        )
+    return ""
+
+
 __all__ = [
     "GOOSE_ACP_SUBCOMMAND",
     "GOOSE_BIN",
+    "MODE_APPROVE",
+    "MODE_BYPASS",
     "missing_adapter_message",
+    "mode_bypasses_gate",
+    "permission_mode_issue",
     "resolve_argv",
     "resolve_argv_cached",
     "signin_hint",

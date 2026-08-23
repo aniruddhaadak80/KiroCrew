@@ -36,6 +36,7 @@ from kiro_crew.acp._dispatch import (
     parse_text_chunk,
     parse_usage_update,
     permission_answerable_on_handle,
+    permission_frame_session_id,
     redact_text,
     reject_option_id,
     resolve_permission_allow_id,
@@ -1045,7 +1046,7 @@ class AcpSessionHandle:
         if reject_id is not None:
             self._permission_options[request_id] = {"reject_once": reject_id}
         await self.reject_tool(request_id)
-        frame_sid = str(params.get("sessionId") or "")
+        frame_sid = permission_frame_session_id(params)
         title = ""
         tool_call = params.get("toolCall")
         if isinstance(tool_call, dict):
@@ -2750,7 +2751,7 @@ class AcpSessionHandle:
         # parser as slot-owned frames), so a well-behaved child carries full
         # structured context; the low-fidelity downgrade applies only when the
         # provenance flags say the context never arrived (frame race, drop).
-        frame_sid = str((msg.params or {}).get("sessionId") or "")
+        frame_sid = permission_frame_session_id(_perm_params)
         if frame_sid and frame_sid != self._session_id:
             event.sub_session_id = frame_sid
         return event

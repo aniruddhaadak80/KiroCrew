@@ -68,6 +68,7 @@ from kiro_crew.slack.blocks import (
 )
 from kiro_crew.slack.files import SLACK_AUDIO_MIMETYPES, process_slack_files
 from kiro_crew.slack.handler import (
+    _FOLLOW_UP_ACK_REACTION,
     APPROVAL_AUTO,
     APPROVAL_INTERACTIVE,
     dequeue_busy_followup,
@@ -2423,25 +2424,16 @@ async def _route_message(
         if _outcome != "idle":
             logger.info("Message %s mid-turn %s for session %s", msg_ts, _outcome, session_key)
             return
-        if _task_busy:
-            orch._pending_queue.setdefault(session_key, []).append(
-                (msg_ts, clean_text, _enqueue_kwargs)
-            )
-            logger.info("Message %s queued for busy session %s (pre-session)", msg_ts, session_key)
-            if orch.slack:
-                try:
-                    await orch.slack.add_reaction(channel, msg_ts, "hourglass_flowing_sand")
-                except Exception:
-                    logger.debug("Failed to add queue reaction", exc_info=True)
-            return
-    elif _task_busy:
+    if _task_busy:
+        # inject returned idle (no live owner yet) or sessions is unset: park
+        # on the orchestrator queue until the handler task exists.
         orch._pending_queue.setdefault(session_key, []).append(
             (msg_ts, clean_text, _enqueue_kwargs)
         )
         logger.info("Message %s queued for busy session %s (pre-session)", msg_ts, session_key)
         if orch.slack:
             try:
-                await orch.slack.add_reaction(channel, msg_ts, "hourglass_flowing_sand")
+                await orch.slack.add_reaction(channel, msg_ts, _FOLLOW_UP_ACK_REACTION)
             except Exception:
                 logger.debug("Failed to add queue reaction", exc_info=True)
         return

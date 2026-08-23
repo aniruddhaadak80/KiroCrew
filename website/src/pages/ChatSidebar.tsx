@@ -1883,7 +1883,7 @@ function ChatSidebar({
   const harnessBackend = useAppSelector((s) => s.dashboard.status?.harness?.backend ?? '')
   const liveBackend = useMemo(() => {
     const live = slots.find((s) => s.key === activeSlot)
-    return live?.acp_backend !== undefined ? live.acp_backend : harnessBackend
+    return live?.acp_backend ?? harnessBackend
   }, [slots, activeSlot, harnessBackend])
   const bulkModelOptions = useAvailableModels({
     enabled: bulkModelOpen,

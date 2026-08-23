@@ -129,6 +129,7 @@ class TestToolGateRow:
         assert any("bypass the PreToolUse gate" in i for i in issues)
 
     def test_a_routed_policy_is_not_an_issue(self, tmp_path: Path) -> None:
+        claude.ensure_routed_settings(tmp_path)
         text, issues = _run(ACP_BACKEND_CLAUDE, tmp_path)
         assert "tool gate:   ✅" in text
         assert not any("bypass" in i for i in issues)
@@ -250,6 +251,7 @@ class TestClaudeRows:
             "kiro_crew.acp.client._resolve_claude_acp_bin",
             lambda: ["/usr/bin/node", "/opt/claude-agent-acp/dist/index.js"],
         )
+        claude.ensure_routed_settings(tmp_path)
         text, issues = _run(ACP_BACKEND_CLAUDE, tmp_path)
         assert "tool gate:   ✅" in text
         assert issues == []
@@ -293,6 +295,7 @@ class TestGooseRows:
         )
         text, issues = _run(ACP_BACKEND_GOOSE, tmp_path)
         assert "tool gate:   ✅" in text
+        assert "approve" in text
         assert not any("bypass" in i for i in issues)
 
 
@@ -329,6 +332,7 @@ class TestOpenCodeRows:
             "kiro_crew.acp.opencode.resolve_argv",
             lambda: ["/usr/local/bin/opencode", "acp"],
         )
+        opencode.ensure_routed_settings(tmp_path)
         text, issues = _run(ACP_BACKEND_OPENCODE, tmp_path)
         assert "tool gate:   ✅" in text
         assert not any("bypass" in i for i in issues)

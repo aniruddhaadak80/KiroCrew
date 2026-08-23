@@ -285,6 +285,9 @@ _GOOSE = BackendDescriptor(
         # leaving only the spec `used`/`size` pair reachable.
         CAP_TURN_USAGE: Level.DEGRADED,
         CAP_BILLING: Level.UNAVAILABLE,
+        # 1.47 advertises loadSession and session/load returns modes without
+        # error. Crew still skips load: a successful RPC is not a measured
+        # transcript restore, and spawn_continue must not start a blank child.
         CAP_NATIVE_RESUME: Level.UNAVAILABLE,
         # goose model ids come from whichever provider it is configured against,
         # so they are not model_registry keys.

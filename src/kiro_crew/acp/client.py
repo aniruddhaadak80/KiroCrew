@@ -2319,6 +2319,11 @@ class AcpClient:
         # kiro-cli / offline fake) — the set_mode guard treats empty as "attempt"
         # for backward compatibility. Populated by _store_session_config.
         self._available_mode_ids: list[str] = []
+        # Current ACP session mode id from session/new|load (`modes.currentModeId`).
+        # Empty when the backend omitted it. goose uses this to detect its
+        # default ``auto`` (auto-approve tools); kiro uses set_mode for agent
+        # selection, not this field.
+        self._current_mode_id: str = ""
         # Whether the backend advertised a `modes` list at all (even an empty
         # one). Distinguishes "unknown, attempt for backward compat" (False)
         # from "advertised zero/some modes, honor the list" (True) so an
@@ -2912,7 +2917,9 @@ class AcpClient:
         # backend never loaded (would fault with "Mode '<agent>' not found").
         # Assigned unconditionally so a re-init that omits `modes` clears any
         # stale state rather than guarding on it.
-        self._available_mode_ids, _current_mode, self._modes_advertised = parse_session_modes(resp)
+        self._available_mode_ids, self._current_mode_id, self._modes_advertised = (
+            parse_session_modes(resp)
+        )
 
     def _handle_config_option_update(self, msg: JsonRpcMessage) -> None:
         """Process a config_option_update session notification.
@@ -3725,13 +3732,13 @@ class AcpClient:
             and acp_backends.level(self.backend, acp_backends.CAP_NATIVE_RESUME)
             is acp_backends.Level.UNAVAILABLE
         ):
-            # goose (and any adapter whose handshake has no resume/fork): a
-            # session/load that cannot work must not silently fall through to
-            # session/new. Callers that need prior context (spawn_continue)
-            # fail closed on ``resumed is False``. OpenCode / pi / KAS are not
-            # marked UNAVAILABLE without a measured live load; the handshake
-            # probe ``_can_load_session`` is what skips them when ``loadSession``
-            # is absent.
+            # goose (CAP_NATIVE_RESUME=UNAVAILABLE): skip session/load even
+            # when the handshake advertises loadSession. 1.47's load RPC
+            # succeeds, but transcript restore is unmeasured, so
+            # spawn_continue fail-closes on ``resumed is False`` rather than
+            # starting a blank child. OpenCode / pi / KAS are not marked
+            # UNAVAILABLE; ``_can_load_session`` skips them when the
+            # handshake omits loadSession.
 
             logger.info(
                 "Skipping session/load for %s: native resume is unavailable on %s",
@@ -3882,6 +3889,9 @@ class AcpClient:
         config is not evidence: adapters may replace it with their own mode when
         they send ``session/prompt``.
         """
+        if self.backend == ACP_BACKEND_GOOSE:
+            await self._apply_goose_permission_mode()
+            return
         descriptor = acp_backends.descriptor_for(self.backend)
         if descriptor.routing is not acp_backends.Routing.SESSION_CONFIG:
             return
@@ -3925,6 +3935,64 @@ class AcpClient:
             descriptor.permission_config_id,
             descriptor.permission_config_value,
         )
+
+    async def _apply_goose_permission_mode(self) -> None:
+        """Pin goose off its default ``auto`` (auto-approve) onto ``approve``.
+
+        Kiro Crew has no auto-approve permission mode. goose 1.47+ starts
+        every session in ``auto``, so a PERMISSION_REQUEST verdict that
+        assumed it asks is wrong until this pin runs. ``smart_approve`` is
+        also a bypass for non-sensitive tools. Positive identity only (H5).
+        """
+        from kiro_crew.acp import goose as goose_backend
+        from kiro_crew.acp.codex import Verdict
+
+        issue = goose_backend.permission_mode_issue(
+            self._available_mode_ids, advertised=self._modes_advertised
+        )
+        remedy = (
+            f"goose must advertise session mode {goose_backend.MODE_APPROVE!r} "
+            "(Ask before every tool call). Kiro Crew has no auto-approve "
+            "permission mode."
+        )
+        if issue:
+            try:
+                tool_gate.enforce_runtime_routing(
+                    self.backend,
+                    issue,
+                    allow_ungated=self._allow_ungated_tools,
+                    session_key=self._session_key or "",
+                    verdict=Verdict.BYPASSED,
+                    remedy=remedy,
+                )
+            except tool_gate.ToolGateUnroutable as exc:
+                raise AcpToolGateUnroutable(str(exc)) from exc
+            return
+        if self._current_mode_id == goose_backend.MODE_APPROVE:
+            return
+        try:
+            req_id = await self._send_request(
+                METHOD_SET_MODE,
+                {"sessionId": self._session_id, "modeId": goose_backend.MODE_APPROVE},
+            )
+            await self._wait_for_response(req_id, timeout=10.0)
+        except AcpError as exc:
+            try:
+                tool_gate.enforce_runtime_routing(
+                    self.backend,
+                    "goose rejected session/set_mode to approve; its auto "
+                    "mode auto-approves tools and Kiro Crew has no equivalent "
+                    "permission mode",
+                    allow_ungated=self._allow_ungated_tools,
+                    session_key=self._session_key or "",
+                    verdict=Verdict.BYPASSED,
+                    remedy=remedy,
+                )
+            except tool_gate.ToolGateUnroutable as gate_exc:
+                raise AcpToolGateUnroutable(str(gate_exc)) from exc
+            return
+        self._current_mode_id = goose_backend.MODE_APPROVE
+        logger.info("ACP goose permission mode pinned: %s", goose_backend.MODE_APPROVE)
 
     async def ensure_ready(self) -> None:
         """Ensure process is spawned and session is initialized.

@@ -121,6 +121,31 @@ def project_config_path(work_dir: Path | str) -> Path:
     return root_path
 
 
+def _read_project_config(work_dir: Path | str) -> tuple[Path, dict | None]:
+    """Load the project file as an object, or ``None`` when it cannot be used.
+
+    ``None`` covers a missing file, an unreadable file, malformed JSON, and a
+    non-object document. Callers that need the raw ``permission`` value still
+    check for the key themselves — a present ``null`` is configured, not absent.
+    """
+    path = project_config_path(work_dir)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return path, None
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return path, None
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        logger.warning("Could not parse %s: %s", path, exc)
+        return path, None
+    if not isinstance(data, dict):
+        return path, None
+    return path, data
+
+
 def _effective_permission_token(value: object) -> str:
     """Collapse OpenCode's string / object permission shapes to one token.
 
@@ -149,20 +174,8 @@ def configured_permission(work_dir: Path | str) -> object:
     ``None`` covers a missing file, unreadable file, malformed JSON, and a
     missing key — every case where the value cannot be established.
     """
-    path = project_config_path(work_dir)
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        logger.warning("Could not read %s: %s", path, exc)
-        return None
-    try:
-        data = json.loads(raw)
-    except ValueError as exc:
-        logger.warning("Could not parse %s: %s", path, exc)
-        return None
-    if not isinstance(data, dict) or "permission" not in data:
+    _path, data = _read_project_config(work_dir)
+    if data is None or "permission" not in data:
         return None
     return data.get("permission")
 
@@ -216,8 +229,8 @@ def ensure_routed_settings(work_dir: Path | str) -> bool:
     caller's routing probe reads the file back, so a failed write surfaces as
     INDETERMINATE and refuses the session rather than passing silently.
     """
-    path = project_config_path(work_dir)
-    existing = configured_permission(work_dir)
+    path, data = _read_project_config(work_dir)
+    existing = data.get("permission") if data is not None and "permission" in data else None
     if existing is not None:
         logger.debug(
             "OpenCode permission already configured as %r in %s; leaving it",
@@ -226,30 +239,15 @@ def ensure_routed_settings(work_dir: Path | str) -> bool:
         )
         return False
 
-    data: dict = {}
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raw = ""
-    except OSError as exc:
-        logger.warning("Could not read %s before seeding: %s", path, exc)
-        raw = ""
-    if raw:
-        try:
-            loaded = json.loads(raw)
-            if isinstance(loaded, dict):
-                data = loaded
-        except ValueError:
-            # Malformed file: start from an empty document rather than refuse
-            # to seed. The readback probe still decides whether the result
-            # routes.
-            logger.warning("Replacing malformed %s while seeding", path)
-
-    data["permission"] = PERMISSION_ASK
+    # Missing, unreadable, or malformed: start from an empty document rather
+    # than refuse to seed. The readback probe still decides whether the result
+    # routes. A dict without ``permission`` is merged so other keys stay.
+    payload: dict = {} if data is None else data
+    payload["permission"] = PERMISSION_ASK
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
         logger.warning("Could not seed %s: %s", path, exc)
         return False

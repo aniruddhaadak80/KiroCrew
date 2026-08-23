@@ -50,9 +50,15 @@ memoised, so installing the adapter needs no gateway restart.
 
 - goose (`acp/goose.py`): `GOOSE_BIN`, then `mise which goose`, then the
   augmented PATH. Argv is `[bin, "acp"]`. goose serves ACP from its own
-  binary; there is no npm adapter. Routing is `PERMISSION_REQUEST` — privileged
-  tools arrive as `session/request_permission`. File I/O stays in-process
-  because we do not advertise `fs/*`.
+  binary; there is no npm adapter. Routing is `PERMISSION_REQUEST`, but
+  goose 1.47+ starts every session in mode `auto` ("Automatically approve
+  tool calls"). Kiro Crew has no auto-approve permission mode. After
+  `session/new` / `session/load` the client pins `session/set_mode` to
+  `approve` ("Ask before every tool call") and refuses the session if
+  `approve` is not advertised or the pin is rejected — unless the named
+  ungated-tools opt-out is on. `smart_approve` is also a bypass (it
+  auto-approves non-sensitive tools). File I/O stays in-process because
+  we do not advertise `fs/*`.
 - OpenCode (`acp/opencode.py`): `OPENCODE_BIN`, then mise, then PATH. Argv is
   `[bin, "acp"]`. Binary distribution; `install_command` is empty. Routing is
   `SEEDED_SETTINGS`. OpenCode's own default is permissive, so Kiro Crew writes
@@ -305,10 +311,10 @@ attempts `session/load` instead of `session/new`:
 
 The resume ID is consumed on attempt (no retry loop). After successful load,
 `client.resumed` returns `True` — callers use this to skip thread history injection.
-A harness whose `CAP_NATIVE_RESUME` is `UNAVAILABLE` (goose: handshake has no
-resume/fork) never sends `session/load`, even if `agentCapabilities.loadSession`
-is true. Regular chat then replays Crew's transcript the same way a provider
-switch does. `spawn_continue` / `keep` still fail closed on `resume_failed`
+A harness whose `CAP_NATIVE_RESUME` is `UNAVAILABLE` (goose: 1.47 advertises
+`loadSession` and `session/load` can succeed, but transcript restore is
+unmeasured) never sends `session/load`. Regular chat then replays Crew's
+transcript the same way a provider switch does. `spawn_continue` / `keep` still fail closed on `resume_failed`
 so a follow-up cannot run on a blank child. OpenCode, pi, and KAS stay
 `UNVERIFIED` — handshake-gated load is attempted when advertised; KAS
 teardown still maps to session delete, so sharing stays fail-closed.

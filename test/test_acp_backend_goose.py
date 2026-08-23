@@ -193,11 +193,12 @@ def unverified(monkeypatch) -> str:
 async def test_goose_skips_session_load_when_native_resume_is_unavailable(
     tmp_path: Path,
 ) -> None:
-    """A handshake that lies about loadSession must still not attempt load.
+    """A handshake that advertises loadSession must still not attempt load.
 
-    goose's real initialize has no resume/fork. Sending session/load anyway
-    either errors or silently starts a blank child. spawn_continue then
-    fail-closes on ``resumed is False`` with a named reason.
+    goose 1.47 advertises loadSession and session/load can succeed, but
+    transcript restore is unmeasured. Crew skips load so spawn_continue
+    fail-closes on ``resumed is False`` with a named reason instead of
+    starting a blank child.
     """
     client = AcpClient(agent="kirocrew", work_dir=str(tmp_path), acp_backend=ACP_BACKEND_GOOSE)
     proc = MagicMock()

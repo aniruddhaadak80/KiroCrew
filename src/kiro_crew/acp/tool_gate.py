@@ -16,12 +16,23 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Protocol
 
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.codex import Verdict
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE, ACP_BACKEND_OPENCODE
 
 logger = logging.getLogger(__name__)
+
+
+class _SeededSettings(Protocol):
+    """Claude / OpenCode module surface used by the SEEDED_SETTINGS dispatch."""
+
+    def ensure_routed_settings(self, work_dir: Path | str) -> bool: ...  # noqa: E704
+
+    def routing_verdict(self, work_dir: Path | str) -> tuple[Verdict, str]: ...  # noqa: E704
+
+    def remediation_hint(self, work_dir: Path | str) -> str: ...  # noqa: E704
 
 
 class ToolGateUnroutable(Exception):
@@ -39,6 +50,25 @@ class ToolGateUnroutable(Exception):
     """
 
 
+def _seeded_settings_module(backend: str) -> _SeededSettings | None:
+    """The adapter module that owns this backend's SEEDED_SETTINGS files.
+
+    Claude and OpenCode share the routing mechanism but own different
+    files. Selecting the module here keeps identity positive (H5) without
+    merging the seeders — each module still writes and reads its own shape.
+    An added SEEDED_SETTINGS harness that is not named here stays None.
+    """
+    if backend == ACP_BACKEND_OPENCODE:
+        from kiro_crew.acp import opencode as opencode_backend
+
+        return opencode_backend
+    if backend == ACP_BACKEND_CLAUDE:
+        from kiro_crew.acp import claude as claude_backend
+
+        return claude_backend
+    return None
+
+
 def _seed_routed_settings(backend: str, work_dir: Path | str) -> None:
     """Write the conservative permission seed for ``SEEDED_SETTINGS`` backends.
 
@@ -49,19 +79,9 @@ def _seed_routed_settings(backend: str, work_dir: Path | str) -> None:
     descriptor = acp_backends.descriptor_for(backend)
     if descriptor.routing is not acp_backends.Routing.SEEDED_SETTINGS:
         return
-    # Positive identity (H5): Claude and OpenCode share this routing but
-    # own different files. Never call claude.ensure_routed_settings for
-    # OpenCode, and never let an added SEEDED_SETTINGS harness inherit
-    # either seed.
-    if backend == ACP_BACKEND_OPENCODE:
-        from kiro_crew.acp import opencode as opencode_backend
-
-        opencode_backend.ensure_routed_settings(work_dir)
-        return
-    if backend == ACP_BACKEND_CLAUDE:
-        from kiro_crew.acp import claude as claude_backend
-
-        claude_backend.ensure_routed_settings(work_dir)
+    seeded = _seeded_settings_module(backend)
+    if seeded is not None:
+        seeded.ensure_routed_settings(work_dir)
 
 
 def routing_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
@@ -80,15 +100,9 @@ def routing_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
         return (Verdict.ROUTED, "the spawn names an agent")
 
     if descriptor.routing is acp_backends.Routing.SEEDED_SETTINGS:
-        # Positive identity (H5): same split as ``_seed_routed_settings``.
-        if backend == ACP_BACKEND_OPENCODE:
-            from kiro_crew.acp import opencode as opencode_backend
-
-            return opencode_backend.routing_verdict(work_dir)
-        if backend == ACP_BACKEND_CLAUDE:
-            from kiro_crew.acp import claude as claude_backend
-
-            return claude_backend.routing_verdict(work_dir)
+        seeded = _seeded_settings_module(backend)
+        if seeded is not None:
+            return seeded.routing_verdict(work_dir)
         return (
             Verdict.INDETERMINATE,
             f"no settings seed for {descriptor.label}",
@@ -122,6 +136,18 @@ def routing_verdict(backend: str, work_dir: Path | str) -> tuple[Verdict, str]:
         # claiming we serve those client methods. OpenCode is SEEDED_SETTINGS
         # instead: its own default is permissive, so a seed+readback is the
         # probe, not this structural ROUTED.
+        #
+        # goose 1.47+ defaults every session to mode ``auto`` (auto-approve).
+        # Kiro Crew has no such permission mode. The client pins
+        # ``session/set_mode`` to ``approve`` after session/new — this probe
+        # names that pin so doctor/GET do not claim a structural ask that
+        # the unpinned default would skip.
+        if backend == ACP_BACKEND_GOOSE:
+            return (
+                Verdict.ROUTED,
+                "the client pins goose session mode approve after session/new "
+                "(goose defaults to auto, which auto-approves tools)",
+            )
         return (
             Verdict.ROUTED,
             "the adapter asks per privileged tool via session/request_permission",
@@ -159,14 +185,9 @@ def remediation_for(backend: str, work_dir: Path | str) -> str:
     """The concrete change an operator must make, per backend."""
     descriptor = acp_backends.descriptor_for(backend)
     if descriptor.routing is acp_backends.Routing.SEEDED_SETTINGS:
-        if backend == ACP_BACKEND_OPENCODE:
-            from kiro_crew.acp import opencode as opencode_backend
-
-            return opencode_backend.remediation_hint(work_dir)
-        if backend == ACP_BACKEND_CLAUDE:
-            from kiro_crew.acp import claude as claude_backend
-
-            return claude_backend.remediation_hint(work_dir)
+        seeded = _seeded_settings_module(backend)
+        if seeded is not None:
+            return seeded.remediation_hint(work_dir)
         return ""
     if descriptor.routing is acp_backends.Routing.SESSION_CONFIG:
         return (
