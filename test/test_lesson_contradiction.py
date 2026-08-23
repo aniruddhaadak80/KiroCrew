@@ -19,6 +19,8 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.vector_memory import (
     _LESSON_NEGATIVE_SEP,
+    LessonWriteOutcome,
+    LessonWriteResult,
     VectorMemoryStore,
     _lesson_display_text,
     _lesson_slug,
@@ -364,7 +366,15 @@ class TestApiLessonsCreateSchedulesSweep:
         vs = MagicMock()
         vs.embed_lesson.return_value = [0.1] * 384
         vs.find_contradiction_candidates.return_value = candidates
-        vs.write_lesson.return_value = wrote
+        # A real result object, not a bare bool: the route reads the outcome to decide
+        # whether to sweep AND to report what happened, and a MagicMock stand-in would
+        # be truthy for every outcome -- which is exactly the conflation this seam
+        # guards against.
+        vs.write_lesson_ex.return_value = (
+            LessonWriteResult(LessonWriteOutcome.INSERTED)
+            if wrote
+            else LessonWriteResult(LessonWriteOutcome.REFUSED, "injection_blocked")
+        )
         with patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=vs)), \
              patch.object(cron, "_is_restricted_session", return_value=False), \
              patch.object(cron, "_sel"), \
@@ -453,16 +463,17 @@ class TestApiLessonsCreateForwardsNegative:
         vs.embed_lesson.return_value = [0.1] * 384
         vs.find_contradiction_candidates.return_value = []
         # No stored lesson matches, so the enrich-in-place shortcut declines and
-        # the write goes through write_lesson -- the path that dropped the clause.
+        # the write goes through the store's lesson writer -- the path that dropped
+        # the clause.
         vs.get_lessons.return_value = []
-        vs.write_lesson.return_value = True
+        vs.write_lesson_ex.return_value = LessonWriteResult(LessonWriteOutcome.INSERTED)
 
         resp = await self._post(state, vs)
 
         assert resp.status == 200
-        # write_lesson(rule, category, negative, source, emb, generation) -- the
+        # write_lesson_ex(rule, category, negative, source, emb, generation) -- the
         # third positional arg was hardcoded None.
-        args = vs.write_lesson.call_args[0]
+        args = vs.write_lesson_ex.call_args[0]
         assert args[0] == self._RULE
         assert args[2] == self._NEGATIVE, f"negative dropped: called with {args!r}"
 

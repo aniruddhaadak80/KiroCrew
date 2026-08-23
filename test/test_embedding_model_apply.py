@@ -711,7 +711,11 @@ class TestCommitTimeGenerationCheck:
         """
         import inspect
 
-        src = inspect.getsource(VectorMemoryStore.write_lesson)
+        # ``write_lesson`` is now a bool projection of ``write_lesson_ex``, which holds
+        # the body -- so the source order lives there. The delegation is asserted in
+        # ``test_both_persisting_paths_recheck_under_the_lock`` below, so the pair
+        # cannot drift into a second, unchecked write path.
+        src = inspect.getsource(VectorMemoryStore.write_lesson_ex)
         sample = src.find("backfill_generation = self._space_generation")
         embed = src.find("existing_emb = self._try_embed(")
         assert -1 not in (sample, embed), "lazy-backfill sampling not found"
@@ -724,7 +728,7 @@ class TestCommitTimeGenerationCheck:
         """Guard against a refactor dropping the re-check from either path."""
         import inspect
 
-        for fn in (VectorMemoryStore.write_episodic, VectorMemoryStore.write_lesson):
+        for fn in (VectorMemoryStore.write_episodic, VectorMemoryStore.write_lesson_ex):
             src = inspect.getsource(fn)
             assert "_space_generation" in src, f"{fn.__name__} lost its generation check"
             lock_at = src.find("with self._db_lock:")
@@ -733,6 +737,11 @@ class TestCommitTimeGenerationCheck:
             assert check_at > lock_at, (
                 f"{fn.__name__} must re-check INSIDE the lock, not before it"
             )
+        # The bool form must remain a pure delegation. If it grew its own write path
+        # the two checks above would guard only one of them.
+        wrapper = inspect.getsource(VectorMemoryStore.write_lesson)
+        assert "self.write_lesson_ex(" in wrapper, "write_lesson must delegate, not re-implement"
+        assert "self.db.execute" not in wrapper, "write_lesson must not persist anything itself"
 
 
 class TestRevertToBundledIsGatedToo:

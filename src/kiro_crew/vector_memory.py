@@ -22,6 +22,7 @@ import struct
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatch
@@ -115,6 +116,67 @@ class SemanticRejectCode(str, Enum):
     VALUE_EMPTY = "value_empty"
     INJECTION = "injection_blocked"
     CONFLICT = "conflict_skip"
+
+
+class LessonWriteOutcome(str, Enum):
+    """What a lesson write actually DID, for callers that must tell the cases apart.
+
+    ``write_lesson`` returns a bare ``bool``, and its ``False`` meant several
+    unrelated things: validation refused the value, a dedup rule claimed the write,
+    the submit was a genuine no-op, or a bare re-submit deliberately kept the stored
+    NOT-clause. The first two mean "your lesson did not land"; the last two mean
+    "your lesson is fine, there was nothing to do". A caller that cannot tell them
+    apart has to guess, and the CLI guessed wrong -- it read every ``False`` as "the
+    vector store did not take it" and wrote a second record into ``lessons.jsonl``.
+
+    The vocabulary matches :meth:`kiro_crew.learn.LessonStore.save_or_enrich`, which
+    already returns ``inserted``/``enriched``/``unchanged``, so the two stores now
+    describe the same events with the same words.
+    """
+
+    INSERTED = "inserted"
+    ENRICHED = "enriched"
+    UNCHANGED = "unchanged"
+    DEDUPED = "deduped"
+    REFUSED = "refused"
+
+
+# The two outcomes that changed the store. UNCHANGED is deliberately NOT here: the
+# lesson IS stored as submitted, but nothing was written, so a caller asking "did I
+# need to do something" gets no, while a caller asking "is my lesson stored" reads
+# ``stored`` below.
+_LESSON_WROTE_OUTCOMES = frozenset({LessonWriteOutcome.INSERTED, LessonWriteOutcome.ENRICHED})
+
+
+@dataclass(frozen=True)
+class LessonWriteResult:
+    """A lesson write's outcome plus the short reason code behind it.
+
+    ``reason`` names WHICH rule produced the outcome -- a
+    :class:`SemanticRejectCode` value for ``REFUSED``, the dedup rule's name for
+    ``DEDUPED``, and ``kept_stored_clause`` for the one ``UNCHANGED`` case that is
+    not a byte-identical re-submit. It is ``None`` when the outcome says everything
+    there is to say. Surfaces that report back to a human or a model (the CLI, the
+    ``/api/lessons`` response, the ``learn_add`` tool result) need the reason; the
+    ones that only branch on success do not.
+    """
+
+    outcome: LessonWriteOutcome
+    reason: str | None = None
+
+    @property
+    def wrote(self) -> bool:
+        """The store changed. This is exactly what ``write_lesson``'s bool returns."""
+        return self.outcome in _LESSON_WROTE_OUTCOMES
+
+    @property
+    def stored(self) -> bool:
+        """The lesson is in the store as submitted -- written now, or already there.
+
+        Distinct from :attr:`wrote`: a no-op re-submit did not write anything, yet
+        the caller's lesson is stored, so telling them it failed would be false.
+        """
+        return self.outcome is LessonWriteOutcome.UNCHANGED or self.wrote
 
 
 _AUDITABLE_REJECT_CODES = {
@@ -2294,7 +2356,42 @@ class VectorMemoryStore:
         rule_emb_generation: int | None = None,
         repo_scope: str | None = None,
     ) -> bool:
+        """Write a lesson as a semantic entry. True when the store changed.
+
+        The bool answers one question -- did this call write something -- and cannot
+        say which of several unrelated things happened when it did not. Callers that
+        need to tell a refusal from a no-op (to report back to a human or a model)
+        use :meth:`write_lesson_ex`, which this method is a projection of. Every
+        caller that only branches on success keeps working unchanged, which is why
+        the bool stays rather than being replaced: a tuple or a string enum is always
+        truthy, so switching this return type would silently invert every ``if
+        store.write_lesson(...)`` in the tree without a type error to catch it.
+        """
+        return self.write_lesson_ex(
+            rule,
+            category,
+            negative,
+            source,
+            rule_emb,
+            rule_emb_generation,
+            repo_scope,
+        ).wrote
+
+    def write_lesson_ex(
+        self,
+        rule: str,
+        category: str = "knowledge",
+        negative: str | None = None,
+        source: str = "user_explicit",
+        rule_emb: list[float] | None = None,
+        rule_emb_generation: int | None = None,
+        repo_scope: str | None = None,
+    ) -> LessonWriteResult:
         """Write a lesson as a semantic entry with key lesson.<hash>.
+
+        The reporting form of :meth:`write_lesson`: same work, but it names WHICH
+        outcome occurred (see :class:`LessonWriteOutcome`) instead of collapsing
+        "refused", "deduped" and "nothing to do" into one ``False``.
 
         Deduplicates against existing lessons:
         - Substring match: if existing contains new (or vice versa), longer wins
@@ -2348,7 +2445,7 @@ class VectorMemoryStore:
         # the schema, which already rejects the same shapes.
         if repo_scope is not None and isinstance(repo_scope, str) and repo_scope.strip():
             if not scope_is_admissible(repo_scope):
-                return False
+                return LessonWriteResult(LessonWriteOutcome.REFUSED, "scope_inadmissible")
         repo_scope = canonical_scope(repo_scope)
         # The category is now part of the stored value, so an unusable one would be
         # scanned by validate_semantic and could REJECT the whole lesson -- turning a
@@ -2411,7 +2508,7 @@ class VectorMemoryStore:
         if preflight is not None:
             code, message = preflight
             logger.info("Lesson rejected before dedup (%s): %s", code, message)
-            return False
+            return LessonWriteResult(LessonWriteOutcome.REFUSED, code.value)
 
         def _flush_backfills() -> None:
             if pending_backfills:
@@ -2433,7 +2530,7 @@ class VectorMemoryStore:
         # TWO PASSES, and the order is load-bearing.
         #
         # Pass 1 resolves THIS lesson. Pass 2 runs the generic dedup rules, and those
-        # can `return False` on an UNRELATED row -- a superset whose text contains our
+        # can claim the write on an UNRELATED row -- a superset whose text contains our
         # rule. get_lessons() orders by md5 key, so whether such a row is scanned
         # before ours is effectively random, and doing both in one loop made the
         # outcome depend on that order: an unrelated superset seen first discarded an
@@ -2536,7 +2633,7 @@ class VectorMemoryStore:
                     existing["key"],
                 )
                 _flush_backfills()
-                return False
+                return LessonWriteResult(LessonWriteOutcome.UNCHANGED, "kept_stored_clause")
             if fields is not None:
                 # Mapping row: a re-submit that changes nothing the fields express
                 # is a no-op. Category is effectively WRITE-ONCE here: it is not
@@ -2546,7 +2643,7 @@ class VectorMemoryStore:
                 # never stored a category for anything to have depended on.
                 if negative == stored_negative:
                     _flush_backfills()
-                    return False
+                    return LessonWriteResult(LessonWriteOutcome.UNCHANGED)
                 stored_category = decoded.get("category")
                 enriched: dict[str, object] = {
                     "rule": stored_rule,
@@ -2570,13 +2667,14 @@ class VectorMemoryStore:
                 target_text = base if not negative else f"{base}{_LESSON_NEGATIVE_SEP}{negative}"
                 if target_text == existing_val:
                     _flush_backfills()
-                    return False
+                    return LessonWriteResult(LessonWriteOutcome.UNCHANGED)
                 target = {"rule": base, "category": category, "negative": negative}
             # The preflight above validated the value built from the SUBMITTED rule;
             # this one differs, so validate what is actually written.
-            if self.validate_semantic(existing["key"], target, confidence, source):
+            enrich_reject = self.validate_semantic(existing["key"], target, confidence, source)
+            if enrich_reject is not None:
                 _flush_backfills()
-                return False
+                return LessonWriteResult(LessonWriteOutcome.REFUSED, enrich_reject[0].value)
             # Write back under the EXISTING key -- a case-variant would otherwise
             # insert a second row for the same lesson under a different md5. The
             # shared tail below does the write.
@@ -2598,7 +2696,7 @@ class VectorMemoryStore:
             if rule_lower in existing_lower:
                 logger.info("Lesson dedup: %r already covered by %r", rule[:60], existing["key"])
                 _flush_backfills()
-                return False
+                return LessonWriteResult(LessonWriteOutcome.DEDUPED, "substring_covered")
             if existing_lower in rule_lower:
                 self.delete_semantic(existing["key"], source)
                 continue
@@ -2662,12 +2760,16 @@ class VectorMemoryStore:
                             self.delete_semantic(existing["key"], source)
                         else:
                             _flush_backfills()
-                            return False
+                            return LessonWriteResult(
+                                LessonWriteOutcome.DEDUPED, "semantic_similarity"
+                            )
 
         _flush_backfills()
 
         err = self.set_semantic(key, value, confidence, source)
-        if err is None and rule_emb:
+        if err is not None:
+            return LessonWriteResult(LessonWriteOutcome.REFUSED, err[0].value)
+        if rule_emb:
             emb_blob = struct.pack(f"{len(rule_emb)}f", *rule_emb)
             with self._db_lock:
                 if self._space_generation != lesson_embed_generation:
@@ -2681,7 +2783,14 @@ class VectorMemoryStore:
                         (emb_blob, key),
                     )
                     self.db.commit()
-        return err is None
+        # ``matched`` is pass 1's verdict: it rewrote an EXISTING row under that row's
+        # own key to attach a clause, which is an enrichment. Every other route here
+        # wrote a new row under the submitted rule's key -- including the ones that
+        # superseded an older row first, since the caller's lesson did not exist under
+        # this key before. Same two words the JSONL store uses for the same events.
+        return LessonWriteResult(
+            LessonWriteOutcome.ENRICHED if matched else LessonWriteOutcome.INSERTED
+        )
 
     @staticmethod
     def _lesson_keywords(text: str) -> set[str]:

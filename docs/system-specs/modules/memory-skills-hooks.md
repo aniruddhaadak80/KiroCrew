@@ -333,7 +333,7 @@ When vector memory is active, lessons are stored as semantic entries:
   re-submit rewrites them anyway. Renderers go through `_lesson_display_text()`;
   embeddings use `_lesson_embed_text()` (the bare rule, matching the write path).
 - Confidence: 1.0 for `user_explicit`, 0.9 for `migration`
-- Methods: `write_lesson()`, `get_lessons()`, `delete_lesson()`, `get_lessons_context()`
+- Methods: `write_lesson()`, `write_lesson_ex()`, `get_lessons()`, `delete_lesson()`, `get_lessons_context()`
 - Context: injected as `[Learned corrections]` block, separate from `[Semantic Memory]`
 - Allowlist: `lesson.*` prefix in `_BUILTIN_PREFIXES`
 
@@ -510,6 +510,24 @@ whose `repo_scope` is present but unusable counts as neither.
 - Substring dedup: "use dark mode" won't duplicate "always use dark mode"
 - Topic-overlap dedup: "use light mode" replaces "use dark mode" (>50% keyword overlap → newer wins)
 - Allowlist validation, injection scanning, audit logging
+
+**What a write reports.** `write_lesson()` answers one question — did this call write
+something — and `write_lesson_ex()` is the same work reporting WHICH outcome occurred:
+`inserted` / `enriched` / `unchanged` / `deduped` / `refused`, plus a short reason code
+(a `SemanticRejectCode` value for a refusal, the dedup rule's name for a dedup). The
+vocabulary is shared with `LessonStore.save_or_enrich()`, which already returned the
+first three words, so both stores describe the same events the same way. The split
+matters because two of those outcomes mean "your lesson did not land" (`refused`,
+`deduped`) while two mean "your lesson is fine, there was nothing to do"
+(`unchanged`, and the `unchanged` variant that deliberately keeps a stored NOT-clause
+on a bare re-submit) — a caller reading only the bool cannot tell them apart. The bool
+stays because it is not interchangeable with a richer return: a tuple or a string enum
+is always truthy, so changing the return type would silently make every
+`if store.write_lesson(...)` unconditional, and mypy flags only the annotated
+assignments, not a bare `if`. Surfaces that report to a human or a model — the
+`learn add` CLI, the `POST /api/lessons` response (`ok` / `outcome` / `reason`), the
+`learn_add` tool result — read the outcome; callers that only branch on success keep
+using the bool.
 
 **Write sources**:
 1. **`learn_add` MCP tool** (immediate): user says "remember X" → LLM calls tool → `POST /api/lessons` → `write_lesson()`
