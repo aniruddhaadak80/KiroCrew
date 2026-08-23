@@ -766,6 +766,24 @@ export interface TrustedAppsRevokeResult extends TrustedAppsData {
 let _sessionExpiredShown = false
 
 /**
+ * The backend's machine-readable label for a denial that only a re-sign-in can
+ * clear: a session signed in BEFORE `KIROCREW_OWNER_ID` was configured carries
+ * a bootstrap token subject for its whole life (refresh preserves the subject),
+ * so once an owner exists every owner-gated call it makes is denied. Matches
+ * `STALE_OWNER_SESSION_CODE` in `dashboard/handlers/source_providers.py`.
+ */
+export const STALE_OWNER_SESSION_CODE = 'stale_session_reauth'
+
+/**
+ * True while the banner on screen is the stale-owner variant. A separate latch
+ * because that session is still AUTHENTICATED: ordinary polls keep succeeding,
+ * so the `j` wrapper's clear-banner-on-2xx self-dismissal would remove the one
+ * instruction that recovers the owner-gated surfaces. It clears via the
+ * banner's own ✕ or the sign-in reload, never via a 2xx.
+ */
+let _staleOwnerBanner = false
+
+/**
  * Synchronous getter so React components can read the auth-banner state on
  * mount (e.g. when the banner was already injected before the component
  * subscribed to the `mc-auth-required` / `mc-auth-cleared` events).
@@ -798,6 +816,10 @@ export function removeAuthBanner(): void {
   // A 2xx means auth works again — clear the terminal-refresh latch so a later
   // lapse retries silently instead of going straight to the banner.
   _silentRefreshExhausted = false
+  // The stale-owner banner is exempt from the 2xx self-dismissal: that session
+  // still authenticates for everything the owner gate does not front, so a
+  // success proves nothing about the stale-subject denial.
+  if (_staleOwnerBanner) return
   if (!_sessionExpiredShown) return
   _sessionExpiredShown = false
   const el = document.getElementById('mc-session-expired')
@@ -827,13 +849,14 @@ export function attemptSilentRefresh(): Promise<boolean> {
 export function __resetAuthRecoveryStateForTests(): void {
   _silentRefreshExhausted = false
   _sessionExpiredShown = false
+  _staleOwnerBanner = false
   __resetRefreshOnceForTests()
   if (typeof document !== 'undefined') {
     document.getElementById('mc-session-expired')?.remove()
   }
 }
 
-function showSessionExpiredBanner(): void {
+function showSessionExpiredBanner(lead?: string): void {
   if (_sessionExpiredShown) return
   _sessionExpiredShown = true
   _emitAuthEvent('mc-auth-required')
@@ -843,7 +866,7 @@ function showSessionExpiredBanner(): void {
     'position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;' +
     'padding:12px 20px;text-align:center;font:14px/1.5 system-ui;'
   const b = document.createElement('b')
-  b.textContent = i18nT('api.client.session_expired')
+  b.textContent = lead ?? i18nT('api.client.session_expired')
   const code = document.createElement('code')
   code.textContent = 'kirocrew token'
   code.style.cssText = 'background:#7f1d1d;padding:2px 6px;border-radius:4px'
@@ -873,6 +896,7 @@ function showSessionExpiredBanner(): void {
   dismiss.addEventListener('click', () => {
     el.remove()
     _sessionExpiredShown = false
+    _staleOwnerBanner = false
     _emitAuthEvent('mc-auth-cleared')
   })
   el.append(dismiss)
@@ -913,6 +937,32 @@ export function checkSessionExpired(r: Response): Response {
     showSessionExpiredBanner()
   }
   return r
+}
+
+/**
+ * Recovery prompt for the ONE denial the silent-refresh path can never clear:
+ * a session whose token was minted before `KIROCREW_OWNER_ID` was configured.
+ * `/api/auth/refresh` re-mints from the incoming subject, so a "successful"
+ * refresh would rotate the cookie and keep the stale bootstrap subject — the
+ * next owner-gated call is denied again, forever. Only a fresh sign-in (a new
+ * token link, whose subject is derived from the now-configured owner) recovers,
+ * so this goes straight to the banner instead of attempting a refresh.
+ */
+function handleStaleOwnerSession(): void {
+  if (_sessionExpiredShown) return
+  // Embedded in the Instances pane stack: hand recovery to the hub, mirroring
+  // checkSessionExpired — the hub force-mints a fresh token (whose subject is
+  // derived from the current owner) and reloads this iframe.
+  if (typeof window !== 'undefined' && window.parent && window.parent !== window) {
+    try {
+      window.parent.postMessage({ type: 'mc-auth-expired' }, '*')
+      return
+    } catch {
+      /* cross-origin parent unreachable — fall through to the banner below */
+    }
+  }
+  _staleOwnerBanner = true
+  showSessionExpiredBanner(i18nT('api.client.stale_owner_session'))
 }
 
 /**
@@ -995,9 +1045,16 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   // the recovery instruction for display; the raw reason still travels in
   // `body` and in the error report's `detail` for diagnostics.
   const authRequired = r.status === 403 && r.headers.get('X-Auth-Required') === 'true'
-  const message = authRequired
-    ? i18nT('api.client.session_expired_sign_in_again')
-    : friendlyErrText(r.status, errText) || `HTTP ${r.status}`
+  // The stale-owner signal is matched on status AND the backend's code — a
+  // generic 401 (or any 403) keeps its current handling untouched.
+  const staleOwnerSession =
+    r.status === 401 && parseErrorCode(errText) === STALE_OWNER_SESSION_CODE
+  if (staleOwnerSession) handleStaleOwnerSession()
+  const message = staleOwnerSession
+    ? i18nT('api.client.stale_owner_session_sign_in_again')
+    : authRequired
+      ? i18nT('api.client.session_expired_sign_in_again')
+      : friendlyErrText(r.status, errText) || `HTTP ${r.status}`
   recordError({
     source: 'api',
     message,
@@ -1006,7 +1063,9 @@ const apiFailure = (r: Response, errText: string): ApiError => {
     endpoint: requestPath(r.url),
     detail: errText,
   })
-  return new ApiError(r.status, message, errText, authRequired)
+  // A stale-owner denial is authRequired in the sense call sites care about:
+  // no retry can succeed until the user signs in again.
+  return new ApiError(r.status, message, errText, authRequired || staleOwnerSession)
 }
 
 const j = async (r: Response) => {
