@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
     from kiro_crew.slack.outbound import PostedOptions
 
+from kiro_crew.context_blocks import attributable_user_chars
 from kiro_crew.dashboard.state import (
     BUSY_RECOVERY_PREFIX,
     CONN_RECOVERY_PREFIX,
@@ -39,6 +40,7 @@ from kiro_crew.dashboard.state import (
 from kiro_crew.history import transcript_sort_key
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
+from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
     oauth_url_contains_credential,
     redact_credentials,
@@ -128,7 +130,10 @@ def _redact_tool_field(text: str | None, *, limit: int = _MAX_TOOL_FIELD) -> str
         if len(encoded) > limit:
             # errors="ignore" cleanly drops a partial trailing multi-byte
             # sequence at the cut point.
-            text = encoded[:limit].decode("utf-8", errors="ignore") + f"\n… [truncated at {limit:,} bytes]"
+            text = (
+                encoded[:limit].decode("utf-8", errors="ignore")
+                + f"\n… [truncated at {limit:,} bytes]"
+            )
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     return text
@@ -156,9 +161,13 @@ def _build_stream_chunk(msg: dict) -> str:
     else:
         cls_val = _redact_deep(cls_val)
     return json.dumps(
-        {"type": msg.get("role", ""), "content": content, "ts": msg.get("ts", ""),
-         "cls": cls_val,
-         **({"meta": meta} if meta else {})}
+        {
+            "type": msg.get("role", ""),
+            "content": content,
+            "ts": msg.get("ts", ""),
+            "cls": cls_val,
+            **({"meta": meta} if meta else {}),
+        }
     )
 
 
@@ -275,6 +284,54 @@ SLASH_COMMAND_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+def user_text_span(
+    offset: int,
+    typed_len: int,
+    *,
+    quick_prompt: bool,
+    prompt_expanded: bool,
+) -> tuple[int, int]:
+    """WHERE the user's typed text sits in the message handed to ``build_message``.
+
+    Deliberately NOT the same question as how much of the turn is ATTRIBUTABLE to
+    the user, which is :func:`attributable_user_chars`. Conflating the two is a live
+    trap: a quick-prompt turn credits the user zero characters, so deriving the
+    span from the attributable count hands ``build_message`` an EMPTY slice — and
+    since that slice is what the quick-prompt matcher reads, the token silently
+    stops expanding altogether.
+
+    So a quick prompt reports its REAL typed span (the matcher has to see the
+    token; ``build_message`` zeroes the attribution itself once it has expanded),
+    while an ``@prompt`` turn — already replaced before this point, so its typed
+    text is gone from the message — reports the empty span the attribution rule
+    asks for.
+    """
+    length = (
+        typed_len
+        if quick_prompt
+        else attributable_user_chars(typed_len, prompt_expanded=prompt_expanded)
+    )
+    return offset, offset + length
+
+
+def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
+    """Whether *first_word* should be forwarded to the harness as a command.
+
+    Two rules, and the second exists because of a trap. A member of
+    :data:`_SLASH_COMMANDS` is a command on every provider. Under ``claude_code``
+    the harness owns its own command set, so ANY leading slash is forwarded --
+    except a quick-prompt token, which is not a command at all but a macro
+    :meth:`ContextBuilder.build_message` expands into an instruction. Forwarding one
+    would hand the harness a command it has no definition for, and the token would
+    silently do nothing on that provider while working everywhere else.
+    """
+    if first_word in _SLASH_COMMANDS:
+        return True
+    if not (cc_provider and first_word.startswith("/")):
+        return False
+    return first_word.lower() not in QUICK_PROMPTS
+
+
 def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEvent") -> str:
     """Broadcast an auto-approved tool call via WS with redacted title. Returns redacted title."""
     title, _ = redact_exfiltration_urls(event.title)
@@ -286,7 +343,11 @@ def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEven
     state.broadcast_ws(
         "tool_call",
         {
-            "slot": slot.key, "tool": title, "kind": kind, "auto": True, "tool_call_id": tcid,
+            "slot": slot.key,
+            "tool": title,
+            "kind": kind,
+            "auto": True,
+            "tool_call_id": tcid,
             "purpose": _redact_tool_field(event.tool_purpose, limit=_MAX_TOOL_PURPOSE),
             "input_preview": _redact_tool_field(event.tool_input),
         },
@@ -294,9 +355,7 @@ def _broadcast_auto_tool(state: DashboardState, slot: _ChatSlot, event: "LLMEven
     return title
 
 
-def _append_compaction_notice(
-    state: DashboardState, slot: _ChatSlot, msg_text: str
-) -> None:
+def _append_compaction_notice(state: DashboardState, slot: _ChatSlot, msg_text: str) -> None:
     """Append a compaction status notice as an assistant message and broadcast it.
 
     The notice is tagged ``kind="compaction"`` so the dashboard can tell it apart
@@ -442,7 +501,7 @@ def _history_key_for(slot_key: str) -> str:
     if slot_key.startswith("dashboard:"):
         return slot_key
     while slot_key.startswith("dashboard_"):
-        slot_key = slot_key[len("dashboard_"):]
+        slot_key = slot_key[len("dashboard_") :]
     return f"dashboard:{slot_key}"
 
 
@@ -473,9 +532,7 @@ def dashboard_slot_key(session_key: str) -> str:
         # (``cron:<job_id>``), so the surface gate is checked against both
         # spellings. Whichever matched, the displaying tab is the job's own.
         job_id = session_key.removeprefix("cron:").split(":", 1)[0]
-        if not (
-            has_dashboard_surface(session_key) or has_dashboard_surface(f"cron:{job_id}")
-        ):
+        if not (has_dashboard_surface(session_key) or has_dashboard_surface(f"cron:{job_id}")):
             return ""
         return _normalize_slot_key(f"cron-{job_id}")
     if not has_dashboard_surface(session_key):
@@ -1192,7 +1249,7 @@ def _maybe_inject_persona(
         and isinstance(theme_consent_sha, str)
         and THEME_CONSENT_SHA_RE.fullmatch(theme_consent_sha)
     ):
-        text = _installed_theme_persona(color_theme[len("custom-"):])
+        text = _installed_theme_persona(color_theme[len("custom-") :])
         if text:
             actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if hmac.compare_digest(actual, theme_consent_sha):
@@ -1228,8 +1285,10 @@ def _maybe_consolidate(state, slot) -> None:
         state.consolidator.maybe_consolidate(effective_session_key(slot))
     elif state.consolidator and slot.is_restricted:
         sel().log_api_access(
-            caller=f"dashboard:{slot.key}", operation="consolidate",
-            outcome="denied", source="dashboard",
+            caller=f"dashboard:{slot.key}",
+            operation="consolidate",
+            outcome="denied",
+            source="dashboard",
             resources="restricted_session_block",
         )
 
@@ -1477,10 +1536,7 @@ _APPROVAL_GATED_RE = re.compile(
     # delete it now" is as gated as "If you approve ...". Bias toward reject is
     # safe here (a false reject just lands normally); the #2696 GPT round widened
     # this from the pronoun list after "If CI passes ..." slipped through.
-    r"\bif\b"
-    r"|\bjust\s+say\s+the\s+word\b"
-    r"|\bwant\s+me\s+to\b"
-    r"|\bshall\s+i\b"
+    r"\bif\b" r"|\bjust\s+say\s+the\s+word\b" r"|\bwant\s+me\s+to\b" r"|\bshall\s+i\b"
     # Consent DEFERRAL: the action is gated on the user's approval/confirmation,
     # even when the sentence reads as "I'll ... now" ("I'll wait for your approval
     # before I delete it right now"). The earlier list only caught "with your
@@ -1921,7 +1977,7 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
                 break
             to_merge.append(item)
         if len(to_merge) > 1:
-            del slot._queue[:len(to_merge)]
+            del slot._queue[: len(to_merge)]
             merged = "\n\n".join(item["content"] for item in to_merge)
             return f"[{len(to_merge)} queued messages merged]\n\n{merged}", to_merge
     item = slot.queue_pop(0)

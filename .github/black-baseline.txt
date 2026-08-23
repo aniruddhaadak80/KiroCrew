@@ -209,7 +209,6 @@ src/kiro_crew/connections/l0_probe.py
 src/kiro_crew/connections/l0_record.py
 src/kiro_crew/connections/registry.py
 src/kiro_crew/connections/tool_aliases.py
-src/kiro_crew/context_blocks.py
 src/kiro_crew/context_management.py
 src/kiro_crew/crew_chat.py
 src/kiro_crew/cron.py
@@ -229,7 +228,6 @@ src/kiro_crew/dashboard/chat_orchestrator.py
 src/kiro_crew/dashboard/chat_persistence.py
 src/kiro_crew/dashboard/chat_slack.py
 src/kiro_crew/dashboard/chat_title.py
-src/kiro_crew/dashboard/chat_utils.py
 src/kiro_crew/dashboard/chat_voice.py
 src/kiro_crew/dashboard/crash_dump_store.py
 src/kiro_crew/dashboard/cron_inject.py
