@@ -1560,7 +1560,15 @@ Examples:
     pod_cleanup = pod_sub.add_parser("_cleanup")
     pod_cleanup.add_argument("name")
 
-    sub.add_parser("update", help="Update Kiro Crew to the latest version")
+    update_parser = sub.add_parser("update", help="Update Kiro Crew to the latest version")
+    update_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Discard local commits when a git checkout has diverged from its "
+            "upstream (git installs only)"
+        ),
+    )
 
     # stop
     stop_parser = sub.add_parser("stop", help="Stop a running Kiro Crew gateway")
@@ -2424,7 +2432,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     elif args.command == "update":
         from kiro_crew.cli_server import _update
 
-        _update()
+        _update(force=args.force)
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 
