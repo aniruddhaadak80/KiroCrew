@@ -1735,45 +1735,90 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
     return restored
 
 
-def _dir_bytes(root: Path) -> int:
-    """Total size of every file under *root*, recursively.
+# Called with the running total of bytes freed by an empty. See :func:`empty_trash`.
+EmptyProgress = Callable[[int], None]
 
-    Uses the stat the directory walk already produced: a batch can hold hundreds
-    of thousands of files, where a separate ``Path.stat()`` per file dominates.
+# How many deleted files pass between two progress callbacks. Per file would be six
+# figures of calls for one batch of the size this reporting exists for.
+_PROGRESS_EVERY_FILES = 500
+
+
+def _delete_tree_reporting(
+    root: Path,
+    on_progress: EmptyProgress | None,
+    base_bytes: int,
+) -> int:
+    """Delete everything under *root*, reporting bytes freed as it goes.
+
+    Replaces the measure-the-whole-tree then :func:`shutil.rmtree` pair this used
+    to be. Both of those already walked the whole tree, so measuring while deleting
+    costs nothing — and it is the only reason a delete can be reported at all.
+    Per-batch accounting cannot: the store this exists for stages a single batch
+    holding tens of thousands of sessions, where "one batch done" is one step from
+    nothing to finished, minutes later.
+
+    ``base_bytes`` is what earlier batches in the same call already freed, so the
+    number handed to ``on_progress`` is always the total for the whole operation
+    rather than a figure that restarts per batch.
+
+    Bottom-up, and a file that cannot be removed is skipped rather than raising —
+    the same tolerance ``rmtree(ignore_errors=True)`` had. Sizes come from
+    ``lstat``, so a symlink is counted as the link it is and never followed; the
+    final sweep clears whatever the walk could not.
     """
-    total = 0
-    stack = [root]
-    while stack:
-        current = stack.pop()
+    freed = 0
+    files = 0
+    for parent, _dirs, names in os.walk(root, topdown=False, onerror=lambda _exc: None):
+        for name in names:
+            path = Path(parent) / name
+            try:
+                size = path.lstat().st_size
+            except OSError:
+                size = 0
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            freed += size
+            files += 1
+            # Reporting per file would call back six figures of times for one
+            # batch; this is often enough that a reader sees the number move.
+            if on_progress is not None and files % _PROGRESS_EVERY_FILES == 0:
+                on_progress(base_bytes + freed)
         try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                        elif entry.is_file(follow_symlinks=False):
-                            total += entry.stat(follow_symlinks=False).st_size
-                    except OSError:
-                        continue
+            os.rmdir(parent)
         except OSError:
             continue
-    return total
+    shutil.rmtree(root, ignore_errors=True)
+    if on_progress is not None:
+        on_progress(base_bytes + freed)
+    return freed
 
 
-def empty_trash(batch_ids: list[str] | None = None) -> int:
+def empty_trash(
+    batch_ids: list[str] | None = None,
+    on_progress: EmptyProgress | None = None,
+) -> int:
     """Delete staged batches for good; return the bytes freed.
 
     Serialized against other mutations, so a batch cannot be destroyed while a
     restore is mid-way through putting its files back.
+
+    ``on_progress`` is called with the running total of bytes freed, from the
+    calling thread. It is advisory: a caller that passes nothing gets exactly the
+    behaviour it always had, and nothing here waits on or trusts the callback.
     """
     with _mutation_lock():
         try:
-            return _empty_trash_locked(batch_ids)
+            return _empty_trash_locked(batch_ids, on_progress)
         finally:
             invalidate_scan_cache()
 
 
-def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
+def _empty_trash_locked(
+    batch_ids: list[str] | None = None,
+    on_progress: EmptyProgress | None = None,
+) -> int:
     """Delete staged batches for real; return the bytes freed.
 
     This is the only call here that destroys data, and the only one that changes
@@ -1818,6 +1863,5 @@ def _empty_trash_locked(batch_ids: list[str] | None = None) -> int:
                 len(leftovers),
             )
             continue
-        freed += _dir_bytes(resolved)
-        shutil.rmtree(resolved, ignore_errors=True)
+        freed += _delete_tree_reporting(resolved, on_progress, freed)
     return freed

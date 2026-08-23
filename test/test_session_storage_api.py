@@ -8,9 +8,11 @@ and the payload never splits a session's size across the two stores it occupies.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -356,8 +358,25 @@ class TestRestore:
 
 
 class TestEmpty:
+    @pytest.fixture(autouse=True)
+    def _no_job_leaks(self) -> Iterator[None]:
+        """The job slot is a module global, so a test must not inherit one.
+
+        Without this a finished job from an earlier test makes the next one's POST
+        look like a second empty, or its status read report a run it never started.
+        """
+        handler._empty_job = None
+        yield
+        job = handler._empty_job
+        if job is not None and job.task is not None and not job.task.done():
+            job.task.cancel()
+        handler._empty_job = None
+
     @pytest.mark.asyncio
-    async def test_frees_space_and_audits_the_bytes(self, stores: tuple[Path, Path]) -> None:
+    async def test_accepts_the_work_then_frees_the_space_and_audits_it(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """202 says "accepted", not "done" — the bytes land when the job finishes."""
         _, kiro_home = stores
         size = _retired(kiro_home, "aaaa1111")
         sel = _sel_stub()
@@ -369,10 +388,148 @@ class TestEmpty:
             resp = await handler.api_session_storage_empty(
                 _request("POST", "/api/system/session-storage/empty", {"all": True})
             )
+            accepted = json.loads(resp.body)
 
-        assert json.loads(resp.body)["freed_bytes"] >= size
+            assert resp.status == 202
+            assert accepted["running"] is True
+            # The denominator comes from the staged manifest, so the screen can draw
+            # progress from the first frame instead of after the first callback.
+            assert accepted["total_bytes"] >= size
+            assert accepted["total_sessions"] == 1
+
+            job = handler._empty_job
+            assert job is not None and job.task is not None
+            await job.task
+
+            status = json.loads((await handler.api_session_storage_empty_status(
+                _request("GET", "/api/system/session-storage/empty", None)
+            )).body)
+
+        assert status["job"]["running"] is False
+        assert status["job"]["error"] == ""
+        assert status["job"]["freed_bytes"] >= size
+        assert status["job"]["job_id"] == accepted["job_id"]
+        assert session_storage_module.list_trash() == []
         resources = [c.kwargs["resources"] for c in sel.log_api_access.call_args_list]
         assert any(r.startswith("freed:") for r in resources)
+
+    @pytest.mark.asyncio
+    async def test_no_job_reads_as_no_job(self, stores: tuple[Path, Path]) -> None:
+        resp = await handler.api_session_storage_empty_status(
+            _request("GET", "/api/system/session-storage/empty", None)
+        )
+        assert json.loads(resp.body) == {"job": None}
+
+    @pytest.mark.asyncio
+    async def test_progress_is_visible_while_the_delete_is_still_running(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The point of the whole change: a partial figure, before it is finished.
+
+        The delete is held open on an event so the status read happens mid-run,
+        which is the only moment the old blocking endpoint could say nothing at all.
+        """
+        _, kiro_home = stores
+        _retired(kiro_home, "aaaa1111")
+        release = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _slow_empty(batch_ids, on_progress=None):  # type: ignore[no-untyped-def]
+            if on_progress is not None:
+                on_progress(512)
+            asyncio.run_coroutine_threadsafe(_wait(), loop).result()
+            return 1024
+
+        async def _wait() -> None:
+            await release.wait()
+
+        with patch.object(handler, "_sel", return_value=_sel_stub()):
+            await handler.api_session_storage_cleanup(
+                _request("POST", "/api/system/session-storage/cleanup", {"older_than_days": 30})
+            )
+            with patch.object(handler, "empty_trash", _slow_empty):
+                await handler.api_session_storage_empty(
+                    _request("POST", "/api/system/session-storage/empty", {"all": True})
+                )
+                job = handler._empty_job
+                assert job is not None and job.task is not None
+                # Let the worker thread report once.
+                for _ in range(200):
+                    if job.freed_bytes:
+                        break
+                    await asyncio.sleep(0.01)
+
+                mid = json.loads((await handler.api_session_storage_empty_status(
+                    _request("GET", "/api/system/session-storage/empty", None)
+                )).body)
+                assert mid["job"]["running"] is True
+                assert mid["job"]["freed_bytes"] == 512
+
+                # A second empty is refused while this one holds the slot, and the
+                # refusal carries the running job so a second tab shows progress
+                # rather than an error it cannot act on.
+                busy = await handler.api_session_storage_empty(
+                    _request("POST", "/api/system/session-storage/empty", {"all": True})
+                )
+                assert busy.status == 409
+                assert json.loads(busy.body)["code"] == "empty_in_progress"
+                assert json.loads(busy.body)["job_id"] == mid["job"]["job_id"]
+
+                release.set()
+                await job.task
+
+        assert job.done is True
+        assert job.freed_bytes == 1024
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_lands_on_the_job_not_on_a_lost_request(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The request is already answered, so a refusal has to be readable later."""
+        def _refuse(batch_ids, on_progress=None):  # type: ignore[no-untyped-def]
+            raise session_storage_module.SessionStorageError("the trash root moved")
+
+        sel = _sel_stub()
+        with patch.object(handler, "_sel", return_value=sel), \
+                patch.object(handler, "_staged_totals", return_value=(0, 0)), \
+                patch.object(handler, "empty_trash", _refuse):
+            await handler.api_session_storage_empty(
+                _request("POST", "/api/system/session-storage/empty", {"all": True})
+            )
+            job = handler._empty_job
+            assert job is not None and job.task is not None
+            await job.task
+
+        assert job.done is True
+        assert "trash root moved" in job.error
+        outcomes = [c.kwargs["outcome"] for c in sel.log_api_access.call_args_list]
+        assert "refused" in outcomes
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_error_finishes_the_job_instead_of_hanging_it(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """A job left flagged running is a screen polling a delete that stopped."""
+        def _boom(batch_ids, on_progress=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError("disk went away")
+
+        sel = _sel_stub()
+        with patch.object(handler, "_sel", return_value=sel), \
+                patch.object(handler, "_staged_totals", return_value=(0, 0)), \
+                patch.object(handler, "empty_trash", _boom):
+            await handler.api_session_storage_empty(
+                _request("POST", "/api/system/session-storage/empty", {"all": True})
+            )
+            job = handler._empty_job
+            assert job is not None and job.task is not None
+            await job.task
+
+        assert job.done is True
+        assert job.error != ""
+        # The client is told something stopped, never the exception text.
+        assert "disk went away" not in job.error
+        outcomes = [c.kwargs["outcome"] for c in sel.log_api_access.call_args_list]
+        assert "error" in outcomes
 
     @pytest.mark.asyncio
     async def test_an_empty_body_destroys_nothing(self, stores: tuple[Path, Path]) -> None:

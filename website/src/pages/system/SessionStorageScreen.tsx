@@ -8,7 +8,7 @@
  * that is an implementation detail and the report carries no per-store
  * breakdown, so this screen cannot accidentally surface it.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ChevronLeft, ChevronRight, Info, Search } from 'lucide-react'
 import { api } from '../../api/client'
@@ -23,6 +23,7 @@ import type {
   SessionInventoryList,
   SessionStorageBatch,
   SessionStorageCleanup,
+  SessionStorageEmptyJob,
   SessionTrashRefusal,
 } from '../../types'
 
@@ -58,7 +59,35 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
     queryKey: ['session-inventory'],
     queryFn: api.sessionInventory,
     refetchOnWindowFocus: false,
+    // The shared client sets staleTime: Infinity — freshness there comes from
+    // WebSocket invalidation, and nothing pushes an event for a delete that
+    // finished while this screen was unmounted. Without this, leaving the page
+    // during an empty and coming back re-rendered the CACHED pre-delete list: the
+    // batch still listed, the totals unchanged. The one scan on mount is the price
+    // of never showing a store that is already gone.
+    staleTime: 0,
+    refetchOnMount: 'always',
   })
+
+  /**
+   * The running or last-finished empty.
+   *
+   * Polled rather than awaited on the mutation, because the delete outlives the
+   * request that starts it and outlives this component: a job started here and
+   * still running when the user comes back is picked up by this same query, which
+   * is what makes "you can leave the page" true on screen and not just in the
+   * gateway. The endpoint reads counters and touches no store, so a 1s poll costs
+   * nothing — but it only polls while something is running.
+   */
+  const { data: emptyState } = useQuery<{ job: SessionStorageEmptyJob | null }>({
+    queryKey: ['session-empty-job'],
+    queryFn: api.sessionStorageEmptyStatus,
+    staleTime: 0,
+    refetchOnMount: 'always',
+    refetchInterval: q => (q.state.data?.job?.running ? 1_000 : false),
+  })
+  const emptyJob = emptyState?.job ?? null
+  const emptyRunning = emptyJob !== null && emptyJob.running
 
   const invalidate = useCallback(() => {
     void qc.invalidateQueries({ queryKey: ['session-inventory'] })
@@ -79,12 +108,36 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
     onSuccess: invalidate,
   })
 
+  /**
+   * Starts an empty. It does NOT wait for the files to go.
+   *
+   * The response only says the work was accepted, so there is nothing to
+   * invalidate here yet — the inventory is still true until the delete lands. What
+   * this does is disarm the confirm and kick the job poll, which then owns
+   * reporting the run and refreshing the list when it finishes.
+   */
   const emptyMut = useMutation({
     mutationFn: (batchId: string) => api.sessionStorageEmpty([batchId]),
-    onSuccess: () => { setArming(null); invalidate() },
+    onSuccess: () => {
+      setArming(null)
+      void qc.invalidateQueries({ queryKey: ['session-empty-job'] })
+    },
   })
 
-  const busy = trashMut.isPending || restoreMut.isPending || emptyMut.isPending
+  // A finished job means the store on disk no longer matches the listing in hand,
+  // so the scan is re-run exactly once per job rather than on a timer. Keyed on the
+  // job id as well as the flag: two empties in a row must each trigger their own
+  // refresh, and a remount that finds an already-finished job must not re-fire for
+  // one it has already accounted for.
+  const settledJob = useRef<string>('')
+  useEffect(() => {
+    if (!emptyJob || emptyJob.running) return
+    if (settledJob.current === emptyJob.job_id) return
+    settledJob.current = emptyJob.job_id
+    invalidate()
+  }, [emptyJob, invalidate])
+
+  const busy = trashMut.isPending || restoreMut.isPending || emptyMut.isPending || emptyRunning
   const blocked = (data?.reclaim_blocked_reason ?? '') !== ''
 
   // Split sessions: foreground vs background
@@ -378,6 +431,7 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
           <TrashSection
             trash={data.trash}
             busy={busy}
+            job={emptyJob}
             trashOpen={trashOpen}
             onToggleTrash={() => setTrashOpen(!trashOpen)}
             arming={arming}
@@ -659,11 +713,12 @@ function Fact({ label, value }: { label: string; value: string }) {
 /* ─────────────────── Trash Section ─────────────────── */
 
 function TrashSection({
-  trash, busy, trashOpen, onToggleTrash,
+  trash, busy, job, trashOpen, onToggleTrash,
   arming, onArm, onRestore, onConfirmEmpty,
 }: {
   trash: SessionInventoryList['trash']
   busy: boolean
+  job: SessionStorageEmptyJob | null
   trashOpen: boolean
   onToggleTrash: () => void
   arming: string | null
@@ -692,10 +747,16 @@ function TrashSection({
             })}
           </span>
         )}
-        {batches.length === 0 && (
+        {batches.length === 0 && !job?.running && (
           <span className="text-[12px] text-muted">{i18nT('pages.sessionStorage.trash_empty')}</span>
         )}
       </Clickable>
+
+      {/* The delete's own status. Outside the collapsed body on purpose: a run
+          that takes minutes must stay visible whether or not the section that
+          started it is open, and it is the only thing on screen that says the
+          work did not die with the click. */}
+      {job !== null && <EmptyProgress job={job} />}
 
       {trashOpen && batches.length > 0 && (
         <div className="pl-4">
@@ -716,6 +777,70 @@ function TrashSection({
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * What the empty is doing, while it does it.
+ *
+ * The reported symptom this answers: the three buttons greyed out and nothing
+ * else changed, so the only way to learn whether a delete of tens of thousands of
+ * sessions had worked was to come back later and see whether the batch was gone.
+ *
+ * Progress is measured in BYTES against the staged total, not in sessions: the
+ * delete walks files, and a session is more than one file, so a session-shaped
+ * count would either be a guess or lag the work it claims to describe. The
+ * "keeps running" line is load-bearing, not reassurance — the job lives in the
+ * gateway, so leaving really is safe, and a user who does not know that waits.
+ */
+function EmptyProgress({ job }: { job: SessionStorageEmptyJob }) {
+  if (job.running) {
+    // Only when the staged total is known: a batch whose manifest reported no
+    // bytes would otherwise render a bar permanently at 0% next to a number that
+    // is climbing, which reads as stuck.
+    const pct = job.total_bytes > 0
+      ? Math.min(100, (job.freed_bytes / job.total_bytes) * 100)
+      : null
+    return (
+      <div className="px-1.5 py-2" role="status">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="text-[12.5px] text-text-strong">
+            {i18nT('pages.sessionStorage.emptying')}
+          </span>
+          <span className="text-[12px] text-muted font-mono tabular-nums">
+            {job.total_bytes > 0
+              ? i18nT('pages.sessionStorage.emptying_progress', {
+                freed: fmtBytes(job.freed_bytes),
+                total: fmtBytes(job.total_bytes),
+              })
+              : fmtBytes(job.freed_bytes)}
+          </span>
+          <span className="text-[11.5px] text-muted">
+            {i18nT('pages.sessionStorage.emptying_leave_ok')}
+          </span>
+        </div>
+        {pct !== null && (
+          <div className="h-[3px] bg-border mt-1.5 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-accent rounded-full transition-[width] duration-500"
+              style={{ width: `${Math.max(1, pct)}%` }}
+            />
+          </div>
+        )}
+      </div>
+    )
+  }
+  if (job.error !== '') {
+    return (
+      <p className="px-1.5 py-2 text-[12px] text-danger" role="status">
+        {i18nT('pages.sessionStorage.empty_failed', { reason: job.error })}
+      </p>
+    )
+  }
+  return (
+    <p className="px-1.5 py-2 text-[12px] text-muted" role="status">
+      {i18nT('pages.sessionStorage.emptied', { size: fmtBytes(job.freed_bytes) })}
+    </p>
   )
 }
 

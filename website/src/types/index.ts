@@ -194,6 +194,29 @@ export interface SessionStorageCleanup {
   dry_run?: boolean
 }
 
+/**
+ * One empty of the trash, running or last finished.
+ *
+ * POST /api/system/session-storage/empty answers 202 with this; GET on the same
+ * path returns the current one. The gateway keeps a single slot, so a second empty
+ * is refused with 409 and this same shape rather than queued.
+ *
+ * `total_bytes` comes from the staged manifests — the same figure the trash row
+ * showed — so it is the denominator for `freed_bytes` and never a remeasurement.
+ */
+export interface SessionStorageEmptyJob {
+  job_id: string
+  running: boolean
+  started_at: number
+  /** 0 while it is still running. */
+  finished_at: number
+  total_bytes: number
+  total_sessions: number
+  freed_bytes: number
+  /** Empty unless the delete was refused or stopped on an error. */
+  error: string
+}
+
 /* ── Session inventory (contract §1–§3) ── */
 
 /** One session row in the inventory list. */

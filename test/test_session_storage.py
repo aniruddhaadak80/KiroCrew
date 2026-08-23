@@ -1760,6 +1760,56 @@ class TestEmptyTrash:
         assert session_storage.list_trash() == []
         assert not (session_storage.trash_root() / batch.batch_id).exists()
 
+    def test_reports_progress_that_ends_at_what_it_returns(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """Progress must be a running total of the WHOLE call, not per batch.
+
+        A screen draws a bar against one denominator, so a figure that restarts on
+        each batch would march to the end and then jump backwards. The last value
+        reported is also the returned total, which is what lets a client stop
+        polling on the callback rather than waiting for a separate confirmation.
+        """
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=4096, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=2048, age_days=40)
+        first = session_storage.move_to_trash(
+            ["aaaa1111"], reason="a", index=_index(), now=_NOW - _DAY
+        )
+        second = session_storage.move_to_trash(
+            ["bbbb2222"], reason="b", index=_index(), now=_NOW
+        )
+
+        seen: list[int] = []
+        freed = session_storage.empty_trash(
+            [first.batch_id, second.batch_id], on_progress=seen.append
+        )
+
+        assert seen, "a delete that frees bytes must report at least once"
+        assert seen == sorted(seen), "a running total cannot go down"
+        assert seen[-1] == freed
+        assert freed >= 4096 + 2048
+        assert session_storage.list_trash() == []
+
+    def test_a_refused_batch_reports_nothing_it_did_not_delete(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The refusal path must not report bytes: nothing was freed."""
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index(), now=_NOW
+        )
+        (session_storage.trash_root() / batch.batch_id / "cli" / "cccc3333.jsonl").write_bytes(
+            b"ONLY COPY"
+        )
+
+        seen: list[int] = []
+        freed = session_storage.empty_trash([batch.batch_id], on_progress=seen.append)
+
+        assert freed == 0
+        assert seen == []
+
     def test_targets_one_batch_and_leaves_the_others(self, stores: tuple[Path, Path]) -> None:
         _, kiro_home = stores
         _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)

@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from aiohttp import web
@@ -347,13 +348,124 @@ async def api_session_storage_restore(request: web.Request) -> web.Response:
     return web.json_response({"restored": restored})
 
 
+@dataclass
+class _EmptyJob:
+    """One in-flight or last-finished empty, as the screen needs to read it.
+
+    Process-local and single-slot on purpose. The work itself is already serialized
+    by the storage module's mutation lock, so a second concurrent empty would only
+    queue behind the first while the screen showed one indistinguishable "working"
+    state for both; refusing it says which operation the progress belongs to. It is
+    not persisted: if the gateway dies mid-delete the files are gone either way, and
+    a resurrected record would claim a delete is running when no thread is.
+    """
+
+    job_id: str
+    started_at: float
+    #: What the batches said they held when the job started, so the screen has a
+    #: denominator. Read from the manifests, not remeasured.
+    total_bytes: int
+    total_sessions: int
+    freed_bytes: int = 0
+    done: bool = False
+    finished_at: float = 0.0
+    #: Empty unless the delete was refused or crashed; already a safe string.
+    error: str = ""
+    task: asyncio.Task[None] | None = None
+
+
+#: The one empty this process knows about, running or last finished.
+_empty_job: _EmptyJob | None = None
+
+
+def _empty_job_payload(job: _EmptyJob) -> dict[str, Any]:
+    """The wire shape of a job. Carries no path and no batch id."""
+    return {
+        "job_id": job.job_id,
+        "running": not job.done,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "total_bytes": job.total_bytes,
+        "total_sessions": job.total_sessions,
+        "freed_bytes": job.freed_bytes,
+        "error": job.error,
+    }
+
+
+def _staged_totals(batch_ids: list[str] | None) -> tuple[int, int]:
+    """What the named batches (or all of them) say they hold: (bytes, sessions).
+
+    Straight from the staged manifests, which is also where the trash listing the
+    user is looking at got its numbers — so the denominator on screen matches the
+    figure they clicked. It is NOT a fresh measurement: remeasuring would walk the
+    tree the delete is about to walk anyway, doubling the wait before the first
+    progress arrives.
+    """
+    wanted = None if batch_ids is None else set(batch_ids)
+    total_bytes = 0
+    total_sessions = 0
+    for batch in list_trash():
+        if wanted is not None and batch.batch_id not in wanted:
+            continue
+        total_bytes += batch.bytes
+        total_sessions += batch.sessions
+    return total_bytes, total_sessions
+
+
+async def _run_empty_job(job: _EmptyJob, batch_ids: list[str] | None, caller: str) -> None:
+    """Run one empty to completion, then audit it.
+
+    Deliberately not tied to the request that started it: the delete is minutes of
+    filesystem work, and a user who closes the tab or walks to another page must
+    not be able to abandon it half-done. That was already true by accident (aiohttp
+    does not cancel handlers on disconnect) — here it is the design, and the job
+    record is what lets the screen pick the run back up when it returns.
+    """
+    outcome = "success"
+    try:
+        job.freed_bytes = await asyncio.to_thread(
+            empty_trash, batch_ids, lambda freed: setattr(job, "freed_bytes", freed)
+        )
+    except SessionStorageError as exc:
+        job.error = str(exc)
+        outcome = "refused"
+    except Exception:
+        # Broad on purpose. Anything unhandled here would otherwise leave the job
+        # flagged running for the life of the process, and the screen polling a
+        # delete that stopped — the exact "I cannot tell whether it worked" this
+        # endpoint exists to remove. The detail goes to the log, not to the client.
+        logger.exception("emptying the session trash failed")
+        job.error = "The delete stopped on an unexpected error. See the gateway log."
+        outcome = "error"
+    finally:
+        job.finished_at = time.time()
+        job.done = True
+
+    _sel().log_api_access(
+        caller=caller,
+        operation="session_storage.empty",
+        outcome=outcome,
+        source="dashboard",
+        resources=f"freed:{job.freed_bytes}",
+    )
+
+
 async def api_session_storage_empty(request: web.Request) -> web.Response:
     """POST /api/system/session-storage/empty — delete staged batches for good.
 
     The only irreversible operation in this surface, and the only one that returns
     space to the filesystem. Audited with the bytes freed so the record shows what
     was actually destroyed rather than what was requested.
+
+    Answers 202 with a job as soon as the work is accepted rather than holding the
+    request open until the files are gone. Emptying tens of thousands of staged
+    sessions is minutes of filesystem work; a client that can only await the
+    response can say nothing during it, which is what left a user unable to tell a
+    running delete from a stuck one. Progress is read from
+    :func:`api_session_storage_empty_status`.
     """
+    global _empty_job
+
     state: DashboardState = request.app["state"]
     if _is_restricted_session(state, request):
         return _deny("session_storage.empty", request)
@@ -380,19 +492,44 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
             "nothing_specified",
         )
 
-    try:
-        freed = await asyncio.to_thread(empty_trash, None if empty_all else batch_ids)
-    except SessionStorageError as exc:
-        return _refused(exc, "empty_refused")
+    # Refused, not queued: see _EmptyJob. Answering with the running job means a
+    # second tab that tried lands on the same progress instead of an error it
+    # cannot act on.
+    if _empty_job is not None and not _empty_job.done:
+        return web.json_response(
+            {
+                "error": "An empty is already running.",
+                "code": "empty_in_progress",
+                **_empty_job_payload(_empty_job),
+            },
+            status=409,
+        )
 
-    _sel().log_api_access(
-        caller=_read_session_key(request),
-        operation="session_storage.empty",
-        outcome="success",
-        source="dashboard",
-        resources=f"freed:{freed}",
+    targets = None if empty_all else batch_ids
+    total_bytes, total_sessions = await asyncio.to_thread(_staged_totals, targets)
+    job = _EmptyJob(
+        # Time-based and process-local; it identifies a run to the screen polling
+        # it, and is never a path or a batch id.
+        job_id=f"empty-{int(time.time() * 1000)}",
+        started_at=time.time(),
+        total_bytes=total_bytes,
+        total_sessions=total_sessions,
     )
-    return web.json_response({"freed_bytes": freed})
+    _empty_job = job
+    job.task = asyncio.create_task(_run_empty_job(job, targets, _read_session_key(request)))
+    return web.json_response(_empty_job_payload(job), status=202)
+
+
+async def api_session_storage_empty_status(request: web.Request) -> web.Response:
+    """GET /api/system/session-storage/empty — the running or last-finished empty.
+
+    Cheap by construction: it reads counters this process already holds and touches
+    no store, which is what makes it pollable at all — every other endpoint in this
+    module walks the sessions on disk.
+    """
+    if _empty_job is None:
+        return web.json_response({"job": None})
+    return web.json_response({"job": _empty_job_payload(_empty_job)})
 
 
 # ------------------------------------------------------------------ inventory

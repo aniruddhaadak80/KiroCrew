@@ -3,7 +3,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from './helpers'
 import SessionStorageScreen from '../pages/system/SessionStorageScreen'
-import type { SessionInventoryList, SessionInventoryDetail, SessionStorageCleanup, SessionTrashResult } from '../types'
+import type { SessionInventoryList, SessionInventoryDetail, SessionStorageCleanup, SessionStorageEmptyJob, SessionTrashResult } from '../types'
 
 globalThis.ResizeObserver = class {
   observe() {}
@@ -17,6 +17,22 @@ const restoreFn = vi.fn()
 const cleanupFn = vi.fn<(days: number, dryRun: boolean) => Promise<SessionStorageCleanup>>()
 let inventory: SessionInventoryList
 let detail: SessionInventoryDetail
+/** What GET /empty reports. A test sets it to stage a running or finished job. */
+let emptyJob: SessionStorageEmptyJob | null = null
+
+function job(over: Partial<SessionStorageEmptyJob> = {}): SessionStorageEmptyJob {
+  return {
+    job_id: 'empty-1',
+    running: true,
+    started_at: 1752480000,
+    finished_at: 0,
+    total_bytes: 1_920_000_000,
+    total_sessions: 3,
+    freed_bytes: 0,
+    error: '',
+    ...over,
+  }
+}
 
 vi.mock('../api/client', () => ({
   api: {
@@ -25,7 +41,13 @@ vi.mock('../api/client', () => ({
     sessionInventoryTrash: (...args: unknown[]) => trashFn(...(args as [string[]])),
     sessionStorageCleanup: (...args: unknown[]) => cleanupFn(...(args as [number, boolean])),
     sessionStorageRestore: (...args: unknown[]) => { restoreFn(...args); return Promise.resolve({ restored: 1 }) },
-    sessionStorageEmpty: (...args: unknown[]) => { emptyFn(...args); return Promise.resolve({ freed_bytes: 100 }) },
+    // 202: the delete is only ACCEPTED here. Progress arrives on the status read.
+    sessionStorageEmpty: (...args: unknown[]) => {
+      emptyFn(...args)
+      emptyJob = emptyJob ?? job()
+      return Promise.resolve(emptyJob)
+    },
+    sessionStorageEmptyStatus: () => Promise.resolve({ job: emptyJob }),
   },
 }))
 
@@ -70,6 +92,7 @@ function withTrash(): SessionInventoryList {
 describe('SessionStorageScreen (inventory)', () => {
   beforeEach(() => {
     trashFn.mockClear(); emptyFn.mockClear(); restoreFn.mockClear()
+    emptyJob = null
     // mockReset, not mockClear: one test installs a never-resolving implementation
     // to hold a request in flight, and mockClear would leave it in place for the
     // next test (whose select would then stay disabled).
@@ -461,6 +484,105 @@ describe('SessionStorageScreen (inventory)', () => {
     const held = boxes.find(b => b.disabled)
     expect(held).toBeTruthy()
     expect(held!.title).toMatch(/storage cleanup is unavailable/i)
+  })
+
+  /* ─────────────────── Emptying, while it happens ─────────────────── */
+
+  /**
+   * The reported symptom: the three buttons greyed out and nothing else changed,
+   * so a delete of tens of thousands of sessions was indistinguishable from a
+   * stuck screen. Ten seconds later the batch was gone, which is how the user
+   * found out it had worked.
+   */
+  it('reports a running empty with a partial figure', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 480_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
+    expect(screen.getByText('480MB of 1.9GB freed')).toBeTruthy()
+  })
+
+  /**
+   * Load-bearing copy, not reassurance: the job runs in the gateway and outlives
+   * the request, so leaving really is safe - and a user who does not know that
+   * sits and waits, which is what happened.
+   */
+  it('says the delete survives leaving the page', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 1 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(
+      screen.getByText('This keeps running if you leave this page.'),
+    ).toBeTruthy())
+  })
+
+  /**
+   * A job already running when the screen mounts belongs to a run the user started
+   * before navigating away. Picking it up is the whole reason the progress lives on
+   * the server rather than in this component's mutation state.
+   */
+  it('picks up a delete that was already running before this screen opened', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 960_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText('960MB of 1.9GB freed')).toBeTruthy())
+    // Nothing was clicked in this session: the run is the server's, not this
+    // component's.
+    expect(emptyFn).not.toHaveBeenCalled()
+  })
+
+  it('says what a finished empty freed', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, finished_at: 1752480900, freed_bytes: 1_920_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText('Freed 1.9GB.')).toBeTruthy())
+    expect(screen.queryByText('Emptying Trash')).toBeNull()
+  })
+
+  /**
+   * The request is answered before the delete runs, so a refusal has nowhere else
+   * to surface. Silence here is the old behaviour: the batch simply stayed.
+   */
+  it('says so when a delete stopped instead of leaving the batch unexplained', async () => {
+    inventory = withTrash()
+    emptyJob = job({
+      running: false,
+      finished_at: 1752480900,
+      error: 'the trash root moved',
+    })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText(/the trash root moved/)).toBeTruthy())
+    expect(screen.getByText(/stopped before it finished/)).toBeTruthy()
+  })
+
+  it('holds the other actions while a delete is running', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 1 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
+
+    const restore = screen.getByRole('button', { name: 'Restore' }) as HTMLButtonElement
+    expect(restore.disabled).toBe(true)
+  })
+
+  /** The confirm is disarmed by acceptance, not by the delete finishing. */
+  it('disarms the confirm as soon as the empty is accepted', async () => {
+    inventory = withTrash()
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/Trash/)).toBeTruthy())
+
+    await userEvent.click(screen.getByText(/Delete forever/))
+    // Past the arm window, so this is consent and not a double-click.
+    vi.setSystemTime(Date.now() + 1000)
+    await userEvent.click(screen.getByRole('button', { name: /Delete forever/ }))
+
+    await waitFor(() => expect(emptyFn).toHaveBeenCalledWith(['20260808T041500-ab12cd34']))
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
   })
 
 })
