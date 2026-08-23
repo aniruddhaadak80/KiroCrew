@@ -68,6 +68,18 @@ function bmpInfo(file) {
   };
 }
 
+function contrastRatio(first, second) {
+  const luminance = color => {
+    const channels = color.match(/[\da-f]{2}/gi).map(value => parseInt(value, 16) / 255);
+    const linear = channels.map(value =>
+      value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+    );
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  };
+  const values = [luminance(first), luminance(second)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+
 describe("electron-builder files list", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   const bundledFiles = pkg.build.files;
@@ -120,6 +132,13 @@ describe("first-download installer design contract", () => {
   const background = path.join(INSTALLER_ASSETS, "dmg-background.tiff");
   const sidebar = path.join(INSTALLER_ASSETS, "windows-installer-sidebar.bmp");
   const header = path.join(INSTALLER_ASSETS, "windows-installer-header.bmp");
+  const fullLight = path.join(INSTALLER_ASSETS, "windows-installer-full-light.bmp");
+  const fullDark = path.join(INSTALLER_ASSETS, "windows-installer-full-dark.bmp");
+  const installer = fs.readFileSync(path.join(ROOT, "build", "installer.nsh"), "utf8");
+  const installerMessages = fs.readFileSync(
+    path.join(ROOT, "build", "installer-messages.nsh"),
+    "utf8"
+  );
 
   it("positions the macOS app and Applications target on the branded background", () => {
     assert.equal(pkg.build.dmg.background, "../../packaging/installer-assets/dmg-background.tiff");
@@ -137,7 +156,7 @@ describe("first-download installer design contract", () => {
     ]);
   });
 
-  it("uses NSIS-native branded artwork without changing the assisted install flow", () => {
+  it("keeps assisted NSIS behavior behind the full-window custom pages", () => {
     assert.equal(
       pkg.build.nsis.installerSidebar,
       "../../packaging/installer-assets/windows-installer-sidebar.bmp"
@@ -154,7 +173,183 @@ describe("first-download installer design contract", () => {
     assert.equal(pkg.build.nsis.runAfterFinish, true);
   });
 
-  it("reuses the shipped logo and opening-animation ghost artwork", () => {
+  it("ships full-window light and dark glass surfaces plus compact animation crops", () => {
+    assert.deepEqual(bmpInfo(fullLight), { width: 1280, height: 860, bitsPerPixel: 24 });
+    assert.deepEqual(bmpInfo(fullDark), { width: 1280, height: 860, bitsPerPixel: 24 });
+
+    const cropSizes = {
+      "top-left": { width: 190, height: 130, bitsPerPixel: 24 },
+      left: { width: 190, height: 270, bitsPerPixel: 24 },
+      large: { width: 270, height: 240, bitsPerPixel: 24 },
+      right: { width: 190, height: 280, bitsPerPixel: 24 },
+      bottom: { width: 400, height: 260, bitsPerPixel: 24 },
+      small: { width: 180, height: 180, bitsPerPixel: 24 },
+      "small-left": { width: 170, height: 190, bitsPerPixel: 24 },
+      "bottom-right": { width: 170, height: 200, bitsPerPixel: 24 },
+    };
+    for (const theme of ["light", "dark"]) {
+      for (const [ghost, dimensions] of Object.entries(cropSizes)) {
+        for (let frame = 0; frame < 8; frame += 1) {
+          const asset = path.join(
+            INSTALLER_ASSETS,
+            `windows-installer-progress-${theme}-${ghost}-${frame}.bmp`
+          );
+          assert.deepEqual(bmpInfo(asset), dimensions);
+        }
+      }
+    }
+  });
+
+  it("keeps theme-aware native controls readable and out of the artwork", () => {
+    const lightSource = fs.readFileSync(
+      path.join(INSTALLER_ASSETS, "windows-installer-full-light.svg"),
+      "utf8"
+    );
+    const darkSource = fs.readFileSync(
+      path.join(INSTALLER_ASSETS, "windows-installer-full-dark.svg"),
+      "utf8"
+    );
+
+    assert.match(lightSource, /fill="#ffffff"[\s\S]*?>Kiro Crew<\/text>/i);
+    assert.match(darkSource, /fill="#ffffff"/i);
+    assert.match(lightSource, /x="230" y="563" width="820" height="273"/);
+    assert.match(lightSource, /stop-color="#a573ff"/i);
+    assert.match(darkSource, /stop-color="#a573ff"/i);
+    assert.match(lightSource, /font-size="88"/);
+    assert.match(lightSource, /id="hero-glow"/);
+    assert.match(lightSource, /Same bright character cast and framing as the opening animation/);
+    assert.doesNotMatch(`${lightSource}\n${darkSource}\n${installer}`, /About 1\.4 GB/i);
+
+    assert.match(installer, /AppsUseLightTheme/);
+    assert.match(installer, /DwmSetWindowAttribute/);
+    assert.match(installer, /DarkMode_Explorer/);
+    assert.match(installer, /GetWindowLongW/);
+    assert.match(installer, /SetWindowLongW/);
+    assert.doesNotMatch(installer, /(?:Get|Set)WindowLongPtrW/);
+    assert.match(installer, /StrCpy \$KiroPrimaryColor 0x24143C/);
+    assert.match(installer, /StrCpy \$KiroMutedColor 0x5C4D6D/);
+    assert.match(installer, /StrCpy \$KiroPrimaryColor 0xFFFFFF/);
+    assert.match(installer, /StrCpy \$KiroMutedColor 0xE3D9F1/);
+    assert.match(installer, /SetCtlColors \$KiroActionButton 0xFFFFFF 0x6332B4/);
+    assert.match(installer, /SetCtlColors \$KiroActionButton 0x2B144B 0xFFFFFF/);
+
+    assert.ok(contrastRatio("#ffffff", "#411188") >= 4.5, "header copy");
+    assert.ok(contrastRatio("#ffffff", "#a573ff") >= 3, "large hero copy");
+    assert.ok(contrastRatio("#24143c", "#f5efff") >= 4.5, "light primary copy");
+    assert.ok(contrastRatio("#5c4d6d", "#f5efff") >= 4.5, "light secondary copy");
+    assert.ok(contrastRatio("#ffffff", "#30165b") >= 4.5, "dark primary copy");
+    assert.ok(contrastRatio("#e3d9f1", "#30165b") >= 4.5, "dark secondary copy");
+    assert.ok(contrastRatio("#ffffff", "#6332b4") >= 4.5, "light action copy");
+    assert.ok(contrastRatio("#2b144b", "#ffffff") >= 4.5, "dark action copy");
+  });
+
+  it("integrates scope, location, shortcut and startup choices into one page", () => {
+    assert.match(installer, /!macro customWelcomePage/);
+    assert.match(installer, /!macro customInstallMode/);
+    assert.match(installer, /!macro customPageAfterChangeDir/);
+    assert.match(installer, /!macro customFinishPage/);
+    assert.match(installer, /\$\(onlyForMe\)/);
+    assert.match(installer, /\$\(forAll\)/);
+    assert.match(installer, /nsDialogs::SelectFolderDialog/);
+    assert.match(installer, /ExecShell "runas"/);
+    assert.match(installer, /Software\\Microsoft\\Windows\\CurrentVersion\\Run/);
+    assert.match(installer, /KiroInstallerDesktopShortcut/);
+    assert.match(installer, /KiroInstallerStartWithWindows/);
+    assert.match(installer, /NSD_CreateCheckbox} 29\.7% 85\.2% 22%/);
+    assert.match(installer, /NSD_CreateCheckbox} 52% 85\.2% 27\.1%/);
+    assert.match(installer, /NSD_CreateBrowseButton} 70\.8% 79\.3% 8\.3%/);
+    assert.match(installer, /NSD_CreateLabel} 19\.4% 80\.6% 15%/);
+    assert.match(installer, /NSD_CreateText} 34\.7% 79\.3% 35\.5%/);
+    assert.match(installer, /\$PROGRAMFILES64/);
+    assert.match(installer, /\$LOCALAPPDATA\\Programs/);
+    assert.match(
+      installer,
+      /Function KiroEnsureAppInstallDir[\s\S]*?\$\{GetFileName\}[\s\S]*?\\\$\{APP_FILENAME\}[\s\S]*?FunctionEnd/,
+      "fresh custom locations must end in an app-owned directory"
+    );
+    assert.match(
+      installer,
+      /KiroCheckFreshInstallDir:[\s\S]*?IfFileExists "\$KiroInstallDir\\\*\.\*" KiroFreshInstallDirExists 0[\s\S]*?IfFileExists "\$KiroInstallDir" KiroFreshInstallDirExists KiroFreshInstallDirReady[\s\S]*?KiroFreshInstallDirExists:[\s\S]*?\\\$\{APP_FILENAME\}[\s\S]*?Goto KiroCheckFreshInstallDir/,
+      "even an existing app-named or empty directory must not become the uninstall root"
+    );
+    assert.match(
+      installer,
+      /Function KiroBrowseClicked[\s\S]*?Call KiroEnsureAppInstallDir[\s\S]*?NSD_SetText} \$KiroLocationInput \$KiroInstallDir/,
+      "Browse must show the actual normalized destination before installation"
+    );
+    assert.match(
+      installer,
+      /Function KiroOptionsLeave[\s\S]*?Call KiroEnsureAppInstallDir[\s\S]*?ExecShell "runas"/,
+      "the parent process must normalize a path before an elevated handoff"
+    );
+    assert.match(
+      installer,
+      /Function KiroApplyOptions[\s\S]*?\$\{If\} \$KiroSkipOptions == 0[\s\S]*?Call KiroEnsureAppInstallDir[\s\S]*?StrCpy \$INSTDIR \$KiroInstallDir/,
+      "fresh installs must be normalized without moving updates or elevated handoffs"
+    );
+  });
+
+  it("reuses the opening ghost and localizes every custom label", () => {
+    const loading = fs.readFileSync(path.join(ROOT, "loading.html"), "utf8");
+    const lightSource = fs.readFileSync(
+      path.join(INSTALLER_ASSETS, "windows-installer-full-light.svg"),
+      "utf8"
+    );
+    const openingGhost = "M398.554 818.914C316.315 1001.03";
+    assert.ok(loading.includes(openingGhost));
+    assert.ok(lightSource.includes(openingGhost));
+    assert.match(installer, /NSD_CreateTimer} KiroAdvanceProgressFrame 150/);
+    assert.match(installer, /windows-installer-progress-\$KiroTheme-/);
+    assert.match(
+      installer,
+      /Function KiroCreateOpeningAnimation[\s\S]*?NSD_CreateBitmap[\s\S]*?Call KiroSetProgressFrame[\s\S]*?NSD_CreateTimer} KiroAdvanceProgressFrame 150[\s\S]*?FunctionEnd/
+    );
+    assert.doesNotMatch(
+      installer,
+      /Function KiroCreateOpeningAnimation\s+Call KiroCreateOpeningAnimation/,
+      "the shared animation setup must not recurse"
+    );
+    assert.match(
+      installer,
+      /Function KiroOptionsCreate[\s\S]*?Call KiroCreateBackground[\s\S]*?Call KiroCreateOpeningAnimation/,
+      "the opening animation must play behind the install choices"
+    );
+    assert.match(
+      installer,
+      /Function KiroInstallShow[\s\S]*?Call KiroCreateOpeningAnimation/,
+      "the opening animation must keep playing while files are extracted"
+    );
+    assert.match(installer, /KiroOpeningSettled/);
+    assert.match(installer, /KiroOpeningBobFrame/);
+    assert.equal(
+      (installer.match(/!insertmacro KiroRefreshOpeningGhost/g) || []).length,
+      8,
+      "all eight opening characters must animate"
+    );
+    assert.match(
+      installer,
+      /Function KiroSetProgressFrame\s+Push \$0\s+Push \$1\s+Push \$2[\s\S]*?Pop \$2\s+Pop \$1\s+Pop \$0\s+FunctionEnd/,
+      "timer callbacks must restore NSIS scratch registers used by the generated installer"
+    );
+
+    for (const message of [
+      "kiroInstallFor",
+      "kiroInstallLocation",
+      "kiroDesktopShortcut",
+      "kiroStartWithWindows",
+      "kiroReadyToInstall",
+      "kiroInstalled",
+      "kiroLaunchAfterFinish",
+      "kiroInstallOptions",
+      "kiroExitSetup",
+      "kiroInstallAction",
+    ]) {
+      const entries = installerMessages.match(new RegExp(`^LangString ${message} `, "gm")) || [];
+      assert.equal(entries.length, 26, `${message} must cover all bundled installer languages`);
+    }
+  });
+
+  it("reuses shipped artwork without adding non-localized installer copy", () => {
     const normalize = text => text.replaceAll(",", " ").replace(/\s+/g, " ");
     const loading = normalize(fs.readFileSync(path.join(ROOT, "loading.html"), "utf8"));
     const siteLogo = normalize(
@@ -169,6 +364,9 @@ describe("first-download installer design contract", () => {
     const headerSource = normalize(
       fs.readFileSync(path.join(INSTALLER_ASSETS, "windows-installer-header.svg"), "utf8")
     );
+    const fullLightSource = normalize(
+      fs.readFileSync(path.join(INSTALLER_ASSETS, "windows-installer-full-light.svg"), "utf8")
+    );
 
     const openingGhost = "M398.554 818.914C316.315 1001.03";
     const logoGhost = "M84.76 266.62c-19.2 42.53";
@@ -178,6 +376,11 @@ describe("first-download installer design contract", () => {
     assert.ok(siteLogo.includes(logoGhost));
     assert.ok(sidebarSource.includes(logoGhost));
     assert.ok(headerSource.includes(logoGhost));
+    assert.ok(fullLightSource.includes(openingGhost));
+    assert.ok(fullLightSource.includes(logoGhost));
+    assert.match(sidebarSource, /fill="#c6a0ff"/i);
+    assert.match(headerSource, /fill="#fbfafd"/i);
+    assert.doesNotMatch(`${sidebarSource}\n${headerSource}`, /Quick setup/i);
   });
 
   it("applies the branded layout again after signing and stapling", () => {

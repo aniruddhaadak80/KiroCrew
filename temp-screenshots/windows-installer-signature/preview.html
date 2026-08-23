@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Kiro Crew Windows installer source preview</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { display: grid; place-items: center; background: #10091a; font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+    button, input, select { font: inherit; }
+    .installer {
+      --primary: #24143c; --muted: #5c4d6d; --control: rgba(255, 255, 255, .72);
+      --border: rgba(105, 69, 157, .38); --accent: #6332b4; --accent-text: #fff;
+      position: relative; width: 1280px; height: 860px; overflow: hidden; color: var(--primary);
+    }
+    .installer[data-theme="dark"] {
+      --primary: #fff; --muted: #e3d9f1; --control: rgba(72, 40, 120, .74);
+      --border: rgba(220, 203, 244, .40); --accent: #fff; --accent-text: #2b144b;
+    }
+    .surface { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; pointer-events: none; }
+    .exit {
+      position: absolute; z-index: 40; left: 1142px; top: 27px; width: 106px; height: 36px;
+      border: 1px solid rgba(255,255,255,.18); border-radius: 999px;
+      background: rgba(61,19,129,.28); color: rgba(255,255,255,.84);
+      font-size: 12px; font-weight: 400;
+    }
+    .page { position: absolute; inset: 0; z-index: 20; }
+    .options-title { position: absolute; left: 248px; top: 579px; font-size: 16px; font-weight: 600; }
+    .label { position: absolute; left: 248px; width: 188px; color: var(--muted); font-size: 13px; line-height: 38px; }
+    .scope-label { top: 612px; }
+    .location-label { top: 681px; }
+    .field {
+      position: absolute; left: 444px; height: 38px; border: 1px solid var(--border); border-radius: 9px;
+      background: var(--control); color: var(--primary); box-shadow: inset 0 1px rgba(255,255,255,.18); outline: none;
+    }
+    .field:focus { border-color: #8e48ff; box-shadow: 0 0 0 2px rgba(142,72,255,.25); }
+    .scope { top: 612px; width: 568px; padding: 0 11px; font-size: 13px; }
+    .scope-note { position: absolute; left: 444px; top: 654px; width: 568px; color: var(--muted); font-size: 11px; line-height: 18px; }
+    .path { top: 682px; width: 454px; padding: 0 11px; font-size: 13px; }
+    .browse {
+      position: absolute; left: 906px; top: 682px; width: 106px; height: 38px;
+      border: 1px solid var(--border); border-radius: 9px; background: var(--control); color: var(--primary); font-size: 12px;
+    }
+    .checks { position: absolute; left: 380px; top: 733px; display: flex; gap: 21px; color: var(--muted); font-size: 12px; }
+    .checks label:first-child { width: 265px; }
+    .checks label, .finish-check { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+    .checks input, .finish-check input { width: 14px; height: 14px; margin: 0; accent-color: var(--accent); }
+    .ready { position: absolute; left: 248px; top: 786px; color: var(--primary); font-size: 13px; font-weight: 500; }
+    .primary {
+      position: absolute; left: 852px; top: 779px; width: 160px; height: 40px; border: 0; border-radius: 11px;
+      background: var(--accent); color: var(--accent-text); font-size: 12px; font-weight: 600;
+      box-shadow: 0 10px 28px rgba(42,8,91,.18);
+    }
+    button { cursor: default; }
+    button:focus-visible { outline: 3px solid rgba(255,255,255,.72); outline-offset: 2px; }
+    .ghost-patch { position: absolute; z-index: 5; object-fit: fill; pointer-events: none; }
+    .ghost-top-left { left: 190px; top: 0; width: 190px; height: 130px; }
+    .ghost-large { left: 760px; top: 0; width: 270px; height: 240px; }
+    .ghost-left { left: 0; top: 210px; width: 190px; height: 270px; }
+    .ghost-right { left: 1090px; top: 350px; width: 190px; height: 280px; }
+    .ghost-bottom { left: 180px; top: 600px; width: 400px; height: 260px; }
+    .ghost-small { left: 1000px; top: 80px; width: 180px; height: 180px; }
+    .ghost-small-left { left: 85px; top: 540px; width: 170px; height: 190px; }
+    .ghost-bottom-right { left: 770px; top: 580px; width: 170px; height: 200px; }
+    .progress-status { position: absolute; left: 248px; top: 640px; width: 784px; color: var(--primary); font-size: 15px; font-weight: 600; }
+    .progress-track {
+      position: absolute; left: 248px; top: 710px; width: 784px; height: 12px; overflow: hidden;
+      border-radius: 999px; background: var(--control); box-shadow: inset 0 1px 3px rgba(26,10,44,.24);
+    }
+    .progress-bar { width: 12%; height: 100%; border-radius: inherit; background: #8e48ff; transition: width 320ms ease; }
+    .finish-title { position: absolute; left: 248px; top: 606px; font-size: 26px; font-weight: 650; }
+    .finish-check { position: absolute; left: 248px; top: 673px; color: var(--primary); font-size: 14px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main class="installer" data-theme="light" data-page="options" aria-label="Kiro Crew Windows installer source preview">
+    <img class="surface" alt="" src="../../packaging/installer-assets/windows-installer-full-light.bmp">
+    <img class="ghost-patch ghost-top-left" alt=""><img class="ghost-patch ghost-large" alt=""><img class="ghost-patch ghost-left" alt=""><img class="ghost-patch ghost-right" alt=""><img class="ghost-patch ghost-bottom" alt=""><img class="ghost-patch ghost-small" alt=""><img class="ghost-patch ghost-small-left" alt=""><img class="ghost-patch ghost-bottom-right" alt="">
+    <button class="exit" type="button">Exit setup&nbsp; ×</button>
+
+    <section class="page options-page" aria-label="Install options">
+      <div class="options-title">Install options</div>
+      <label class="label scope-label" for="scope">Install for</label>
+      <select class="field scope" id="scope"><option value="current">Only for me (demo.user)</option><option value="all">Anyone who uses this computer (all users)</option></select>
+      <div class="scope-note">Fresh install for current user only.</div>
+      <label class="label location-label" for="location">Install location</label>
+      <input class="field path" id="location" value="C:\Users\demo.user\AppData\Local\Programs\KiroCrew">
+      <button class="browse" type="button">Browse…</button>
+      <div class="checks"><label><input type="checkbox" checked> Create a desktop shortcut</label><label><input type="checkbox" checked> Start Kiro Crew when Windows starts</label></div>
+      <div class="ready">Ready to install</div><button class="primary install" type="button">Install Kiro Crew</button>
+    </section>
+
+    <section class="page progress-page hidden" aria-label="Installation progress">
+      <div class="progress-status">Installing, please wait...</div><div class="progress-track"><div class="progress-bar"></div></div>
+    </section>
+    <section class="page finish-page hidden" aria-label="Installation complete">
+      <div class="finish-title">Kiro Crew is ready</div><label class="finish-check"><input type="checkbox" checked> Open Kiro Crew</label><button class="primary" type="button">Finish</button>
+    </section>
+  </main>
+  <script>
+    const root = document.querySelector(".installer");
+    const surface = document.querySelector(".surface");
+    const scope = document.querySelector("#scope");
+    const locationInput = document.querySelector("#location");
+    const scopeNote = document.querySelector(".scope-note");
+    const optionsPage = document.querySelector(".options-page");
+    const progressPage = document.querySelector(".progress-page");
+    const finishPage = document.querySelector(".finish-page");
+    const progressBar = document.querySelector(".progress-bar");
+    const params = new URLSearchParams(location.search);
+    const theme = params.get("theme") === "dark" ? "dark" : "light";
+    const ghosts = [
+      { name: "top-left", delay: 0, offset: 0 }, { name: "large", delay: 1, offset: 3 },
+      { name: "left", delay: 2, offset: 6 }, { name: "right", delay: 3, offset: 9 },
+      { name: "bottom", delay: 4, offset: 12 }, { name: "small", delay: 5, offset: 15 },
+      { name: "small-left", delay: 6, offset: 18 }, { name: "bottom-right", delay: 7, offset: 21 }
+    ];
+    let animationTick = 0, progressTimer;
+
+    root.dataset.theme = theme;
+    surface.src = `../../packaging/installer-assets/windows-installer-full-${theme}.bmp`;
+    function updateScope() {
+      const allUsers = scope.value === "all";
+      locationInput.value = allUsers ? "C:\\Program Files\\KiroCrew" : "C:\\Users\\demo.user\\AppData\\Local\\Programs\\KiroCrew";
+      scopeNote.textContent = allUsers ? "Fresh install for all users. (will prompt for admin credentials)" : "Fresh install for current user only.";
+      root.dataset.scope = scope.value;
+    }
+    function visualFrame(ghost) {
+      if (animationTick < 11) return Math.max(0, Math.min(4, animationTick - ghost.delay));
+      const bob = (animationTick - 11 + ghost.offset) % 24;
+      if (bob === 0) return 7;
+      if (bob < 6) return 4;
+      if (bob < 12) return 5;
+      if (bob < 18) return 6;
+      return 5;
+    }
+    function drawFrame() {
+      for (const ghost of ghosts) {
+        const frame = visualFrame(ghost);
+        document.querySelector(`.ghost-${ghost.name}`).src = `../../packaging/installer-assets/windows-installer-progress-${theme}-${ghost.name}-${frame}.bmp`;
+      }
+      animationTick += 1;
+    }
+    function restartAnimation() {
+      animationTick = 0;
+      drawFrame();
+    }
+    function showProgress() {
+      root.dataset.page = "progress"; optionsPage.classList.add("hidden"); finishPage.classList.add("hidden"); progressPage.classList.remove("hidden");
+      restartAnimation();
+      let progress = 12; progressTimer = setInterval(() => { progress = Math.min(progress + 7, 96); progressBar.style.width = `${progress}%`; }, 260);
+      setTimeout(showFinish, 3500);
+    }
+    function showFinish() { clearInterval(progressTimer); root.dataset.page = "finish"; progressPage.classList.add("hidden"); finishPage.classList.remove("hidden"); restartAnimation(); }
+    scope.addEventListener("change", updateScope); document.querySelector(".install").addEventListener("click", showProgress);
+    if (params.get("scope") === "all") scope.value = "all";
+    updateScope(); restartAnimation(); setInterval(drawFrame, 150);
+    window.kiroInstallerPreview = { showProgress, showFinish, updateScope };
+  </script>
+</body>
+</html>

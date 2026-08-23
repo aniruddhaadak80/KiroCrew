@@ -93,9 +93,15 @@ Notes:
 - The result is an assisted (non-one-click, per-user) NSIS installer,
   `KiroCrew Setup <version>.exe` (nightly builds:
   `KiroCrew Nightly Setup <version>.exe`), in `website/electron/dist/`.
-- The native welcome/finish sidebar and the header used on intermediate pages
-  carry the Kiro Crew logo and ghost artwork. The standard NSIS controls and
-  localized instructions remain native; only their supporting artwork changes.
+- Its borderless 1280×860 design follows the Windows light/dark app theme. The
+  upper field uses the shipped app mark and centered Kiro Crew name; a
+  high-contrast frosted-glass panel combines current/all-user scope, destination,
+  desktop-shortcut and Windows-startup choices. Selecting all users switches to
+  Program Files and requests UAC; current user remains the no-UAC default.
+- Functional labels and controls stay native and cover electron-builder's 26
+  bundled installer languages. Compact 24-bit bitmap crops give all eight
+  characters the opening screen's one-time staggered entrance, continuous bob,
+  and interleaved blink throughout setup; no browser or WebView is embedded.
 
 See `../../docs/guides/windows-install.md` for the CI-built installer and the
 current Windows support status.

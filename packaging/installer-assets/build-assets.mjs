@@ -32,6 +32,32 @@ function render(source, format, destination) {
   );
 }
 
+function renderBmp24(source, destination) {
+  const intermediate = join(scratch, `${source.replaceAll(/[\\/]/g, "-")}.bmp`);
+  render(source, "bmp", intermediate);
+  bmp32To24(intermediate, destination);
+}
+
+function renderSvgTextBmp24(name, svg, destination) {
+  const source = join(scratch, `${name}.svg`);
+  const intermediate = join(scratch, `${name}.bmp`);
+  writeFileSync(source, svg);
+  run(
+    "/usr/bin/sips",
+    ["-s", "format", "bmp", source, "--out", intermediate],
+    `sips render for ${name}`
+  );
+  bmp32To24(intermediate, destination);
+}
+
+function renderSvgCropBmp24(name, svg, crop, destination) {
+  const cropped = svg.replace(
+    'width="1280" height="860" viewBox="0 0 1280 860"',
+    `width="${crop.width}" height="${crop.height}" viewBox="${crop.x} ${crop.y} ${crop.width} ${crop.height}"`
+  );
+  renderSvgTextBmp24(name, cropped, destination);
+}
+
 function renderSvgAtScale(source, scale, destination) {
   const sourcePath = join(here, source);
   const scaledPath = join(scratch, `${source.replace(".svg", "")}@${scale}x.svg`);
@@ -98,10 +124,62 @@ try {
     ["-cathidpicheck", dmg1x, dmg2x, "-out", join(here, "dmg-background.tiff")],
     "Retina TIFF assembly"
   );
-  for (const name of ["windows-installer-sidebar", "windows-installer-header"]) {
-    const intermediate = join(scratch, `${name}.bmp`);
-    render(`${name}.svg`, "bmp", intermediate);
-    bmp32To24(intermediate, join(here, `${name}.bmp`));
+  for (const name of [
+    "windows-installer-sidebar",
+    "windows-installer-header",
+    "windows-installer-full-light",
+    "windows-installer-full-dark",
+  ]) {
+    renderBmp24(`${name}.svg`, join(here, `${name}.bmp`));
+  }
+
+  // All eight opening-animation characters get a one-time pop-in followed by
+  // the same gentle vertical bob and staggered blink. Each 24-bit frame is a
+  // compact crop that covers the matching static character underneath.
+  const openingFrames = [
+    { scale: 0.001, dy: 0 },
+    { scale: 0.55, dy: 0 },
+    { scale: 1.14, dy: 0 },
+    { scale: 0.95, dy: 0 },
+    { scale: 1, dy: -4 },
+    { scale: 1, dy: 0 },
+    { scale: 1, dy: 4 },
+    { scale: 1, dy: 0, blink: true },
+  ];
+  const openingGhosts = {
+    "top-left": { x: 190, y: 0, width: 190, height: 130, anchorX: 282, anchorY: 13 },
+    large: { x: 760, y: 0, width: 270, height: 240, anchorX: 896, anchorY: 17 },
+    left: { x: 0, y: 210, width: 190, height: 270, anchorX: 15, anchorY: 344 },
+    right: { x: 1090, y: 350, width: 190, height: 280, anchorX: 1265, anchorY: 499 },
+    bottom: { x: 180, y: 600, width: 400, height: 260, anchorX: 384, anchorY: 851 },
+    small: { x: 1000, y: 80, width: 180, height: 180, anchorX: 1088, anchorY: 163 },
+    "small-left": { x: 85, y: 540, width: 170, height: 190, anchorX: 166, anchorY: 636 },
+    "bottom-right": { x: 770, y: 580, width: 170, height: 200, anchorX: 845, anchorY: 671 },
+  };
+  for (const theme of ["light", "dark"]) {
+    const source = readFileSync(join(here, `windows-installer-full-${theme}.svg`), "utf8");
+    for (const [ghost, crop] of Object.entries(openingGhosts)) {
+      const marker = `id="ghost-${ghost}" transform="translate(${crop.anchorX} ${crop.anchorY}) scale(1) translate(-${crop.anchorX} -${crop.anchorY})"`;
+      for (let index = 0; index < openingFrames.length; index += 1) {
+        const { scale, dy, blink } = openingFrames[index];
+        let frame = source.replace(
+          marker,
+          `id="ghost-${ghost}" transform="translate(0 ${dy}) translate(${crop.anchorX} ${crop.anchorY}) scale(${scale.toFixed(4)}) translate(-${crop.anchorX} -${crop.anchorY})"`
+        );
+        if (blink) {
+          frame = frame.replace(
+            'id="ghost-eyes"',
+            'id="ghost-eyes" transform="translate(0 487) scale(1 .08) translate(0 -487)"'
+          );
+        }
+        renderSvgCropBmp24(
+          `windows-installer-progress-${theme}-${ghost}-${index}`,
+          frame,
+          crop,
+          join(here, `windows-installer-progress-${theme}-${ghost}-${index}.bmp`)
+        );
+      }
+    }
   }
 } finally {
   rmSync(scratch, { recursive: true, force: true });
