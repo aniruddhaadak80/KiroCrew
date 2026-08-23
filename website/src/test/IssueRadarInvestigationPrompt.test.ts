@@ -77,3 +77,47 @@ describe('buildInvestigationPrompt — findings write channel', () => {
     expect(p).toContain('"number":1039')
   })
 })
+
+describe('buildInvestigationPrompt — reply ordering', () => {
+  it('asks for the explanation first, ahead of the verdict', () => {
+    // Without the ordering the agent opens on remediation, which is unreadable
+    // to anyone who has not already read the thread.
+    const p = buildInvestigationPrompt(GH, GH.owner, GH.repo, ISSUE)
+    const explainAt = p.search(/Open your reply with the issue EXPLANATION/)
+    const verdictAt = p.search(/report a short verdict/)
+    expect(explainAt).toBeGreaterThan(-1)
+    expect(verdictAt).toBeGreaterThan(-1)
+    expect(explainAt).toBeLessThan(verdictAt)
+  })
+
+  it('names all four parts of the explanation, so its shape is fixed', () => {
+    const p = buildInvestigationPrompt(GH, GH.owner, GH.repo, ISSUE)
+    expect(p).toMatch(/what this issue is about/i)
+    expect(p).toMatch(/what happens today versus what should happen/i)
+    expect(p).toMatch(/who hits it and when/i)
+    expect(p).toMatch(/why it is worth doing/i)
+  })
+
+  it('bounds the explanation and keeps the fix out of it', () => {
+    const p = buildInvestigationPrompt(GH, GH.owner, GH.repo, ISSUE)
+    expect(p).toMatch(/under ten lines/i)
+    expect(p).toMatch(/no proposed fix/i)
+  })
+
+  it('makes the diagram conditional on a multi-hop issue, not routine', () => {
+    // An unconditional diagram would be drawn for single-site defects too,
+    // where a one-box flowchart costs tokens and teaches nothing.
+    const p = buildInvestigationPrompt(GH, GH.owner, GH.repo, ISSUE)
+    expect(p).toContain('```mermaid')
+    expect(p).toMatch(/spans more than one component or more than one hop/i)
+    expect(p).toMatch(/skip the diagram/i)
+  })
+
+  it('carries the explanation into the recorded summary, condensed', () => {
+    // The record -- not the chat -- is what a later session reads, so the four
+    // parts have to reach it. They are condensed because `summary` surfaces as
+    // the status pill's `title` (a native tooltip), not as card body text.
+    const p = buildInvestigationPrompt(GH, GH.owner, GH.repo, ISSUE)
+    expect(p).toContain('"summary":"the explanation\'s four parts condensed to one sentence each')
+  })
+})
