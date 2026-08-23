@@ -15,7 +15,11 @@
  */
 import { createRoot } from 'react-dom/client'
 import { CircleDot } from 'lucide-react'
-import { initI18n } from '../src/i18n'
+// The ALL-LANGUAGES entry, because `initI18n()` below takes no locale and so
+// honours whichever one the harness selects. `../src/i18n` registers the English
+// catalog only, which would render this frame in English for every other
+// language while nothing throws and no key renders raw.
+import { initI18n } from '../src/i18n/all'
 import '../src/index.css'
 import { ToolDetails } from '../src/pages/chat/ToolDetails'
 import ThinkingBlock from '../src/pages/chat/ThinkingBlock'

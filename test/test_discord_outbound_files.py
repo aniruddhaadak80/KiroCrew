@@ -418,3 +418,52 @@ async def _done(value: Any) -> Any:
 
 async def _noop_sleep(_seconds: float) -> None:
     return None
+
+
+class TestDisplayRedactionIsAFloor:
+    """Display-form redaction runs on every send, not only the upload path.
+
+    ``TurnDriver`` redacts the LITERAL form of every chunk upstream. The display
+    pass exists for the credential that is invisible until Discord renders the
+    markdown away, so gating it on the upload path left a restricted session, an
+    unset upload root, and every length rotation sending model text that only the
+    literal-form redactor had seen.
+    """
+
+    #: A credential split by Markdown that Discord strips when it renders. The
+    #: literal bytes carry ``**``, so a literal-form scan does not match; the
+    #: rendered form is one contiguous key.
+    SPLIT_SECRET = "AKIA**IOSFODNN7**EXAMPLE"
+
+    @pytest.mark.asyncio
+    async def test_a_restricted_session_still_gets_the_display_pass(self) -> None:
+        cli = await _turn(f"here it is {self.SPLIT_SECRET}", uploads_allowed=False)
+        body = cli.final_text()
+        assert "IOSFODNN7" not in body, body
+
+    @pytest.mark.asyncio
+    async def test_no_upload_root_still_gets_the_display_pass(self) -> None:
+        cli = await _turn(f"here it is {self.SPLIT_SECRET}", upload_root="")
+        assert "IOSFODNN7" not in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_a_channel_without_files_outbound_still_gets_the_display_pass(self) -> None:
+        caps = replace(DISCORD_CAPABILITIES, files_outbound=False)
+        cli = await _turn(f"here it is {self.SPLIT_SECRET}", capabilities=caps)
+        assert "IOSFODNN7" not in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_a_length_rotated_segment_still_gets_the_display_pass(self) -> None:
+        """Length seals pass ``extract_uploads=False``, which was the widest of
+        the ungated routes: it is reached on any reply long enough to rotate."""
+        r, cli = _renderer()
+        await r.on_text_chunk("y" * (r._limit() + 50) + f"\n\n{self.SPLIT_SECRET}\n")
+        await r.on_done()
+        assert all("IOSFODNN7" not in text for text in _bodies(cli))
+
+    @pytest.mark.asyncio
+    async def test_mentions_are_defanged_on_an_ungated_send_too(self) -> None:
+        cli = await _turn("ping @everyone now", uploads_allowed=False)
+        # The text survives; only the ping is broken (the zero-width space is the
+        # renderer's half, `allowed_mentions` is the transport's).
+        assert "@​everyone" in cli.final_text()
