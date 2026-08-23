@@ -39,30 +39,34 @@ from kiro_crew.snapshot import (
 
 logger = logging.getLogger(__name__)
 
-EXPORT_EXCLUDE = frozenset({
-    ".env",
-    ".local_secret",
-    "sel_hmac.key",
-    "telemetry_salt",
-    # NOTE: the beacon's per-install identity files (beacon_install_id /
-    # beacon_last_sent) are deliberately NOT listed here. This set is matched by
-    # BASENAME and `_is_excluded` runs over the workspace/, plan_memory/ and
-    # skills/ trees, so an entry here would silently drop any USER file that
-    # happens to share the name. They need no entry: root-level export is a
-    # hard-coded allowlist (config.json, hooks.json, crons.json,
-    # notifications.jsonl, project_dir, workspace_dir), so a root beacon file is
-    # never selected in the first place.
-    "session_map.json",
-    "kiro_session_pids.txt",
-    "kiro_pids.txt",
-})
+EXPORT_EXCLUDE = frozenset(
+    {
+        ".env",
+        ".local_secret",
+        "sel_hmac.key",
+        "telemetry_salt",
+        # NOTE: the beacon's per-install identity files (beacon_install_id /
+        # beacon_last_sent) are deliberately NOT listed here. This set is matched by
+        # BASENAME and `_is_excluded` runs over the workspace/, plan_memory/ and
+        # skills/ trees, so an entry here would silently drop any USER file that
+        # happens to share the name. They need no entry: root-level export is a
+        # hard-coded allowlist (config.json, hooks.json, crons.json,
+        # notifications.jsonl, project_dir, workspace_dir), so a root beacon file is
+        # never selected in the first place.
+        "session_map.json",
+        "kiro_session_pids.txt",
+        "kiro_pids.txt",
+    }
+)
 
-EXCLUDE_DIRS = frozenset({
-    "snapshots",
-    "outbox",
-    "uploads",
-    "__pycache__",
-})
+EXCLUDE_DIRS = frozenset(
+    {
+        "snapshots",
+        "outbox",
+        "uploads",
+        "__pycache__",
+    }
+)
 
 
 def _mc_dir() -> Path:
@@ -126,8 +130,14 @@ def create_export_zip() -> tuple[bytes, dict]:
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         # Core JSON/text files
-        for fname in ("config.json", "hooks.json", "crons.json", "notifications.jsonl",
-                      "project_dir", "workspace_dir"):
+        for fname in (
+            "config.json",
+            "hooks.json",
+            "crons.json",
+            "notifications.jsonl",
+            "project_dir",
+            "workspace_dir",
+        ):
             src = mc / fname
             if src.is_file() and not src.is_symlink():
                 zf.write(str(src), f"{prefix}/{fname}")
@@ -185,7 +195,7 @@ def create_export_zip() -> tuple[bytes, dict]:
 # millions of entries) is rejected before extraction rather than filling the
 # host disk.
 _MAX_IMPORT_MEMBERS = 50_000
-_MAX_IMPORT_UNCOMPRESSED = 2 * 1024 ** 3  # 2 GiB
+_MAX_IMPORT_UNCOMPRESSED = 2 * 1024**3  # 2 GiB
 
 
 def _is_link_entry(info: zipfile.ZipInfo) -> bool:
@@ -223,13 +233,21 @@ def validate_import_zip(zip_path: Path) -> tuple[bool, str, dict]:
             # Zip-bomb guard: bound entry count and total uncompressed size.
             infos = zf.infolist()
             if len(infos) > _MAX_IMPORT_MEMBERS:
-                return False, f"Rejected: archive has too many entries ({len(infos)} > {_MAX_IMPORT_MEMBERS})", {}
+                return (
+                    False,
+                    f"Rejected: archive has too many entries ({len(infos)} > {_MAX_IMPORT_MEMBERS})",
+                    {},
+                )
             total_uncompressed = sum(i.file_size for i in infos)
             if total_uncompressed > _MAX_IMPORT_UNCOMPRESSED:
-                return False, (
-                    f"Rejected: uncompressed size {total_uncompressed} exceeds cap "
-                    f"{_MAX_IMPORT_UNCOMPRESSED} (possible zip bomb)"
-                ), {}
+                return (
+                    False,
+                    (
+                        f"Rejected: uncompressed size {total_uncompressed} exceeds cap "
+                        f"{_MAX_IMPORT_UNCOMPRESSED} (possible zip bomb)"
+                    ),
+                    {},
+                )
 
             # Link members can redirect a later write outside the extraction root
             # even when every name passes the traversal check above.
@@ -416,9 +434,7 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
 
         snap_dirs = [d for d in work.iterdir() if d.is_dir()]
         if len(snap_dirs) != 1:
-            raise ValueError(
-                f"Expected 1 top-level directory in zip, found {len(snap_dirs)}"
-            )
+            raise ValueError(f"Expected 1 top-level directory in zip, found {len(snap_dirs)}")
         snap = snap_dirs[0]
 
         # Re-vet imported cron commands before ANY path below consumes
@@ -453,6 +469,13 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
             auto_dir = snap / "skills" / "auto"
             if auto_dir.is_dir():
                 shutil.rmtree(str(auto_dir))
+            # A platform that cannot pin a directory by descriptor refuses this
+            # staging pass, and the refusal is allowed to propagate. An earlier
+            # revision caught it and returned the summary, which was worse than the
+            # crash it avoided: the caller reads a returned summary as success, so the
+            # dashboard rendered "Import complete" over a data home nothing had been
+            # written to. Raised in review. Propagating reaches the existing error
+            # path, which is the one that tells the user the import did not happen.
             _do_replace(snap, mc, None)
             summary["items"].append("full replace")
         else:
@@ -488,14 +511,10 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
 
             if (snap / "notifications.jsonl").is_file():
                 if (mc / "notifications.jsonl").is_file():
-                    _merge_notifications(
-                        snap / "notifications.jsonl", mc / "notifications.jsonl"
-                    )
+                    _merge_notifications(snap / "notifications.jsonl", mc / "notifications.jsonl")
                     summary["items"].append("notifications (merged)")
                 else:
-                    shutil.copy2(
-                        str(snap / "notifications.jsonl"), str(mc / "notifications.jsonl")
-                    )
+                    shutil.copy2(str(snap / "notifications.jsonl"), str(mc / "notifications.jsonl"))
                     summary["items"].append("notifications (copied)")
 
             for dirname in ("workspace", "plan_memory"):

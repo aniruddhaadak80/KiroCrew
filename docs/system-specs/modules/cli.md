@@ -168,6 +168,38 @@ choice blob makes the usage line unreadable.
 | `kirocrew restore <file> --components X,Y` | Selective component restore |
 | `kirocrew restore <file> --dry-run` | Preview restore without writing |
 | `kirocrew restore --list-components` | Show available component names |
+| `kirocrew snapshot --allow-unpinned-staging` | Stage by path name where a directory cannot be pinned by descriptor |
+| `kirocrew restore <file> --allow-unpinned-staging` | Same, for the restore side |
+
+### Staging is descriptor-pinned, and refuses rather than degrading silently
+
+Snapshot and restore stage through `kiro_crew.pinned_fs`: the parent chain is resolved
+once, pinned component by component with `openat` + `O_NOFOLLOW`, and everything
+downstream is addressed through the descriptor already held. A validated path and the
+inode later opened are otherwise not the same thing, and anything running as the user
+— which in this product includes an agent — can plant the swap between the two.
+
+`os.supports_dir_fd` is empty and `O_NOFOLLOW` does not exist on Windows, so pinning
+is unavailable there. The decision, recorded here rather than only in the pull request
+that made it: staging is **refused** on such a platform unless
+`--allow-unpinned-staging` is passed, and when it is, the archive's `MANIFEST.json`
+carries `"staging": "unpinned"` and `kirocrew restore --dry-run` prints that the
+archive was staged by name. The refusal is the default because a by-name walk is not a
+slightly weaker version of a pinned one; it is the mechanism whose failure closed two
+earlier attempts at this change. The flag is a permission for a platform that cannot
+pin, **not** a switch that turns pinning off where it works.
+
+`MANIFEST.json` also carries `"skipped"`: any file omitted during staging (a hardlink
+alias, a symlink, an entry that vanished mid-walk) with its reason, so an incomplete
+archive says so in its own record instead of only in the console output of whoever ran
+the command.
+
+Two entry points do not take the flag and should not be assumed to. `kirocrew restore`
+covers the command line; the dashboard's import path (`portability.apply_import_zip`) has
+no command line, so on a platform that cannot pin the refusal propagates to that path's
+existing error handling and the import fails loudly. It deliberately does NOT return a
+summary describing the refusal: a returned summary reads as success to its caller, which
+would render "Import complete" over a data home nothing was written to.
 | `kirocrew config get [key]` | Print full config or a dot-path value |
 | `kirocrew config set <key> <val>` | Set a config value (auto type detection) |
 | `kirocrew config set --file <path>` | Replace config from a JSON file |

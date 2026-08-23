@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import socket
+import stat
 import tarfile
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from kiro_crew import platform_compat
+from kiro_crew import pinned_fs, platform_compat
 
 try:
     import pysqlite3 as sqlite3
@@ -186,34 +189,347 @@ def _list_components() -> None:
     print("\nCombine with commas: --components memory,crons,skills")
 
 
-def _copytree_safe(src: Path, dst: Path, **kwargs) -> None:
-    """copytree that skips symlinks to prevent sensitive file leakage."""
-    outer_ignore = kwargs.pop("ignore", None)
+def _report_skip(reason: str, path: str) -> None:
+    """Word a primitive's skip classification in this module's existing voice.
 
+    The primitive classifies and never prints, so these strings stay byte-identical
+    to what snapshot/restore printed before the migration.
+    """
+    if reason == pinned_fs.SKIP_SYMLINK:
+        print(f"⚠️  Skipping symlink in source tree: {path}")
+    elif reason == pinned_fs.SKIP_VANISHED:
+        print(f"⚠️  Skipping vanished entry during snapshot copy: {path}")
+    else:
+        print(f"⚠️  Skipping hardlinked or non-regular file during snapshot copy: {path}")
+
+
+def _staging_is_pinned(*, allow_unpinned: bool, what: str) -> bool:
+    """Whether staging may proceed, and whether it will be descriptor-pinned.
+
+    Returns True for a pinned traversal, False for the by-name traversal the caller
+    explicitly asked for. Raises rather than returning False when the platform cannot
+    pin and no one said that is acceptable.
+
+    This is the whole "refuse rather than fall back" rule, in one place. The reason it
+    is a refusal and not a warning: a by-name walk is not a slightly weaker version of
+    a pinned walk, it is the mechanism whose failure closed two pull requests. An
+    operator who needs a snapshot on a platform without ``dir_fd`` can still have one,
+    but they say so on the command line and the archive records that they did, so the
+    weaker mode is never something the tool chose on their behalf.
+    """
+    if pinned_fs.supports_pinned_tree_walk():
+        return True
+    if allow_unpinned:
+        return False
+    raise pinned_fs.PinnedPathRefusal(
+        f"refusing to stage the {what}: this platform cannot open a directory "
+        "relative to a descriptor, so every component would be re-opened by name and "
+        "an ancestor swapped mid-walk could redirect the copy into a credential "
+        "store. Re-run with --allow-unpinned-staging to accept a by-name traversal; "
+        "the archive will record that it was staged unpinned."
+    )
+
+
+def _copytree_safe(
+    src: Path,
+    dst: Path,
+    *,
+    allow_unpinned: bool = False,
+    on_skip: pinned_fs.SkipReporter | None = None,
+    **kwargs,
+) -> None:
+    """Copy a tree for staging, with the source traversal pinned where possible.
+
+    Was: ``shutil.copytree`` with an ignore callback that tested ``os.path.islink`` on
+    a NAME. That screened the final component of each entry and nothing else, so an
+    ancestor directory swapped for a link between the listing and the copy redirected
+    every deeper open, and the screen had nothing to report -- what it found inside
+    the replaced tree was an ordinary file. Now the traversal is descriptor-pinned by
+    :func:`kiro_crew.pinned_fs.stage_tree_pinned`, including the chain above the root.
+
+    ``dirs_exist_ok`` is accepted and ignored: the pinned walk always creates
+    destination directories with ``exist_ok=True``, so the flag has no remaining
+    meaning. Every other keyword is rejected rather than silently dropped.
+
+    *on_skip* lets a caller both print and RECORD what was skipped. It defaults to
+    printing only, which is right for restore; the snapshot path passes a recorder so
+    an incomplete archive says so in its own manifest instead of only in the console
+    output of whoever ran it.
+    """
+    report = on_skip or _report_skip
+    outer_ignore = kwargs.pop("ignore", None)
+    kwargs.pop("dirs_exist_ok", None)
+    if kwargs:
+        raise TypeError(f"_copytree_safe got unexpected keyword arguments: {sorted(kwargs)}")
+
+    if _staging_is_pinned(allow_unpinned=allow_unpinned, what=f"tree {src.name!r}"):
+        pinned_fs.stage_tree_pinned(
+            src,
+            dst,
+            what=f"tree {src.name!r}",
+            ignore=outer_ignore,
+            on_skip=report,
+        )
+        return
+
+    # Declared by-name traversal. The link screen is kept because it is still the
+    # only thing standing between staging and a symlinked entry, but it protects
+    # final components only -- which is exactly why reaching this branch has to be
+    # asked for.
     def _ignore_symlinks(directory, contents):
         skipped = {name for name in contents if os.path.islink(os.path.join(directory, name))}
         for name in skipped:
-            print(f"⚠️  Skipping symlink in source tree: {os.path.join(directory, name)}")
+            report(pinned_fs.SKIP_SYMLINK, os.path.join(directory, name))
         if outer_ignore:
             skipped |= set(outer_ignore(directory, contents))
         return skipped
 
-    shutil.copytree(str(src), str(dst), ignore=_ignore_symlinks, **kwargs)
+    shutil.copytree(str(src), str(dst), ignore=_ignore_symlinks, dirs_exist_ok=True)
 
 
-def _copy_tree_no_overwrite(src: Path, dst: Path) -> None:
-    for item in src.rglob("*"):
-        if item.is_symlink():
-            continue
-        target = dst / item.relative_to(src)
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        elif item.is_file() and not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(item), str(target))
+def _copy_tree_no_overwrite(src: Path, dst: Path, *, allow_unpinned: bool = False) -> None:
+    """Merge *src* into *dst* without overwriting, with both ends pinned.
+
+    The destination side is where #3797's third finding lives. The previous version
+    walked the source with ``rglob`` and wrote each file with ``shutil.copy2`` to a
+    path composed by name, so the destination's ancestor chain was never pinned: a
+    component of *dst* swapped for a link after ``mkdir`` redirected the write, and
+    ``not target.exists()`` answered for whatever the link pointed at rather than for
+    the directory the caller validated.
+
+    This is now one call into the shared primitive with ``skip_existing=True``, which
+    is what makes the no-overwrite promise real: exclusive creation is atomic, so "it
+    did not exist a moment ago" and "this call created it" are the same statement
+    rather than two with a window between them.
+
+    An earlier revision open-coded a second pinned walk here, with its own copy body.
+    Review pointed out the two had already diverged -- this one's child-directory open
+    lacked the ``ELOOP``/``ENOTDIR`` handling, so the very swap the staging walk skips
+    would have escaped restore as a raw ``OSError`` -- which is the argument for a
+    parameter on one primitive rather than a parallel implementation the shared
+    module's own docstring says should not exist.
+    """
+    if not _staging_is_pinned(allow_unpinned=allow_unpinned, what=f"restore of {dst.name!r}"):
+        for item in src.rglob("*"):
+            if item.is_symlink():
+                continue
+            target = dst / item.relative_to(src)
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif item.is_file() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(item), str(target))
+        return
+
+    pinned_fs.stage_tree_pinned(
+        src,
+        dst,
+        what=f"restore of {dst.name!r}",
+        on_skip=_report_skip,
+        skip_existing=True,
+    )
 
 
 # ── Snapshot ──────────────────────────────────────────────────────────────────
+
+
+def _db_source_is_safe(src: Path, *, on_skip: pinned_fs.SkipReporter) -> bool:
+    """Whether a SQLite source may be handed to ``sqlite3.connect`` by name.
+
+    ``sqlite3`` cannot open a descriptor, so this is the one place on the staging path
+    that must name a path. The inode is still judged first, on an open descriptor, which
+    is what makes the hardlink case answerable at all: an alias shares its target's
+    inode, so ``realpath`` yields the alias's own name and no path test can see it.
+
+    Returns False (and reports the omission) rather than raising, matching how every
+    other unusable source on this path is handled -- the archive records what it left
+    out.
+    """
+    try:
+        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            on_skip(pinned_fs.SKIP_SYMLINK, str(src))
+            return False
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            on_skip(pinned_fs.SKIP_NOT_REGULAR, str(src))
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def _build_snapshot(mc: Path, out: Path, name: str, *, allow_unpinned: bool = False) -> Path:
+    """Stage the data home into a temporary tree and publish it as one tarball.
+
+    Extracted from ``snapshot_main`` so the staging pass has a boundary a refusal can
+    be contained at: everything in here either produces a finished archive or raises,
+    and the caller turns a :class:`kiro_crew.pinned_fs.PinnedPathRefusal` into an exit
+    code rather than a traceback.
+    """
+    # Decided BEFORE anything is staged, not per-tree. An earlier revision gated
+    # inside _copytree_safe only, so a data home with core files and no trees staged
+    # them on a platform that cannot pin without ever consulting the opt-in -- the
+    # gate was reachable only through a path that happened to exist. Asking once, up
+    # front, is also what makes the manifest's "staging" value true of the whole
+    # archive rather than of whichever component ran last.
+    pinned = _staging_is_pinned(allow_unpinned=allow_unpinned, what="data home")
+
+    # Every skip is recorded, not just printed. A snapshot that omitted a hardlinked
+    # or symlinked file used to report success with a console warning and nothing in
+    # the archive -- the same "silent partial" shape this change fixes on the restore
+    # side, raised in review. Paths are stored relative to the data home so the record
+    # names the file without carrying the absolute layout of the machine into an
+    # archive that may be moved somewhere else.
+    skipped: list[dict[str, str]] = []
+
+    def _record_skip(reason: str, path: str) -> None:
+        try:
+            rel = str(Path(path).relative_to(mc))
+        except ValueError:
+            rel = Path(path).name
+        skipped.append({"reason": reason, "path": rel})
+        _report_skip(reason, path)
+
+    with tempfile.TemporaryDirectory() as work:
+        stage = Path(work) / name
+        for d in ("workspace", "skills", "plan_memory"):
+            (stage / d).mkdir(parents=True, exist_ok=True)
+
+        # Core files. Copied through the pinned primitive rather than shutil.copy2:
+        # copy2 dereferences a hardlink into ordinary-looking regular bytes, and the
+        # tar pass's hardlink screen then has no link left to reject, so an alias
+        # planted at a core file's name would have shipped as content. The name-based
+        # islink check is gone with it -- it answered about a name, and the open that
+        # followed could land on a different inode.
+        #
+        # Both ends are pinned where the platform allows it: the data home is opened
+        # once and every core file is opened relative to THAT descriptor, so an
+        # ancestor of the data home swapped mid-run cannot redirect the read. Opening
+        # `mc / f` by name was a real gap in the first revision of this PR, caught in
+        # review -- the file's own O_NOFOLLOW says nothing about the directories walked
+        # to reach it.
+        mc_fd = pinned_fs.open_dir_pinned(mc, what="data home") if pinned else None
+        try:
+            for files in CORE_FILES.values():
+                for f in files:
+                    src = mc / f
+                    if not src.is_file():
+                        continue
+                    if f.endswith(".db"):
+                        # sqlite3 has no fd-based open, so the connection below must
+                        # name a path. That does NOT mean the inode cannot be judged
+                        # first: the name is opened here, the DESCRIPTOR is checked,
+                        # and only then is sqlite pointed at the path.
+                        #
+                        # Both screens matter and for different reasons. A symlink is
+                        # refused because the connection would follow it. A HARDLINK is
+                        # refused because it is invisible to every path check -- review
+                        # found that aliasing memory.db onto a credential-bearing
+                        # database elsewhere would have had SQLite faithfully back up
+                        # its token rows into the archive, with no link for any name
+                        # test to see. That is the same alias hazard copy_file_pinned
+                        # exists for, and the .db path had been left out of it.
+                        if not _db_source_is_safe(src, on_skip=_record_skip):
+                            continue
+                        with (
+                            closing(sqlite3.connect(str(src))) as src_conn,
+                            closing(sqlite3.connect(str(stage / f))) as dst_conn,
+                        ):
+                            src_conn.backup(dst_conn)
+                    elif mc_fd is not None:
+                        pinned_fs.copy_file_pinned(
+                            str(src),
+                            str(stage / f),
+                            dir_fd=mc_fd,
+                            name=f,
+                            on_skip=_record_skip,
+                        )
+                    else:
+                        pinned_fs.copy_file_pinned(str(src), str(stage / f), on_skip=_record_skip)
+        finally:
+            if mc_fd is not None:
+                os.close(mc_fd)
+
+        # Workspace (exclude hygiene_data, insert_facts*.py)
+        if (mc / "workspace").is_dir():
+            _copytree_safe(
+                mc / "workspace",
+                stage / "workspace",
+                allow_unpinned=allow_unpinned,
+                on_skip=_record_skip,
+                ignore=shutil.ignore_patterns("hygiene_data", "insert_facts*.py"),
+            )
+
+        # Plan memory
+        if (mc / "plan_memory").is_dir():
+            _copytree_safe(
+                mc / "plan_memory",
+                stage / "plan_memory",
+                allow_unpinned=allow_unpinned,
+                on_skip=_record_skip,
+            )
+
+        # Skills
+        if (mc / "skills").is_dir():
+            _copytree_safe(
+                mc / "skills",
+                stage / "skills",
+                allow_unpinned=allow_unpinned,
+                on_skip=_record_skip,
+            )
+
+        # Manifest
+        ws_files = sum(1 for _ in (stage / "workspace").rglob("*") if _.is_file())
+        pm_files = sum(1 for _ in (stage / "plan_memory").rglob("*") if _.is_file())
+        sk_count = sum(1 for _ in (stage / "skills").iterdir() if _.is_dir())
+        # Recorded so a reader can tell how the archive was built. "unpinned" means
+        # the trees were walked by name, which an ancestor swap during staging could
+        # have redirected. Someone deciding whether to trust this archive needs that
+        # on the record rather than in the memory of whoever ran the command.
+        staging_mode = "pinned" if pinned else "unpinned"
+        manifest = {
+            "version": 2,
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "hostname": socket.gethostname(),
+            "user": os.environ.get("USER", "unknown"),
+            "kirocrew_dir": str(mc),
+            "staging": staging_mode,
+            "skipped": skipped,
+            "contents": {
+                "memory_db": _fsize(stage / "memory.db"),
+                "memory_index_db": _fsize(stage / "memory_index.db"),
+                "crons_json": _fsize(stage / "crons.json"),
+                "config_json": _fsize(stage / "config.json"),
+                "notifications_jsonl": _fsize(stage / "notifications.jsonl"),
+                "workspace_files": ws_files,
+                "plan_memory_files": pm_files,
+                "skill_count": sk_count,
+            },
+        }
+        (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
+        if staging_mode == "unpinned":
+            print(
+                "⚠️  Staged by path name (--allow-unpinned-staging): this platform "
+                "cannot pin a directory by descriptor, so an ancestor swapped during "
+                "staging could have redirected a copy. Recorded in MANIFEST.json."
+            )
+
+        # Tarball — write to temp file and rename atomically to avoid corrupt partials
+        out.mkdir(parents=True, exist_ok=True)
+        outfile = out / f"{name}.tar.gz"
+        tmp_tar = outfile.with_suffix(".tar.gz.tmp")
+        try:
+            with tarfile.open(str(tmp_tar), "w:gz") as tar:
+                tar.add(str(stage), arcname=name, filter=_data_filter)
+            tmp_tar.rename(outfile)
+        except BaseException:
+            tmp_tar.unlink(missing_ok=True)
+            raise
+    return outfile
 
 
 def snapshot_main(
@@ -222,13 +538,25 @@ def snapshot_main(
     if parsed is None:
         p = argparse.ArgumentParser(
             prog="kirocrew-snapshot",
-            description="Create a portable .tar.gz snapshot of KiroCrew state.",
+            description="Create a portable .tar.gz snapshot of Kiro Crew state.",
         )
         p.add_argument("output_dir", nargs="?", default=_default_snapshot_dir())
         p.add_argument("--keep", type=int, default=7)
         p.add_argument("--list", action="store_true", dest="list_snapshots")
+        p.add_argument(
+            "--allow-unpinned-staging",
+            action="store_true",
+            dest="allow_unpinned",
+            help=(
+                "Stage by path name on a platform that cannot open a directory "
+                "relative to a descriptor. Without this the snapshot is refused there "
+                "rather than taken with a traversal an ancestor swap could redirect. "
+                "The archive's MANIFEST.json records that it was staged unpinned."
+            ),
+        )
         parsed = p.parse_args(argv)
     args = parsed
+    allow_unpinned = bool(getattr(args, "allow_unpinned", False))
 
     if args.keep <= 0:
         print(f"❌ --keep value must be a positive integer, got: {args.keep}")
@@ -265,8 +593,6 @@ def snapshot_main(
     # WAL checkpoint
     if (mc / "memory.db").is_file():
         try:
-            from contextlib import closing
-
             with closing(sqlite3.connect(str(mc / "memory.db"))) as c:
                 c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         except Exception:
@@ -275,81 +601,13 @@ def snapshot_main(
                 "The backup API still produces a consistent copy."
             )
 
-    with tempfile.TemporaryDirectory() as work:
-        stage = Path(work) / name
-        for d in ("workspace", "skills", "plan_memory"):
-            (stage / d).mkdir(parents=True, exist_ok=True)
-
-        # Core files
-        for files in CORE_FILES.values():
-            for f in files:
-                src = mc / f
-                if src.is_file():
-                    if os.path.islink(src):
-                        print(f"⚠️  Skipping symlinked core file: {src}")
-                        continue
-                    if f.endswith(".db"):
-                        from contextlib import closing
-
-                        with (
-                            closing(sqlite3.connect(str(src))) as src_conn,
-                            closing(sqlite3.connect(str(stage / f))) as dst_conn,
-                        ):
-                            src_conn.backup(dst_conn)
-                    else:
-                        shutil.copy2(str(src), str(stage / f))
-
-        # Workspace (exclude hygiene_data, insert_facts*.py)
-        if (mc / "workspace").is_dir():
-            _copytree_safe(
-                mc / "workspace",
-                stage / "workspace",
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("hygiene_data", "insert_facts*.py"),
-            )
-
-        # Plan memory
-        if (mc / "plan_memory").is_dir():
-            _copytree_safe(mc / "plan_memory", stage / "plan_memory", dirs_exist_ok=True)
-
-        # Skills
-        if (mc / "skills").is_dir():
-            _copytree_safe(mc / "skills", stage / "skills", dirs_exist_ok=True)
-
-        # Manifest
-        ws_files = sum(1 for _ in (stage / "workspace").rglob("*") if _.is_file())
-        pm_files = sum(1 for _ in (stage / "plan_memory").rglob("*") if _.is_file())
-        sk_count = sum(1 for _ in (stage / "skills").iterdir() if _.is_dir())
-        manifest = {
-            "version": 2,
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "hostname": socket.gethostname(),
-            "user": os.environ.get("USER", "unknown"),
-            "kirocrew_dir": str(mc),
-            "contents": {
-                "memory_db": _fsize(stage / "memory.db"),
-                "memory_index_db": _fsize(stage / "memory_index.db"),
-                "crons_json": _fsize(stage / "crons.json"),
-                "config_json": _fsize(stage / "config.json"),
-                "notifications_jsonl": _fsize(stage / "notifications.jsonl"),
-                "workspace_files": ws_files,
-                "plan_memory_files": pm_files,
-                "skill_count": sk_count,
-            },
-        }
-        (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
-
-        # Tarball — write to temp file and rename atomically to avoid corrupt partials
-        out.mkdir(parents=True, exist_ok=True)
-        outfile = out / f"{name}.tar.gz"
-        tmp_tar = outfile.with_suffix(".tar.gz.tmp")
-        try:
-            with tarfile.open(str(tmp_tar), "w:gz") as tar:
-                tar.add(str(stage), arcname=name, filter=_data_filter)
-            tmp_tar.rename(outfile)
-        except BaseException:
-            tmp_tar.unlink(missing_ok=True)
-            raise
+    try:
+        outfile = _build_snapshot(mc, out, name, allow_unpinned=allow_unpinned)
+    except pinned_fs.PinnedPathRefusal as exc:
+        # A refusal is a decision this command made on purpose. A traceback would
+        # read like a crash and bury the sentence saying what to do about it.
+        print(f"❌ {exc}")
+        return 1
 
     sz = outfile.stat().st_size
     # restrict_to_owner (fail-loud), NOT chmod_safe: this tarball can contain
@@ -403,6 +661,14 @@ def _print_manifest(snap: Path) -> None:
         print(f"  Skills: {c.get('skill_count', 0)}")
         print(f"  Notifications: {c.get('notifications_jsonl', 0) // 1024} KB")
         print(f"  Plan memory files: {c.get('plan_memory_files', 0)}")
+        # Both of these are the record that makes an incomplete or weaker archive
+        # visible. A value written but never displayed is only findable by untarring
+        # the archive by hand, which is not a reader -- so they are shown here, where
+        # anyone inspecting a snapshot before restoring it already looks.
+        if m.get("staging") == "unpinned":
+            print("  ⚠️  Staged by path name (unpinned): see --allow-unpinned-staging")
+        for entry in m.get("skipped") or ():
+            print(f"  ⚠️  Omitted ({entry.get('reason', '?')}): {entry.get('path', '?')}")
     except Exception as e:
         print(f"  (Could not read manifest: {e})")
 
@@ -538,37 +804,134 @@ def _merge_notifications(src_path: Path, dst_path: Path) -> None:
     print(f"  Notifications imported: {imported}")
 
 
-def _backup_and_copy(mc: Path, backup: Path, snap: Path, component: str) -> None:
-    for f in CORE_FILES.get(component, ()):
-        if (mc / f).is_file():
-            if os.path.islink(mc / f):
-                print(f"⚠️  Skipping symlinked core file during backup: {mc / f}")
-                continue
-            shutil.move(str(mc / f), str(backup / f))
-        if (snap / f).is_file():
-            if os.path.islink(snap / f):
-                print(f"⚠️  Skipping symlinked file from snapshot: {snap / f}")
-                continue
-            shutil.copy2(str(snap / f), str(mc / f))
-            if component == "security":
-                # restrict_to_owner (fail-loud), NOT chmod_safe (swallows OSError):
-                # security files include sel_hmac.key. Mirrors the create path's
-                # deliberate fail-loud lockdown — better to abort than silently
-                # land a restored secret group/world-readable. POSIX applies
-                # chmod 0o600; Windows applies an owner-only DACL via icacls.
-                # Unlink the freshly
-                # copied file on failure so the "abort" the comment promises
-                # actually removes the exposed artifact — otherwise the
-                # restored secret would sit under the destination-inherited
-                # DACL after the OSError propagates out of _do_replace.
-                try:
-                    platform_compat.restrict_to_owner(str(mc / f))
-                except OSError:
-                    (mc / f).unlink(missing_ok=True)
-                    raise
+def _backup_and_copy(
+    mc: Path, backup: Path, snap: Path, component: str, *, allow_unpinned: bool = False
+) -> None:
+    """Move the live core files aside, then restore the archive's, destination pinned.
+
+    The restore side used to compose ``mc / f`` and hand it to ``shutil.copy2``, so
+    the destination was reached by name every time. Two consequences, both real: a
+    component of the data home swapped for a link redirected the write out of the
+    data home entirely, and a symlink left at the core file's own name was written
+    THROUGH rather than refused -- the name-based ``islink`` check above skipped the
+    backup move and then the copy followed the link it had just declined to move.
+
+    Now the data home is pinned once and each file is created relative to that
+    descriptor with ``O_EXCL``. A name that is still occupied after the backup move
+    is refused instead of written through, which is the symlink case above.
+    """
+    if not _staging_is_pinned(allow_unpinned=allow_unpinned, what=f"restore of {component!r}"):
+        for f in CORE_FILES.get(component, ()):
+            if (mc / f).is_file():
+                if os.path.islink(mc / f):
+                    print(f"⚠️  Skipping symlinked core file during backup: {mc / f}")
+                    continue
+                shutil.move(str(mc / f), str(backup / f))
+            if (snap / f).is_file():
+                if os.path.islink(snap / f):
+                    print(f"⚠️  Skipping symlinked file from snapshot: {snap / f}")
+                    continue
+                shutil.copy2(str(snap / f), str(mc / f))
+                _lock_down_restored(mc / f, component)
+        return
+
+    src_fd = pinned_fs.open_dir_pinned(snap, what=f"snapshot payload for {component!r}")
+    try:
+        dst_fd = pinned_fs.open_dir_pinned(mc, what=f"data home for {component!r}")
+        try:
+            backup_fd = pinned_fs.create_and_open_dir_pinned(
+                backup, what=f"pre-restore backup for {component!r}"
+            )
+            try:
+                for f in CORE_FILES.get(component, ()):
+                    live = mc / f
+                    # A symlink at a core file's name is MOVED aside like any other
+                    # occupant, not skipped. The old code skipped the move and then let
+                    # the copy write through the very link it had just declined to
+                    # move; skipping the whole entry instead would be no better,
+                    # because the archive's version of that file would then silently
+                    # never be restored. Moving a symlink moves the LINK, never its
+                    # target, so nothing outside the data home is touched.
+                    #
+                    # The move goes through both pinned descriptors rather than
+                    # shutil.move on two composed paths: review pointed out that a
+                    # by-name move re-resolves both ends, so an ancestor swapped
+                    # between the check and the move would relocate something else.
+                    # os.rename with src_dir_fd/dst_dir_fd cannot be redirected, and it
+                    # is atomic within the data home, which a copy-then-delete is not.
+                    if live.is_symlink():
+                        print(f"⚠️  Moving symlinked core file aside during backup: {live}")
+                        os.rename(f, f, src_dir_fd=dst_fd, dst_dir_fd=backup_fd)
+                    elif live.is_file():
+                        os.rename(f, f, src_dir_fd=dst_fd, dst_dir_fd=backup_fd)
+                    if not (snap / f).is_file():
+                        continue
+                    try:
+                        copied = pinned_fs.copy_file_pinned(
+                            str(snap / f),
+                            dir_fd=src_fd,
+                            name=f,
+                            dst_dir_fd=dst_fd,
+                            dst_name=f,
+                            # Owner-only applied through the destination DESCRIPTOR, in
+                            # the same call that wrote the bytes. Two things wrong with
+                            # the previous _lock_down_restored(mc / f) here, both raised
+                            # in review: it reopened the freshly written file BY NAME, so
+                            # a link swapped in at that instant had restrict_to_owner
+                            # change the permissions of whatever it pointed at; and the
+                            # mode cannot be inherited from the archive, which is
+                            # untrusted input -- a hand-built tarball can record 0o777 on
+                            # telemetry_salt. The reviewer's suggested fix was to drop
+                            # the lockdown because "the copy already applies mode", which
+                            # would have done exactly that: applied the ARCHIVE's mode.
+                            force_mode=0o600 if component == "security" else None,
+                            on_skip=_report_skip,
+                        )
+                    except FileExistsError as exc:
+                        raise pinned_fs.PinnedPathRefusal(
+                            f"refusing to restore {f!r}: something still occupies that "
+                            "name in the data home after the backup pass, so it is a "
+                            "hardlink alias or a name this restore could not move "
+                            "aside. Writing to it could follow whatever it points at. "
+                            "Remove it and re-run."
+                        ) from exc
+                    if copied and component == "security":
+                        # Nothing to re-apply: force_mode above already set owner-only
+                        # through the descriptor. On Windows the by-name branch still
+                        # needs restrict_to_owner for its DACL, which is why that call
+                        # survives there and not here.
+                        pass
+            finally:
+                os.close(backup_fd)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
 
 
-def _do_replace(snap: Path, mc: Path, components: list[str] | None) -> None:
+def _lock_down_restored(path: Path, component: str) -> None:
+    """Apply the owner-only lockdown a restored security file needs.
+
+    restrict_to_owner (fail-loud), NOT chmod_safe (which swallows OSError): security
+    files include sel_hmac.key. Mirrors the create path's deliberate fail-loud
+    lockdown -- better to abort than silently land a restored secret group- or
+    world-readable. POSIX applies chmod 0o600; Windows applies an owner-only DACL via
+    icacls. The freshly copied file is unlinked on failure so the abort this promises
+    actually removes the exposed artifact, instead of leaving the restored secret
+    under the destination's inherited DACL after the OSError propagates.
+    """
+    if component != "security":
+        return
+    try:
+        platform_compat.restrict_to_owner(str(path))
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _do_replace(
+    snap: Path, mc: Path, components: list[str] | None, *, allow_unpinned: bool = False
+) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = mc / f"pre-restore-{ts}"
     backup.mkdir(exist_ok=True)
@@ -576,30 +939,30 @@ def _do_replace(snap: Path, mc: Path, components: list[str] | None) -> None:
 
     for comp in ("memory", "crons", "config", "notifications", "security"):
         if _want(components, comp):
-            _backup_and_copy(mc, backup, snap, comp)
+            _backup_and_copy(mc, backup, snap, comp, allow_unpinned=allow_unpinned)
             print(f"  ✅ {comp}")
 
     if _want(components, "workspace"):
         for dirname in ("workspace", "plan_memory"):
             d = mc / dirname
             if d.is_dir():
-                _copytree_safe(d, backup / dirname, dirs_exist_ok=True)
+                _copytree_safe(d, backup / dirname, allow_unpinned=allow_unpinned)
             sd = snap / dirname
             if sd.is_dir():
                 if d.is_dir():
                     shutil.rmtree(str(d))
-                _copytree_safe(sd, d)
+                _copytree_safe(sd, d, allow_unpinned=allow_unpinned)
         print("  ✅ workspace")
 
     if _want(components, "skills"):
         sk = mc / "skills"
         if sk.is_dir():
-            _copytree_safe(sk, backup / "skills", dirs_exist_ok=True)
+            _copytree_safe(sk, backup / "skills", allow_unpinned=allow_unpinned)
         snap_sk = snap / "skills"
         if snap_sk.is_dir():
             if sk.is_dir():
                 shutil.rmtree(str(sk))
-            _copytree_safe(snap_sk, sk)
+            _copytree_safe(snap_sk, sk, allow_unpinned=allow_unpinned)
         print("  ✅ skills")
 
     try:
@@ -609,7 +972,16 @@ def _do_replace(snap: Path, mc: Path, components: list[str] | None) -> None:
     print("✅ Replace complete.")
 
 
-def _do_merge(snap: Path, mc: Path, components: list[str] | None) -> None:
+def _do_merge(
+    snap: Path, mc: Path, components: list[str] | None, *, allow_unpinned: bool = False
+) -> None:
+    # Asked once, at entry, BEFORE any mutation. The core-file copies below run before
+    # any tree call, so gating inside the tree helpers meant a merge on a platform that
+    # cannot pin wrote memory.db, crons.json and the security files first and only then
+    # met the refusal -- either redirecting those writes through a planted link, or
+    # aborting with the restore already half applied. Review caught it; it is the same
+    # gate-placement defect as the snapshot side, one path over.
+    _staging_is_pinned(allow_unpinned=allow_unpinned, what="merge restore")
     print("🔀 Merge mode — importing...")
 
     if _want(components, "memory") and (snap / "memory.db").is_file():
@@ -675,13 +1047,13 @@ def _do_merge(snap: Path, mc: Path, components: list[str] | None) -> None:
             if sd.is_dir():
                 dd = mc / dirname
                 dd.mkdir(parents=True, exist_ok=True)
-                _copy_tree_no_overwrite(sd, dd)
+                _copy_tree_no_overwrite(sd, dd, allow_unpinned=allow_unpinned)
         print("  ✅ workspace")
 
     if _want(components, "skills"):
         if (snap / "skills").is_dir():
             (mc / "skills").mkdir(parents=True, exist_ok=True)
-            _copy_tree_no_overwrite(snap / "skills", mc / "skills")
+            _copy_tree_no_overwrite(snap / "skills", mc / "skills", allow_unpinned=allow_unpinned)
         print("  ✅ skills")
 
     print("✅ Merge complete.")
@@ -715,8 +1087,19 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
         )
         p.add_argument("--components")
         p.add_argument("--list-components", action="store_true")
+        p.add_argument(
+            "--allow-unpinned-staging",
+            action="store_true",
+            dest="allow_unpinned",
+            help=(
+                "Restore by path name on a platform that cannot open a directory "
+                "relative to a descriptor. Without this the restore is refused there "
+                "rather than run with a destination an ancestor swap could redirect."
+            ),
+        )
         parsed = p.parse_args(argv)
     args = parsed
+    allow_unpinned = bool(getattr(args, "allow_unpinned", False))
 
     if args.list_components:
         _list_components()
@@ -783,10 +1166,17 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
             return 0
 
         mc.mkdir(parents=True, exist_ok=True)
-        if mode == "replace":
-            _do_replace(snap, mc, components)
-        else:
-            _do_merge(snap, mc, components)
+        # Contained here rather than allowed to propagate: a refusal is a decision
+        # this command made on purpose, and a traceback would read like a crash and
+        # bury the one sentence saying what to do about it.
+        try:
+            if mode == "replace":
+                _do_replace(snap, mc, components, allow_unpinned=allow_unpinned)
+            else:
+                _do_merge(snap, mc, components, allow_unpinned=allow_unpinned)
+        except pinned_fs.PinnedPathRefusal as exc:
+            print(f"❌ {exc}")
+            return 1
 
     # Integrity check
     if _want(components, "memory") and (mc / "memory.db").is_file():
