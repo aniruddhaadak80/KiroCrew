@@ -1345,6 +1345,24 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             await state.sessions.destroy(effective_session_key(slot))
         except Exception:
             pass
+    # The work ledger persists independently of the transcript too, and its
+    # content is disposable intermediate state (nothing reconstructs from it),
+    # so a permanent delete reaps it unconditionally. Runs LAST — after the
+    # slot's turn is cancelled and its session destroyed — so an in-flight
+    # ledger write from the dying turn cannot land after the purge; a write
+    # racing in from another process can at worst recreate an orphan directory
+    # the next delete sweeps (see session_ledger.purge). Keyed by the same
+    # lossless fold the write path applies, over every candidate spelling.
+    # Tab close (api_chat_slot_delete) deliberately does NOT reach here: the
+    # ledger is part of a session's resumable state.
+    from kiro_crew import session_ledger
+
+    for candidate in {session_ledger.ledger_key(k) for k in pin_slot_keys if k}:
+        try:
+            await asyncio.to_thread(session_ledger.purge, candidate)
+        except Exception:
+            logger.warning("History delete: ledger purge failed for %s",
+                           candidate, exc_info=True)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:

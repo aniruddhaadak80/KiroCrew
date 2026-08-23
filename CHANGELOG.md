@@ -2,6 +2,21 @@
 
 All notable changes to KiroCrew are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Session work ledger** — long-running sessions can persist their working
+  state (goal, phase, next step, tried approaches, artifact pointers) to a
+  per-session on-disk ledger via the new `session_ledger_read` /
+  `session_ledger_record` core MCP tools, instead of carrying it in the
+  context window. Monitor-loop cycles are prefixed with a compact snapshot of
+  the ledger, so a loop's per-cycle cost no longer grows with its history and
+  the state survives harness-side context compaction. The ledger lives under
+  the data home, is scoped to the calling session, and is removed when the
+  session's history is permanently deleted.
+  (docs/system-specs/features/session-work-ledger.md)
+
 ## [0.4.0] — 2026-08-21
 
 The dashboard became a place to work on code rather than only talk about it: real

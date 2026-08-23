@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict
 from typing import Any
@@ -27,6 +28,35 @@ logger = logging.getLogger(__name__)
 def render_nudge_message(message: str, stop_sentinel_path: str | None) -> str:
     """Replace {{STOP_FILE}} template with the resolved sentinel path."""
     return message.replace("{{STOP_FILE}}", stop_sentinel_path or "")
+
+
+async def compose_nudge_body(
+    message: str, stop_sentinel_path: str | None, slot_key: str | None
+) -> str:
+    """Compose one nudge cycle's full body text — the shared fire-path composer.
+
+    Applies :func:`render_nudge_message`'s template substitution and, when the
+    loop's session has a non-empty, non-terminal work ledger, prefixes a
+    compact snapshot of it so every cycle starts from the durable state
+    instead of from transcript memory. Derived server-side at fire time;
+    sessions without a ledger render exactly as before.
+
+    The ledger read is filesystem I/O, so it runs in a worker thread — a slow
+    or wedged filesystem costs this loop's snapshot, never the event loop.
+    Best-effort throughout: a snapshot failure must not cost the nudge itself.
+    """
+    body = render_nudge_message(message, stop_sentinel_path)
+    if slot_key:
+        try:
+            from kiro_crew.session_ledger import ledger_key, render_snapshot
+
+            snapshot = await asyncio.to_thread(render_snapshot, ledger_key(slot_key))
+        except Exception:
+            logger.debug("nudge: ledger snapshot failed for %s", slot_key, exc_info=True)
+            snapshot = ""
+        if snapshot:
+            return f"{snapshot}\n\n{body}"
+    return body
 
 
 def _serialize(loop: Any) -> dict:
