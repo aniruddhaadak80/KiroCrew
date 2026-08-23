@@ -176,6 +176,10 @@ interface Props {
   filePath: string
   content: string
   onContentChange: (c: string) => void
+  /** Disk-originated content (file watch, Refresh). Document tabs restamp
+   *  their saved baseline here so a re-open still treats the tab as clean;
+   *  omitted by other hosts, which fall back to onContentChange. */
+  onDiskContent?: (c: string) => void
   onSave: (filePath: string, content: string) => Promise<void>
   onClose: () => void
   liveWatch?: boolean
@@ -819,7 +823,7 @@ export interface MarkdownPanelHandle {
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle }: Props, ref) {
   const ime = useImeGuard()
   const qc = useQueryClient()
   // Code files (non-rich, non-markdown) have no meaningful preview — their
@@ -1133,7 +1137,10 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
 
   useFileWatch(
     liveWatch && !editing && !dirty ? filePath : null,
-    useCallback((c: string) => { onContentChange(c) }, [onContentChange]),
+    // A watch-fired change IS the disk truth, so route it through
+    // onDiskContent when the host can restamp its saved baseline; falling
+    // back to onContentChange keeps non-tab hosts unchanged.
+    useCallback((c: string) => { (onDiskContent ?? onContentChange)(c) }, [onDiskContent, onContentChange]),
   )
 
 
@@ -1173,10 +1180,16 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       if (onRefresh) { await onRefresh(filePath) }
       else {
         const res = await fetch(fileReadUrl(filePath))
-        if (res.ok) onContentChange(await res.text())
+        if (!res.ok) return
+        const text = await res.text()
+        // The read is async, and the dirty check above ran at click time:
+        // anything typed while it was in flight made the buffer dirty, and
+        // these disk bytes must not clobber that work.
+        if (dirtyRef.current) return
+        ;(onDiskContent ?? onContentChange)(text)
       }
     } finally { setRefreshing(false) }
-  }, [filePath, onContentChange, onRefresh, refreshing, dirty])
+  }, [filePath, onContentChange, onDiskContent, onRefresh, refreshing, dirty])
 
   // Discard pending edits (matches the artifact detail page's Cancel button).
   // Re-reads the file from disk into the buffer, clearing dirty. Confirms first
@@ -1194,12 +1207,16 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       if (onRefresh) { await onRefresh(filePath) }
       else {
         const res = await fetch(fileReadUrl(filePath))
-        if (res.ok) onContentChange(await res.text())
+        // Cancel means "match the disk", so the re-read moves the saved
+        // baseline too (onDiskContent), the same as Refresh — otherwise the
+        // stale baseline could later read a deliberate edit back to it as
+        // clean and let a close discard that work.
+        if (res.ok) (onDiskContent ?? onContentChange)(await res.text())
       }
       setDirty(false)
       if (canPreview) setEditing(false)
     } finally { setRefreshing(false) }
-  }, [dirty, filePath, onContentChange, onRefresh, canPreview, confirm])
+  }, [dirty, filePath, onContentChange, onDiskContent, onRefresh, canPreview, confirm])
 
   const resolveSelectionCoords = useCallback((fallbackText?: string) => {
     const sel = window.getSelection()

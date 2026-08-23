@@ -2979,12 +2979,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       body: JSON.stringify({ path: filePath, content }),
     })
     if (!res.ok) throw new Error(`Save failed: ${res.status}`)
+    // The saved bytes become the tab's dirty baseline, so a later re-open of
+    // the same path refreshes the buffer instead of (needlessly) preserving it
+    // as if it still held unsaved work. Best-effort: a tab that is not open
+    // right now is simply not found by id.
+    tabsCtl.patchTab(`file:${filePath}`, { savedContent: content })
     // Reconcile the inline-preview draft for the SAVING slot (drafts are
-    // slot+path keyed). Clear it ONLY if it still equals what we just saved —
+    // slot+path keyed). Clear it ONLY if it still equals what we just saved -
     // if the user typed more while the write was in flight, the draft now holds
     // newer content and must be preserved, not dropped.
     if (getInlineDraft(requestSlot, filePath) === content) clearInlineDraft(requestSlot, filePath)
-  }, [])
+  }, [tabsCtl])
 
   const takeScreenshot = useCallback(async () => {
     // Capture the slot at click-time. If the user switches away before the
@@ -4920,8 +4925,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     coldFileResults.forEach((r, i) => {
       const t = coldFileTabs[i]
       if (!t || t.content !== undefined) return
-      if (r.data) tabsCtl.patchTab(t.id, { content: r.data.text })
-      else if (r.isError) tabsCtl.patchTab(t.id, { content: i18nT('pages.chatPage.error_reading_file') })
+      if (r.data) tabsCtl.patchTab(t.id, { content: r.data.text, savedContent: r.data.text })
+      else if (r.isError) {
+        // The placeholder is not user work: stamp it as its own baseline so
+        // the tab counts clean and the next chip/tree click retries the read
+        // instead of "protecting" the error text as unsaved edits.
+        const errText = i18nT('pages.chatPage.error_reading_file')
+        tabsCtl.patchTab(t.id, { content: errText, savedContent: errText })
+      }
     })
   }, [coldFileResults, coldFileTabs, tabsCtl])
   // Session mode of the active slot. In the unified chat view the page-level

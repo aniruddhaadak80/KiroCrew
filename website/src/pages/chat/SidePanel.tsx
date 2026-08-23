@@ -756,6 +756,7 @@ export default function SidePanel({
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
+                onDiskContent={(c) => patchTab(t.id, { content: c, savedContent: c })}
                 onDiffModeChange={(diffMode) => patchTab(t.id, { diffMode })}
                 onRevealConsumed={() => patchTab(t.id, { revealLine: undefined })}
                 onPathChange={(p) => patchTab(t.id, { path: p, title: p.replace(/\/+$/, '').split('/').pop() || p })}
@@ -840,10 +841,13 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
  * Rail visibility is a single app-wide preference; the rail only renders at
  * all when the chat has a project dir whose tree the backend serves.
  */
-function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFileSave, onFileOpen, onClose, onSubmitComments, onRevealConsumed }: {
+function FileTabBody({ tab, projectDir, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onClose, onSubmitComments, onRevealConsumed }: {
   tab: PanelTab
   projectDir?: string
   onContentChange: (c: string) => void
+  /** Disk-originated content (file watch / Refresh): the panel routes it here
+   *  so the tab's saved baseline moves with the buffer it just replaced. */
+  onDiskContent: (c: string) => void
   onDiffModeChange: (diffMode: boolean) => void
   onFileSave: (fp: string, c: string) => Promise<void>
   onFileOpen?: (p: string, opts?: { diffMode?: boolean; replaceId?: string; canReplace?: () => boolean }) => void
@@ -864,6 +868,8 @@ function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFil
       filePath={tab.path || ''}
       content={tab.content || ''}
       onContentChange={onContentChange}
+      onDiskContent={onDiskContent}
+      savedBaseline={tab.savedContent}
       initialDiffMode={tab.diffMode}
       onDiffModeChange={onDiffModeChange}
       onSave={onFileSave}
@@ -896,12 +902,15 @@ function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFil
   )
 }
 
-function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onSubmitComments, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
+function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onSubmitComments, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
   tab: PanelTab; active: boolean; slot: string
   /** The chat's project directory — the file-browser rail's tree root. */
   projectDir?: string
   onClose: () => void
   onContentChange: (c: string) => void
+  /** Disk-originated content (file watch / Refresh): restamps the tab's saved
+   *  baseline alongside the buffer, so a re-open still treats the tab clean. */
+  onDiskContent: (c: string) => void
   onDiffModeChange: (diffMode: boolean) => void
   /** Drop the tab's one-shot line-reveal target once the panel has acted on it. */
   onRevealConsumed: () => void
@@ -924,6 +933,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
         tab={tab}
         projectDir={projectDir}
         onContentChange={onContentChange}
+        onDiskContent={onDiskContent}
         onDiffModeChange={onDiffModeChange}
         onFileSave={onFileSave}
         onFileOpen={onFileOpen}
