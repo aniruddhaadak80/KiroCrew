@@ -1037,6 +1037,28 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
     )
 
 
+def _string_identifier(body: dict, field: str) -> tuple[str, web.Response | None]:
+    """Read one mutation identifier the dashboard's forms post.
+
+    The field must be a STRING before normalization: a truthy non-string
+    (array/object/number from a malformed client) used to reach ``.strip()``
+    and surface as HTTP 500 before any validation ran — past the point where
+    such a handler would already hold the config lock or have touched
+    persistence. Missing or blank keeps the handlers' existing required-field
+    responses untouched; only the TYPE contract is new, and its 400 carries a
+    stable machine-readable ``code``.
+    """
+    raw = body.get(field)
+    if raw is None:
+        raw = ""
+    if isinstance(raw, str):
+        return raw.strip(), None
+    return "", web.json_response(
+        {"error": f"{field} must be a string", "code": f"mcp.{field}_not_string"},
+        status=400,
+    )
+
+
 async def api_mcp_toggle(request: web.Request) -> web.Response:
     """POST /api/mcp/toggle — enable or disable an MCP server globally.
 
@@ -1047,7 +1069,9 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    name = body.get("name", "").strip()
+    name, err = _string_identifier(body, "name")
+    if err is not None:
+        return err
     enabled = body.get("enabled", True)
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
@@ -1111,8 +1135,12 @@ async def api_mcp_toggle_tool(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    server = body.get("server", "").strip()
-    tool = body.get("tool", "").strip()
+    server, err = _string_identifier(body, "server")
+    if err is not None:
+        return err
+    tool, err = _string_identifier(body, "tool")
+    if err is not None:
+        return err
     enabled = body.get("enabled", True)
     if not server or not tool:
         return web.json_response({"error": "server and tool are required"}, status=400)
@@ -1219,7 +1247,9 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    name = body.get("name", "").strip()
+    name, err = _string_identifier(body, "name")
+    if err is not None:
+        return err
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
 
