@@ -77,15 +77,35 @@ def _mgr(request: web.Request) -> ChannelManager:
     return mgr
 
 
+async def _parse_object_body(request: web.Request) -> dict:
+    """Parse the request body as a JSON OBJECT, or raise HTTPBadRequest.
+
+    Every Channels write handler routes through here so the input contract is
+    one shape: valid JSON that is not an object (array/string/number/null)
+    reaches ``.get(...)`` otherwise and surfaces as HTTP 500. Other dashboard
+    handlers already reject this class with a 400.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text='{"error":"invalid JSON"}', content_type="application/json")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(
+            text=json.dumps({
+                "error": "body must be a JSON object",
+                "code": "channels.body_not_object",
+            }),
+            content_type="application/json",
+        )
+    return body
+
+
 async def _get_channel_body(request: web.Request):
     """Get channel + parsed JSON body, or raise web.HTTPException."""
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         raise web.HTTPNotFound(text='{"error":"not found"}', content_type="application/json")
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(text='{"error":"invalid JSON"}', content_type="application/json")
+    body = await _parse_object_body(request)
     return ch, body
 
 
@@ -157,13 +177,32 @@ async def api_channel_get(request: web.Request) -> web.Response:
 
 
 async def api_channel_create(request: web.Request) -> web.Response:
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    topic = body.get("topic", "").strip()[:500]
+    # Validate EVERYTHING before the first mutation: ChannelManager.create adds
+    # the channel and broadcasts channel_created, so an agents payload that
+    # failed validation AFTER that point had already published a half-built
+    # channel and then answered 500.
+    body = await _parse_object_body(request)
+    topic_raw = body.get("topic", "")
+    if not isinstance(topic_raw, str):
+        return web.json_response({"error": "topic must be a string"}, status=400)
+    topic = topic_raw.strip()[:500]
     if not topic:
         return web.json_response({"error": "topic required"}, status=400)
+
+    agents_def = body.get("agents", [])
+    if not isinstance(agents_def, list) or not all(isinstance(a, dict) for a in agents_def):
+        return web.json_response({"error": "agents must be a list of objects"}, status=400)
+    # Every field add_agent dereferences must be type- and value-safe BEFORE
+    # the channel exists: ApprovalPolicy(...) raises on an unknown policy, so
+    # an unvalidated "approval" here would publish the channel and then 500.
+    allowed_policies = {"all", "writes", "trusted"}
+    for a in agents_def:
+        approval = a.get("approval", "writes")
+        if not isinstance(approval, str) or approval not in allowed_policies:
+            return web.json_response(
+                {"error": f"agent approval must be one of {sorted(allowed_policies)}"},
+                status=400,
+            )
 
     ch = _mgr(request).create(topic)
     if not ch:
@@ -175,7 +214,6 @@ async def api_channel_create(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
 
     # Spawn agents from preset
-    agents_def = body.get("agents", [])
     has_orchestrator = any(a.get("is_orchestrator") for a in agents_def)
     if not has_orchestrator:
         agents_def = [
@@ -316,10 +354,7 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
     agent = ch.members.get(request.match_info["aid"])
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body = await _parse_object_body(request)
     action = body.get("action", "rejected")  # approved|rejected|trust
     if action not in ("approved", "rejected", "trust"):
         return web.json_response({"error": "invalid action"}, status=400)
@@ -374,13 +409,13 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
 
     try:
-        body = await request.json()
-    except Exception:
+        body = await _parse_object_body(request)
+    except web.HTTPBadRequest:
         sel().log_api_access(
             caller="dashboard", operation="channel.clear_context",
             outcome="denied", source="dashboard", resources=ch.id,
         )
-        return web.json_response({"error": "invalid or missing request body"}, status=400)
+        raise
 
     scope = body.get("scope", "all")
     agent_id = body.get("agent_id")
