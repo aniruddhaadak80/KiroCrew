@@ -1416,12 +1416,12 @@ class TestEffectiveModelSection:
         assert "unreadable" in out
         assert issues == ["agent spec unreadable"]
         assert "(defers)" in out.split("default spec pin:", 1)[1].splitlines()[0]
-        # ... and explains the gap instead of accusing its own tier list of being
-        # stale. `effective` may still carry the value: the RESOLVER reads the
-        # spec through its own path, which follows the link, and hiding what will
-        # actually run would make the report lie. That resolver-side following is
-        # pre-existing and main-owned; noted as a follow-up, not changed here.
-        assert "refused to follow" in out
+        # ... and nothing else acts on it either: the resolver reads through
+        # the same hardened reader, so it refuses too -- `effective` carries no
+        # value from the refused spec, and there is no resolver-vs-report gap
+        # to explain.
+        assert "leaked-value" not in out
+        assert "refused to follow" not in out
         assert "out of date" not in out
 
     def test_an_absent_spec_is_not_reported_as_a_fault(self, capsys) -> None:
