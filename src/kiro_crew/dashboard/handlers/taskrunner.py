@@ -153,6 +153,7 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         spec_path = str(resolved)
 
     # Handle inline spec content
+    created_spec: Path | None = None
     if spec_path.startswith("__inline__:"):
         content = spec_path[len("__inline__:"):]
         if not content.strip():
@@ -162,6 +163,7 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         fpath = Path(work_dir) / fname
         fpath.parent.mkdir(parents=True, exist_ok=True)
         fpath.write_text(content, encoding="utf-8")
+        created_spec = fpath
         spec_path = str(fpath)
 
     try:
@@ -180,6 +182,19 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
             auto_approve=auto_approve,
         )
     except Exception as exc:
+        # The handler owns the temp file ONLY when it created it: a rejected
+        # start must not strand TASK_*.md orphans in the work dir, and an
+        # external spec the caller passed by path must never be deleted.
+        # Cleanup is best-effort — its failure must not replace the startup
+        # error the client is about to receive.
+        if created_spec is not None:
+            try:
+                created_spec.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "failed to remove inline spec %s after a rejected start",
+                    created_spec, exc_info=True,
+                )
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response({"ok": True, "spec": spec_path, "task_id": task_id})
 
