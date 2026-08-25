@@ -140,21 +140,32 @@ jobs:
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "Merged PRs in window: $COUNT"
 
-      # Issues FILED in the same window. Reuses the PR window verbatim, so the
+# Issues FILED in the same window. Reuses the PR window verbatim, so the
       # inbound side inherits the contiguity and at-least-once properties for
       # free: a failed run does not advance the window, and the next run
       # re-covers these issues too.
       #
       # WHY HERE AND NOT AS ITS OWN SLACK POST. The webhook is a channel-locked
       # Slack Workflow Builder webhook shared with this report (which is why
-      # SHIP_REPORT_LINK_STYLE is `plain` — that flavour renders <url|text>
+      # SHIP_REPORT_LINK_STYLE is `plain` -- that flavour renders <url|text>
       # literally). One post per issue would mean ~14 notifications a day into
       # the channel this twice-daily digest already owns, under a workflow named
       # for shipping. Riding the digest costs nothing and reads correctly.
       # The per-issue, reporter-facing half lives in issue-summary.yml as a
       # comment on the issue itself.
+      - name: Check if issues are enabled
+        id: check_issues
+        run: |
+          set -euo pipefail
+          HAS_ISSUES="$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)"
+          echo "has_issues=$HAS_ISSUES" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_ISSUES" = "false" ]; then
+            echo "Issues are disabled on this repository; skipping issue fetch."
+          fi
+
       - name: Fetch filed issues
         id: issues
+        if: steps.check_issues.outputs.has_issues == 'true'
         env:
           START: ${{ steps.window.outputs.start }}
           END: ${{ steps.window.outputs.end }}
@@ -179,6 +190,13 @@ jobs:
             echo "::warning::100+ issues in this window; the section lists a subset"
           fi
 
+      - name: Set zero issue count for disabled repos
+        if: steps.check_issues.outputs.has_issues == 'false'
+        run: |
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Issues filed in window: 0 (issues disabled)"
+        id: issues_disabled
+
       # Gated on EITHER half having content, not on PRs alone. The issue
       # narrative is a separate model call that needs these same credentials, so
       # a PR-only gate would silently skip them on an inbound-only window --
@@ -186,7 +204,7 @@ jobs:
       # promised narrative would always degrade to the fallback list.
       - name: Configure AWS credentials
         id: creds
-        if: (steps.fetch.outputs.count != '0' || steps.issues.outputs.count != '0') && env.HAS_BEDROCK
+        if: (steps.fetch.outputs.count != '0' || steps.issues.outputs.count != '0' || steps.issues_disabled.outputs.count != '0') && env.HAS_BEDROCK
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -507,13 +525,13 @@ jobs:
           fi
 
       - name: Deliver report
-        if: steps.fetch.outputs.count != '0' || steps.issues.outputs.count != '0'
+        if: steps.fetch.outputs.count != '0' || (steps.issues.outputs.count != '' && steps.issues.outputs.count != '0')
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           START: ${{ steps.window.outputs.start }}
           END: ${{ steps.window.outputs.end }}
           COUNT: ${{ steps.fetch.outputs.count }}
-          ICOUNT: ${{ steps.issues.outputs.count }}
+          ICOUNT: ${{ steps.issues.outputs.count != '' && steps.issues.outputs.count || steps.issues_disabled.outputs.count }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || '' }}
         run: |
           set -euo pipefail
