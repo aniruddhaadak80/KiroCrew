@@ -7862,19 +7862,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 // text so it no longer matches, leave text alone — the chip
                 // still un-highlights for consistency).
                 if (followUpPickedRef.current.has(o)) {
+                  const pickedSuffix = Array.from(followUpPickedRef.current).join(', ')
                   const next = new Set(followUpPickedRef.current); next.delete(o)
+                  const remainingSuffix = Array.from(next).join(', ')
                   followUpPickedRef.current = next
                   setInput(prev => {
-                    // Order matters: try leading ", o" first so "opt, opt" + remove
-                    // last "opt" doesn't match "opt, " and splice the wrong one.
-                    const leading = ', ' + o
-                    let idx = prev.indexOf(leading)
-                    if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + leading.length)
-                    const trailing = o + ', '
-                    idx = prev.indexOf(trailing)
-                    if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + trailing.length)
-                    if (prev === o) return ''
-                    return prev  // user edited — leave text, still unmark below
+                    // Options are appended as one ordered suffix. Remove only
+                    // from that complete generated structure: searching for a
+                    // last occurrence still corrupts an earlier ", Go" if the
+                    // user has already deleted the appended ", Go" by hand.
+                    if (prev === pickedSuffix) return remainingSuffix
+                    const delimitedSuffix = ', ' + pickedSuffix
+                    if (!prev.endsWith(delimitedSuffix)) return prev
+                    const draft = prev.slice(0, -delimitedSuffix.length)
+                    return remainingSuffix ? draft + ', ' + remainingSuffix : draft
                   })
                   setFollowUpPicked(next)
                 } else {
