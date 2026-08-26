@@ -1570,6 +1570,8 @@ class TestHealthCheckLoop:
     def _instant(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(bmod, "_HEALTH_CHECK_INTERVAL", 0)
         monkeypatch.setattr(bmod, "_HEALTH_CHECK_RETRIES", 2)
+        monkeypatch.setattr(bmod, "_LIVENESS_RECHECK_INTERVAL", 0)
+        monkeypatch.setattr(bmod, "_LIVENESS_MAX_CONSECUTIVE_FAILURES", 2)
 
     def test_an_error_status_is_retried_and_then_scrubbed(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1616,6 +1618,105 @@ class TestHealthCheckLoop:
             bmod._processes["racy"] = AppProcess(app_name="racy", port=9135)
         bmod._health_check_loop("racy", 9135, "/health")
         assert gate == []
+
+
+# ---------------------------------------------------------------------------
+# Liveness re-check (periodic monitoring after startup)
+# ---------------------------------------------------------------------------
+
+
+class TestLivenessRecheck:
+    """After the startup health check passes, the loop continues periodic liveness
+    re-checks and demotes backends that become unhealthy."""
+
+    def _setup_liveness(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(bmod, "_HEALTH_CHECK_INTERVAL", 0)
+        monkeypatch.setattr(bmod, "_HEALTH_CHECK_RETRIES", 2)
+        monkeypatch.setattr(bmod, "_LIVENESS_RECHECK_INTERVAL", 0)
+        monkeypatch.setattr(bmod, "_LIVENESS_MAX_CONSECUTIVE_FAILURES", 2)
+
+    def test_process_exit_demotes_unhealthy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A spawned process that exits is immediately marked unhealthy."""
+        self._setup_liveness(monkeypatch)
+        gate: list[tuple[str, int, bool]] = []
+        monkeypatch.setattr(
+            bmod, "_gate_mcp_registration",
+            lambda name, port, *, healthy: gate.append((name, port, healthy)),
+        )
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *a, **k: _FakeResp(200))
+
+        fake_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        with bmod._lock:
+            bmod._processes["dying"] = AppProcess(
+                app_name="dying", port=9140, pid=fake_proc.pid, proc=fake_proc, healthy=True,
+            )
+        try:
+            # Kill the process so proc.poll() returns a non-None value.
+            fake_proc.kill()
+            fake_proc.wait()
+            bmod._health_check_loop("dying", 9140, "/health")
+            assert bmod._processes["dying"].healthy is False
+            # Startup phase registered (True), then liveness phase demoted (False).
+            assert ("dying", 9140, True) in gate
+            assert ("dying", 9140, False) in gate
+        finally:
+            with bmod._lock:
+                bmod._processes.clear()
+
+    def test_consecutive_http_failures_demote_unhealthy(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A live process whose health endpoint fails N consecutive times is demoted."""
+        self._setup_liveness(monkeypatch)
+        gate: list[tuple[str, int, bool]] = []
+        monkeypatch.setattr(
+            bmod, "_gate_mcp_registration",
+            lambda name, port, *, healthy: gate.append((name, port, healthy)),
+        )
+
+        call_count = {"n": 0}
+
+        def _phase_aware_urlopen(*_a: Any, **_k: Any) -> Any:
+            call_count["n"] += 1
+            # First 2 calls succeed (startup phase), then fail (liveness phase).
+            if call_count["n"] <= 2:
+                return _FakeResp(200)
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", _phase_aware_urlopen)
+        with bmod._lock:
+            bmod._processes["flaky"] = AppProcess(
+                app_name="flaky", port=9141, healthy=True,
+            )
+        try:
+            bmod._health_check_loop("flaky", 9141, "/health")
+            assert bmod._processes["flaky"].healthy is False
+            # Startup registered (True), liveness demoted (False).
+            assert ("flaky", 9141, True) in gate
+            assert ("flaky", 9141, False) in gate
+        finally:
+            with bmod._lock:
+                bmod._processes.clear()
+
+    def test_liveness_exits_when_process_removed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The liveness loop exits cleanly when the app is removed from _processes."""
+        self._setup_liveness(monkeypatch)
+        gate: list[tuple[str, int, bool]] = []
+        monkeypatch.setattr(
+            bmod, "_gate_mcp_registration",
+            lambda name, port, *, healthy: gate.append((name, port, healthy)),
+        )
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *a, **k: _FakeResp(200))
+
+        with bmod._lock:
+            bmod._processes["ephemeral"] = AppProcess(
+                app_name="ephemeral", port=9142, healthy=True,
+            )
+        # Remove before calling — the loop should exit without touching MCP.
+        with bmod._lock:
+            bmod._processes.clear()
+        bmod._health_check_loop("ephemeral", 9142, "/health")
+        assert gate == []  # no registration or demotion — process was already gone
 
 
 # ---------------------------------------------------------------------------

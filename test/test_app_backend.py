@@ -1360,11 +1360,14 @@ class TestHealthGatedMcpRegistration:
     a dead-URL entry (the kiro-cli outage shape)."""
 
     def _fast_health(self, bmod, monkeypatch):
-        # Make the loop iterate instantly.
+        # Make the loop iterate instantly (startup + liveness phases).
         monkeypatch.setattr(bmod, "_HEALTH_CHECK_INTERVAL", 0)
         monkeypatch.setattr(bmod, "_HEALTH_CHECK_RETRIES", 3)
+        monkeypatch.setattr(bmod, "_LIVENESS_RECHECK_INTERVAL", 0)
+        monkeypatch.setattr(bmod, "_LIVENESS_MAX_CONSECUTIVE_FAILURES", 2)
 
     def test_registers_when_healthy_and_still_tracked(self, monkeypatch):
+        import threading
         import kiro_crew.apps.backend as bmod
         self._fast_health(bmod, monkeypatch)
         calls = []
@@ -1375,13 +1378,21 @@ class TestHealthGatedMcpRegistration:
 
         with bmod._lock:
             bmod._processes["hg-app"] = AppProcess(app_name="hg-app", port=9150, healthy=False)
-        try:
-            bmod._health_check_loop("hg-app", 9150, "/health")
-            assert calls == [("hg-app", 9150, True)]  # registered exactly once, healthy
-            assert bmod._processes["hg-app"].healthy is True
-        finally:
-            with bmod._lock:
-                bmod._processes.clear()
+        t = threading.Thread(
+            target=bmod._health_check_loop, args=("hg-app", 9150, "/health"), daemon=True,
+        )
+        t.start()
+        # Wait for the startup health check to mark the backend healthy.
+        for _ in range(100):
+            if bmod._processes.get("hg-app", AppProcess()).healthy:
+                break
+            time.sleep(0.01)
+        assert calls == [("hg-app", 9150, True)]  # registered exactly once, healthy
+        assert bmod._processes["hg-app"].healthy is True
+        # Remove the entry so the liveness re-check loop exits.
+        with bmod._lock:
+            bmod._processes.clear()
+        t.join(timeout=2)
 
     def test_does_not_register_if_stopped_mid_healthcheck(self, monkeypatch):
         # review-bot race finding: app removed from _processes between the poll and the lock →

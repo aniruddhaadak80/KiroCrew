@@ -51,6 +51,12 @@ _MAX_PORT = 9200
 _HEALTH_CHECK_TIMEOUT = 5
 _HEALTH_CHECK_RETRIES = 15
 _HEALTH_CHECK_INTERVAL = 2.0
+# Liveness re-check: continues polling after the initial startup health check passes.
+# A backend that becomes unhealthy after startup is demoted (healthy=False) so the
+# reverse proxy stops routing to it. Consecutive failures avoid false demotion on a
+# single slow response.
+_LIVENESS_RECHECK_INTERVAL = 30.0
+_LIVENESS_MAX_CONSECUTIVE_FAILURES = 3
 
 # Spawn survival check: poll the freshly-spawned child over a short grace window to
 # confirm it survived its initial bind (an immediate exit -> EADDRINUSE crash-loop must
@@ -1448,8 +1454,17 @@ def _gate_mcp_registration(app_name: str, port: int, *, healthy: bool) -> None:
 
 
 def _health_check_loop(app_name: str, port: int, health_path: str) -> None:
-    """Poll the health endpoint until it responds or we give up."""
+    """Poll the health endpoint until it responds or we give up.
+
+    After the startup health check succeeds, continues periodic liveness
+    re-checks at ``_LIVENESS_RECHECK_INTERVAL``.  If the backend process
+    exits or the health endpoint fails ``_LIVENESS_MAX_CONSECUTIVE_FAILURES``
+    consecutive times, the backend is marked unhealthy (``healthy=False``) so
+    the reverse proxy stops routing to it, and MCP entries are scrubbed.
+    """
     url = f"http://127.0.0.1:{port}{health_path}"
+
+    # --- Phase 1: startup health check (existing behaviour) ------------------
     for attempt in range(_HEALTH_CHECK_RETRIES):
         time.sleep(_HEALTH_CHECK_INTERVAL)
         with _lock:
@@ -1476,17 +1491,64 @@ def _health_check_loop(app_name: str, port: int, health_path: str) -> None:
                     # global mcp.json. Registering before this could leave a dead-but-enabled
                     # url for an app whose backend never became healthy — the kiro-cli outage.
                     _gate_mcp_registration(app_name, port, healthy=True)
-                    return
+                    break  # proceed to liveness monitoring
+        except (urllib.error.URLError, OSError):
+            pass
+    else:
+        # All startup retries exhausted without a healthy response.
+        logger.warning(
+            "App %s backend failed health check after %d attempts",
+            app_name, _HEALTH_CHECK_RETRIES,
+        )
+        _gate_mcp_registration(app_name, port, healthy=False)
+        return
+
+    # --- Phase 2: liveness re-check (continues until the backend is gone) ----
+    consecutive_liveness_failures = 0
+    while True:
+        time.sleep(_LIVENESS_RECHECK_INTERVAL)
+        with _lock:
+            if app_name not in _processes:
+                return  # stopped or re-spawned — this thread's job is done
+
+        # Fast path: a spawned process that has exited cannot recover.
+        with _lock:
+            ap = _processes.get(app_name)
+        if ap is not None and ap.proc is not None and ap.proc.poll() is not None:
+            logger.warning(
+                "App %s backend process exited (rc=%s) — marking unhealthy",
+                app_name, ap.proc.returncode,
+            )
+            with _lock:
+                cur = _processes.get(app_name)
+                if cur is not None:
+                    cur.healthy = False
+            _gate_mcp_registration(app_name, port, healthy=False)
+            return
+
+        # HTTP health probe.
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=_HEALTH_CHECK_TIMEOUT) as resp:
+                if resp.status < 400:
+                    consecutive_liveness_failures = 0
+                    continue
         except (urllib.error.URLError, OSError):
             pass
 
-    logger.warning(
-        "App %s backend failed health check after %d attempts",
-        app_name, _HEALTH_CHECK_RETRIES,
-    )
-    # Backend never became healthy: scrub any optimistic/stale MCP entry so kiro-cli does
-    # not keep dialing a dead port on every session (the reverted-outage shape).
-    _gate_mcp_registration(app_name, port, healthy=False)
+        consecutive_liveness_failures += 1
+        if consecutive_liveness_failures >= _LIVENESS_MAX_CONSECUTIVE_FAILURES:
+            logger.warning(
+                "App %s backend failed liveness re-check %d consecutive times "
+                "(port %d) — marking unhealthy",
+                app_name, consecutive_liveness_failures, port,
+            )
+            with _lock:
+                cur = _processes.get(app_name)
+                if cur is not None:
+                    cur.healthy = False
+            _gate_mcp_registration(app_name, port, healthy=False)
+            return
 
 
 # ---------------------------------------------------------------------------
