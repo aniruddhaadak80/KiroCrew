@@ -6,6 +6,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import web
 
 from kiro_crew.dashboard.handlers_channel import api_channel_clear_context
 
@@ -136,9 +137,10 @@ class TestChannelClearContext:
             "kiro_crew.dashboard.handlers_channel._mgr",
             return_value=MagicMock(get=MagicMock(return_value=ch)),
         ):
-            resp = await api_channel_clear_context(request)
-
-        assert resp.status == 400
+            # The handler now RAISES the 400 (aiohttp turns it into the
+            # response) instead of returning it — same wire result.
+            with pytest.raises(web.HTTPBadRequest):
+                await api_channel_clear_context(request)
 
     @pytest.mark.asyncio
     async def test_returns_400_when_scope_agent_but_no_agent_id(self):
