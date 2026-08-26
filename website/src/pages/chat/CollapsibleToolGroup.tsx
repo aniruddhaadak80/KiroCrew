@@ -4,6 +4,8 @@ import { sanitizeLlmOutput } from '../../utils/sanitize'
 import { purposeFromToolArgs } from '../../utils/toolPurpose'
 import { ToolInputText } from '../../components/ToolInputText'
 import { useRowDisclosure } from './rowDisclosure'
+import ErrorNotice from '../../components/ErrorNotice'
+import { ApiError } from '../../api/client'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
@@ -64,12 +66,14 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
   const userToggled = useRef(false)
   const [submitting, setSubmitting] = useState(false)
   const [localResolved, setLocalResolved] = useState<string | null>(null)
+  const [failure, setFailure] = useState<{ terminal: boolean; message: string; attempted: string } | null>(null)
+  const buttonsRef = useRef<HTMLDivElement | null>(null)
   const needsAttention = !!hasPermission && !localResolved
 
   useEffect(() => { if (!userToggled.current) setExpanded(!!autoExpand) }, [autoExpand, setExpanded])
 
   // Reset approval state when permission props change (new approval arrives)
-  useEffect(() => { setLocalResolved(null); setSubmitting(false) }, [hasPermission, pendingPermCount])
+  useEffect(() => { setLocalResolved(null); setSubmitting(false); setFailure(null) }, [hasPermission, pendingPermCount])
 
   // Auto-collapse when tools finish running (unless user manually toggled)
   const wasRunning = useRef(false)
@@ -98,8 +102,11 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
   const truncated = preview.length > 150 ? preview.slice(0, 150) + '…' : preview
 
   // Dispatch an approval decision, optimistically reflecting it locally and rolling
-  // back on failure. Logs failures for diagnostics via the error console.
+  // back on failure. Failure state mirrors ApprovalCard: `terminal` marks a
+  // refusal that retrying can never clear; `message` carries the server's own
+  // refusal text (empty = transport failure).
   const submitDecision = (decision: string) => {
+    setFailure(null)
     setSubmitting(true)
     setLocalResolved(decision)
     void Promise.resolve()
@@ -110,8 +117,29 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
         console.error('Approval failed:', err)
         setLocalResolved(null)
         setSubmitting(false)
+        const refusal = err instanceof ApiError ? err : null
+        const gone = !!refusal && !refusal.authRequired
+          && (refusal.status === 404 || (refusal.status === 400 && refusal.message === 'no pending approval'))
+        setFailure({
+          terminal: gone,
+          message: refusal?.message ?? '',
+          attempted: decision,
+        })
       })
   }
+
+  // Restore focus to the button matching the failed decision — never a
+  // different one, so a keyboard user retrying a failed Reject with Enter
+  // does not silently approve the command instead.
+  useEffect(() => {
+    if (!failure || failure.terminal) return
+    const buttons = Array.from(buttonsRef.current?.querySelectorAll('button') ?? [])
+    if (!buttons.length) return
+    const target = failure.attempted === 'approved' ? buttons[0]
+      : failure.attempted === 'rejected' ? buttons[buttons.length - 1]
+        : buttons.length > 2 ? buttons[1] : buttons[0]
+    target.focus()
+  }, [failure])
 
   return (
     <div className="my-1">
@@ -149,11 +177,19 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
         </div>
       )}
       {needsAttention && onApprove && (
-        <div className="mt-1 ml-4 pl-3 flex gap-2 flex-wrap">
+        <div ref={buttonsRef} className="mt-1 ml-4 pl-3 flex gap-2 flex-wrap">
           <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('approved') }}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.approve')}</button>
           {canTrust && <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('trust') }}><Handshake className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.trust')}</button>}
           <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-danger hover:border-danger transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('rejected') }}><Ban className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.reject')}</button>
         </div>
+      )}
+
+      {failure !== null && (
+        <ErrorNotice variant="inline" className="mt-1 ml-4 pl-3" message={failure.terminal
+          ? i18nT('components.approvalCard.approval_no_longer_pending')
+          : failure.message
+            ? i18nT('components.approvalCard.decision_not_recorded_error', { error: failure.message })
+            : i18nT('components.approvalCard.decision_failed')} />
       )}
 
       {expanded && <div className="mt-1 ml-4 pl-3 shadow-[inset_2px_0_0_0_var(--border)] forced-colors:border-l-2 flex flex-col gap-1">
