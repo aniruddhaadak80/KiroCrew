@@ -203,6 +203,7 @@ class CronSDK:
         persistent_session: bool,
         silent: bool,
         enabled: bool,
+        timezone: str = "",
     ) -> dict[str, Any]:
         """Build the kwargs common to the sync/async ``CronService.add_job``.
 
@@ -224,6 +225,7 @@ class CronSDK:
             silent=silent,
             enabled=enabled,
             created_by=self._owner_prefix,
+            timezone=timezone,
         )
 
     # ── Create ──
@@ -243,6 +245,7 @@ class CronSDK:
         persistent_session: bool = True,
         silent: bool = False,
         enabled: bool = True,
+        timezone: str = "",
     ) -> Any:
         """Create a cron job owned by this app. **Synchronous** (preserves the
         published SDK contract). See :meth:`add_job_async` for the loop-native
@@ -258,7 +261,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled,
+                enabled=enabled, timezone=timezone,
             ),
         )
         self._audit_add(job)
@@ -279,6 +282,7 @@ class CronSDK:
         persistent_session: bool = True,
         silent: bool = False,
         enabled: bool = True,
+        timezone: str = "",
     ) -> Any:
         """Event-loop-native :meth:`add_job`: routes through
         ``CronService.add_job_async`` (bounded store-lock spin offloaded to a
@@ -292,7 +296,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled,
+                enabled=enabled, timezone=timezone,
             ),
         )
         self._audit_add(job)
@@ -313,6 +317,7 @@ class CronSDK:
         persistent_session: bool = True,
         silent: bool = False,
         enabled: bool = True,
+        timezone: str = "",
     ) -> Any:
         """Atomic add-if-absent by job name; returns None when already present.
 
@@ -330,7 +335,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled,
+                enabled=enabled, timezone=timezone,
             ),
         )
         if job is not None:

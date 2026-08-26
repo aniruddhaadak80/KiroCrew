@@ -51,6 +51,7 @@ class MockCronJob:
     user_paused: bool = False
     every_secs: int | None = None
     cron_expr: str | None = None
+    timezone: str = ""
 
 
 class MockCronService:
@@ -223,6 +224,33 @@ class TestCronJobCreation:
 
         assert job.enabled is True
         assert getattr(job, "user_paused", False) is False
+
+    def test_add_job_passes_timezone(self) -> None:
+        """timezone is threaded through add_job to the cron service."""
+        svc = MockCronService()
+        sdk = CronSDK("my-app", svc)
+
+        job = _run(sdk.add_job(
+            name="daily",
+            message="run daily",
+            cron_expr="0 6 * * *",
+            timezone="America/Los_Angeles",
+        ))
+
+        assert job.timezone == "America/Los_Angeles"
+
+    def test_add_job_defaults_timezone_empty(self) -> None:
+        """When no timezone is given, the job gets the empty string (UTC fallback)."""
+        svc = MockCronService()
+        sdk = CronSDK("my-app", svc)
+
+        job = _run(sdk.add_job(
+            name="daily",
+            message="run daily",
+            cron_expr="0 6 * * *",
+        ))
+
+        assert job.timezone == ""
 
     def test_paused_at_registration_job_can_be_resumed(self) -> None:
         """A job registered disabled can be re-enabled (resumed) via update_job."""
