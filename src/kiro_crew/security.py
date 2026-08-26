@@ -5354,6 +5354,12 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
     "apps/ops-mission-control/data/rotation.yaml",
     "apps/ops-mission-control/data/incidents/index.json",
     "connections-tool-aliases.json",
+    # config.json / config.local.json: security-relevant resource ceilings.
+    # Paired with the same leaves in _WRITE_PROTECTED_HOME_PATHS so the
+    # file-edit and shell paths agree — a leaf on only one of the two is
+    # reachable through the other.
+    "config.json",
+    "config.local.json",
     # The browse launch config (browser_cli/launch.py), paired with the same leaf
     # in _WRITE_PROTECTED_HOME_PATHS so the file-edit and shell paths agree — a
     # leaf on only one of the two is reachable through the other.
