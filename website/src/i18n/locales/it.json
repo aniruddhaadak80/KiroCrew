@@ -1749,7 +1749,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "non è stato possibile avviare",
-          "resume": "Riprendi"
+          "resume": "Riprendi",
+          "reinvestigate": "Reindaga",
+          "reinvestigate_confirm": "Questa indagine ha già un verdetto. Riavviandola verrà sovrascritto. Continuare?"
         },
         "aiSummaryCard": {
           "ai_summary": "Riepilogo IA",

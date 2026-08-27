@@ -6,7 +6,10 @@ import { i18nT } from '../../../i18n/t'
  * identical in every respect except their icon and labels, so the markup lives
  * here once. Reflects the item's saved record:
  *   * no record   → the primary label ("Investigate" / "Review")
- *   * has session → "Resume" + a status pill (in-progress / done + verdict)
+ *   * has session, unresolved → "Resume" + a status pill
+ *   * has session, resolved   → "Re-investigate" + a status pill (a re-run
+ *     replaces the verdict already on the record, so the action is gated on a
+ *     window.confirm prompt before calling onClick)
  * The owning component supplies the click handler and busy/error state. */
 export default function AgentSessionButton({
   icon: Icon, label, record, busy, error, onClick,
@@ -42,10 +45,25 @@ export default function AgentSessionButton({
   const verdict = record?.findings?.verdict
   const summary = record?.findings?.summary
 
+  const handleClick = () => {
+    // A resolved record already has a verdict on it; re-running overwrites
+    // it. Make the user confirm before that happens — the "Resume" affordance
+    // is for picking up a paused/in-progress session, not silently re-doing
+    // finished work. The label above (Re-investigate) is the visible signal;
+    // the confirm prompt is the deliberate-action gate.
+    if (resolved) {
+      const ok = window.confirm(
+        i18nT('apps.issueRadar.components.agentSessionButton.reinvestigate_confirm'),
+      )
+      if (!ok) return
+    }
+    onClick()
+  }
+
   return (
     <span className="inline-flex items-center gap-1.5">
       <button
-        onClick={onClick}
+        onClick={handleClick}
         disabled={busy || disabled}
         title={hasSession ? resumeHint : startHint}
         className={
@@ -61,7 +79,11 @@ export default function AgentSessionButton({
         {busy
           ? <Loader2 size={13} className="animate-spin" />
           : <Icon size={13} />}
-        {hasSession ? i18nT('apps.issueRadar.components.agentSessionButton.resume') : label}
+        {resolved
+          ? i18nT('apps.issueRadar.components.agentSessionButton.reinvestigate')
+          : hasSession
+            ? i18nT('apps.issueRadar.components.agentSessionButton.resume')
+            : label}
       </button>
 
       {showStatus && record && (

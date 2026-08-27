@@ -1721,7 +1721,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "開始できませんでした",
-          "resume": "再開"
+          "resume": "再開",
+          "reinvestigate": "再調査",
+          "reinvestigate_confirm": "この調査にはすでに結論があります。再実行すると上書きされます。続行しますか？"
         },
         "aiSummaryCard": {
           "ai_summary": "AI要約",

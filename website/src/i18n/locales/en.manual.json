@@ -307,6 +307,8 @@
       },
       "components": {
         "agentSessionButton": {
+          "reinvestigate": "Re-investigate",
+          "reinvestigate_confirm": "This investigation already has a verdict. Re-running will overwrite it. Continue?",
           "resume": "Resume"
         },
         "aiSummaryCard": {

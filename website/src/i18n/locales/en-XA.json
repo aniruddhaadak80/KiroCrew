@@ -1741,7 +1741,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "[çøùĺðñ'ţ şţàŕţ ·············]",
-          "resume": "[Ŕèşùɱè ·········]"
+          "resume": "[Ŕèşùɱè ·········]",
+          "reinvestigate": "Re-investigate",
+          "reinvestigate_confirm": "This investigation already has a verdict. Re-running will overwrite it. Continue?"
         },
         "aiSummaryCard": {
           "ai_summary": "[ÀÌ şùɱɱàŕý ···············]",

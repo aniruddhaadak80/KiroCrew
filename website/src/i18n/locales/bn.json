@@ -1713,7 +1713,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "শুরু করা যায়নি",
-          "resume": "আবার শুরু করো"
+          "resume": "আবার শুরু করো",
+          "reinvestigate": "পুনঃ তদন্ত",
+          "reinvestigate_confirm": "এই তদন্তের ইতিমধ্যে একটি রায় রয়েছে। পুনঃ চালালে এটি প্রতিস্থাপিত হবে। চালিয়ে যেতে চান?"
         },
         "aiSummaryCard": {
           "ai_summary": "AI সারসংক্ষেপ",

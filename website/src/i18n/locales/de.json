@@ -1757,7 +1757,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "konnte nicht starten",
-          "resume": "Fortsetzen"
+          "resume": "Fortsetzen",
+          "reinvestigate": "Erneut untersuchen",
+          "reinvestigate_confirm": "Diese Untersuchung hat bereits ein Ergebnis. Ein erneuter Durchlauf überschreibt es. Fortfahren?"
         },
         "aiSummaryCard": {
           "ai_summary": "KI-Zusammenfassung",

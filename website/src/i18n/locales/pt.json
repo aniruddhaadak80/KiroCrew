@@ -1749,7 +1749,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "não foi possível iniciar",
-          "resume": "Retomar"
+          "resume": "Retomar",
+          "reinvestigate": "Reinvestigar",
+          "reinvestigate_confirm": "Esta investigação já tem um veredicto. Executá-la novamente irá sobrescrevê-lo. Continuar?"
         },
         "aiSummaryCard": {
           "ai_summary": "Resumo por IA",

@@ -1713,7 +1713,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "शुरू नहीं हो सका",
-          "resume": "फिर शुरू करें"
+          "resume": "फिर शुरू करें",
+          "reinvestigate": "पुनः जाँच",
+          "reinvestigate_confirm": "इस जाँच का पहले से एक निर्णय है। पुनः चलाने पर यह अधिलेखित हो जाएगा। जारी रखें?"
         },
         "aiSummaryCard": {
           "ai_summary": "AI सारांश",

@@ -119,4 +119,39 @@ describe('InvestigateButton', () => {
     await userEvent.click(button)
     await waitFor(() => expect(investigate).toHaveBeenCalledWith(REF, ISSUE, existing))
   })
+
+  it('shows Re-investigate (not Resume) for a resolved record', async () => {
+    const resolved = { slot_key: 'zzq-existing', status: 'resolved', findings: { verdict: 'zzq-verdict' } }
+    api.getInvestigation.mockResolvedValue({
+      owner: REF.owner, repo: REF.repo, number: ISSUE.number, investigation: resolved,
+    })
+    renderButton()
+
+    // Resolved records must not advertise a plain Resume affordance — the
+    // verdict already on the record would be silently replaced if the user
+    // clicked that.
+    const button = await screen.findByRole('button', { name: /Re-investigate/ })
+    expect(button).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Resume$/ })).not.toBeInTheDocument()
+  })
+
+  it('requires a confirm prompt before re-investigating a resolved record', async () => {
+    const resolved = { slot_key: 'zzq-existing', status: 'resolved', findings: { verdict: 'zzq-verdict' } }
+    api.getInvestigation.mockResolvedValue({
+      owner: REF.owner, repo: REF.repo, number: ISSUE.number, investigation: resolved,
+    })
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    renderButton()
+
+    const button = await screen.findByRole('button', { name: /Re-investigate/ })
+    await userEvent.click(button)
+    // The user said no — nothing should be investigated.
+    expect(investigate).not.toHaveBeenCalled()
+    expect(confirmSpy).toHaveBeenCalled()
+
+    confirmSpy.mockReturnValue(true)
+    investigate.mockResolvedValue(resolved)
+    await userEvent.click(button)
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith(REF, ISSUE, resolved))
+  })
 })

@@ -1785,7 +1785,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "не удалось запустить",
-          "resume": "Продолжить"
+          "resume": "Продолжить",
+          "reinvestigate": "Пересмотреть",
+          "reinvestigate_confirm": "У этого расследования уже есть вердикт. Повторный запуск перезапишет его. Продолжить?"
         },
         "aiSummaryCard": {
           "ai_summary": "ИИ-сводка",

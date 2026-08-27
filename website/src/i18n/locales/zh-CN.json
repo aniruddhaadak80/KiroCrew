@@ -1677,7 +1677,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "无法启动",
-          "resume": "恢复"
+          "resume": "恢复",
+          "reinvestigate": "重新调查",
+          "reinvestigate_confirm": "此调查已有结论。重新运行将覆盖该结论。是否继续？"
         },
         "aiSummaryCard": {
           "ai_summary": "AI 摘要",

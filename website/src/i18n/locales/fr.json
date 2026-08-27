@@ -1793,7 +1793,9 @@
       "components": {
         "agentSessionButton": {
           "couldn_t_start": "impossible à démarrer",
-          "resume": "Reprendre"
+          "resume": "Reprendre",
+          "reinvestigate": "Réexaminer",
+          "reinvestigate_confirm": "Cette enquête a déjà un verdict. La relancer l'écrasera. Continuer ?"
         },
         "aiSummaryCard": {
           "ai_summary": "Résumé IA",
