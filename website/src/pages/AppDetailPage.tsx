@@ -6,6 +6,7 @@
  * Shows full description, features, screenshots, tags, and action buttons.
  */
 import { useEffect, useState, useCallback, useRef } from 'react'
+import { useReducedMotion } from 'framer-motion'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   ArrowLeft, Download, Check, Loader2, Power, PowerOff,
@@ -21,6 +22,7 @@ import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate }
 import { isRegistrySourced } from '../components/appstore/types'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
+import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
 import AskAgentButton from '../components/AskAgentButton'
 
 import { i18nT } from '../i18n/t'
@@ -157,6 +159,17 @@ interface AppManifest {
 // Exported for tests: the per-index latch guards (self-match, '' placeholder
 // skip) are not all reachable through the page once the call site gates the
 // fallback list on a registry-supplied primary.
+
+/** Screenshot zoom bounds. `1` is fit-to-viewport. The ceiling matches the
+ *  image viewer's (5), not the diagram viewer's (8): a screenshot is raster
+ *  pixels, and 8x would only blur it, while a vector diagram's labels need the
+ *  deeper zoom to become readable. */
+const SCREENSHOT_ZOOM_MIN = 1
+const SCREENSHOT_ZOOM_MAX = 5
+/** Travel a one-finger drag must cover before it counts as a pan rather than a
+ *  tap — below it the double-tap path is left alone. */
+const DRAG_SLOP = 6
+
 export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: string[]; fallbacks?: string[] }) {
   const [selected, setSelected] = useState<number | null>(null)
   // Both lists are TYPED string[] but can arrive as arbitrary JSON at
@@ -189,6 +202,111 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
     setFallbackFailed(new Set())
   }, [screensKey])
   useEffect(() => { setFallbackFailed(new Set()) }, [fallbacksKey])
+
+  // ── screenshot magnification (issue #6162) ────────────────────────────────
+  // This lightbox is the third full-viewport magnify overlay, bound by the same
+  // own-your-zoom rule as the image viewer and DiagramLightbox (page-layout.md):
+  // page zoom is off on touch shell-wide, so a phone user has no other way to
+  // inspect a fit-scaled screenshot. Unlike those two, the surface also owns
+  // prev/next navigation and click-to-dismiss, so the shared hook supplies only
+  // the gesture math while the page keeps those interactions.
+  const dialogRef = useRef<HTMLDivElement | null>(null)
+  const imgRef = useRef<HTMLImageElement | null>(null)
+  const reduceMotion = useReducedMotion()
+  // A finished pinch or double-tap synthesises a click; without suppression it
+  // reaches the backdrop handler and closes the viewer the user just zoomed
+  // into (mirrors DiagramLightbox's `suppressClickRef`).
+  const suppressClickRef = useRef(false)
+  const lastTapRef = useRef({ t: 0, x: 0, y: 0 })
+  const [dragging, setDragging] = useState(false)
+  const dragRef = useRef({ id: -1, startX: 0, startY: 0, baseX: 0, baseY: 0, active: false })
+  const open = selected !== null
+  const {
+    zoom, setZoom, pan, setPan, pinching, clampPan,
+    trackPointerDown, trackPointerMove, trackPointerUp, reset,
+  } = usePinchZoom({
+    targetRef: imgRef,
+    // Claim a trackpad gesture anywhere in the overlay, not just over the
+    // image: around a small or portrait screenshot most of the backdrop is
+    // visually part of the viewer (mirrors DiagramLightbox).
+    containRef: dialogRef,
+    // Only while the lightbox is open. It unmounts its viewers by returning
+    // null elsewhere, but the component itself stays mounted and a non-passive
+    // `wheel` listener would otherwise sit on `window` for the page's lifetime.
+    enabled: open,
+    min: SCREENSHOT_ZOOM_MIN,
+    max: SCREENSHOT_ZOOM_MAX,
+    onPinchEnd: () => { suppressClickRef.current = true },
+  })
+
+  // Reset to fit whenever the selected screenshot changes, so a zoom applied to
+  // one screenshot is never inherited by the next (mirrors DiagramLightbox's
+  // reset on `svg` change).
+  useEffect(() => { reset() }, [selected, reset])
+
+  // Re-clamp the pan after a zoom change: the pannable box is a function of the
+  // zoom, so shrinking back toward fit must pull an out-of-range pan back in.
+  useEffect(() => { setPan(p => (zoom <= SCREENSHOT_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
+
+  /** Double-tap toggles fit <-> DOUBLE_TAP, anchored where the user tapped so
+   *  the detail they aimed at is what they get. */
+  const onTap = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    if (e.pointerType === 'mouse') return
+    const now = Date.now()
+    const last = lastTapRef.current
+    const isDouble = now - last.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - last.x, e.clientY - last.y) < DOUBLE_TAP_SLOP
+    lastTapRef.current = { t: now, x: e.clientX, y: e.clientY }
+    if (!isDouble) return
+    lastTapRef.current = { t: 0, x: 0, y: 0 }
+    suppressClickRef.current = true
+    if (zoom > SCREENSHOT_ZOOM_MIN) { setZoom(SCREENSHOT_ZOOM_MIN); setPan({ x: 0, y: 0 }); return }
+    const cx = window.innerWidth / 2
+    const cy = window.innerHeight / 2
+    const z = DOUBLE_TAP_ZOOM
+    setZoom(z)
+    setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
+  }, [zoom, setZoom, setPan, clampPan])
+
+  const onImgPointerDown = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    // Clear here (not on the wrapper) because the <img> stops propagation, so
+    // a wrapper-level clear would never run for an image click.
+    suppressClickRef.current = false
+    // A pinch owns the gesture when it seats; neither the tap nor the pan path
+    // must also run. The first contact already ran through `onTap` and left a
+    // tap candidate, so clear it.
+    if (trackPointerDown(e)) {
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+      dragRef.current.active = false
+      setDragging(false)
+      return
+    }
+    onTap(e)
+    if (zoom <= SCREENSHOT_ZOOM_MIN) return
+    dragRef.current = { id: e.pointerId, startX: e.clientX, startY: e.clientY, baseX: pan.x, baseY: pan.y, active: true }
+  }, [trackPointerDown, onTap, zoom, pan])
+
+  const onImgPointerMove = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    if (trackPointerMove(e)) return
+    const d = dragRef.current
+    if (!d.active || e.pointerId !== d.id) return
+    const dx = e.clientX - d.startX
+    const dy = e.clientY - d.startY
+    // Below the slop the gesture is still a candidate tap; committing to a drag
+    // early would eat the double-tap.
+    if (!dragging && Math.hypot(dx, dy) < DRAG_SLOP) return
+    if (!dragging) {
+      setDragging(true)
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+    }
+    suppressClickRef.current = true
+    setPan(clampPan(d.baseX + dx, d.baseY + dy))
+  }, [trackPointerMove, dragging, clampPan, setPan])
+
+  const onImgPointerUp = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    trackPointerUp(e)
+    const d = dragRef.current
+    if (d.active && e.pointerId === d.id) { d.active = false; if (dragging) setDragging(false) }
+  }, [trackPointerUp, dragging])
 
   // The effective (post-swap) src for one index — '' when the index is
   // terminal (primary failed and no usable fallback: absent, an '' alignment
@@ -270,20 +388,45 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
           // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
           <div
             className="fixed inset-0 z-[9999] flex items-center justify-center bg-bg/80 backdrop-blur-sm"
-            onClick={() => setSelected(null)}
+            onClick={() => {
+              // A pinch, drag or double-tap just finished — that click is gesture
+              // residue and must not dismiss the viewer the user just zoomed into.
+              if (suppressClickRef.current) { suppressClickRef.current = false; return }
+              setSelected(null)
+            }}
             onKeyDown={e => {
               if (e.key === 'Escape') setSelected(null)
               if (e.key === 'ArrowRight' && nextVisible !== undefined) setSelected(nextVisible)
               if (e.key === 'ArrowLeft' && prevVisible !== undefined) setSelected(prevVisible)
             }}
             tabIndex={-1}
-            ref={el => el?.focus()}
+            ref={el => {
+              dialogRef.current = el
+              el?.focus()
+            }}
             role="dialog"
             aria-modal="true"
           >
             {/* Presentational wrapper: stops backdrop-dismiss when clicking the image. */}
             <div role="presentation" className="relative max-w-4xl max-h-[80vh] mx-4" onClick={e => e.stopPropagation()}>
-              <img src={resolvedAt(selected)} alt="" className="max-w-full max-h-[80vh] rounded-xl shadow-2xl" />
+              <img
+                src={resolvedAt(selected)}
+                alt=""
+                ref={imgRef}
+                className="max-w-full max-h-[80vh] rounded-xl shadow-2xl touch-none"
+                style={{
+                  transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                  // No transition during a gesture: a pinch already produces a frame
+                  // per move, and easing between them lags the fingers. Nor for a user
+                  // who opted out of motion — a double-tap animates a 2.5x scale.
+                  transition: pinching || dragging || reduceMotion ? 'none' : 'transform 150ms ease-out',
+                  cursor: zoom > SCREENSHOT_ZOOM_MIN ? (dragging ? 'grabbing' : 'grab') : undefined,
+                }}
+                onPointerDown={onImgPointerDown}
+                onPointerMove={onImgPointerMove}
+                onPointerUp={onImgPointerUp}
+                onPointerCancel={onImgPointerUp}
+              />
               <button className="absolute top-2 right-2 bg-bg/80 rounded-full p-1.5 text-muted hover:text-text" onClick={() => setSelected(null)} aria-label={i18nT('pages.appDetailPage.close')}><X size={18} /></button>
               {prevVisible !== undefined && (
                 <button className="absolute left-2 top-1/2 -translate-y-1/2 bg-bg/80 rounded-full p-2 text-muted hover:text-text" onClick={e => { e.stopPropagation(); setSelected(prevVisible) }} aria-label={i18nT('pages.appDetailPage.previous')}><ChevronLeft size={20} /></button>
