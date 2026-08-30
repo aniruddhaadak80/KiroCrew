@@ -1637,6 +1637,15 @@ file-tree-container{
 .scrollbar-overlay::-webkit-scrollbar-thumb{background:transparent;border-radius:9999px;transition:background .2s}
 .scrollbar-overlay:hover::-webkit-scrollbar-thumb{background:var(--border)}
 .scrollbar-overlay:hover::-webkit-scrollbar-thumb:hover{background:var(--border-strong)}
+/* On touch the overlay utility would stay perpetually transparent: a finger never
+   produces the :hover that restores the thumb. A coarse pointer shows a persistent
+   thin thumb instead, so a capped scroll surface keeps a real affordance. Fine
+   pointers keep the hidden-until-hover behaviour so a scrollable box does not
+   always carry the global always-visible thumb. */
+@media (pointer: coarse) {
+  .scrollbar-overlay{scrollbar-color:var(--border) transparent}
+  .scrollbar-overlay::-webkit-scrollbar-thumb{background:var(--border)}
+}
 
 /* ── Send button sweep ── */
 .btn-sweep{position:relative;overflow:hidden}

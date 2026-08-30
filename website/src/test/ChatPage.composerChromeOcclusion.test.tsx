@@ -79,6 +79,17 @@ describe('composer status chrome cannot occlude the header rename editor', () =>
     expect(INDEX_CSS).toMatch(/\.scrollbar-overlay:hover::-webkit-scrollbar-thumb\{background:var\(--border\)/)
   })
 
+  it('restores a persistent thumb on coarse pointers, so a capped box has a touch affordance', () => {
+    // A finger never produces the :hover that reveals the thumb, so on touch
+    // (.scrollbar-overlay on a capped `max-h-[Nsvh]` stack) the scroller would
+    // show no cue that it scrolls. The utility must scope its persistent thumb
+    // to @media (pointer: coarse) — a permanent (unscoped) thumb would trip the
+    // hover-revealed assertion above on fine pointers. Precedence: the house
+    // already carries @media (pointer: coarse) blocks in index.css.
+    expect(INDEX_CSS).toMatch(/@media \(pointer: coarse\) \{[\s\S]*?\.scrollbar-overlay\{scrollbar-color:var\(--border\) transparent\}/)
+    expect(INDEX_CSS).toMatch(/@media \(pointer: coarse\) \{[\s\S]*?\.scrollbar-overlay::-webkit-scrollbar-thumb\{background:var\(--border\)\}/)
+  })
+
   it('caps the bar stack and scrolls it internally, so it never climbs into the band', () => {
     const cls = STACK![1]
     expect(cls).toMatch(/max-h-\[\d+svh\]/)
