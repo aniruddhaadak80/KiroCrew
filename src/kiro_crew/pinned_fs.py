@@ -36,12 +36,23 @@ Two things this module deliberately does NOT do:
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import os
 import shutil
 import stat as _stat
 from pathlib import Path, PurePath
 from typing import Callable
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
 
 __all__ = [
     "PinnedPathRefusal",
@@ -52,6 +63,7 @@ __all__ = [
     "copy_file_pinned",
     "create_and_open_dir_pinned",
     "fatal_skip_reporter",
+    "fd_real_path",
     "is_reparse_point",
     "is_regular_at",
     "stat_at",
@@ -336,6 +348,61 @@ def is_reparse_point(path: str | Path) -> bool:
         return bool(getattr(os.lstat(path), "st_reparse_tag", 0))
     except OSError:  # pragma: no cover - a component that vanished mid-walk
         return False
+
+
+def fd_real_path(fd: int) -> str | None:
+    """Real filesystem path of an OPEN descriptor.
+
+    Windows fail-closed descriptor-path containment lives here, not in
+    ``hooks`` — the descriptor is pinned, so a component that is open is
+    fixed and the path it reports is the inode actually opened. Used by the
+    staging helpers and by the safe-read path that pins the open before
+    validating containment.
+    """
+    if os.name == "nt":
+        try:
+            win_dll = getattr(ctypes, "WinDLL", None)
+            get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
+            if not callable(win_dll) or not callable(get_osfhandle):
+                return None
+            kernel32 = win_dll("kernel32", use_last_error=True)
+            get_final_path = kernel32.GetFinalPathNameByHandleW
+            get_final_path.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+            get_final_path.restype = ctypes.c_uint32
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_final_path(
+                ctypes.c_void_p(get_osfhandle(fd)),
+                buffer,
+                len(buffer),
+                0,
+            )
+            if length == 0 or length >= len(buffer):
+                return None
+            path = buffer.value
+            if path.startswith("\\\\?\\UNC\\"):
+                return "\\\\" + path[8:]
+            if path.startswith("\\\\?\\"):
+                return path[4:]
+            return path
+        except (AttributeError, ImportError, OSError, ValueError):
+            return None
+
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")  # Linux
+    except OSError:
+        pass
+    try:
+        if fcntl is not None and hasattr(fcntl, "F_GETPATH"):  # macOS
+            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))  # type: ignore[union-attr]
+            return buf.split(b"\x00", 1)[0].decode()
+    except (OSError, ValueError, ImportError):
+        pass
+    return None
 
 
 def copy_file_pinned(

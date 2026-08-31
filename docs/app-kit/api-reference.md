@@ -760,19 +760,48 @@ Dev mode speeds up app-UI iteration: no manual copy-and-hard-refresh loop. When
 an installed app is in dev mode the gateway serves its UI files with
 `Cache-Control: no-store` and watches the app's `ui/` directory; on any file
 change it broadcasts an `app_reload` WebSocket event and the dashboard reloads
-the app so edits appear immediately. The recommended setup symlinks
-`~/.kiro/crew/apps/<name>/ui/` to your source tree so the watcher sees edits at
-the real files.
+the app so edits appear immediately.
+
+Link the whole `ui/` **directory**, never individual files inside it: since
+#6809 the UI route opens the final name with `O_NOFOLLOW`, so a per-file
+symlink like `ln -s ~/src/app/dist/index.mjs ui/index.mjs` answers 404 —
+indistinguishable from "not built yet". The directory link keeps working
+because the route resolves the ui root before validating against it. The
+recommended setup is `ln -s ~/src/my-app/dist ~/.kiro/crew/apps/<name>/ui`
+(a directory symlink to your source tree) so the watcher sees edits at the
+real files.
 
 **Contract surface:**
 
 - **`installed.json` field — `dev: bool`** (default `false`): persisted per-app
   flag. Tolerant on read (absent ⇒ `false`); reversible; no migration needed.
-  Builtin apps cannot enter dev mode.
+  Builtin apps cannot enter dev mode. This field drives the watcher and the
+  `no-store` header, but for an out-of-install `ui` root it is **not**
+  sufficient for serving — see the grant below.
+- **Operator grant — `.dev-grants.json` under `~/.kiro/crew/apps/`** (JSON
+  object `app -> resolved ui root` as `os.path.realpath(<install>/ui)` at
+  toggle time), written **only** by `POST /api/apps/{name}/dev` (and pruned by
+  `remove_dev_app` on uninstall) — never by the startup reconcile. A grant
+  is bound to the **specific resolved directory** the operator approved, so it
+  is self-invalidating: repointing `ui/` after the toggle (swap, update,
+  reinstall under the same name) yields a root that no longer equals the
+  granted one, and the UI route answers `400` with `code: dev_grant_mismatch`
+  until you re-toggle dev mode once after repointing to re-bind it. A
+  pre-existing escaped root from before #6809 behaves the same — `400` until
+  that one re-toggle after upgrade. Grants for a missing app are pruned on
+  next reconcile (remove-only, never add — deriving a grant from
+  app-writable `installed.json` is the laundering path #6809 closes).
+- **Safety gate — sensitive roots are refused.** Toggling dev mode on while
+  `ui` resolves into **or contains** a sensitive location
+  (`is_sensitive_path` / `path_contains_sensitive`, e.g. `~/.ssh`,
+  `~/.aws`) is refused with `400` and no state is changed — no dev workflow
+  legitimately serves those, and the unauthenticated `/apps/{name}/ui/`
+  route must never be grantable onto them.
 - **Endpoint — `POST /api/apps/{name}/dev`**, body `{"enabled": <bool>}`.
   Returns `{"name": <name>, "dev": <bool>}`. `400` for a non-boolean body,
-  a builtin app, or an unsafe app name; `404` if the app is not installed.
-  Behind the standard gateway auth; emits an `app_dev_mode` SEL audit event.
+  a builtin app, an unsafe app name, or a sensitive `ui` root; `404` if the
+  app is not installed. Behind the standard gateway auth; emits an
+  `app_dev_mode` SEL audit event.
 - **WebSocket event — `app_reload`**, payload `{"app": <name>, "ts": <float>}`.
   Re-dispatched to the frontend as the `mc:app-reload` window CustomEvent; the
   AppHost triggers a full page reload for the matching app.
@@ -783,13 +812,16 @@ the real files.
 **Cost model:** dev mode is off for essentially all gateways. The
 authoritative per-app state is the `installed.json` `dev` field above; to keep
 the steady-state cost negligible the gateway also maintains an **internal,
-unstable cache** (a small sentinel file under `~/.kiro/crew/apps/`, plus an
-in-memory mirror) listing the app names currently in dev mode. The watcher
-`stat()`s only that one file each second and walks a `ui/` tree solely for apps
-in the set — so a gateway with no dev apps pays one `stat()` per second and
-never invokes the heavier `list_apps()` walk; the in-memory mirror lets the
-UI-serving hot path decide the cache header with no per-request disk IO. This
-sentinel is a derived cache and **not** part of the App Kit contract: its path,
-name, and format are internal implementation details, may change without
-notice, and must not be read or written by app or third-party tooling — treat
-`installed.json` `dev` as the only supported source of truth.
+unstable cache** (a small sentinel file `.dev-apps.json` under
+`~/.kiro/crew/apps/`, plus an in-memory mirror) listing the app names currently
+in dev mode. The watcher `stat()`s only that one file each second and walks a
+`ui/` tree solely for apps in the set — so a gateway with no dev apps pays one
+`stat()` per second and never invokes the heavier `list_apps()` walk; the
+in-memory mirror lets the UI-serving hot path decide the cache header with no
+per-request disk IO. This sentinel is a derived cache and **not** part of the
+App Kit contract: its path, name, and format are internal implementation
+details, may change without notice, and must not be read or written by app or
+third-party tooling — treat `installed.json` `dev` as the only supported source
+of truth for watching. The `.dev-grants.json` record above **is** part of the
+contract for out-of-install roots, but its path is still an internal detail —
+do not read or write it by hand; use the toggle endpoint.

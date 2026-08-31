@@ -84,9 +84,13 @@ except Exception:  # pragma: no cover - constant always present in prod
     CHAT_TURN_TIMEOUT = 1800  # type: ignore[assignment]
 
 try:
-    from kiro_crew.hooks import _fd_real_path, safe_read_file_bytes_nolink
-except Exception:  # pragma: no cover - hooks always present in prod
+    from kiro_crew.pinned_fs import fd_real_path as _fd_real_path
+except Exception:  # pragma: no cover - pinned_fs always present in prod
     _fd_real_path = None  # type: ignore[assignment]
+
+try:
+    from kiro_crew.hooks import safe_read_file_bytes_nolink
+except Exception:  # pragma: no cover - hooks always present in prod
     safe_read_file_bytes_nolink = None  # type: ignore[assignment]
 
 try:

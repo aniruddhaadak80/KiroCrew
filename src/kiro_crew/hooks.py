@@ -26,6 +26,7 @@ from pathlib import Path
 
 from kiro_crew import platform_compat, security, webhooks
 from kiro_crew.config import paths as _config_paths
+from kiro_crew.pinned_fs import fd_real_path as _fd_real_path  # noqa: F401  (re-exported)
 from kiro_crew.platform import current_context, redact_via_context
 from kiro_crew.platform.governance import (
     CU_CLASS_OBSERVE,
@@ -2092,59 +2093,6 @@ def stat_identity(raw: str) -> tuple[int, int] | None:
     except OSError:
         return None
     return (st.st_dev, st.st_ino)
-
-
-def _fd_real_path(fd: int) -> str | None:
-    """Real filesystem path of an OPEN descriptor."""
-    if os.name == "nt":
-        try:
-            import ctypes
-            import msvcrt
-
-            win_dll = getattr(ctypes, "WinDLL", None)
-            get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
-            if not callable(win_dll) or not callable(get_osfhandle):
-                return None
-            kernel32 = win_dll("kernel32", use_last_error=True)
-            get_final_path = kernel32.GetFinalPathNameByHandleW
-            get_final_path.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_wchar_p,
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-            ]
-            get_final_path.restype = ctypes.c_uint32
-            buffer = ctypes.create_unicode_buffer(32768)
-            length = get_final_path(
-                ctypes.c_void_p(get_osfhandle(fd)),
-                buffer,
-                len(buffer),
-                0,
-            )
-            if length == 0 or length >= len(buffer):
-                return None
-            path = buffer.value
-            if path.startswith("\\\\?\\UNC\\"):
-                return "\\\\" + path[8:]
-            if path.startswith("\\\\?\\"):
-                return path[4:]
-            return path
-        except (AttributeError, ImportError, OSError, ValueError):
-            return None
-
-    try:
-        return os.readlink(f"/proc/self/fd/{fd}")  # Linux
-    except OSError:
-        pass
-    try:
-        import fcntl
-
-        if hasattr(fcntl, "F_GETPATH"):  # macOS
-            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            return buf.split(b"\x00", 1)[0].decode()
-    except (OSError, ValueError, ImportError):
-        pass
-    return None
 
 
 def safe_read_file_bytes_nolink(
