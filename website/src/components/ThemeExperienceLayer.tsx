@@ -50,9 +50,9 @@ const MAX_CONCURRENT_SOUNDS = 4
 // on the runtime resize path (see the Message Router).
 const TOPBAR_MAX_PX = 200
 // Overlay zIndex ceiling: the backend allows up to 9999, but overlays must sit
-// below the topbar's peers and, critically, below the mute button (z=50) and
-// the consent modal (z=120) so those stay clickable. Clamp to the 45 band.
-const OVERLAY_Z_MAX = 45
+// below the topbar (z=45) and, critically, below the mute button (z=50) and
+// the consent modal (z=120) so those stay clickable. Clamp below the topbar.
+const OVERLAY_Z_MAX = 44
 // `activate` + `once` overlays play a one-shot animation on theme activation.
 // The wire carries no per-overlay duration, so we auto-unmount after this
 // window (agent-chosen default; the overlay may also self-hide via
