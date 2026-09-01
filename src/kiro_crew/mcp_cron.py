@@ -133,9 +133,9 @@ _CRON_SECRET_NAME_RE = re.compile(
 # backtick pairs. We deliberately reject a lone backtick too — a stray one means
 # unmatched-quoting confusion, not a benign literal.
 _CRON_CMD_SUBST_RE = re.compile(
-    r"\$\(|"     # $( ... ) and $(( ... )) (`\(` covers both since $((… starts with $()
-    r"\$'|"      # $'...' ANSI-C quoting: `$'\x2e\x73\x73\x68'` decodes to ".ssh"
-    r"`",        # backtick — matches EITHER end of a pair, and unmatched too
+    r"\$\(|"  # $( ... ) and $(( ... )) (`\(` covers both since $((… starts with $()
+    r"\$'|"  # $'...' ANSI-C quoting: `$'\x2e\x73\x73\x68'` decodes to ".ssh"
+    r"`",  # backtick — matches EITHER end of a pair, and unmatched too
 )
 # A ``${...}`` that is NOT a plain ``${NAME}`` reference. Every other brace form
 # COMPOSES a string at expansion time, which is the same hazard as command
@@ -150,6 +150,12 @@ _CRON_CMD_SUBST_RE = re.compile(
 # rather than enumerating the operators means a form nobody listed is refused by
 # default instead of admitted.
 _CRON_BRACE_EXPANSION_RE = re.compile(r"\$\{(?![A-Za-z_][A-Za-z0-9_]*\})")
+# Bash brace expansion in a cron `command` (`{a,b}` / `{1..3}`): the shell
+# expands it before the vet gate's static string checks run, so a credential
+# path can be assembled from fragments that never appear literally. Whitespace-
+# free braces only — `find -exec {} ;` and `awk '{print $1}'` contain no comma
+# or `..` and stay allowed (verified: bash does not expand `{a b,c}`).
+_CRON_BASH_BRACE_RE = re.compile(r"\{[^}\s]*,[^}\s]*\}|\{[0-9]+\.\.[0-9]+\}")
 # Any `$NAME` / `${NAME}` variable reference. Used AFTER local assignment
 # resolution to catch the last composition class: an UNRESOLVED reference. sh
 # expands an unset variable to the empty string, so `cat ~/.ss${UNSET}h/id_rsa`
@@ -178,9 +184,7 @@ _CRON_POSITIONAL_PARAM_RE = re.compile(r"\$[0-9@*#]|\$\{[0-9@*#]")
 # start-of-command / after a separator / after `do`/`then` and word-bounded, so
 # `git log --format=for` (keyword as an argument) and a quoted `'while ...'` are
 # NOT matched. `case` is included because its patterns compose the same way.
-_CRON_SHELL_KEYWORD_RE = re.compile(
-    r"(?:^|[;&|]|\bdo\b|\bthen\b)\s*\b(?:for|while|until|case)\b"
-)
+_CRON_SHELL_KEYWORD_RE = re.compile(r"(?:^|[;&|]|\bdo\b|\bthen\b)\s*\b(?:for|while|until|case)\b")
 # Pathname expansion (globbing) is a FOURTH way to compose a sensitive path that
 # never appears literally: ``cat ~/.s?h/id_rsa`` reads ``~/.ssh/id_rsa`` (verified
 # against real sh, all three metacharacters). Blanket-refusing ``*``/``?``/``[``
@@ -211,10 +215,10 @@ _CRON_MAX_GLOB_WORD = 256
 # ``a=b`` as an assignment is harmless here: this map is only ever used to make
 # the credential-path scan see MORE, never to permit something.
 _CRON_LOCAL_ASSIGN_RE = re.compile(
-    r"(?:^|[;&|\s])\s*"          # start-of-command, a separator, or whitespace
+    r"(?:^|[;&|\s])\s*"  # start-of-command, a separator, or whitespace
     r"([A-Za-z_][A-Za-z0-9_]*)"  # variable name
-    r"="                         # literal =
-    r"([^\s;&|]*)",             # value up to next separator
+    r"="  # literal =
+    r"([^\s;&|]*)",  # value up to next separator
 )
 # A backslash escaping any character. sh drops the backslash and keeps the
 # character during word expansion, so the scan must do the same to see the string
@@ -329,7 +333,7 @@ def _glob_could_reach_credentials(command: str) -> bool:
             # stripped above). Both fnmatch directions so a glob in EITHER the
             # command or the sensitive name is caught.
             for start in range(len(cand_segments) - depth + 1):
-                win_segs = cand_segments[start:start + depth]
+                win_segs = cand_segments[start : start + depth]
                 # sh does NOT let a leading `*`/`?`/`[` match a leading dot — a
                 # hidden file is excluded from globbing unless the pattern spells
                 # the dot literally. Every sensitive name here is a dotfile
@@ -618,6 +622,18 @@ def _vet_shell_command(command: str) -> str | None:
             "strings a static check cannot see. If your job needs runtime "
             "composition, ship it as a `script` job — the body is scanned in full."
         )
+    # Bash brace expansion (`{a,b}` / `{1..3}`) assembles paths at
+    # expansion time that never appear literally. Whitespace-free braces
+    # only — `find -exec {} ;` and `awk '{print $1}'` stay allowed because
+    # they contain no comma or `..` (verified: bash does not expand
+    # `{a b,c}`).
+    if _CRON_BASH_BRACE_RE.search(command):
+        return (
+            "Error: cron command blocked: brace expansion "
+            "(`{a,b}`, `{1..3}`) is not permitted in a cron `command`. "
+            "If your job needs runtime composition, ship it as a `script` "
+            "job — the script body is scanned in full."
+        )
     if _CRON_POSITIONAL_PARAM_RE.search(command):
         return (
             "Error: cron command blocked: positional and special parameters "
@@ -729,9 +745,7 @@ def _vet_shell_command(command: str) -> str | None:
     # fragment). `resolved` already has the tracked `A=.s; ... $A` cases expanded,
     # so this does not fire on those.
     leftover = {
-        name
-        for name in _CRON_VAR_REF_RE.findall(resolved)
-        if name not in _CRON_VAR_REF_ALLOWED
+        name for name in _CRON_VAR_REF_RE.findall(resolved) if name not in _CRON_VAR_REF_ALLOWED
     }
     if leftover:
         return (
