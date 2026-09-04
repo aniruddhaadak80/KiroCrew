@@ -305,7 +305,7 @@ jobs:
       # issue that has neither.
       - name: Partition issues
         id: partition
-        if: steps.issues.outputs.count != '0'
+        if: steps.issues.outputs.count != '' && steps.issues.outputs.count != '0'
         run: |
           set -euo pipefail
           jq '{
@@ -339,7 +339,7 @@ jobs:
       # it is just not required.
       - name: Summarize issues (Bedrock)
         id: issue_narrative
-        if: steps.issues.outputs.count != '0' && env.HAS_BEDROCK && steps.creds.outcome == 'success'
+        if: steps.issues.outputs.count != '' && steps.issues.outputs.count != '0' && env.HAS_BEDROCK && steps.creds.outcome == 'success'
         continue-on-error: true
         env:
           MODEL_IDS: ${{ vars.SHIP_REPORT_BEDROCK_MODEL_ID || 'global.anthropic.claude-opus-5 global.anthropic.claude-opus-4-8' }}
@@ -428,7 +428,7 @@ jobs:
       # Degrades to a deterministic label-grouped list, so a Bedrock outage
       # costs the prose but never the two-section split or the counts.
       - name: Append issue sections
-        if: steps.issues.outputs.count != '0'
+        if: steps.issues.outputs.count != '' && steps.issues.outputs.count != '0'
         run: |
           set -euo pipefail
           touch body.txt
