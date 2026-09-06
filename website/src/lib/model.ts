@@ -94,10 +94,13 @@ export function displayModel(
     return match ? match.name : pinned
   }
   // Unknown (null/undefined): fail open, show the pin. No membership
-  // inference — it conflated every unrelated picker filter with entitlement.
+  // inference — absence from `models` is not evidence of withholding (it
+  // conflated every unrelated picker filter with entitlement). Still return
+  // the list's spelling when the pin matches a row, so the dropdown row
+  // highlights; only the `auto` fallback for absent rows is gone.
   void degraded
-  void models
-  return pinned
+  const match = models.find(m => normalizeModelKey(m.name) === key)
+  return match ? match.name : pinned
 }
 
 /** True when a real model is pinned but display fell back to `auto` — i.e. the
