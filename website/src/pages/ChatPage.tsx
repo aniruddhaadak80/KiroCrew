@@ -5588,23 +5588,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // render pass every time the query settled, for a value that is a pure function
   // of the query result.
   const resolvedModel = _slotResolvedModel || ''
-  // The model to DISPLAY for this slot. A slot can stay pinned to a model the
-  // account can no longer run (a plan downgrade leaves the pin behind): the
-  // backend withholds it at spawn and runs the session on its own default, so
-  // showing the pin would name a model no turn will use. The slot carries the
-  // backend's verdict for exactly that (`model_withheld`), and it is pinned
-  // server-side to the model it was computed for, so it always describes the
-  // first operand below whenever that operand is the slot's own pin. The
-  // degraded flag gates the list-membership fallback used when there is no
-  // verdict — a cached list served while /api/models fails is stale, not
-  // authoritative — and is subscribed to rather than read, because it can flip
-  // without the list changing.
+  // The slot's effective model (normalized wire id, or "auto" when
+  // withheld) wins when known; unknown fails open to the pin. The legacy
+  // `model_withheld` boolean is the fallback. Degraded is retained for
+  // subscription but no longer gates display; the backend's effective field
+  // already resolves deprecated aliases even before the first turn.
   const _modelsDegraded = useModelsDegraded(provider.id)
   const shownModel = displayModel(
     currentSlot?.model || resolvedModel || '',
     availableModels,
     _modelsDegraded,
-    currentSlot?.model_withheld,
+    (currentSlot as unknown as { effective_model?: string | null })?.effective_model ??
+      currentSlot?.model_withheld,
   )
   // True when the pin row would be a no-op: the agent already stores exactly
   // the model the composer is showing. 'auto' is the inherit spelling, never a
