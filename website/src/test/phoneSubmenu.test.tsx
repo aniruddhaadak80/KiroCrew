@@ -2,7 +2,6 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
 import { renderHook } from '@testing-library/react'
 import * as React from 'react'
-import { useIsCoarsePointer } from '../hooks/useIsCoarsePointer'
 import { PhoneSubContentDiv, PhoneSubTriggerDiv, usePhoneSubState } from '../components/ui/phoneSubmenu'
 import {
   ContextMenu,
@@ -55,43 +54,17 @@ function stubMatchMedia(initial: Record<string, boolean>) {
 }
 
 const COARSE = '(pointer: coarse)'
+const HOVER_NONE = '(hover: none)'
+
+/** A phone-shaped stub: coarse pointer with no hover. */
+function stubPhone() {
+  return stubMatchMedia({ [COARSE]: true, [HOVER_NONE]: true })
+}
 
 let mm: ReturnType<typeof stubMatchMedia> | null = null
 afterEach(() => {
   mm?.restore()
   mm = null
-})
-
-describe('useIsCoarsePointer', () => {
-  it('is false on a fine pointer', () => {
-    mm = stubMatchMedia({ [COARSE]: false })
-    const { result } = renderHook(() => useIsCoarsePointer())
-    expect(result.current).toBe(false)
-  })
-
-  it('is true on a coarse pointer', () => {
-    mm = stubMatchMedia({ [COARSE]: true })
-    const { result } = renderHook(() => useIsCoarsePointer())
-    expect(result.current).toBe(true)
-  })
-
-  it('re-renders when the pointer kind changes', () => {
-    mm = stubMatchMedia({ [COARSE]: false })
-    const { result } = renderHook(() => useIsCoarsePointer())
-    expect(result.current).toBe(false)
-    act(() => {
-      mm!.set(COARSE, true)
-    })
-    expect(result.current).toBe(true)
-  })
-
-  it('reports false when matchMedia is unavailable', () => {
-    const original = window.matchMedia
-    Object.defineProperty(window, 'matchMedia', { writable: true, configurable: true, value: undefined })
-    const { result } = renderHook(() => useIsCoarsePointer())
-    expect(result.current).toBe(false)
-    Object.defineProperty(window, 'matchMedia', { writable: true, value: original })
-  })
 })
 
 describe('usePhoneSubState', () => {
@@ -224,14 +197,14 @@ describe('ContextMenu phone submenu', () => {
   }
 
   it('renders the submenu inline with an expanded toggle on coarse pointers', () => {
-    mm = stubMatchMedia({ [COARSE]: true })
+    mm = stubPhone()
     renderSub({ defaultOpen: true })
     expect(screen.getByRole('button', { name: /More/ })).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('Deep action')).toBeTruthy()
   })
 
   it('hides inline content while collapsed and reveals it on toggle', () => {
-    mm = stubMatchMedia({ [COARSE]: true })
+    mm = stubPhone()
     renderSub()
     expect(screen.queryByText('Deep action')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: /More/ }))
@@ -239,7 +212,7 @@ describe('ContextMenu phone submenu', () => {
   })
 
   it('keeps the Radix submenu without an inline toggle on fine pointers', () => {
-    mm = stubMatchMedia({ [COARSE]: false })
+    mm = stubMatchMedia({ [COARSE]: false, [HOVER_NONE]: false })
     renderSub({ defaultOpen: true })
     expect(screen.queryByRole('button', { name: /More/ })).toBeNull()
   })

@@ -37,8 +37,12 @@ export interface PhoneSubTriggerDivProps extends React.HTMLAttributes<HTMLDivEle
 
 /** Inline trigger row: a `role="button"` div composing caller handlers with the toggle. */
 export const PhoneSubTriggerDiv = React.forwardRef<HTMLDivElement, PhoneSubTriggerDivProps>(
-  ({ className, inset, expanded, onToggle, onClick, onKeyDown, children, ...rest }, ref) => (
-    <div
+  function PhoneSubTriggerDiv(
+    { className, inset, expanded, onToggle, onClick, onKeyDown, children, ...rest },
+    ref,
+  ) {
+    return (
+      <div
       {...rest}
       ref={ref}
       role="button"
@@ -65,25 +69,27 @@ export const PhoneSubTriggerDiv = React.forwardRef<HTMLDivElement, PhoneSubTrigg
       )}
     >
       {children}
-    </div>
-  ),
+      </div>
+    )
+  },
 )
-PhoneSubTriggerDiv.displayName = 'PhoneSubTriggerDiv'
+
 
 /** Inline submenu body rendered beneath its trigger when expanded. */
 export const PhoneSubContentDiv = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
->(({ className, children, ...rest }, ref) => (
-  <div
-    {...rest}
-    ref={ref}
-    className={cn(
-      'mt-1 ml-3 border-l border-border pl-2 space-y-0.5 overflow-y-auto overscroll-contain rounded-md bg-bg-elevated p-1',
-      className,
-    )}
-  >
-    {children}
-  </div>
-))
-PhoneSubContentDiv.displayName = 'PhoneSubContentDiv'
+>(function PhoneSubContentDiv({ className, children, ...rest }, ref) {
+  return (
+    <div
+      {...rest}
+      ref={ref}
+      className={cn(
+        'mt-1 ml-3 border-l border-border pl-2 space-y-0.5 overflow-y-auto overscroll-contain rounded-md bg-bg-elevated p-1',
+        className,
+      )}
+    >
+      {children}
+    </div>
+  )
+})

@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as DropdownMenuPrimitive from '@radix-ui/react-dropdown-menu'
 import { cn } from '../../lib/utils'
-import { useIsCoarsePointer } from '../../hooks/useIsCoarsePointer'
+import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
 import { PhoneSubContentDiv, PhoneSubTriggerDiv, usePhoneSubState } from './phoneSubmenu'
 
 const DropdownMenu = DropdownMenuPrimitive.Root
@@ -15,25 +15,23 @@ const DropdownSubPhoneContext = React.createContext<SubPhoneContextValue | null>
 
 const DropdownMenuSub = React.forwardRef<
   HTMLDivElement,
-  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Sub> & { className?: string }
->(({ children, className, open, defaultOpen, onOpenChange, ...rest }, ref) => {
-  const isPhone = useIsCoarsePointer()
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Sub>
+>(function DropdownMenuSub({ children, open, defaultOpen, onOpenChange, ...rest }, ref) {
+  const isPhone = useIsTouchDevice()
   const { expanded, toggle } = usePhoneSubState(open, defaultOpen, onOpenChange)
   if (isPhone) {
     return (
       <DropdownSubPhoneContext.Provider value={{ isPhone: true, expanded, toggle }}>
-        <div ref={ref} className={cn('w-full', className)} {...(rest as React.HTMLAttributes<HTMLDivElement>)}>
+        <div ref={ref} className="w-full" {...(rest as React.HTMLAttributes<HTMLDivElement>)}>
           {children}
         </div>
       </DropdownSubPhoneContext.Provider>
     )
   }
-  // Radix Sub is a logical container with no DOM — className only applies to the phone branch.
   return (
     <DropdownMenuPrimitive.Sub open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange} {...rest}>{children}</DropdownMenuPrimitive.Sub>
   )
 })
-DropdownMenuSub.displayName = 'DropdownMenuSub'
 
 const DropdownMenuContent = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Content>,

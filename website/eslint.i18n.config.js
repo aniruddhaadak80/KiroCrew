@@ -40,10 +40,6 @@ export default [
       // Storybook fixtures are development-only renders of a primitive with
       // sample copy; nothing in them reaches a user. Same category as tests.
       'src/**/*.stories.{ts,tsx}',
-      // UI primitive components with no user-visible copy (displayName only)
-      'src/components/ui/dropdown-menu.tsx',
-      'src/components/ui/context-menu.tsx',
-      'src/components/ui/phoneSubmenu.tsx',
       // MODEL-FACING PROMPTS, by naming convention. A `*.prompt.ts` module may
       // contain ONLY the text of a message sent to an agent — no UI copy — so the
       // suffix IS the boundary and its sibling module stays fully covered. Same

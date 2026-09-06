@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as ContextMenuPrimitive from '@radix-ui/react-context-menu'
 import { cn } from '../../lib/utils'
-import { useIsCoarsePointer } from '../../hooks/useIsCoarsePointer'
+import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
 import { PhoneSubContentDiv, PhoneSubTriggerDiv, usePhoneSubState } from './phoneSubmenu'
 
 const ContextMenu = ContextMenuPrimitive.Root
@@ -15,23 +15,21 @@ const ContextSubPhoneContext = React.createContext<ContextSubPhoneContextValue |
 
 const ContextMenuSub = React.forwardRef<
   HTMLDivElement,
-  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Sub> & { className?: string }
->(({ children, className, open, defaultOpen, onOpenChange, ...rest }, ref) => {
-  const isPhone = useIsCoarsePointer()
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Sub>
+>(function ContextMenuSub({ children, open, defaultOpen, onOpenChange, ...rest }, ref) {
+  const isPhone = useIsTouchDevice()
   const { expanded, toggle } = usePhoneSubState(open, defaultOpen, onOpenChange)
   if (isPhone) {
     return (
       <ContextSubPhoneContext.Provider value={{ isPhone: true, expanded, toggle }}>
-        <div ref={ref} className={cn('w-full', className)} {...(rest as React.HTMLAttributes<HTMLDivElement>)}>
+        <div ref={ref} className="w-full" {...(rest as React.HTMLAttributes<HTMLDivElement>)}>
           {children}
         </div>
       </ContextSubPhoneContext.Provider>
     )
   }
-  // Radix Sub is a logical container — className only for phone inline branch.
   return <ContextMenuPrimitive.Sub open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange} {...rest}>{children}</ContextMenuPrimitive.Sub>
 })
-ContextMenuSub.displayName = 'ContextMenuSub'
 
 const ContextMenuContent = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.Content>,
