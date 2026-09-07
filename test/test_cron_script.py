@@ -1171,13 +1171,13 @@ class TestMcpToolClient:
         assert "AKIA1234567890123456" not in tail
         assert "boom" in tail
 
-    def test_stderr_tail_redacts_credential_straddling_window_start(self, tmp_path):
-        """A key straddling the read edge must not leak a fragment.
+    def test_stderr_tail_redacts_credential_straddling_the_slice_boundary(self, tmp_path):
+        """A key straddling the tail cut must not leak a fragment.
 
-        Sized so a naive `seek(size - limit)` window would open ten
-        characters INTO the access key, leaving a digit fragment the key
-        regex cannot match. The bounded read reaches back past the key, so
-        redaction sees it whole before the final tail slice cuts.
+        Sized so slicing FIRST would open ten characters INTO the access
+        key, leaving a digit fragment the key regex cannot match. The whole
+        capture is redacted before the tail slice cuts, so redaction sees
+        the key whole.
         """
         import re
 
@@ -1197,12 +1197,37 @@ class TestMcpToolClient:
         assert re.search(r"\d{4,}", tail) is None
         assert "failure" in tail
 
+    def test_stderr_tail_redacts_url_longer_than_any_window(self, tmp_path):
+        """A URL longer than any read window must not leak its query tail.
+
+        The URL itself spans ~6 KiB, so its scheme sits thousands of
+        characters from EOF while the query tail lands inside the served
+        tail; only a full-capture redaction pass sees the scheme and scrubs
+        the match whole. A windowed read would scan the tail without its
+        scheme and serve the raw query.
+        """
+        from kiro_crew.cron_script import McpToolClient
+        stderr_path = tmp_path / "stderr.log"
+        # Long query triggers redact_exfiltration_urls' length-based
+        # heuristic, as in the test below; here it is long enough that no
+        # fixed window reaches back to the scheme.
+        long_query = "data=" + ("a" * 6000)
+        url = f"https://evil.example.com/leak?{long_query}"
+        stderr_path.write_text("x" * 100 + url + " failure")
+        client = object.__new__(McpToolClient)
+        client._stderr_file = SimpleNamespace(name=str(stderr_path))
+        tail = client._stderr_tail()
+        assert len(tail) <= 1024
+        assert "evil.example.com/leak" not in tail
+        assert "a" * 100 not in tail
+        assert "failure" in tail
+
     def test_stderr_tail_withholds_oversized_captures_behind_a_marker(
         self, tmp_path, monkeypatch
     ):
         """Beyond the full-redaction ceiling the tail is WITHHELD, not windowed.
 
-        A pathological (>4 MiB) capture is not worth serving even a bounded
+        A pathological (over the ceiling) capture is not worth serving even a bounded
         slice of: it gets a fixed marker instead of a tail that would
         misrepresent a log the operator cannot see.
         """

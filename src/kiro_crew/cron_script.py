@@ -972,18 +972,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Whole-file ceiling for a captured stderr. Crash stderr is small in practice;
-# captures at or under this bound are served (redacted, then tail-sliced);
-# beyond it the tail is withheld behind a fixed marker (see _stderr_tail)
-# rather than partially redacted.
-_STDERR_FULL_REDACT_MAX = 4 * 1024 * 1024
-
-# Overlap margin for the bounded redaction read in _stderr_tail. Only the
-# last ``limit + _STDERR_TAIL_OVERLAP`` characters ever reach the redactor,
-# so a pathological-but-under-ceiling capture cannot feed megabytes into the
-# per-chunk credential scan. The margin clears the longest matchable token
-# (the JWT/JWE ceiling the streaming redactor already uses), so a secret
-# straddling the read edge is still matched whole before the tail slice.
-_STDERR_TAIL_OVERLAP = 4096
+# captures at or under this bound are redacted whole, then tail-sliced (see
+# _stderr_tail); beyond it the tail is withheld behind a fixed marker rather
+# than partially redacted, because no window can prove a secret does not
+# straddle its start. The bound also caps the redaction input itself: the
+# redaction passes scan the whole capture, so an unbounded ceiling would let
+# a pathological multi-megabyte capture turn error reporting into a CPU sink
+# on every disconnect. 64 KiB keeps real crash output fully served while the
+# scan stays a fixed, small cost.
+_STDERR_FULL_REDACT_MAX = 64 * 1024
 
 
 class SkipError(Exception):
@@ -1271,12 +1268,11 @@ class McpToolClient:
 
         Credentials and exfiltration URLs are redacted BEFORE the tail is cut,
         so a secret straddling the cut cannot survive as an unredacted
-        fragment: the tail window plus a ``_STDERR_TAIL_OVERLAP`` margin is
-        redacted in a single bounded pass, then only the tail is kept. The
-        overlap clears the longest matchable token, so an edge-straddling
-        secret is still matched whole. Beyond ``_STDERR_FULL_REDACT_MAX``
-        bytes the tail is withheld behind a fixed marker instead: a
-        pathological log is not worth serving even a windowed slice of.
+        fragment: the whole capture (at or under ``_STDERR_FULL_REDACT_MAX``)
+        is redacted in one pass, then only the tail is kept. Beyond the
+        ceiling the tail is withheld behind a fixed marker instead: a
+        pathological log is not worth serving even a redacted slice of, and
+        no window can prove a secret does not straddle its start.
         """
         path = getattr(self, "_stderr_file", None)
         if path is None:
@@ -1287,19 +1283,18 @@ class McpToolClient:
                 size = fh.tell()
                 if size > _STDERR_FULL_REDACT_MAX:
                     return "[stderr omitted: too large to redact in full]"
-                window = limit + _STDERR_TAIL_OVERLAP
-                fh.seek(max(0, size - window))
-                # Read at most one char past the window so a concurrent
-                # writer that pushes the file past the ceiling is caught even
-                # if it grows between the seek-end and the read.
-                chunk = fh.read(window + 1)
-                if len(chunk) > window:
+                fh.seek(0)
+                text = fh.read(_STDERR_FULL_REDACT_MAX + 1)
+                if len(text) > _STDERR_FULL_REDACT_MAX:
+                    # The file grew past the ceiling between the size check
+                    # and the read; withhold rather than serve a slice no
+                    # redaction pass has fully covered.
                     return "[stderr omitted: too large to redact in full]"
-                # Redact the window, THEN take the tail — this is
+                # Redact the whole capture, THEN take the tail — this is
                 # ``redact_and_truncate``'s ordering: scrub first so that
                 # no credential fragment survives the slice boundary, then
                 # keep only the last ``limit`` characters.
-                return redact(chunk.strip())[-limit:]
+                return redact(text.strip())[-limit:]
         except Exception as exc:
             # Defensive — _stderr_tail runs inside error reporting itself, so we
             # never raise here. We DO log the exception type at debug so that a
