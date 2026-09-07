@@ -1443,6 +1443,7 @@ class AutoNudgeService:
                     target=target,
                     objective=objective,
                     created_ts=created,
+                    version=MONITOR_STATE_VERSION,
                     budgets=budgets,
                     cadence_secs=cadence,
                     wake_instructions=wake_instructions,
@@ -3155,7 +3156,16 @@ class AutoNudgeService:
                 monitor.version,
                 MONITOR_STATE_VERSION,
             )
-            return
+            # If the loop has no raw payload (i.e. it was just created rather than
+            # loaded from an old store), still attempt to arm it so that newly-
+            # created monitors are always visible via monitor_inspect. Records
+            # loaded from an older gateway will be handled by the upgrade path.
+            if getattr(monitor, "_raw_payload", None) is None:
+                # Newly created monitor: normalise the version and continue arming
+                monitor.version = MONITOR_STATE_VERSION
+            else:
+                # Old persisted record: refuse to arm (downgrade safety)
+                return
         now = time.time()
         if loop.next_due_ts <= 0:
             loop.next_due_ts = now + loop.idle_secs
