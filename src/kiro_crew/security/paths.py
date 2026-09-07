@@ -1804,10 +1804,35 @@ def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     the leaf holds the leaf's full payload, so READ is blocked alongside write -- a
     write-only fence there would still disclose ``.env`` or ``token_signing.key`` to a
     reader that wins the race.
+
+    The kiro-cli agent-spec directory (~/.kiro/agents) is write-protected but
+    MUST remain readable for kiro-cli's own --agent resolution and the MCP
+    rewriter. Explicitly allow reads here to prevent the bash gate from
+    refusing legitimate read operations (fixes #9198).
     """
+    # Explicitly allow reads of the kiro-cli agent-spec directory
+    # It is write-protected (_WRITE_PROTECTED_HOME_PATHS) but must remain readable
+    if _is_kiro_agents_dir(path_str, base_dir):
+        return False
     return _path_in_home_dirs(
         path_str, _SENSITIVE_HOME_DIRS, base_dir
     ) or _is_keystone_publish_artifact(path_str, base_dir)
+
+
+def _is_kiro_agents_dir(path_str: str, base_dir: str | None = None) -> bool:
+    """Check if path is under the kiro-cli agent-spec directory (~/.kiro/agents).
+
+    This directory is write-protected (_WRITE_PROTECTED_HOME_PATHS) but must
+    remain readable for kiro-cli's --agent resolution and MCP rewriter.
+    """
+    candidates = _candidate_forms(path_str, base_dir)
+    kiro_agents = _home_dir_targets_uncached([_KIRO_AGENTS_DIR])
+    for cand in candidates:
+        cand_cf = cand.casefold()
+        for target in kiro_agents:
+            if cand_cf == target or cand_cf.startswith(target + os.sep):
+                return True
+    return False
 
 
 def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
