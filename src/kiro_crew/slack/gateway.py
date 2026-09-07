@@ -11343,7 +11343,7 @@ class GatewayOrchestrator:
 
         # Wire up event routing and interactive handlers
         init_interactions(self)
-        # Awaited ON the loop, never offloaded whole: WSSocketModeClient's
+# Awaited ON the loop, never offloaded whole: WSSocketModeClient's
         # __init__ ends in ``asyncio.ensure_future``, which needs a current
         # event loop in the *constructing* thread — a ``to_thread`` worker has
         # none, so offloading the whole function (as #7518 did to keep its
