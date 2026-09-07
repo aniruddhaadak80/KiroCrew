@@ -115,20 +115,42 @@ async def test_connection_tools(provider: Provider) -> ConnectionTestResult:
     provider tool. ``/mcp`` reads the MCP manager's post-``tools/list`` status;
     ``/tools`` reads the final agent-exposed set. Raw command output and tool
     descriptions never cross the API boundary.
+
+    For persistent connections, reuse the existing session to preserve stored
+    credentials. Fall back to a dedicated test session if no persistent session
+    exists.
     """
     slug = str(provider["slug"])
     alias = mcp_server_alias(slug)
+    # Try to use the connection's persistent session first (e.g. "connections-{slug}")
+    # which holds stored credentials for remote MCP servers. Fall back to a
+    # dedicated test session if no persistent session exists.
+    persistent_session_key = f"connections-{slug}"
+    test_session_key = f"connections-test-{slug}"
+    
     try:
         work_root = await asyncio.to_thread(data_home)
+        # Try persistent session first for credential reuse
         batch = await run_kiro_native_commands(
             ("/mcp", "/tools"),
-            work_dir=work_root / "connections" / "test",
+            work_dir=work_root / "connections" / slug,
             agent=_MAIN_AGENT,
-            session_key=f"connections-test-{slug}",
+            session_key=persistent_session_key,
             timeout_seconds=_TEST_TIMEOUT_SECONDS,
         )
     except Exception:
-        return _result(slug, "failed", "connection_test_failed")
+        # Fall back to isolated test session if persistent session unavailable
+        try:
+            work_root = await asyncio.to_thread(data_home)
+            batch = await run_kiro_native_commands(
+                ("/mcp", "/tools"),
+                work_dir=work_root / "connections" / "test",
+                agent=_MAIN_AGENT,
+                session_key=test_session_key,
+                timeout_seconds=_TEST_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return _result(slug, "failed", "connection_test_failed")
     if not batch.ok:
         return _result(slug, "failed", batch.code)
     return _classify(batch.results, slug, alias)
