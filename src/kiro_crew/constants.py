@@ -170,10 +170,19 @@ SUBAGENT_TIMEOUT_MAX = 86400
 #: so the pair form -- which is where the deciding lookahead lives -- is the one
 #: NOT to skip. Both readmit all four codepoints at once, which is why adding
 #: these three introduces no ambiguity that ASCII ``]`` did not already have.
+#: Opening brackets accepted on a protocol marker, paired positionally with
+#: MARKER_CLOSERS. ASCII ``[`` pairs with ``]``, U+3010 ``【`` with U+3011 ``】``,
+#: U+FF3B ``［`` with U+FF3D ``］``, U+3014 ``〔`` with U+3015 ``〕``.
+MARKER_OPENERS = "[\u3010\uff3b\u3014"
 MARKER_CLOSERS = "]\u3011\uff3d\u3015"
+_MARKER_OPEN_CLASS = "[" + re.escape(MARKER_OPENERS) + "]"
 _MARKER_CLOSE_CLASS = "[" + re.escape(MARKER_CLOSERS) + "]"
 
-#: Markdown WRAPPER characters tolerated around a complete marker line.
+# Paired opener-closer tuples for matched-pair parsing (see issue #9375).
+# Each opener at index i pairs with the closer at the same index.
+MARKER_PAIRS = tuple(zip(MARKER_OPENERS, MARKER_CLOSERS))
+
+#: Markdown WRAPPER characters tolerated around a complete marker line (#9110).
 #: A model sometimes wraps the whole marker in inline code or emphasis --
 #: ``\`[OPTIONS: A | B]\``` or ``**[OPTIONS: A | B]**``. The wrapper character
 #: lands AFTER the closer, breaks the end anchor, and the marker leaks into the
