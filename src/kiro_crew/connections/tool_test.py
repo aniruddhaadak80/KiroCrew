@@ -127,7 +127,7 @@ async def test_connection_tools(provider: Provider) -> ConnectionTestResult:
     # dedicated test session if no persistent session exists.
     persistent_session_key = f"connections-{slug}"
     test_session_key = f"connections-test-{slug}"
-    
+
     try:
         work_root = await asyncio.to_thread(data_home)
         # Try persistent session first for credential reuse
