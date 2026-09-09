@@ -1561,23 +1561,37 @@ def _iter_shell_chars(text: str, state: int = 0, ansi: bool = False) -> "Iterato
                 # inactive; brace depth handles nesting, a backslash pair never
                 # closes, and an unclosed expansion simply runs out (malformed
                 # input bash would not execute; the walk keeps failing closed).
-                # Quote state is frozen across the span so an exotic interior
-                # cannot corrupt the rest of the walk.
+                # Quote state runs THROUGH the span, not frozen across it:
+                # POSIX 2.6.2 skips quoted strings when finding the matching
+                # ``}``, so only an UNQUOTED, unescaped ``}`` decrements depth
+                # (``: ${v:-"}"}; ...`` closes at the second ``}``, and the
+                # quoted ``}`` in ``${v:-'}X)Y'}`` is literal). The tracked
+                # quotes stay local to the span -- they decide depth only and
+                # never leak into the outer walk.
                 yield _ShellChar(i, ch, ch, True, state, ansi, False)
                 yield _ShellChar(i + 1, "{", "{", True, state, ansi, False)
                 i += 2
                 dollar_run = 0
                 at_word_start = False
                 depth = 1
+                qstate = 0
                 while i < n and depth > 0:
                     c = text[i]
-                    if c == "\\" and i + 1 < n:
+                    if c == "\\" and qstate != 1 and i + 1 < n:
                         yield _ShellChar(i, text[i : i + 2], text[i + 1], False, state, ansi, False)
                         i += 2
                         continue
-                    if c == "{":
+                    if qstate == 0 and c == "'":
+                        qstate = 1
+                    elif qstate == 1 and c == "'":
+                        qstate = 0
+                    elif qstate == 0 and c == '"':
+                        qstate = 2
+                    elif qstate == 2 and c == '"':
+                        qstate = 0
+                    elif qstate == 0 and c == "{":
                         depth += 1
-                    elif c == "}":
+                    elif qstate == 0 and c == "}":
                         depth -= 1
                         if depth == 0:
                             yield _ShellChar(i, c, c, True, state, ansi, False)
