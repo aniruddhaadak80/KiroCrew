@@ -1728,6 +1728,9 @@ export default function MembersPage() {
                     // ready" would contradict it one line down.
                     hideEmptyHint={activeThreadFailed}
                     openSideChat={openMemberSideChat}
+                    // Attachment cards / @mention chips open in this page's
+                    // detail-drawer file viewer (#9487).
+                    onFileOpen={openFile}
                   />
                 </ErrorBoundary>
               </div>
