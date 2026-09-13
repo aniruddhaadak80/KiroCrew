@@ -208,6 +208,8 @@ class _Slot:
         self.model = None
         self._queue = []
         self._stop_generation = 0
+        # Mirrors _ChatSlot._chunk_seq: the per-slot chunk counter _run_chat continues.
+        self._chunk_seq = 0
         self.linked_session_key = ""
         # Mirrors _ChatSlot.project: the per-slot local project @mention/​/prompts
         # resolve against. "" means no project (global prompts only), matching
@@ -789,7 +791,7 @@ class TestLocalLookupIsBounded:
         assert names == ["local-sop"]
 
     def test_the_project_independent_half_still_wins_a_stem_collision(self, tmp_path):
-        """Ordering is unchanged: both halves used to be one list, global first."""
+        """The two halves form a single ordering, global first, so it wins a stem collision."""
         _user_prompt(tmp_path, "shared", "# Global\nGLOBAL-BODY\n")
         proj = tmp_path / "checkout"
         d = proj / ".kiro" / "prompts"
@@ -1195,7 +1197,7 @@ class TestPromptReadsGoThroughTheDescriptorGate:
         the description READ into a blanket link refusal without going red.
 
         Asserted on the reader directly, and with a link that stays inside the
-        prompt root, because the LISTING no longer offers a linked entry to reach
+        prompt root, because the LISTING does not offer a linked entry to reach
         it with: ``_prompt_dir_entry`` refuses one outright so the local scope
         offers exactly the names its own read, update and delete verbs can
         address. That withdrawal is pinned by
@@ -1482,7 +1484,7 @@ class TestUnscopedDetailReadStaysOffTheEventLoop:
     Offloading only the resolution was survivable while a match could name nothing
     but a package root or the gateway's own ``~/.kiro/prompts``. A match can now
     name ``<project>/.kiro/prompts``, a directory the gateway does not own and that
-    may be network-backed, so the ``stat`` and ``read_text`` that used to run after
+    may be network-backed, so the ``stat`` and ``read_text`` that would run after
     the metadata came back would stall every other request and the heartbeat on
     exactly the storage this route newly reaches. The scoped branch already reads
     inside one job (``_api_user_prompt_detail``'s ``_read``); this is the unscoped
@@ -1709,7 +1711,7 @@ class TestEveryPromptReaderUsesTheNoLinkGate:
     def test_a_user_scope_read_with_no_serveable_root_is_refused_not_widened(self, tmp_path):
         """``None`` from the root derivation means REFUSE, never "unconstrained".
 
-        A user-scope entry that can no longer name a serveable root is exactly the
+        A user-scope entry that cannot name a serveable root is exactly the
         state a swapped root leaves, so falling back to the canonical path's own
         parent there would pin the read inside the directory the swap named — the
         leak the pin exists to close. A package SOP takes that fallback, because
@@ -1945,9 +1947,9 @@ class TestApiPromptsCreate:
         assert "slot-local" in _listed_names(project=proj)
 
     def test_local_create_is_not_listed_for_a_different_slot(self, tmp_path, mock_sel):
-        """The bug #7345 fixes: a local prompt created under slot A's project
-        must NOT leak into a different slot B bound to a different project.
-        Per-slot resolution keeps each slot's local prompts to itself."""
+        """A local prompt created under slot A's project must NOT leak into a
+        different slot B bound to a different project. Per-slot resolution keeps
+        each slot's local prompts to itself."""
         proj_a = tmp_path / "proj-a"
         proj_a.mkdir()
         proj_b = tmp_path / "proj-b"
@@ -2305,7 +2307,7 @@ class TestApiPromptUpdate:
 
 class TestPromptEditCompareAndSwap:
     """A PUT names the file state its edit was based on; the writer refuses when
-    the file no longer matches. Without this, an edit started before someone
+    the file does not match. Without this, an edit started before someone
     else's save silently discards their work on completion."""
 
     def test_stale_base_hash_answers_409_and_leaves_the_file(self, tmp_path, mock_sel):
@@ -3177,8 +3179,8 @@ class TestCreateAndDeletePinTheDirectory:
         """Every outcome is audited, including a non-OS failure, and the create fd
         is owned here so each failed attempt closes exactly one.
 
-        A ``MemoryError`` stands in for the whole class the narrower ``OSError``
-        catch used to let escape: it would have answered 500 with no audit line,
+        A ``MemoryError`` stands in for the whole class a narrower ``OSError``
+        catch lets escape: that would answer 500 with no audit line,
         which is the one thing this handler promises not to do.
 
         Descriptors are counted through the process's own fd directory: Linux
@@ -3351,6 +3353,10 @@ class TestCreateAndDeletePinTheDirectory:
             "bool",
         }, f"boot-path constant calls something that may touch the filesystem: {sorted(calls)}"
 
+    @pytest.mark.skipif(
+        not _prompts_mod._UNNAMED_CREATE_SUPPORTED or not os.path.isdir("/proc/self/fd"),
+        reason="platform cannot build an unnamed inode (O_TMPFILE + /proc/self/fd)",
+    )
     def test_the_body_is_durable_before_the_name_appears(self, tmp_path, mock_sel, monkeypatch):
         """The flush precedes the publish, and the DIRECTORY is flushed too.
 
@@ -3364,6 +3370,16 @@ class TestCreateAndDeletePinTheDirectory:
         that is not comes back from a power loss with the body intact and nothing
         pointing at it -- acknowledged, then vanished. Both flushes are the
         contract, so the whole order is what is asserted.
+
+        WHICH order that is depends on the branch the filesystem takes, so the
+        branch is read rather than assumed. The unnamed publish has no name until
+        ``link`` makes one, so there the flush provably precedes the name. A mount
+        without ``O_TMPFILE`` (every darwin host, and NFS) never calls ``link`` at
+        all: its ``O_EXCL`` open IS the entry, so what is left to pin there is that
+        the body is flushed before the flush that claims the entry is durable. That
+        branch's other promises -- the 409 on an occupied name and the
+        identity-checked cleanup -- are pinned by the ``force_named_fallback``
+        tests below.
         """
         order: list[str] = []
         real_fsync, real_link = os.fsync, os.link
@@ -3385,11 +3401,27 @@ class TestCreateAndDeletePinTheDirectory:
         monkeypatch.setattr(os, "link", real_link)
 
         assert resp.status == 201
-        assert order[:2] == ["fsync_file", "publish"], f"flush must precede publish, got {order}"
+        assert "fsync_file" in order, f"the body was never flushed: {order}"
         assert "fsync_dir" in order, f"the directory entry was never flushed: {order}"
-        assert order.index("fsync_dir") > order.index(
-            "publish"
-        ), f"the directory flush must follow the publish it is making durable: {order}"
+        assert order.index("fsync_file") < order.index(
+            "fsync_dir"
+        ), f"the body must be durable before the entry's flush claims it: {order}"
+        # The production predicate, so this cannot quietly settle for the weaker
+        # arm on a host where the stronger property holds.
+        unnamed = _prompts_mod._UNNAMED_CREATE_SUPPORTED and os.path.isdir("/proc/self/fd")
+        if unnamed:
+            assert order[:2] == [
+                "fsync_file",
+                "publish",
+            ], f"flush must precede publish, got {order}"
+            assert order.index("fsync_dir") > order.index(
+                "publish"
+            ), f"the directory flush must follow the publish it is making durable: {order}"
+        else:
+            assert "publish" not in order, (
+                "the by-name branch has no unnamed inode to link, so a publish here "
+                f"means the branch predicate and the code disagree: {order}"
+            )
         assert (tmp_path / ".kiro" / "prompts" / "durable.md").read_text() == "B"
 
     def test_a_failing_directory_flush_is_reported_not_swallowed(
@@ -3441,6 +3473,36 @@ class TestCreateAndDeletePinTheDirectory:
         assertions run here as would run on an NFS home.
         """
         monkeypatch.setattr(_prompts_mod, "_UNNAMED_CREATE_SUPPORTED", False)
+
+    def test_the_named_fallback_flushes_the_body_before_the_entry(
+        self, tmp_path, mock_sel, monkeypatch, force_named_fallback
+    ):
+        """The by-name branch's own half of the durability order, run HERE.
+
+        ``O_TMPFILE`` is present on every Linux runner, so the branch every darwin
+        host and every NFS home actually takes would otherwise be exercised only
+        where nobody watches. It has no ``link`` to order against -- its ``O_EXCL``
+        open is the entry -- so the property left is the one that still matters: the
+        body is flushed before the flush that claims the entry is durable, and a
+        201 therefore never rests on an unflushed body.
+        """
+        order: list[str] = []
+        real_fsync = os.fsync
+
+        def _note_fsync(fd):
+            order.append("fsync_dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync_file")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", _note_fsync)
+        resp = asyncio.run(api_prompts_create(_create_request({"name": "byname", "content": "B"})))
+        monkeypatch.setattr(os, "fsync", real_fsync)
+
+        assert resp.status == 201
+        assert order[:2] == [
+            "fsync_file",
+            "fsync_dir",
+        ], f"the body must be flushed before the entry's flush claims it: {order}"
+        assert (tmp_path / ".kiro" / "prompts" / "byname.md").read_text() == "B"
 
     def test_the_named_fallback_publishes_a_correct_prompt(
         self, tmp_path, mock_sel, force_named_fallback
@@ -3506,6 +3568,10 @@ class TestCreateAndDeletePinTheDirectory:
         ).exists(), "the fallback left behind a prompt whose entry it could not flush"
         assert _outcomes(mock_sel)[-1] == "error"
 
+    @pytest.mark.skipif(
+        not _prompts_mod._UNNAMED_CREATE_SUPPORTED or not os.path.isdir("/proc/self/fd"),
+        reason="platform cannot build an unnamed inode (O_TMPFILE + /proc/self/fd)",
+    )
     def test_a_create_cannot_disturb_a_prompt_already_at_the_name(
         self, tmp_path, mock_sel, monkeypatch
     ):
@@ -3537,8 +3603,12 @@ class TestCreateAndDeletePinTheDirectory:
         assert (rival.stat().st_dev, rival.stat().st_ino) == (before.st_dev, before.st_ino)
         assert [p.name for p in d.iterdir()] == ["rival.md"]
 
-        # And a create that FAILS mid-write never had the name to lose: the
-        # incumbent survives and no debris is left beside it.
+        # And a create that FAILS mid-write never reaches its own name: the
+        # incumbent beside it survives and no debris is left. The name is a FREE
+        # one on purpose. A mount without ``O_TMPFILE`` refuses an OCCUPIED name at
+        # its ``O_EXCL`` open, before any body is written, so aiming the failure at
+        # ``rival`` again makes this half vacuous there -- which is exactly what it
+        # reported on darwin.
         real_write = os.write
         failed = {"done": False}
 
@@ -3550,13 +3620,15 @@ class TestCreateAndDeletePinTheDirectory:
 
         monkeypatch.setattr(os, "write", _fail_the_body)
         broke = asyncio.run(
-            api_prompts_create(_create_request({"name": "rival", "content": "MINE"}))
+            api_prompts_create(_create_request({"name": "newcomer", "content": "MINE"}))
         )
         monkeypatch.setattr(os, "write", real_write)
 
         assert failed["done"], "the write never failed — the test would be vacuous"
         assert broke.status == 500 and json.loads(broke.body)["code"] == "write_failed"
         assert rival.read_text() == "NOT YOURS"
+        # No ``newcomer.md``: the unnamed branch never named the inode, and the
+        # by-name branch removed the leaf its own O_EXCL made.
         assert [p.name for p in d.iterdir()] == ["rival.md"]
 
 

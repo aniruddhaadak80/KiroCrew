@@ -1,6 +1,6 @@
 """Tests for the sync-IO-in-async ratchet (scripts/check_sync_io_in_async.py).
 
-#3057: nothing in the repository failed when blocking IO was written inside an
+Nothing in the repository failed when blocking IO was written inside an
 ``async def``, so the count grew back after every individual fix -- ~70 on-loop
 ``store.db.execute()`` calls in ``dashboard/handlers/knowledge.py`` against zero
 in ``dashboard/handlers/memory.py`` in the same directory. These tests pin the
@@ -18,6 +18,11 @@ from pathlib import Path
 import pytest
 import yaml
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_sync_io_in_async_gate")
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_sync_io_in_async.py"
 BASELINE = ROOT / ".github" / "sync-io-in-async-baseline.txt"
@@ -398,7 +403,7 @@ class TestReportMode:
 
 class TestExemplarStaysClean:
     def test_the_fully_offloaded_handler_stays_clean(self) -> None:
-        # dashboard/handlers/memory.py is #3057's control case: it wraps every
+        # dashboard/handlers/memory.py is the control case: it wraps every
         # store call in asyncio.to_thread while handlers/knowledge.py next door
         # does not. It must never appear in the baseline.
         rel = "src/kiro_crew/dashboard/handlers/memory.py"

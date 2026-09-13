@@ -20,7 +20,7 @@ import re
 import threading
 import time as _time
 import uuid
-from collections.abc import Callable, Container, Iterator, Sequence
+from collections.abc import Callable, Container, Iterable, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -118,7 +118,7 @@ from kiro_crew.llm_helpers import (  # noqa: F401 - facade re-exports
     stream_and_collect,
     stream_and_collect_json,
 )
-from kiro_crew.messaging.link import canonical_key, legacy_key
+from kiro_crew.messaging.link import canonical_key, is_legacy_slack_key, legacy_key
 from kiro_crew.preview_text import strip_markdown_preview  # noqa: F401 - facade re-export
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel  # noqa: F401 - facade re-export
@@ -178,6 +178,12 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "autocompact_pct",
         "mode",
         "workspace",
+        # Slot-owned so ABSENCE can retract it. A crew rebound from a named
+        # memory store back to the default writes no key at all, and an unowned
+        # key is carried forward forever by ``carry_unowned_metadata`` -- so the
+        # rebind would be un-erasable and the session would keep consolidating
+        # into the silo it left.
+        "memory_store",
         "project",
         # Remote-execution binding: owned by the slot, so clearing it in memory
         # clears it on disk. Left unowned, a rebind or an unbind would be undone
@@ -194,7 +200,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "folder_id",
         "app",
         "artifact",
-        # Durable copy of the slot's held /note lines (issue #4093). Owned, not
+        # Durable copy of the slot's held /note lines. Owned, not
         # monotonic: the hold is written while notes are held and must be
         # CLEARED by absence once the flush delivers them — carried forward
         # instead, a restart would re-deliver a note the user already saw.
@@ -1016,7 +1022,7 @@ def metadata_now_iso() -> str:
     offset, so a reader (the browser, or a merge running on another host) has no
     way to know which timezone produced it -- the dashboard then renders it
     verbatim, showing a Slack/channel session's creation time in UTC instead of
-    the viewer's local zone (issue #1948). Resolving to an absolute instant with
+    the viewer's local zone. Resolving to an absolute instant with
     ``astimezone()`` records the offset, matching the message-row convention in
     :func:`monotonic_transcript_ts` so both the metadata line and the rows below
     it speak the same, unambiguous format.
@@ -1029,7 +1035,7 @@ def mint_row_mid() -> str:
 
     The ONE place the ``meta.mid`` format is spelled. ``_ChatSlot.append`` mints
     the id for a row that enters a dashboard window, and the dashboard
-    dual-writers (``cron_inject``, ``workflow_inject``, ``crew_chat``) read it back
+    dual-writers (``cron_inject``, ``workflow_inject``) read it back
     off that append to stamp their durable copy (``row_mid``). A writer with no
     slot to mint from -- a channel dispatcher persisting a turn it ran on its own
     session -- has to mint the id itself, and it must produce the SAME shape,
@@ -1165,6 +1171,24 @@ def transcript_stems(key: str) -> tuple[str, ...]:
         if legacy not in stems:
             stems.append(legacy)
     return tuple(stems)
+
+
+def transcript_lock_stems(key: str) -> tuple[str, ...]:
+    """Canonical and bare physical lock stems for either Slack spelling.
+
+    Unlike :func:`transcript_stems`, which preserves the caller's exact path
+    identity for ownership decisions, this helper is deliberately symmetric:
+    ``slack:<ts>``, ``slack_<ts>``, and bare ``<ts>`` all lock the same two
+    sidecars. Non-Slack keys have one lock stem.
+    """
+    bare = legacy_key(canonical_key(key))
+    if bare is None and key.startswith("slack_"):
+        candidate = key[len("slack_") :]
+        if is_legacy_slack_key(candidate):
+            bare = candidate
+    if bare is None:
+        return (_safe_key(key),)
+    return (_safe_key(f"slack:{bare}"), _safe_key(bare))
 
 
 def _redact_at_write_boundary(role: str, content: str) -> str:
@@ -1524,14 +1548,32 @@ class ConversationLog:
         fut.add_done_callback(lambda f: f.exception())
 
     @contextlib.contextmanager
-    def _locked(self, key: str) -> Iterator[None]:
-        """Hold BOTH the in-process RLock and a cross-process advisory flock.
+    def locked_stems(self, stems: Iterable[str]) -> Iterator[None]:
+        """Hold exact physical transcript stems in deterministic order."""
+        with contextlib.ExitStack() as locks:
+            for stem in sorted(set(stems)):
+                locks.enter_context(self._locked_stem(stem))
+            yield
 
-        Serializes create/append/rotate/rewrite/metadata mutations of a single
-        session file against every other writer — threads in this process (via
-        the RLock) *and* other processes such as subagents, crons, and the CLI
-        (via the ``flock`` on the sidecar lock file). Reentrant: a nested
-        ``_locked`` for the same key on the same thread reuses the held fd.
+    @contextlib.contextmanager
+    def _locked(self, key: str) -> Iterator[None]:
+        """Hold every physical lock that can represent one transcript.
+
+        Slack's canonical, sanitized, and pre-migration bare spellings all map
+        to one sorted lock set. Target-path resolution must happen inside this
+        context so a waiter cannot publish a filename choice made before a
+        concurrent restore.
+        """
+        with self.locked_stems(transcript_lock_stems(key)):
+            yield
+
+    @contextlib.contextmanager
+    def _locked_stem(self, key: str) -> Iterator[None]:
+        """Hold the in-process and cross-process locks for one physical stem.
+
+        Callers use :meth:`_locked`, which acquires every stable alias stem in
+        deterministic order. This primitive stays separate so that alias locking
+        never resolves a target path before all sidecars are held.
         """
         # Fail loud (strict) or diagnose (production) if a mutation reached the
         # lock ON the event loop — the un-offloaded-call-site guard (see
@@ -1633,13 +1675,13 @@ class ConversationLog:
                     # Depth hit 0. ``platform_compat.release_lock`` (flock
                     # LOCK_UN) and ``os.close`` are both ``blocking: true``
                     # syscalls, so run them off the event loop — a wedged
-                    # descriptor must never freeze chat/WS/heartbeat (the
-                    # finding this addresses). We DO NOT pop the state here:
+                    # descriptor must never freeze chat/WS/heartbeat. We DO NOT
+                    # pop the state here:
                     # the entry stays alive with ``held``=1 so a sequential
                     # same-key re-acquire before the release runs reuses the
-                    # still-held flock instead of ``flock``-ing a fresh fd (the
-                    # regression that spuriously raised HistoryLockTimeout under
-                    # executor load). The deferred release re-checks depth and
+                    # still-held flock instead of ``flock``-ing a fresh fd, which
+                    # would spuriously raise HistoryLockTimeout under executor
+                    # load. The deferred release re-checks depth and
                     # its own fd under the guard, so a reuse cancels it.
                     self._schedule_flock_release(key, lock_key, state[0])
 
@@ -1950,13 +1992,14 @@ class ConversationLog:
         correct agent later.  (Has no effect if the file already exists;
         use :meth:`update_metadata` to change the agent after creation.)
         """
-        path = self._path(key)
         # Serialize the create-if-missing + append + rotate against concurrent
         # rewrites (compaction / consolidation) so no write is lost and readers
-        # never observe a torn file. ``_locked`` also takes a cross-process
-        # advisory flock so a subagent / cron / CLI writing the SAME session
-        # file in another process can't interleave and lose this append.
+        # never observe a torn file. ``_locked`` also takes every stable
+        # cross-process alias lock so a subagent / cron / CLI writing the same
+        # logical session in another process cannot interleave or split its
+        # canonical and pre-migration files.
         with self._locked(key):
+            path = self._path(key)
             created_with_tab_id = False
             created_now = False
             if not path.exists():
@@ -1987,7 +2030,7 @@ class ConversationLog:
                 # created provably holds no rows yet, so it is not consulted.
                 #
                 # ``astimezone()`` resolves the clock to an absolute instant
-                # before it is stored. This used to record a bare local wall
+                # before it is stored. A bare local wall
                 # clock, which repeats for an hour when daylight saving ends and
                 # cannot be ordered against the offset-aware rows the dashboard
                 # writes into this same file.
@@ -2226,10 +2269,11 @@ class ConversationLog:
         them from memory/history extraction). When neither trips, the offset is
         applied as-is.
         """
-        path = self._path(key)
-        # Serialize behind the cross-process lock and re-read under it so a
-        # concurrent append (in this or another process) is never lost.
+        # Serialize behind the cross-process lock and resolve/re-read under it so
+        # a concurrent append or restore cannot redirect this key after its path
+        # was chosen.
         with self._locked(key):
+            path = self._path(key)
             if not path.exists():
                 return
             prev_mtime = _safe_mtime(path)
@@ -2705,6 +2749,36 @@ class ConversationLog:
         if skip_pinned:
             return self._metadata_projection.delete_session(key, skip_pinned=True)
         return self._metadata_projection.delete_session(key, skip_pinned=False)
+
+    def delete_memory_consolidation_session(self, key: str, expected_store: str) -> bool:
+        """Delete every artifact of one retired generated consolidation turn."""
+        from kiro_crew.member_memory_auth import (
+            read_private_session_store,
+            require_memory_consolidation_session_key,
+        )
+
+        require_memory_consolidation_session_key(key, expected_store)
+        binding = read_private_session_store(key)
+        if binding is not None and binding != expected_store:
+            raise ValueError("The transient session belongs to another private store")
+        path = self._path(key)
+        existed = path.exists()
+        deleted = self.delete_session(key)
+        if existed and not deleted:
+            raise OSError(f"Could not delete transient consolidation session {key!r}")
+
+        removed = bool(deleted)
+        archive_dir = _archive_dir(self._dir)
+        stem = _safe_key(key) + ARCHIVE_SEGMENT_DELIMITER
+        if archive_dir.exists():
+            for archived in archive_dir.glob(f"{stem}*.jsonl"):
+                archived.unlink()
+                removed = True
+        lock_path = self._lock_path(key)
+        if lock_path.exists():
+            lock_path.unlink()
+            removed = True
+        return removed
 
     def set_title(self, key: str, title: str) -> None:
         self._metadata_projection.set_title(key, title)

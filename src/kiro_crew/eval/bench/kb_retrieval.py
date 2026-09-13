@@ -46,7 +46,7 @@ from kiro_crew.eval.bench.retrieval import (
 from kiro_crew.eval.bench.safepath import UnsafePathError, read_text_nofollow
 from kiro_crew.eval.bench.toy_embedder import TOY_EMBEDDER_ID, toy_embed_fn
 from kiro_crew.knowledge.embedder import floats_to_bytes
-from kiro_crew.knowledge.retrieval import HybridRetriever
+from kiro_crew.knowledge.retrieval import ANY_EMBEDDING_SPACE, HybridRetriever
 from kiro_crew.knowledge.store import KnowledgeStore
 
 # Module-scope imports are safe here despite the boot-path perf concern: this
@@ -383,9 +383,46 @@ def _mean(xs: Sequence[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
+def golden_set_dir() -> Path:
+    """Directory holding the packaged golden sets."""
+    return Path(__file__).resolve().parent / "data"
+
+
 def default_golden_set_path() -> Path:
-    """Path to the shipped v1 golden set (packaged next to this module)."""
-    return Path(__file__).resolve().parent / "data" / "kb_golden_v1.json"
+    """Path to the golden set a no-argument run measures: v2.
+
+    v2, not v1, because v1 cannot discriminate: on it every class scores 1.000
+    recall under BOTH a keyword-only and a semantic retriever, so the number
+    confirms only that the harness ran. That is a property of v1's shape rather
+    than its size -- each of its gold documents is the only one in that corpus
+    using its topic's vocabulary, so matching a single term wins. v2 carries
+    competing distractors, and the legs separate on it: keyword-only
+    (deterministic: FTS5 + graph, no model) scores nDCG@3 0.825 / MRR@3 0.804,
+    against 0.903 / 0.887 for the semantic leg measured with
+    ``qwen3-embedding:0.6b``, and ``multi_hop`` recall_all@3 reads 0.400 keyword
+    versus 1.000 semantic. Re-measure the semantic pair after a model or
+    quantization change; only the keyword pair is reproducible from the corpus
+    alone.
+
+    Consequence for anyone comparing runs: a v1 report and a v2 report measure
+    DIFFERENT corpora and their metrics are not comparable. Nothing mechanical
+    stops that comparison -- ``bench kb-retrieval`` PRINTS its report and writes no
+    file (it has no ``--out-dir``), and ``bench compare`` only diffs saved
+    memory-retrieval reports, so it never sees a KB run at all. The one guard is
+    the corpus name in the printed header (``KB retrieval eval: kb_golden_v2``):
+    read it before putting two of these numbers side by side.
+    """
+    return golden_set_dir() / "kb_golden_v2.json"
+
+
+def v1_golden_set_path() -> Path:
+    """Path to the smaller v1 set, packaged alongside the default.
+
+    Shipped so a v1-labelled report stays reproducible. Not the default: it cannot
+    separate two retrievers, because each of its gold documents is the only one in
+    that corpus using its topic's vocabulary (see :func:`default_golden_set_path`).
+    """
+    return golden_set_dir() / "kb_golden_v1.json"
 
 
 def _fail_closed_embed(
@@ -529,7 +566,11 @@ def run_kb_retrieval(
     store = KnowledgeStore(db_path)
     try:
         _build_store(store, golden.docs, wrapped)
-        retriever = HybridRetriever(store, embedder=wrapped)
+        # This disposable corpus and every query use the same callable. Its
+        # vectors have no persisted model identity and cannot mix with user data.
+        retriever = HybridRetriever(
+            store, embedder=wrapped, embed_sig=ANY_EMBEDDING_SPACE if wrapped else None
+        )
 
         report = KBRetrievalReport(
             golden_set=golden.name,

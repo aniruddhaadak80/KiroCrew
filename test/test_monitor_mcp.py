@@ -9,6 +9,12 @@ from kiro_crew import mcp_core, session_directive
 from kiro_crew.mcp_tools import control
 
 
+def test_monitor_watch_does_not_offer_an_unenforced_evidence_scope():
+    schema = next(item for item in control.schemas() if item["name"] == "monitor_watch")
+
+    assert "evidence_scope" not in schema["inputSchema"]["properties"]
+
+
 def test_monitor_watch_is_stateless_and_canonical(gateway_posts):
     with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
         result = mcp_core._call_tool(
@@ -33,6 +39,46 @@ def test_monitor_watch_is_stateless_and_canonical(gateway_posts):
     assert gateway_posts[0][0] == "/api/session-directive"
     assert gateway_posts[0][1]["tool"] == "monitor_watch"
     assert gateway_posts[0][1]["raw_args"]["target"] == "https://www.github.com/acme/widgets/pull/7"
+
+
+@pytest.mark.parametrize(
+    ("kind", "target"),
+    [
+        ("gitlab_merge_request", "https://gitlab.com/acme/widgets/-/merge_requests/8"),
+        (
+            "azure_devops_pull_request",
+            "https://dev.azure.com/acme/project/_git/widgets/pullrequest/9",
+        ),
+        ("bitbucket_pull_request", "https://bitbucket.org/acme/widgets/pull-requests/10"),
+    ],
+)
+def test_monitor_watch_emits_each_supported_provider_kind(kind, target, gateway_posts):
+    with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
+        result = control.monitor_watch(
+            "monitor_watch",
+            {"kind": kind, "target": target, "objective": "review_ready"},
+        )
+
+    args = session_directive.decode(result, "monitor_watch")
+    assert args is not None
+    assert args["kind"] == kind
+    assert args["target"] == target
+
+
+def test_monitor_watch_rejects_kind_target_mismatch_before_emitting_directive(gateway_posts):
+    with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
+        result = control.monitor_watch(
+            "monitor_watch",
+            {
+                "kind": "bitbucket_pull_request",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "objective": "review_ready",
+            },
+        )
+
+    assert result.startswith("Error:")
+    assert session_directive.decode(result, "monitor_watch") is None
+    assert gateway_posts == []
 
 
 def test_monitor_watch_rejects_native_subagent_binding(gateway_posts):
@@ -185,9 +231,13 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                     "kind": "github_pull_request",
                     "created_ts": 123.0,
                     "wake_count": 3,
+                    "token_usage_known": False,
                     "wake_instructions": "large prompt omitted from inspect",
                     "last_wake_reason_code": "checks_failed",
                     "user_stop_reason": "operator stopped",
+                    "last_observation_status": "pending",
+                    "last_observation_reason_code": "checks_pending",
+                    "last_observation_summary": "Two checks are pending.",
                     "last_observation": {
                         "head_revision": "abc123",
                         "checks": {"passed": [f"check-{index}" for index in range(20)]},
@@ -205,6 +255,10 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     assert payload["monitor"]["wake_count"] == 3
     assert payload["monitor"]["last_wake_reason_code"] == "checks_failed"
     assert payload["monitor"]["user_stop_reason"] == "operator stopped"
+    assert payload["monitor"]["token_usage_known"] is False
+    assert payload["monitor"]["last_observation_status"] == "pending"
+    assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
+    assert "last_observation_summary" not in payload["monitor"]
     assert payload["monitor"]["observation"]["checks"]["passed_count"] == 20
     assert "wake_instructions" not in payload["monitor"]
     assert "check-0" not in result
@@ -231,7 +285,7 @@ def test_monitor_inspect_reports_internal_read_failure_as_error():
 
 
 def test_monitor_inspect_surfaces_armed_autonudge_loop():
-    """#9194: monitor_inspect must let a caller see an armed auto-nudge loop.
+    """monitor_inspect must let a caller see an armed auto-nudge loop.
 
     The gateway reports ``monitor: None`` (no structured monitor) together with
     a truthful ``autonudge_loop`` reading; the compact projection must pass that

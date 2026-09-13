@@ -1,12 +1,12 @@
 """Guards for the per-instrument histogram bucket Views.
 
-Context: bucket boundaries used to be ONE shared array applied through a single
-catch-all ``View(instrument_type=Histogram)``. Its top bound was 60s, sized for
-session startup, so the first ``kirocrew.turn.duration`` sample ever recorded
-(227589ms) fell into the +Inf overflow bucket and the aggregator reported
+One shared boundary array applied through a single catch-all
+``View(instrument_type=Histogram)`` cannot serve every instrument: a 60s top
+bound sized for session startup sends a 227589ms ``kirocrew.turn.duration``
+sample into the +Inf overflow bucket, and the aggregator then reports
 ``p50 == p90 == 60000`` — a ceiling artifact rendered as a real latency.
 
-The fix replaces the catch-all with one View per instrument. That makes two
+One View per instrument replaces that catch-all. That makes two
 properties load-bearing, and both are asserted here:
 
 1. **Completeness.** With no catch-all, an instrument missing from
@@ -39,6 +39,11 @@ from kiro_crew.metrics.provider import (
     histogram_bounds,
 )
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_provider_bucket_views")
 _SRC = Path(provider_mod.__file__).resolve().parent.parent
 # Histogram instrument names are the `.duration` metrics (all ms); counters
 # end in `.count` / `.acquire` / `.action` / `.outcome` and carry no bounds.
@@ -559,8 +564,8 @@ class TestAggregatorReadsRealPercentiles:
     def test_turn_percentiles_are_no_longer_pinned_to_the_ceiling(self):
         from kiro_crew.dashboard.handlers.telemetry import _pct_from_buckets
 
-        # Same sample, old vs new boundaries.
-        old_bounds = _STARTUP_BUCKETS_MS  # what every histogram used to get
+        # The same sample read against the startup boundaries and the turn ones.
+        old_bounds = _STARTUP_BUCKETS_MS  # the catch-all's shared array
         old_counts = [0] * len(old_bounds) + [1]  # 227589ms -> overflow
         assert _pct_from_buckets(old_counts, old_bounds, 0.50) == 60000.0
         assert _pct_from_buckets(old_counts, old_bounds, 0.90) == 60000.0

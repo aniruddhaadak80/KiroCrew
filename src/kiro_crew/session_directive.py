@@ -80,11 +80,11 @@ CORE_MCP_SERVER = "kirocrew-core"
 # ``{"kind": <tool>, "args": {...}}``. Placed on its own trailing line after the
 # human-readable confirmation so a consumer-less surface still shows sane text.
 #
-# ASCII-ONLY, deliberately. This previously carried a leading U+2063 INVISIBLE
-# SEPARATOR so the marker rendered invisibly, and that made every directive
-# silently fail: ``validation.build_tool_response`` — the single exit point for
-# all tool responses — strips category ``Cf``, so the prefix was destroyed
-# before the response left the MCP server and ``decode`` could no longer match.
+# ASCII-ONLY, deliberately. A leading U+2063 INVISIBLE SEPARATOR would render the
+# marker invisibly and make every directive silently fail:
+# ``validation.build_tool_response`` — the single exit point for
+# all tool responses — strips category ``Cf``, so such a prefix is destroyed
+# before the response leaves the MCP server and ``decode`` cannot match.
 # A machine-facing framing token must not depend on characters that sanitisers,
 # Unicode normalisers and transports all legitimately rewrite.
 _SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE]]"
@@ -104,10 +104,10 @@ MAX_DIRECTIVE_CHARS = 3800
 # consumer sees it (``acp/_dispatch.py``, which imports this constant so the two
 # cannot drift). It lives HERE because both markers are tail-anchored and so must
 # survive it: :data:`MAX_DIRECTIVE_CHARS` is deliberately far below it, and
-# :func:`tag_refusal` bounds its text against it. An unbounded refusal was
-# reachable -- ``validate_tool_args`` echoes the argument NAME, which the model
-# chooses, so a 9,000-character name produced a 9,087-character result whose tail
-# tag the cut removed, and the decline read as a lost marker again (#8635).
+# :func:`tag_refusal` bounds its text against it. An unbounded refusal is
+# otherwise reachable -- ``validate_tool_args`` echoes the argument NAME, which
+# the model chooses, so a 9,000-character name yields a 9,087-character result
+# whose tail tag the cut removes, and the decline reads as a lost marker.
 MAX_TOOL_RESULT_CHARS = 8000
 
 # Stamped on a directive tool's marker-less result INSTEAD of the directive
@@ -122,8 +122,8 @@ MAX_TOOL_RESULT_CHARS = 8000
 # stamps its own oversized-payload refusal, and :func:`refuse_if_markerless`
 # stamps every OTHER marker-less return — a schema rejection before the handler
 # ran, a "this session can never carry the effect" refusal, an empty required
-# argument. Before that second producer existed, only the oversized case was
-# distinguishable and every other refusal read as a lost marker (#8635).
+# argument. Without that second producer only the oversized case is
+# distinguishable and every other refusal reads as a lost marker.
 #
 # Forgery-inert by construction: unlike the directive marker this token carries
 # no payload and grants no effect, so a model emitting the literal bytes can only
@@ -330,12 +330,12 @@ def call_input_digest(tool: str, raw_args: Any) -> str:
 
     A directive tool's validated payload is parked on the gateway
     (``dashboard.directive_queue``) and the turn's consumer claims it. The
-    consumer used to learn WHICH record to claim by reading the marker back out
-    of the tool RESULT text, and that text is whatever the backend chose to put on
+    consumer cannot learn WHICH record to claim from the tool RESULT text, because
+    that text is whatever the backend chose to put on
     the wire: KAS re-serialises the envelope (quotes escaped), copies the result
     into two fields, replaces one of them with an offload reference above a size
     threshold, and caps every string at 30k chars with the tail-anchored marker
-    falling off the end. Each shape was one more repair branch in the shared ACP
+    falling off the end. Each shape is one more repair branch in the shared ACP
     parser, and each backend can add another at any time.
 
     The tool call's INPUT reaches both sides through no envelope at all. The MCP
@@ -376,7 +376,7 @@ def call_input_digest(tool: str, raw_args: Any) -> str:
     # ``reset_conversation({})`` record be claimed by the victim session's own
     # ``resource_status({})`` frame -- any same-args call of any tool. Binding the
     # tool name means a record is claimable only by a call to the tool that parked
-    # it, which is the correlation the marker's ``kind`` used to carry.
+    # it, which is the same correlation the marker's ``kind`` carries.
     return hashlib.sha256(f"{tool}\x00{canon}".encode("utf-8", "replace")).hexdigest()
 
 
@@ -393,7 +393,11 @@ def directive_tool_from_call(mcp_server_name: str, tool_name: str, title: str) -
     wire: kiro-agent's MCP wrapper (KAS) sets the ``tool_call`` title to
     ``@<serverName>/<toolName>`` from its own tool config, and claude-agent-acp
     (Claude) passes Claude's raw tool name ``mcp__<server>__<tool>`` through as
-    the title. Either spelling with ``kirocrew-core`` as the server resolves.
+    the title. opencode names an MCP tool ``<server>_<tool>`` with a SINGLE
+    underscore and emits no ``_meta.kiro`` at all, so for that harness the title
+    is the only identity a call carries (measured on 1.18.30 --
+    ``agent-host-contract.md`` section 9). Any of the three spellings with
+    ``kirocrew-core`` as the server resolves.
     Anything else is ``""``, and a call with no resolvable tool records no digest.
 
     *title* MUST be the frame's ``wire_title`` -- the backend's own field -- and
@@ -405,7 +409,7 @@ def directive_tool_from_call(mcp_server_name: str, tool_name: str, title: str) -
     This is a SELECTOR input, never a grant: a model that forges the title has
     only chosen which record to look up, and the record was still parked by a real
     tool call under this session's kernel-checked key with the tool's own name.
-    Forging it buys exactly what forging the marker's ``kind`` used to buy.
+    Forging it buys exactly what forging the marker's ``kind`` buys.
     """
     resolved = directive_tool_for(mcp_server_name or "", tool_name or "")
     if resolved:
@@ -431,7 +435,36 @@ def directive_tool_from_call(mcp_server_name: str, tool_name: str, title: str) -
     if title.startswith(f"mcp__{CORE_MCP_SERVER}__"):
         candidate = title[len(f"mcp__{CORE_MCP_SERVER}__") :].strip()
         return candidate if candidate in DIRECTIVE_TOOLS else ""
-    return ""
+    # opencode: ``<server>_<tool>``, joined by ONE underscore, and no
+    # ``_meta.kiro`` anywhere -- so this is the only channel that names the tool.
+    return _server_underscore_qualified(title)
+
+
+def _server_underscore_qualified(name: str) -> str:
+    """The directive tool *name* spells as ``<CORE_MCP_SERVER>_<tool>``, else ``""``.
+
+    opencode's MCP tool id is its server name and tool name joined by a SINGLE
+    underscore (each half with ``[^a-zA-Z0-9_-]`` replaced by ``_``; Crew's server
+    names survive that unchanged). Deliberately an EXACT server-qualified match
+    rather than teaching :func:`match_tool` that one underscore separates a
+    qualifier: one underscore as a separator resolves ``do_monitor_start``, which
+    that function excludes on purpose, and there is no way to tell that spelling
+    apart from a bare tool name whose own words happen to end in a directive
+    name. Exactness costs nothing here, because the whole point of this spelling
+    is that both halves are on the wire.
+
+    The SERVER half is the guard, as in the KAS and Claude branches: a
+    third-party server exposing a tool literally named
+    ``kirocrew-core_monitor_start`` spells its own id
+    ``<that-server>_kirocrew-core_monitor_start`` and fails the prefix, and a
+    longer Crew-looking name (``kirocrew-core_monitor_start_extra``) fails the
+    :data:`DIRECTIVE_TOOLS` membership check on the tool half.
+    """
+    prefix = f"{CORE_MCP_SERVER}_"
+    if not name.startswith(prefix):
+        return ""
+    candidate = name[len(prefix) :].strip()
+    return candidate if candidate in DIRECTIVE_TOOLS else ""
 
 
 def match_tool(raw: str) -> str:

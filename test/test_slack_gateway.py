@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -66,6 +67,50 @@ def _make_orchestrator(
     return orch
 
 
+class TestInboundReplayResolvesItsSpoolWhenScheduled:
+    """The detached replay pass reads the spool THIS boot resolved, not a later one.
+
+    ``_start_channel_transports`` schedules ``_replay_spooled_inbound`` as a detached
+    task, and the pass reads the spool on a worker thread (``asyncio.to_thread``).
+    Resolving ``spool_path()`` there means resolving the data home at whatever
+    moment the thread runs -- under the suite, after the starting test's
+    ``KIROCREW_HOME`` pin is gone. Five full runs left
+    ``~/.kiro/crew/inbound-spool/refused.jsonl.lock`` in the operator's REAL data
+    home exactly this way. The scheduler now resolves the path on the loop as it
+    creates the task; this pins that the path the pass receives is the one in
+    force at schedule time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_spool_path_is_fixed_when_the_task_is_created(self, monkeypatch, tmp_path):
+        from kiro_crew.messaging import inbound_spool
+
+        seen: list[Path | None] = []
+
+        async def _record(*, transports, path=None, now=None):
+            seen.append(path)
+            return inbound_spool.ReplayReport()
+
+        monkeypatch.setattr(inbound_spool, "replay_spooled", _record)
+        monkeypatch.setattr(gw, "_channel_transport_permitted", lambda member: False)
+        boot_home = tmp_path / "boot-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(boot_home))
+        orch = _make_orchestrator()
+
+        await orch._start_channel_transports()
+        # The environment moves on BEFORE the detached task gets its first step --
+        # the shape a finished test's teardown has from the task's point of view.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "later-home"))
+        replay = orch._inbound_replay_task
+        assert replay is not None
+        await asyncio.wait_for(replay, timeout=5.0)
+
+        assert seen == [boot_home / "inbound-spool" / "refused.jsonl"], (
+            "the replay pass was handed a spool resolved after scheduling -- a worker "
+            "thread would read (and lock) whatever data home the environment names then"
+        )
+
+
 # ─── Helper utilities ────────────────────────────────────────────────────
 
 
@@ -93,6 +138,13 @@ def _mock_sessions():
     s.close_all = AsyncMock()
     s.recycle_background = AsyncMock()
     return s
+
+
+def _mock_context_builder():
+    """Return a context builder with readable, unbound session metadata."""
+    builder = MagicMock()
+    builder.conversation_log.get_metadata_status.return_value = ({}, True)
+    return builder
 
 
 def _mock_dashboard_state():
@@ -366,7 +418,13 @@ class TestInitServices:
                                                         "asyncio.create_subprocess_exec",
                                                         new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
                                                     ):
-                                                        asyncio.run(orch._init_services())
+                                                        try:
+                                                            asyncio.run(orch._init_services())
+                                                            mock_mem_inst.init.assert_not_called()
+                                                            mock_vm_inst.init.assert_not_called()
+                                                            mock_mem_inst.rebuild_index.assert_not_called()
+                                                        finally:
+                                                            orch._stop_memory_startup()
 
         assert orch.sessions is not None
         assert orch.ctx_builder is not None
@@ -401,7 +459,12 @@ class TestInitServices:
                                                         "asyncio.create_subprocess_exec",
                                                         new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
                                                     ):
-                                                        asyncio.run(orch._init_services())
+                                                        try:
+                                                            asyncio.run(orch._init_services())
+                                                            mock_mem_inst.init.assert_not_called()
+                                                            mock_vm_inst.init.assert_not_called()
+                                                        finally:
+                                                            orch._stop_memory_startup()
 
         assert orch.slack is None
         assert orch.sessions is not None
@@ -571,10 +634,9 @@ class TestInteractiveApproval:
     async def test_all_slots_trusted_does_not_auto_approve(self):
         """All slots trusted, no resolver → still PROMPTS (no implicit trust).
 
-        This previously asserted auto-approval. That rule is gone: session
-        trust speaks for a chat session, not for an unattended job, and with
-        one trusted chat open the `all()` test was trivially satisfied.
-        Asserting the return value alone would now pass vacuously, because the
+        Session trust speaks for a chat session, not for an unattended job, and
+        with one trusted chat open the `all()` test is trivially satisfied.
+        Asserting the return value alone would pass vacuously, because the
         mocked `request_approval` also returns True -- so assert the prompt was
         actually raised.
         """
@@ -685,9 +747,13 @@ class TestDeliverResult:
         assert any(a[0] == "post" for a in mock_slack.actions)
 
     @pytest.mark.asyncio
-    async def test_slack_thread_delivery(self):
+    async def test_slack_thread_delivery(self, monkeypatch):
         from conftest import MockSlackClient
 
+        # The deliver tag is agent-writable, so the named channel must be tracked
+        # (or be the owner's own DM channel) before an unattended report is posted
+        # into it — see test_slack_heartbeat_channel_deliver.py for the refusals.
+        monkeypatch.setattr("kiro_crew.slack.gateway.is_tracked_channel", lambda c: c == "C123")
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         mock_slack = MockSlackClient()
         orch.slack = mock_slack
@@ -1247,7 +1313,7 @@ class TestBrazilInstallAndDeps:
 
         spawn.assert_not_awaited()
         # The skip must name the machine-readable reason, not just that it
-        # skipped -- an undiagnosable failure is the class #8409 is about.
+        # skipped -- an undiagnosable failure is the class this guards.
         logged = log_error.call_args.args
         assert "no_backend" in logged
         assert any("EPERM" in str(part) for part in logged)
@@ -1390,7 +1456,7 @@ class TestInitCron:
     async def test_init_cron_no_crons_flag(self):
         orch = _make_orchestrator(no_crons=True)
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.subagent_mgr = MagicMock()
         orch.subagent_mgr.running = []
         with patch("kiro_crew.slack.gateway.CronService") as mock_cs:
@@ -1407,7 +1473,7 @@ class TestInitCron:
     async def test_init_cron_starts_when_enabled(self):
         orch = _make_orchestrator(no_crons=False)
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.subagent_mgr = MagicMock()
         orch.subagent_mgr.running = []
         with patch("kiro_crew.slack.gateway.CronService") as mock_cs:
@@ -1425,7 +1491,7 @@ class TestInitCron:
         """Cron callback runs single-agent path."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1450,6 +1516,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j1"
@@ -1495,7 +1563,7 @@ class TestInitCron:
         unless an unrelated surface happened to be mid-turn."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1519,6 +1587,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j1"
@@ -1568,7 +1638,7 @@ class TestInitCron:
         key (cron:<job>:<agent>) — identity must be re-published for each."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1592,6 +1662,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j1"
@@ -1643,7 +1715,7 @@ class TestInitCron:
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
         orch.sessions.reset = AsyncMock()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
@@ -1680,6 +1752,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j1"
@@ -1731,7 +1805,7 @@ class TestInitCron:
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
         orch.sessions.reset = AsyncMock()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
@@ -1763,6 +1837,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j1"
@@ -1814,7 +1890,7 @@ class TestInitCron:
         secret = "AKIAIOSFODNN7EXAMPLE"
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1838,6 +1914,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j1"
@@ -1880,7 +1958,7 @@ class TestInitCron:
         """Duplicate result suppresses Slack delivery."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1904,6 +1982,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j2"
@@ -1945,7 +2025,7 @@ class TestInitCron:
         """Silent job suppresses delivery."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1966,6 +2046,8 @@ class TestInitCron:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j3"
@@ -2012,7 +2094,7 @@ class TestInitSubagents:
     async def test_init_subagents_creates_manager(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
         with patch("kiro_crew.slack.handler.is_yolo_mode", return_value=False):
@@ -2029,7 +2111,7 @@ class TestInitSubagents:
         orch = _make_orchestrator()
         orch._cfg.agent.max_subagents = 5
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = None
         with patch("kiro_crew.slack.handler.is_yolo_mode", return_value=False):
@@ -2062,7 +2144,7 @@ class TestInitSubagents:
 
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
         on_event = self._capture_on_event(orch)
@@ -2089,7 +2171,7 @@ class TestInitSubagents:
 
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
         on_event = self._capture_on_event(orch)
@@ -2134,7 +2216,7 @@ class TestSubagentDoneStoppedClassification:
         output — never 'completed ✅'."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
         orch.dashboard_state.get_slot = MagicMock(return_value=None)  # slot gone
@@ -2157,7 +2239,7 @@ class TestSubagentDoneStoppedClassification:
         record_failure (a deliberate stop is not a retryable failure)."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
 
@@ -2198,7 +2280,7 @@ class TestSubagentFinalSummaryDirective:
 
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         ds = _mock_dashboard_state()
         slot = MagicMock()
@@ -2246,7 +2328,7 @@ class TestInitHeartbeat:
     async def test_init_heartbeat_creates_service(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.memory = MagicMock()
         orch.ctx_builder.hooks = MagicMock()
         orch.consolidator = MagicMock()
@@ -2271,7 +2353,7 @@ class TestInitTaskRunner:
     def test_init_task_runner_creates_runner(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
@@ -2324,9 +2406,9 @@ class TestNotifyNudgeExpired:
     """A monitoring loop that stops at its cycle cap must tell the user.
 
     Reaching ``max_cycles`` is a runaway backstop, not a finish line — the loop
-    stopped with its goal possibly unmet. Previously the only trace was a log
+    stopped with its goal possibly unmet. Without this the only trace is a log
     line plus an ``active=False`` state change indistinguishable from a manual
-    Stop, so a capped-out loop looked the same as the agent stopping itself.
+    Stop, so a capped-out loop looks the same as the agent stopping itself.
     """
 
     @staticmethod
@@ -2357,7 +2439,7 @@ class TestNotifyNudgeExpired:
         monitor's recorded outcome rather than lumping both under a finish.
         """
         import kiro_crew.autonudge as _an
-        from kiro_crew.monitoring.models import MonitorOutcome
+        from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
 
         for outcome, expect_no_action in ((MonitorOutcome.SUCCESS, True), (MonitorOutcome.BLOCKED, False)):
             loop = self._loop()
@@ -2365,7 +2447,15 @@ class TestNotifyNudgeExpired:
             # loop would exercise the wrong case entirely.
             loop.cycle_count = 3
             loop.stopped_reason = _an.MONITOR_TERMINAL_REASON
-            loop.monitor = SimpleNamespace(outcome=outcome)
+            loop.monitor = MonitorState(
+                kind="github_pull_request",
+                target="https://github.com/acme/widgets/pull/7",
+                objective="review_ready",
+                created_ts=1.0,
+                outcome=outcome,
+                stopped_at=2.0,
+                stopped_reason="pull_request_merged" if expect_no_action else "pull_request_closed",
+            )
             state = MagicMock()
             GatewayOrchestrator._notify_nudge_expired(self._orch(state), loop)
             _args, _kwargs = state.notify.call_args
@@ -2426,7 +2516,7 @@ class TestInitDashboard:
         orch.sessions = _mock_sessions()
         orch.cron_svc = MagicMock()
         orch.subagent_mgr = MagicMock()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
         orch.task_runner = MagicMock()
@@ -2497,7 +2587,7 @@ class TestCronFailurePaths:
         """First failure sends alert."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -2520,6 +2610,8 @@ class TestCronFailurePaths:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "jfail"
@@ -2564,7 +2656,7 @@ class TestCronFailurePaths:
         """Duplicate failure within window suppresses Slack."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -2587,6 +2679,8 @@ class TestCronFailurePaths:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "jfail2"
@@ -2633,7 +2727,7 @@ class TestCronFailurePaths:
         """Multi-agent sequence runs agents sequentially."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -2654,6 +2748,8 @@ class TestCronFailurePaths:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "jmulti"
@@ -2876,6 +2972,15 @@ class TestAutoApplyUpdateGitPath:
         refusing before reaching the fetch/reset sequence they exist to cover. The
         refusals have their own tests in ``TestAutoApplyUpdatePreconditions`` and
         ``TestAutoApplyUpdateResetPath``.
+
+        The git binary is pinned too: ``_auto_apply_update`` resolves it through
+        ``platform_compat.trusted_git_bin`` (fixed trusted directories, never
+        PATH) and skips the whole update when that answers ``None``. Every spawn
+        below is faked, so the value only has to be an argv[0]; without the pin,
+        a host whose git lives outside those directories (a per-user Git for
+        Windows install) made every test here pass or fail on the refusal branch
+        instead of the sequence it covers. A test about the resolver itself
+        patches it again explicitly, and that inner patch wins.
         """
         with patch(
             "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]
@@ -2886,6 +2991,15 @@ class TestAutoApplyUpdateGitPath:
             "kiro_crew.slack.gateway.tracks_upstream", return_value=True
         ), patch(
             "kiro_crew.slack.gateway.commits_ahead", return_value=0
+        ), patch(
+            "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
+            return_value="/trusted/bin/git",
+        ), patch(
+            # The interpreter-floor gate reads the pinned commit with a real
+            # `git show`; against a non-repo that read FAILS, and a failed read
+            # refuses (its own tests are in TestAutoApplyUpdateResetPath).
+            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+            return_value=None,
         ):
             yield
 
@@ -3259,7 +3373,7 @@ class TestCronSuccessReminder:
         """After 24h of same result, re-posts with warning."""
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -3283,6 +3397,8 @@ class TestCronSuccessReminder:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "j_remind"
@@ -3330,7 +3446,7 @@ class TestSubagentDone:
         """Create orchestrator with subagent manager initialized."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -3659,7 +3775,7 @@ class TestHeartbeatCallback:
     async def test_heartbeat_task_success(self):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.memory = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
@@ -3694,7 +3810,7 @@ class TestHeartbeatCallback:
         """HEARTBEAT_KEEP response suppresses delivery."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.memory = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
@@ -3725,7 +3841,7 @@ class TestHeartbeatCallback:
         """Heartbeat task exception propagates."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.memory = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
@@ -3769,6 +3885,15 @@ class TestAutoApplyUpdateVenvPath:
         refusing before reaching the fetch/reset sequence they exist to cover. The
         refusals have their own tests in ``TestAutoApplyUpdatePreconditions`` and
         ``TestAutoApplyUpdateResetPath``.
+
+        The git binary is pinned too: ``_auto_apply_update`` resolves it through
+        ``platform_compat.trusted_git_bin`` (fixed trusted directories, never
+        PATH) and skips the whole update when that answers ``None``. Every spawn
+        below is faked, so the value only has to be an argv[0]; without the pin,
+        a host whose git lives outside those directories (a per-user Git for
+        Windows install) made every test here pass or fail on the refusal branch
+        instead of the sequence it covers. A test about the resolver itself
+        patches it again explicitly, and that inner patch wins.
         """
         with patch(
             "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]
@@ -3779,6 +3904,15 @@ class TestAutoApplyUpdateVenvPath:
             "kiro_crew.slack.gateway.tracks_upstream", return_value=True
         ), patch(
             "kiro_crew.slack.gateway.commits_ahead", return_value=0
+        ), patch(
+            "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
+            return_value="/trusted/bin/git",
+        ), patch(
+            # The interpreter-floor gate reads the pinned commit with a real
+            # `git show`; against a non-repo that read FAILS, and a failed read
+            # refuses (its own tests are in TestAutoApplyUpdateResetPath).
+            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+            return_value=None,
         ):
             yield
 
@@ -3820,10 +3954,10 @@ class TestAutoApplyUpdateVenvPath:
     async def test_kiro_cli_update_timeout_kills_child_and_stays_nonfatal(self):
         """A hung `kiro-cli update` is tree-killed AND the update stays non-fatal.
 
-        Both halves matter (issue #4210). Before the fix, the 120s timeout was
-        swallowed by the bare ``except Exception`` → DEBUG, so the run fell
-        through to the frontend build and dep reinstall while the ABANDONED
-        `kiro-cli update` kept mutating the installation concurrently — the
+        Both halves matter. If the 120s timeout is swallowed by a bare
+        ``except Exception`` → DEBUG, the run falls through to the frontend
+        build and dep reinstall while the ABANDONED `kiro-cli update` keeps
+        mutating the installation concurrently — the
         same half-replaced-install race the wheel path's CancelledError branch
         exists to prevent. A kill-only assertion would pass on a fix that
         turned the timeout fatal; the non-fatal half pins that the surrounding
@@ -4053,7 +4187,7 @@ class TestSubagentSlackInjection:
     def _setup(self):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -4172,7 +4306,7 @@ class TestTaskRunnerApproval:
     def test_task_runner_has_approval_callbacks(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
@@ -4579,6 +4713,15 @@ class TestAutoApplyUpdateResetPath:
         refusing before reaching the fetch/reset sequence they exist to cover. The
         refusals have their own tests in ``TestAutoApplyUpdatePreconditions`` and
         ``TestAutoApplyUpdateResetPath``.
+
+        The git binary is pinned too: ``_auto_apply_update`` resolves it through
+        ``platform_compat.trusted_git_bin`` (fixed trusted directories, never
+        PATH) and skips the whole update when that answers ``None``. Every spawn
+        below is faked, so the value only has to be an argv[0]; without the pin,
+        a host whose git lives outside those directories (a per-user Git for
+        Windows install) made every test here pass or fail on the refusal branch
+        instead of the sequence it covers. A test about the resolver itself
+        patches it again explicitly, and that inner patch wins.
         """
         with patch(
             "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]
@@ -4589,8 +4732,87 @@ class TestAutoApplyUpdateResetPath:
             "kiro_crew.slack.gateway.tracks_upstream", return_value=True
         ), patch(
             "kiro_crew.slack.gateway.commits_ahead", return_value=0
+        ), patch(
+            "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
+            return_value="/trusted/bin/git",
+        ), patch(
+            # The interpreter-floor gate reads the pinned commit with a real
+            # `git show`; against a non-repo that read FAILS, and a failed read
+            # refuses (its own tests are in TestAutoApplyUpdateResetPath).
+            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+            return_value=None,
         ):
             yield
+
+    @pytest.mark.asyncio
+    async def test_a_floor_refusal_is_redacted_and_capped_before_it_is_pushed(self, tmp_path):
+        """The refusal quotes the remote's `requires-python` and local paths verbatim.
+
+        Every sibling push of text the gateway did not author is redacted and
+        capped; the floor refusal is text the remote wrote, so it gets the same.
+        """
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        secret = "https://evil.example/leak?token=AKIA" + "X" * 40
+        breach = "the incoming revision requires Python >=3.12 (" + secret + ") " + "p" * 900
+        with patch.dict(os.environ, {"KIROCREW_PROJECT_DIR": str(tmp_path)}), patch(
+            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+            return_value=breach,
+        ), patch("asyncio.create_subprocess_exec", side_effect=self._scripted_git):
+            await orch._auto_apply_update()
+        pushed = [c.args for c in ds.push_update_progress.call_args_list if c.args[0] == "failed"]
+        assert len(pushed) == 1
+        detail = pushed[0][1]
+        assert detail.startswith("Update refused: ")
+        assert secret not in detail and "AKIA" not in detail
+        assert len(detail) <= len("Update refused: ") + 500
+        spawned = [[str(a) for a in c.args[1:3]] for c in self._spawns]
+        assert ["reset", "--hard"] not in spawned
+
+    @pytest.mark.asyncio
+    async def test_a_floor_git_cannot_read_refuses_before_the_reset(self, tmp_path):
+        """Unreadable is not absent: a git hiccup must not re-admit the stranded state."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        with patch.dict(os.environ, {"KIROCREW_PROJECT_DIR": str(tmp_path)}), patch(
+            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+            side_effect=gw.dep_sync.IncomingFloorUnreadable("git show timed out"),
+        ), patch("asyncio.create_subprocess_exec", side_effect=self._scripted_git):
+            await orch._auto_apply_update()
+        pushed = [c.args for c in ds.push_update_progress.call_args_list if c.args[0] == "failed"]
+        assert len(pushed) == 1 and "could not read" in pushed[0][1]
+        spawned = [[str(a) for a in c.args[1:3]] for c in self._spawns]
+        assert ["reset", "--hard"] not in spawned
+
+    async def _scripted_git(self, *argv, **_kwargs):
+        """Answer each pre-reset git step as a clean, behind-origin checkout would."""
+        self.__dict__.setdefault("_spawns", []).append(MagicMock(args=argv))
+
+        def _proc(rc: int, stdout: bytes = b"") -> MagicMock:
+            proc = MagicMock()
+            proc.returncode = rc
+            proc.communicate = AsyncMock(return_value=(stdout, b""))
+            proc.wait = AsyncMock(return_value=rc)
+            return proc
+
+        words = [str(a) for a in argv[1:]]
+        if words[:2] == ["rev-parse", "--abbrev-ref"]:
+            return _proc(0, b"main\n")
+        if words[:1] == ["fetch"]:
+            return _proc(0)
+        if words[:2] == ["rev-parse", "--verify"]:
+            return _proc(0, b"0123456789abcdef0123456789abcdef01234567\n")
+        if words[:1] == ["diff"] and "--quiet" in words:
+            return _proc(1)
+        if words[:2] == ["status", "--porcelain"]:
+            return _proc(0)
+        if words[:2] == ["diff", "--name-only"]:
+            return _proc(0)
+        if words[:2] == ["reset", "--hard"]:
+            return _proc(0)
+        raise AssertionError(f"unexpected spawn on the git update path: {argv!r}")
 
     @pytest.mark.asyncio
     async def test_reset_then_frontend_then_pip(self):
@@ -4599,9 +4821,9 @@ class TestAutoApplyUpdateResetPath:
         Public OSS flow (no Brazil ws sync / toolbox / AIM): branch → fetch →
         diff → status → reset → [kiro-cli optional] → build frontend → pip.
 
-        This test used to pass ` M file.py` here and assert that the reset ran
-        anyway -- it encoded the warn-and-destroy behaviour that
-        `test_uncommitted_tracked_changes_refuse_the_reset` now forbids. The
+        A dirty tree is not exercised here: passing ` M file.py` and expecting
+        the reset to run would encode a warn-and-destroy behaviour that
+        `test_uncommitted_tracked_changes_refuse_the_reset` forbids. The
         happy path is a clean tree; the dirty tree is a refusal, not a variant
         of this flow.
         """
@@ -4632,11 +4854,11 @@ class TestAutoApplyUpdateResetPath:
     async def test_uncommitted_tracked_changes_refuse_the_reset(self):
         """An unattended update must not delete a developer's uncommitted work.
 
-        This check used to log a warning and reset anyway, which made the
-        boot-time path the one place that could silently destroy uncommitted
-        edits. It now refuses, like the committed-work and exec-config checks
-        immediately above it, and defers to `kirocrew update` -- where a human
-        chose the destructive semantics.
+        This check refuses rather than logging a warning and resetting anyway:
+        a warn-and-reset would make the boot-time path the one place that could
+        silently destroy uncommitted edits. It refuses like the committed-work
+        and exec-config checks immediately above it, and defers to `kirocrew
+        update` -- where a human chose the destructive semantics.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -5481,7 +5703,7 @@ class TestCronAcpRetry:
         """ACP error with 'not running' triggers retry."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -5502,6 +5724,8 @@ class TestCronAcpRetry:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "jacp"
@@ -5552,7 +5776,7 @@ class TestInjectWithRetry:
     def _setup(self):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -5644,7 +5868,7 @@ class TestOrchestrationGuard:
     def _setup(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -5769,11 +5993,11 @@ class TestAutonudgeFire:
         """Fire with missing slot → removes loop.
 
         The rehydrate fallback is stubbed to a miss because that is what "slot
-        missing" means here. It used to be produced incidentally: the mock
-        dashboard state's MagicMock metadata read as ``closed``, and the
-        rehydrate helper's closed-guard bailed. The fire path now passes
+        missing" means here. It is stubbed explicitly rather than relying on the
+        mock dashboard state's MagicMock metadata reading as ``closed`` and the
+        rehydrate helper's closed-guard bailing: the fire path passes
         ``adopt_closed=True`` (idle archival must not destroy a loop), so that
-        accident no longer stops the walk.
+        accident does not stop the walk.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -5844,7 +6068,7 @@ class TestTaskApprovalCallback:
         """No dashboard → denies task."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
@@ -5868,7 +6092,7 @@ class TestTaskApprovalCallback:
         """Dashboard available → requests approval."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
@@ -5903,7 +6127,7 @@ class TestInitDashboardWiring:
         orch.sessions = _mock_sessions()
         orch.cron_svc = MagicMock()
         orch.subagent_mgr = MagicMock()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
         orch.task_runner = MagicMock()
@@ -5926,7 +6150,7 @@ class TestInitDashboardWiring:
         orch.sessions = _mock_sessions()
         orch.cron_svc = MagicMock()
         orch.subagent_mgr = MagicMock()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.conv_log = MagicMock()
         orch.consolidator = MagicMock()
         orch.task_runner = MagicMock()
@@ -5954,7 +6178,7 @@ class TestCronAckedItems:
     async def test_acked_items_appended_to_message(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -5975,6 +6199,8 @@ class TestCronAckedItems:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "jack"
@@ -6024,7 +6250,7 @@ class TestRetriggerRecovery:
     def _setup(self):
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -6338,11 +6564,10 @@ class TestBgSessionDashboardBranch:
     async def test_failing_url_announcement_does_not_abort_boot(self):
         """Announcing the URL is best effort — it must not take the gateway down.
 
-        This block used to live inside a fire-and-forget task, where a raise
-        could not reach the boot path. Hoisting it ahead of the MCP probe put it
-        on the synchronous path, so the fault isolation has to be explicit or a
-        formatting/token failure becomes a failed boot of an already-listening
-        dashboard.
+        This block runs on the synchronous boot path, ahead of the MCP probe,
+        so a raise here reaches the boot path. The fault isolation has to be
+        explicit or a formatting/token failure becomes a failed boot of an
+        already-listening dashboard.
         """
         orch = _make_orchestrator(no_dashboard=False, no_open=True)
 
@@ -6530,12 +6755,12 @@ class TestCheckMissingDepsPip:
 class TestInitServicesLoopResponsiveness:
     """The event loop must keep servicing callbacks during slow startup work.
 
-    Invariant (issue #3051): the loop runs callbacks one at a time, so a
+    Invariant: the loop runs callbacks one at a time, so a
     synchronous subprocess/scan inside ``_init_services`` starves every other
     coroutine — including the loop-stall watchdog heartbeat once armed — for
     its whole duration.
 
-    These tests assert the PROPERTY, not a duration (#4235): a fast ticker
+    These tests assert the PROPERTY, not a duration: a fast ticker
     runs concurrently with the init work, and the stand-in for each slow
     call blocks — in whatever execution context production invoked it —
     until it OBSERVES the ticker advance. Fixed code runs the work off the
@@ -6640,7 +6865,7 @@ class TestInitServicesLoopResponsiveness:
         # this synchronously ON the loop, where the probe's ticks can never
         # arrive — it flags starvation at the deadline. Patched on the
         # subprocess MODULE (not the gateway namespace) because the fixed
-        # gateway no longer imports subprocess at all.
+        # gateway does not import subprocess at all.
         _blocking_run = self._make_probe(
             state,
             "pip-blocking-run",
@@ -6719,7 +6944,17 @@ class TestInitServicesLoopResponsiveness:
                                                             await asyncio.wait_for(
                                                                 orch._init_services(), timeout=90
                                                             )
+                                                            assert state["probed"] == []
+                                                            orch.ctx_builder.memory = mock_mem_inst
+                                                            with (
+                                                                patch("kiro_crew.context.reset_memory_caches"),
+                                                                patch("kiro_crew.memory_backup.apply_pending_member_restores", return_value={}),
+                                                            ):
+                                                                assert await asyncio.wait_for(
+                                                                    asyncio.to_thread(orch._initialize_memory_worker), timeout=90
+                                                                )
                                                         finally:
+                                                            await asyncio.to_thread(orch._stop_memory_startup)
                                                             ticker_task.cancel()
         assert state["starved"] == [], (
             f"loop starved during service init: {state['starved']} observed no "
@@ -6743,7 +6978,7 @@ class TestCronSlackDeliveryFailure:
     async def test_slack_delivery_exception_notifies_dashboard(self):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -6767,6 +7002,8 @@ class TestCronSlackDeliveryFailure:
         callback = mock_cs.create.call_args[1]["on_job"]
 
         job = MagicMock()
+        job.member_id = ""
+        job.memory_store = ""
         job.script = ""
         job.command = ""
         job.id = "jslack"
@@ -6947,7 +7184,7 @@ class TestSlackSubagentCompletionPersistence:
     def _setup(self):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -7198,7 +7435,7 @@ class TestSubagentChannelTransportDelivery:
         orch.sessions.get_origin_link = MagicMock(return_value=None)
         orch.sessions.get_mirror_link = MagicMock(return_value=None)
         orch.sessions.get_channel = MagicMock(return_value=parent_channel)
-        orch.ctx_builder = MagicMock()
+        orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
         orch.dashboard_state = _mock_dashboard_state()
@@ -8465,7 +8702,7 @@ class TestMandatoryUpdateOnWheelInstall:
         apply_called.assert_awaited_once()
 
 
-# ─── Channel skip-reason warning on the PRODUCTION start path (#304, #5418) ──
+# ─── Channel skip-reason warning on the PRODUCTION start path ──
 
 
 _UNCREDENTIALED_PROBE_EXEMPTIONS = {
@@ -8478,6 +8715,15 @@ _UNCREDENTIALED_PROBE_EXEMPTIONS = {
     "whatsapp": "config-only enablement; pairing state is not a credential operand",
     "imessage": "config-only enablement through the signed-in Messages.app",
 }
+
+
+def _gateway_class() -> ast.ClassDef:
+    tree = ast.parse(Path(gw.__file__).read_text(encoding="utf-8"))
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GatewayOrchestrator"
+    )
 
 
 def _gateway_method(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
@@ -8495,33 +8741,48 @@ def _gateway_method(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
 
 
 def _collapsed_enabled_operands() -> dict[str, set[str]]:
-    """Return self-attribute operands read by each collapsed enabled flag."""
+    """Return self-attribute operands read by each collapsed enabled flag.
+
+    Scans ``__init__`` AND every ``_hoist_<channel>`` method: the per-channel
+    hoists are where each ``_<channel>_enabled`` predicate is now written, so a
+    scan of the constructor alone would find no predicate at all and the ratchet
+    would pass vacuously.
+    """
     found: dict[str, set[str]] = {}
-    for node in ast.walk(_gateway_method("__init__")):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "self"
-            and target.attr.startswith("_")
-            and target.attr.endswith("_enabled")
-        ):
-            continue
-        channel = target.attr.removeprefix("_").removesuffix("_enabled")
-        found[channel] = {
-            child.attr
-            for child in ast.walk(node.value)
-            if isinstance(child, ast.Attribute)
-            and isinstance(child.value, ast.Name)
-            and child.value.id == "self"
-        }
+    gateway_class = _gateway_class()
+    methods = [
+        node
+        for node in gateway_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (node.name == "__init__" or node.name.startswith("_hoist_"))
+    ]
+    assert methods, "no __init__ / _hoist_* methods found on the orchestrator"
+    for method in methods:
+        for node in ast.walk(method):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr.startswith("_")
+                and target.attr.endswith("_enabled")
+            ):
+                continue
+            channel = target.attr.removeprefix("_").removesuffix("_enabled")
+            found[channel] = {
+                child.attr
+                for child in ast.walk(node.value)
+                if isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id == "self"
+            }
     return found
 
 
 def _uncredentialed_probe_operands() -> dict[str, set[str]]:
-    """Return the self-attribute values named by each production probe row."""
+    """Return the self-attributes whose presence each production probe checks."""
     assignment = next(
         node
         for node in ast.walk(_gateway_method("_start_channel_transports"))
@@ -8536,15 +8797,18 @@ def _uncredentialed_probe_operands() -> dict[str, set[str]]:
         channel_node, _, _, credentials_node = row.elts
         assert isinstance(channel_node, ast.Constant) and isinstance(channel_node.value, str)
         assert isinstance(credentials_node, ast.Tuple)
-        found[channel_node.value] = {
-            pair.elts[1].attr
-            for pair in credentials_node.elts
-            if isinstance(pair, ast.Tuple)
-            and len(pair.elts) == 2
-            and isinstance(pair.elts[1], ast.Attribute)
-            and isinstance(pair.elts[1].value, ast.Name)
-            and pair.elts[1].value.id == "self"
-        }
+        operands = set()
+        for pair in credentials_node.elts:
+            assert isinstance(pair, ast.Tuple) and len(pair.elts) == 2
+            presence = pair.elts[1]
+            assert isinstance(presence, ast.Call)
+            assert isinstance(presence.func, ast.Name) and presence.func.id == "bool"
+            assert len(presence.args) == 1 and not presence.keywords
+            operand = presence.args[0]
+            assert isinstance(operand, ast.Attribute)
+            assert isinstance(operand.value, ast.Name) and operand.value.id == "self"
+            operands.add(operand.attr)
+        found[channel_node.value] = operands
     return found
 
 
@@ -8685,8 +8949,8 @@ class TestChannelSkipReasonAtTransportStart:
     ``_start_channel_transports`` at the decision point, which runs AFTER
     ``KIROCREW_READY`` (outside the boot-path window), via the seven-channel
     table feeding ``warn_if_channel_uncredentialed``. These pin that wiring
-    for every collapsed-flag channel (issue #5418, generalizing the
-    WeCom-only class issue #304 introduced); the helper's message contract is
+    for every collapsed-flag channel, generalizing the WeCom-only
+    class; the helper's message contract is
     pinned in ``test_wecom_gateway.py``.
 
     Rows that make a ``_<channel>_enabled`` flag True (fully-credentialed
@@ -8716,8 +8980,27 @@ class TestChannelSkipReasonAtTransportStart:
     async def _start(self, orch: GatewayOrchestrator, monkeypatch) -> None:
         from kiro_crew.slack import gateway as gw
 
+        warn = gw.warn_if_channel_uncredentialed
+
+        def warn_with_presence(channel_type, settings_name, cfg_enabled, presence):
+            assert all(type(present) is bool for _, present in presence)
+            warn(channel_type, settings_name, cfg_enabled, presence)
+
+        monkeypatch.setattr(gw, "warn_if_channel_uncredentialed", warn_with_presence)
         monkeypatch.setattr(gw, "_channel_transport_permitted", lambda member: False)
         await orch._start_channel_transports()
+        # `_start_channel_transports` detaches `_replay_spooled_inbound` as a
+        # background task on purpose (a slow platform send must not hold the
+        # gateway's start open), so it can still be resolving `data_home()` on
+        # the event loop after this test's `KIROCREW_HOME` pin is torn down —
+        # the same "background worker resolves its path when it runs" class as
+        # the safety-override breadcrumb publisher. Drain it here the same way
+        # `_shutdown()` does, so no write happens once the pin is gone.
+        replay = orch._inbound_replay_task
+        if replay is not None and not replay.done():
+            replay.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(replay, timeout=1.0)
 
     def _channel_records(self, caplog) -> list[logging.LogRecord]:
         names = {f"kiro_crew.{c}.gateway" for c in _UNCREDENTIALED_CHANNEL_TYPES}

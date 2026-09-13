@@ -6,6 +6,7 @@ import argparse
 import ast
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -90,24 +91,36 @@ def _isolate_pod_host_state(tmp_path_factory, monkeypatch: pytest.MonkeyPatch) -
     that reads it, so a future path that resolves through the home is covered
     without a matching change here. ``USERPROFILE`` too, because Windows
     ``Path.home()`` reads that one. Tests that pin either themselves still win.
+
+    The rootdir conftest now ALSO pins ``KIROCREW_POD_ROOT`` / ``KIROCREW_POD_ENV_DIR``
+    for every test (the same leak, found again from a module without this fixture).
+    This module clears those two pins on purpose: its subject includes the
+    home-DERIVED defaults (``TestHostStateIsFenced`` asserts the pod dirs follow the
+    pinned home), and with ``HOME`` redirected above the derivation is already
+    hermetic. Tests here that set the variables themselves are unaffected.
     """
     home = tmp_path_factory.mktemp("pod-host-home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("KIROCREW_POD_ROOT", raising=False)
+    monkeypatch.delenv("KIROCREW_POD_ENV_DIR", raising=False)
 
 
 @pytest.fixture(autouse=True)
 def _systemd_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise the SYSTEMD backend by default, on every host.
 
-    ``runtime`` dispatches unit operations on ``IS_MACOS``, so without this the
-    tests that monkeypatch ``rt.systemctl`` would silently exercise the launchd
-    branch when the suite runs on a Mac — passing on Linux CI and failing (or
-    worse, vacuously passing) on a developer's laptop. Pinning it makes the
-    default explicit and keeps the Linux/Windows contract asserted everywhere.
-    Tests for the macOS path set ``IS_MACOS`` True themselves.
+    ``runtime`` dispatches unit operations on ``IS_MACOS`` and ``IS_WINDOWS``,
+    so without this the tests that monkeypatch ``rt.systemctl`` would silently
+    exercise the launchd branch on a Mac or the Task Scheduler branch on the
+    Windows shards — passing on Linux CI and failing (or worse, vacuously
+    passing) elsewhere. The first full Windows run of this file after the
+    Windows backend landed failed exactly that way. Pinning both makes the
+    default explicit and keeps the systemd contract asserted everywhere. Tests
+    for the macOS or Windows path set their flag True themselves.
     """
     monkeypatch.setattr(rt, "IS_MACOS", False)
+    monkeypatch.setattr(rt, "IS_WINDOWS", False)
 
 
 @pytest.fixture
@@ -691,15 +704,6 @@ class TestPortAllocation:
         )
         assert displaced == shared, "the second pod should report what it moved off"
 
-    @pytest.mark.skipif(
-        rt.fcntl is None,
-        reason=(
-            "pod_name_mutex -- which pod_plane_mutex borrows -- degrades to a no-op "
-            "without fcntl, so nothing serializes these threads there. Not a gap: "
-            "require_backend refuses pods on any host without systemd/launchd, so "
-            "production never reaches the no-op. Only this test could."
-        ),
-    )
     def test_concurrent_allocations_never_hand_out_one_port_twice(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -826,8 +830,8 @@ class TestPortAllocation:
     def test_the_scan_leaks_no_descriptors(self, tmp_path, monkeypatch) -> None:
         """Every branch closes its fd, including the non-regular refusal.
 
-        Worth pinning rather than assuming: round 10 made an un-runnable probe RAISE
-        precisely because descriptor exhaustion is a real state, so a scan leaking one
+        Worth pinning rather than assuming: an un-runnable probe RAISES precisely
+        because descriptor exhaustion is a real state, so a scan leaking one
         per peer would be feeding the very failure it sits in front of.
         """
         c = self._plane(tmp_path, monkeypatch)
@@ -1016,10 +1020,9 @@ class TestPortAllocation:
     def test_the_shared_parser_defines_what_counts_as_a_port(self, value, expected, why) -> None:
         """One parser, one answer, every character class pinned.
 
-        Three call sites used to guard this themselves and each got it wrong
-        differently -- on length, on a sibling that was never audited, and on
-        character class. The guard is now a single function, so these cases are
-        asserted once here instead of being rediscovered per site.
+        Guarding this per call site gets it wrong differently -- on length, on a
+        sibling that was never audited, and on character class. The parser is a
+        single function, so these cases are asserted once here instead of per site.
 
         `isdecimal` rather than `isdigit` is the whole point: `isdigit` is not the
         predicate that matches `int()`. And `isascii` would have been wrong in the
@@ -1189,7 +1192,7 @@ class TestWorktreeResolution:
     ) -> None:
         monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
         c = PodConfig.load()
-        rt.pin_checkout(c, "demo", tmp_path / "gone")  # pinned dir no longer exists
+        rt.pin_checkout(c, "demo", tmp_path / "gone")  # pinned dir is absent
         (tmp_path / "real").mkdir()
         monkeypatch.setattr(rt, "_git_worktrees", lambda ref: {"demo": tmp_path / "real"})
         assert rt.resolve_checkout(c, "demo", cwd=tmp_path) == tmp_path / "real"
@@ -1433,16 +1436,12 @@ class TestPodEnvCredentialScrub:
         credential and a pod runs agent turns, and ``KIROCREW_OWNER_ID`` is the pod
         dashboard's owner identity rather than a bot credential.
         """
-        from kiro_crew.config.loader import (
-            _CREDENTIAL_KEYS,
-            CRED_KIRO_API_KEY,
-            CRED_OWNER_ID,
-        )
+        from kiro_crew.config.loader import CRED_KIRO_API_KEY, CRED_OWNER_ID, CREDENTIAL_KEYS
 
-        for key in _CREDENTIAL_KEYS:
+        for key in CREDENTIAL_KEYS:
             monkeypatch.setenv(key, f"live-{key}")
         env = rt.build_pod_env(cfg, tmp_path / "home", 7999, tmp_path / "co")
-        survivors = set(_CREDENTIAL_KEYS) & set(env)
+        survivors = set(CREDENTIAL_KEYS) & set(env)
         assert survivors == {CRED_KIRO_API_KEY, CRED_OWNER_ID}
 
     @pytest.mark.parametrize("inherited", ["::1", "0.0.0.0", "192.168.1.5"])
@@ -1541,18 +1540,16 @@ class TestPortOwner:
     """
 
     @pytest.fixture(autouse=True)
-    def _posix(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Pin the POSIX branch, for the same reason the module pins ``IS_MACOS``.
+    def _recorded_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stand in for a pid record that PROVED fresh.
 
-        ``port_owner`` returns ``OWNER_UNPROVEN`` on a non-POSIX host before it
-        consults any of the helpers these tests patch, so on Windows the decision
-        cases FAILED (`'unproven' == 'pod'`) while the four that expect
-        ``OWNER_UNPROVEN`` passed VACUOUSLY -- they would have passed whatever the
-        logic did. Pinning it makes the branch under test explicit and asserts the
-        same contract on every platform. ``test_non_posix_is_unproven`` sets it
-        False itself, which still wins: this fixture runs first.
+        This deliberately does NOT pin ``rt.IS_POSIX``, because ``port_owner``
+        returned ``OWNER_UNPROVEN`` on a non-POSIX host before consulting any
+        helper — so on Windows the decision cases FAILED and the ones expecting
+        ``OWNER_UNPROVEN`` passed VACUOUSLY. That platform gate is gone: both facts
+        the proof needs now answer on win32, so every case below exercises the
+        real branch on every platform and there is nothing left to pin.
         """
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         # Every positive ownership verdict requires the gateway's pid sidecar to
         # agree with the service manager's MainPID. Patching the reader stands in
         # for a record that PROVED fresh (it answers ``None`` otherwise), which is
@@ -1640,11 +1637,32 @@ class TestPortOwner:
         )
         assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
 
-    def test_non_posix_is_unproven(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(rt, "IS_POSIX", False)
-        monkeypatch.setattr(
-            rt, "listening_pid_tool_available", lambda: pytest.fail("must not be reached")
-        )
+    def test_windows_can_prove_ownership_because_both_facts_now_answer(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blanket ``not IS_POSIX`` return would refuse Windows here outright.
+
+        That was unsatisfiable rather than strict: ``pod up`` mints a token and
+        ``mint_token`` requires positive proof, so every healthy Windows pod
+        would have been refused its own credential forever. The proof needs
+        exactly two facts and both answer on win32 now — ``pid_start_token`` reads
+        the process creation FILETIME, and ``main_pid`` reads the pid the Task
+        Scheduler wrapper's ``supervise_gateway`` records.
+        """
+        monkeypatch.setattr(rt, "IS_WINDOWS", True)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda c, n, p: 4242)
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_POD
+
+    def test_a_windows_pod_with_no_agreeing_record_is_still_unproven(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Opening the platform gate must not weaken the proof itself."""
+        monkeypatch.setattr(rt, "IS_WINDOWS", True)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda c, n, p: None)
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
         assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
 
     def test_an_unaskable_service_manager_is_unproven(
@@ -1839,8 +1857,8 @@ class TestProvisionBuildPaths:
 
 
 class TestProvisionDependencyInstall:
-    """Dependency-gap fixes: npm deps before dist build (#229), dev extras in
-    the venv with graceful fallback for old pip (#230)."""
+    """npm deps install before the dist build, and dev extras install in
+    the venv with a graceful fallback for old pip."""
 
     def _venv_seeding_run(self, co: Path, calls: list[list[str]], group_fails: bool = False):
         """Return a fake _run that records calls and materializes the venv bin on
@@ -1952,17 +1970,36 @@ class TestProvisionDependencyInstall:
 
 
 class TestPodEnv:
+    def test_redirects_provider_cli_credentials_into_pod_home(
+        self, cfg: PodConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        host_glab = tmp_path / "host" / ".config" / "glab-cli"
+        host_azure = tmp_path / "host" / ".azure"
+        monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "host" / ".config" / "gh"))
+        monkeypatch.setenv("GLAB_CONFIG_DIR", str(host_glab))
+        monkeypatch.setenv("AZURE_CONFIG_DIR", str(host_azure))
+        home = tmp_path / "pod-home"
+
+        env = rt.build_pod_env(cfg, home, 7999, tmp_path / "co")
+
+        assert env["GH_CONFIG_DIR"] == str(home / ".config" / "gh")
+        assert env["GLAB_CONFIG_DIR"] == str(home / ".config" / "glab-cli")
+        assert env["AZURE_CONFIG_DIR"] == str(home / ".azure")
+        assert env["AZURE_EXTENSION_DIR"] == str(home / ".azure" / "cliextensions")
+
     def test_scrubs_slack_and_nonaws_tokens_keeps_aws(
         self, cfg: PodConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-live-bot")
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-live")
         monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
+        monkeypatch.setenv("JIRA_TOKEN_ABC123", "jira-secret")
         monkeypatch.setenv("AWS_REGION", "us-west-2")
         monkeypatch.setenv("AWS_SESSION_TOKEN", "sts-temp")
         env = rt.build_pod_env(cfg, tmp_path / "home", 7999, tmp_path / "co")
         assert "SLACK_BOT_TOKEN" not in env and "SLACK_APP_TOKEN" not in env
         assert "GITHUB_TOKEN" not in env  # non-AWS *_TOKEN scrubbed
+        assert "JIRA_TOKEN_ABC123" not in env
         # AWS_* kept (agent turns need it); AWS_SESSION_TOKEN must survive.
         assert env.get("AWS_REGION") == "us-west-2"
         assert env.get("AWS_SESSION_TOKEN") == "sts-temp"
@@ -2020,7 +2057,7 @@ class TestSeedPodOsHome:
     those copied HOST bearer tokens to any agent shell in the pod, and live
     acceptance had already shown the copy was not load-bearing (sign-in comes from
     the runtime's own data store, ``_RUNTIME_AUTH_STORES``). These tests pin the
-    absence of that copy; the tests that used to pin its presence are inverted here.
+    absence of that copy.
 
     ``Path.home()`` inside these tests resolves to the module's autouse
     per-test ``HOME`` pin, not the real invoking user's home -- see the
@@ -2508,10 +2545,10 @@ class TestEveryBootPathWriteRefusesAPlantedLink:
         assert victim.read_text() == "do not truncate me"
 
     def test_a_link_at_the_seed_config_is_refused(self, tmp_path: Path) -> None:
-        """`config.json` carries provider tokens. The create-only guard used to be
-        `exists()`, which FOLLOWS a link -- so a link pointing at any existing host
-        file read as "already configured" and the pod booted on the attacker's file
-        with no write and no error. The guard is an lstat now and a link is refused."""
+        """`config.json` carries provider tokens. The create-only guard is an lstat,
+        not `exists()`: `exists()` FOLLOWS a link, so a link pointing at any existing
+        host file would read as "already configured" and boot the pod on the
+        attacker's file with no write and no error. A link is refused."""
         victim = tmp_path / "host-secret"
         victim.write_text("keep me")
         home = tmp_path / "home"
@@ -2546,11 +2583,10 @@ class TestEveryBootPathWriteRefusesAPlantedLink:
 
 
 class TestEveryTerminalReturnOnTheBootPathIsRecorded:
-    """CLASS 2 of the round-8 restructure. Round 7 unified the terminal returns
-    through `_refuse` but MISSED the scenario-seed path, which printed its own FATAL
-    and returned 3 with no record. Enumerating the returns by AST is what makes a
-    third miss structurally impossible: a new bare `return <terminal code>` fails
-    this test rather than shipping."""
+    """Every terminal return on the boot path is recorded, including the
+    scenario-seed path, which prints its own FATAL and returns 3. Enumerating the
+    returns by AST is what makes a miss structurally impossible: a new bare
+    `return <terminal code>` fails this test rather than shipping."""
 
     def _boot_returns(self) -> list[ast.Return]:
         import inspect
@@ -2592,7 +2628,7 @@ class TestEveryTerminalReturnOnTheBootPathIsRecorded:
     def test_the_scenario_seed_refusal_is_recorded(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The specific path round 7 missed, pinned end to end."""
+        """The scenario-seed refusal is recorded, pinned end to end."""
         monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         cfg = PodConfig.load()
@@ -2676,13 +2712,11 @@ class TestTheExitTranslationRequiresTheRecord:
 
 
 class TestNoRefusalEscapesBootWithANonTerminalExit:
-    """Round 9's class closure. Rounds 7 and 8 unified the explicit `return` sites
-    and then AST-guarded them -- and a `raise PodError` walked past both, escaping
-    to the CLI's generic handler which exits 1, a code NOT in
-    TERMINAL_BOOT_EXIT_CODES, so systemd retried and launchd's KeepAlive restarted
-    it every ThrottleInterval. `boot` is now a wrapper that converts any refusal
-    into a recorded terminal exit, so escape is impossible by construction rather
-    than by enumeration."""
+    """A `raise PodError` must not escape boot to the CLI's generic handler, which
+    exits 1 -- a code NOT in TERMINAL_BOOT_EXIT_CODES, so systemd retries and
+    launchd's KeepAlive restarts it every ThrottleInterval. `boot` is a wrapper
+    that converts any refusal into a recorded terminal exit, so escape is
+    impossible by construction rather than by enumeration."""
 
     def test_boot_is_a_wrapper_that_converts_refusals(self) -> None:
         import inspect
@@ -2701,8 +2735,8 @@ class TestNoRefusalEscapesBootWithANonTerminalExit:
         for.
 
         Raised from `read_env_file`, the first thing the body does AFTER the name is
-        validated. Round 9 used `validate_name` here, but round 10 moved validation
-        OUTSIDE the guard on purpose: recording a refusal for an unvalidated name made
+        validated. Validation is OUTSIDE the guard on purpose: recording a refusal
+        for an unvalidated name would make
         the refusal machinery a host-write primitive (see
         `TestTheRefusalRecordIsNotAHostWritePrimitive`). So the guard is proved with a
         post-validation site, which is the region it is actually responsible for."""
@@ -2764,9 +2798,9 @@ class TestNoRefusalEscapesBootWithANonTerminalExit:
 
 
 class TestAnAcpTurnHasNoInheritedAwsCredentials:
-    """Round 9 comment-truth fix. The prose claimed "env-credentialed turns are
-    unaffected", which confused the pod GATEWAY's environment with the ACP child's:
-    `build_pod_env` does keep `AWS_*`, but the child is scrubbed AFTER it."""
+    """An ACP turn inherits no AWS credentials. `build_pod_env` does keep `AWS_*`
+    for the pod GATEWAY, but the ACP child is scrubbed AFTER it -- the gateway's
+    environment and the child's are not the same."""
 
     def test_the_scrubber_removes_the_secret_and_session_token(self) -> None:
         from kiro_crew import sandbox
@@ -2797,12 +2831,12 @@ class TestAnAcpTurnHasNoInheritedAwsCredentials:
 
 
 class TestTheRefusalRecordIsNotAHostWritePrimitive:
-    """Round 10. The round-9 wrapper records every refusal it catches, and
-    `_record_refusal` derives its path from the NAME -- so catching a
-    name-VALIDATION failure made `pod _run /tmp/important` atomically overwrite
-    `/tmp/important.refused` outside the pod plane. Two independent controls now:
-    validation happens before the guard, and the record refuses to write outside
-    `pods_dir` regardless of caller."""
+    """The wrapper records every refusal it catches, and `_record_refusal` derives
+    its path from the NAME -- so catching a name-VALIDATION failure would let
+    `pod _run /tmp/important` atomically overwrite `/tmp/important.refused` outside
+    the pod plane. Two independent controls prevent that: validation happens before
+    the guard, and the record refuses to write outside `pods_dir` regardless of
+    caller."""
 
     @pytest.mark.parametrize(
         "bad_name",
@@ -2948,6 +2982,39 @@ class TestCleanupHomeVerifies:
 
         monkeypatch.setattr(Path, "iterdir", _boom)
         assert rt.cleanup_home(c, "demo") == 1
+
+    def test_a_transiently_locked_home_is_reclaimed_on_a_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ "Still there" and "cannot be reclaimed" are different states on Windows.
+
+        MEASURED on a native host: killing a process that held a file open and
+        deleting immediately leaves the tree in place, because handles of an exited
+        process are released ASYNCHRONOUSLY; a retry clears it on the second
+        attempt. A control with no holder deletes on the first, and a holder that is
+        still alive survives every attempt. So the retry absorbs the OS's release
+        latency, and the survivor check keeps its teeth — proven by
+        ``test_reports_a_home_that_survived_the_delete``, where every attempt fails
+        and the result is still 1.
+        """
+        # Captured BEFORE _held_home, which patches this same module attribute to a
+        # no-op: `rt.shutil` and `shutil` are one module object, so capturing after
+        # would hand the no-op back and the "retry" would delete nothing.
+        real = shutil.rmtree
+        c, home = self._held_home(tmp_path, monkeypatch)
+        attempts: list[int] = []
+
+        def flaky(path, *a, **k):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return None  # the OS has not released the handle yet
+            real(path, *a, **k)
+
+        monkeypatch.setattr(rt.shutil, "rmtree", flaky)
+
+        assert rt.cleanup_home(c, "demo") == 0, "a tree that CAN be reclaimed must be"
+        assert len(attempts) == 2, f"exactly one retry was needed, saw {len(attempts)}"
+        assert not home.exists()
 
 
 class TestDrainCgroup:
@@ -3338,9 +3405,8 @@ class TestTheUnitFileNeverOutlivesAFailedLoad:
 
 @requires_posix_pod_lifecycle
 class TestPodNameMutexOnLinux:
-    """Linux teardown moved onto the ``down`` path, so Linux now has the same
-    down/up race the launchd backend needed the flock for: the mutex can no longer
-    be a no-op there."""
+    """Linux teardown runs on the ``down`` path, so Linux has the same down/up race
+    the launchd backend needs the flock for: the mutex must not be a no-op there."""
 
     def test_start_and_stop_hold_it(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
         import contextlib as _ctx
@@ -3364,10 +3430,6 @@ class TestPodNameMutexOnLinux:
         rt.stop_pod(cfg, "demo")
         assert held == ["enter:demo", "exit:demo"], "the sweep must run INSIDE the mutex"
 
-    @pytest.mark.skipif(
-        rt.fcntl is None,
-        reason="flock needs POSIX; without it the mutex is a documented no-op",
-    )
     def test_it_is_a_real_lock(self, cfg: PodConfig) -> None:
         with rt.pod_name_mutex(cfg, "demo"):
             pass
@@ -3929,7 +3991,16 @@ class TestOrphanSymlinkSafety:
             rt.shutil, "rmtree", lambda p, ignore_errors=False: seen.append(Path(p))
         )
         rt.cleanup_home(c, "demo")
-        assert seen == [c.pod_root / "demo"], "rmtree must get the unresolved name"
+        # Asserted over EVERY call rather than as a one-element list. The reclaim
+        # retries while the OS releases handles, and a faked rmtree never makes the
+        # entry disappear, so the bounded window runs to its cap here. The property
+        # under test is WHICH path is passed, not how many times: quantifying over
+        # all attempts pins it harder, because a retry that resolved the name would
+        # now fail too.
+        assert seen, "rmtree must be called at least once"
+        assert all(
+            p == c.pod_root / "demo" for p in seen
+        ), "rmtree must get the unresolved name on every attempt"
         assert seen[0] != (c.pod_root / "demo").resolve(), "test setup lost the distinction"
 
     def test_a_dangling_symlink_swap_is_reported_not_swallowed(
@@ -4002,7 +4073,7 @@ class TestDownSamplesStateUnderTheLock:
 @requires_posix_pod_lifecycle
 class TestDownReclaimsResidue:
     """``pod down`` is the reclaim command the orphan report points at, so it has
-    to work on a pod that is no longer running."""
+    to work on a pod that is not running."""
 
     def _orphan(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[PodConfig, Path]:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
@@ -4366,12 +4437,11 @@ class TestAuditEvents:
 
 
 class TestLsSurfacesARefusedPod:
-    """`PodConfig.refusal_file`'s stated justification is that `pod ls` reports a
-    terminal refusal the same way on both service managers. It did not: a refused pod
-    is not running, so it fell out of the listing entirely and `ls` printed "no pods
-    running" -- the note existed with no reader, and a pod that silently vanishes from
-    `ls` is exactly how a boot failure hides. Round 11 made the claim true rather than
-    deleting it."""
+    """`PodConfig.refusal_file`'s justification is that `pod ls` reports a terminal
+    refusal the same way on both service managers. A refused pod is not running, so
+    without this it falls out of the listing entirely and `ls` prints "no pods
+    running" -- the note has no reader, and a pod that silently vanishes from `ls`
+    is exactly how a boot failure hides."""
 
     def test_a_refused_pod_appears_with_its_reason(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -4740,7 +4810,7 @@ class TestUpVerb:
         exists to give them.
 
         So the marker is cleared the moment an operator pin is detected, and the
-        follow-on is asserted too: pinning the previously-auto value is respected.
+        follow-on is asserted too: pinning the once-auto value is respected.
         """
         c = self._prep(tmp_path, monkeypatch)
         c.pods_dir.mkdir(parents=True, exist_ok=True)
@@ -4764,7 +4834,7 @@ class TestUpVerb:
             f"a stale marker survived as {env.get(rt.AUTO_PORT_KEY)!r}; if the "
             "operator later pins that same port it would read as machine-made"
         )
-        # The follow-on: pinning the previously-auto port is now respected.
+        # The follow-on: pinning the once-auto port is respected.
         c.env_file("demo").write_text(f"PORT='7850'\n{rt.AUTO_PORT_KEY}=''\n")
         assert rt.operator_pinned(c, "demo") is True, (
             "after the marker is cleared, pinning the old auto port must read as "
@@ -5122,10 +5192,6 @@ class TestReviewRound2Fix:
         assert rt.read_env_file(c, "y")["CHECKOUT"] == "/a/b"
 
 
-@pytest.mark.skipif(
-    rt.fcntl is None,
-    reason="flock needs POSIX; without it the mutex is a documented no-op",
-)
 class TestEnvFileConcurrentWrite:
     """``write_env_file`` merges, so it must serialize per pod name.
 
@@ -5133,9 +5199,9 @@ class TestEnvFileConcurrentWrite:
     file, so an unserialized merge drops one side's keys and boots the pod on stale
     config.
 
-    Both tests assert a property only the real lock provides, so both are POSIX-only:
-    where ``fcntl`` is absent ``pod_name_mutex`` degrades to a no-op by design, and
-    pods are refused on those hosts anyway.
+    Both tests assert a property only the real lock provides, and both run on every
+    platform: ``pod_name_mutex`` locks through ``platform_compat.file_lock``, which
+    is ``flock`` on POSIX and ``msvcrt.locking`` on Windows.
     """
 
     def test_a_concurrent_write_does_not_drop_the_other_writers_keys(
@@ -5246,8 +5312,16 @@ class TestEnvFileConcurrentWrite:
         fd = os.open(str(env_path), os.O_RDONLY)
         try:
             head = os.read(fd, len(before) // 2)
-            # The writer runs while this reader is mid-file.
-            rt.write_env_file(c, "demo", {"APPROVAL": "yolo"})
+            # The writer runs while this reader is mid-file. On Windows the
+            # reader's handle carries no FILE_SHARE_DELETE, so the final rename
+            # is refused with a sharing violation once the bounded retry is spent:
+            # the contract there is fail CLOSED, never torn, so the old generation
+            # must survive byte for byte and the caller must hear about it.
+            if sys.platform == "win32":
+                with pytest.raises(PermissionError):
+                    rt.write_env_file(c, "demo", {"APPROVAL": "yolo"})
+            else:
+                rt.write_env_file(c, "demo", {"APPROVAL": "yolo"})
             chunks = [head]
             while True:
                 part = os.read(fd, 4096)
@@ -5262,9 +5336,14 @@ class TestEnvFileConcurrentWrite:
         assert head, "reader consumed nothing; the fixture is not exercising the seam"
         # The reader must have seen exactly one whole generation, old or new.
         assert seen in (before, after), "torn read: the reader spliced two generations together"
-        # And the new generation must be complete on disk.
         final = rt.read_env_file(c, "demo")
-        assert final["APPROVAL"] == "yolo"
+        if sys.platform == "win32":
+            # Refused, so the old generation is what remains, whole.
+            assert after == before
+            assert final["APPROVAL"] == "interactive"
+        else:
+            # And the new generation must be complete on disk.
+            assert final["APPROVAL"] == "yolo"
         assert final["CHECKOUT"] == "/a"
 
 
@@ -5636,13 +5715,19 @@ class TestSessionBus:
 
 @requires_posix_pod_lifecycle
 class TestBootTimeSettings:
-    """``pod up --approval`` / ``--crons`` are persisted per pod and applied at boot.
+    """``pod up --approval`` / ``--crons`` / ``--no-embeddings`` are persisted per
+    pod and applied at boot.
 
-    Neither can ride the unit file: both backends re-enter the pod as
+    None of them can ride the unit file: both backends re-enter the pod as
     ``kirocrew pod _run <name>`` with no flags. On systemd one template unit is
     shared by every instance, so it cannot carry per-pod flags; launchd writes a
     per-pod plist but still execs that same flagless argv. So they travel through
     the per-pod env file, exactly as ``SEED`` does.
+
+    ``--approval`` and ``--crons`` land on the gateway ARGV; ``--no-embeddings``
+    lands in the gateway's ENV instead, because the setting it expresses is an env
+    var the embedder reads rather than a flag the gateway parses. Hence two boot
+    helpers below.
     """
 
     def _booted_argv(
@@ -5661,6 +5746,40 @@ class TestBootTimeSettings:
         rt.boot(c, "x")
         assert len(seen) == 1, "boot did not exec exactly once"
         return seen[0][1:]  # drop argv[0], the venv binary path
+
+    def _booted_env(
+        self,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        env: dict[str, str],
+        *,
+        inherit_skip: bool = False,
+    ) -> dict[str, str]:
+        """Boot a ready pod with *env* merged into its env file; return the exec ENV.
+
+        The sibling of :meth:`_booted_argv` for a setting that travels in the
+        environment instead of the argv. Both are needed: asserting one says
+        nothing about the other, and an env-only option that accidentally grew an
+        argv flag (or the reverse) would pass a single-sided check.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(root / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(root / "pods"))
+        # A value inherited from the runner's own environment would make an
+        # assertion about what boot exports unfalsifiable.
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        if inherit_skip:
+            # The boot environment (not the env file) already carries the switch.
+            monkeypatch.setenv(rt.SKIP_MODEL_DOWNLOAD_ENV, "1")
+        c = PodConfig.load()
+        rt.pin_checkout(c, "x", _ready_worktree(root, "x"))
+        if env:
+            rt.write_env_file(c, "x", env)
+        seen: list[dict[str, str]] = []
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(os, "execve", lambda path, argv, e: seen.append(e))
+        rt.boot(c, "x")
+        assert len(seen) == 1, "boot did not exec exactly once"
+        return seen[0]
 
     def test_boot_forwards_the_recorded_mode(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5926,6 +6045,7 @@ class TestBootTimeSettings:
             c, argparse.Namespace(name="demo", json=False, seed="", ttl="2h", provision=False)
         )
         assert "APPROVAL" not in rt.read_env_file(c, "demo")
+        assert "EMBEDDINGS" not in rt.read_env_file(c, "demo")
 
     def test_up_audits_the_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # `yolo` auto-approves every tool, so the SEL trail must name the mode
@@ -6000,6 +6120,255 @@ class TestBootTimeSettings:
         assert allowed, "pod.up allowed was never audited"
         assert "crons=on" in allowed[0][2]
 
+    # --- embeddings --------------------------------------------------------
+
+    def test_the_skip_download_env_name_matches_the_embedder(self) -> None:
+        # runtime.py restates the name instead of importing embeddings (which drags
+        # the vendored llama.cpp resolution onto the gateway boot path), so this is
+        # what keeps the two spellings from drifting. A typo here exports a variable
+        # nothing reads and the pod downloads the model anyway -- silently, since a
+        # pod with the model IS healthy.
+        from kiro_crew import embeddings
+
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV == embeddings._SKIP_DOWNLOAD_ENV
+
+    def test_boot_without_embeddings_skips_the_model_download(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+
+    def test_boot_leaves_the_model_download_alone_when_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A pod whose env file carries no EMBEDDINGS key boots with the variable
+        # absent rather than set to any value. Embeddings are ON by default, so the
+        # opposite polarity to CRONS: saying nothing must not disable them.
+        env = self._booted_env(tmp_path, monkeypatch, {})
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in env
+
+    def test_boot_accepts_alternative_falsy_spellings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The env file is hand-editable, so the obvious spellings are honoured.
+        for i, raw in enumerate(("false", "NO", " off ")):
+            env = self._booted_env(tmp_path / f"e{i}", monkeypatch, {"EMBEDDINGS": raw})
+            assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1", raw
+
+    def test_boot_ignores_an_unrecognised_embeddings_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Falls back to the default (embeddings ON) rather than
+        # guessing, and the pod still boots. Note this is the SAFER answer here for
+        # the opposite reason it is with CRONS: a pod that unexpectedly kept its
+        # embeddings is a normal pod, whereas one that unexpectedly lost them
+        # answers search from a different index while looking perfectly healthy.
+        env = self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "maybe"})
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in env
+
+    def test_boot_announces_the_embedding_light_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        # The journal is the only place this mode is observable after the fact, so a
+        # measurement taken against the pod stays attributable.
+        self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        out = capsys.readouterr().out
+        assert "embeddings off" in out and "keyword fallback" in out
+
+    def test_boot_stays_silent_about_embeddings_on_a_normal_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        self._booted_env(tmp_path, monkeypatch, {})
+        assert "embeddings off" not in capsys.readouterr().out
+
+    def test_the_embedding_option_changes_no_boot_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # It is an ENV passthrough, not a gateway flag: the gateway has no
+        # --no-embeddings to receive. Pinned so a later change cannot quietly start
+        # passing one to a target checkout that would reject the whole argv.
+        argv = self._booted_argv(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        assert argv == ["gateway", "--no-crons", "--no-tunnel"]
+
+    def test_boot_combines_no_embeddings_with_the_other_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._booted_env(
+            tmp_path, monkeypatch, {"EMBEDDINGS": "0", "CRONS": "1", "APPROVAL": "reads"}
+        )
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+
+    def test_build_pod_env_writes_the_skip_into_the_returned_env_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The whole promise of the option: a load test runs embedding-free without
+        # the operator's own environment or home losing its model. Setting it in
+        # os.environ would leak the mode into every later host command in this
+        # process, the live gateway included.
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        cfg = PodConfig.load()
+        env = rt.build_pod_env(
+            cfg, tmp_path / "home", 7999, tmp_path / "co", skip_model_download=True
+        )
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in os.environ
+
+    def test_the_embed_model_override_env_names_match_the_embedder(self) -> None:
+        # Same drift guard as the skip switch: a misspelt override name here is a
+        # variable nothing reads, and the pod loads the custom model anyway.
+        from kiro_crew import embeddings
+
+        assert set(rt.EMBED_MODEL_OVERRIDE_ENVS) == {
+            embeddings._MODEL_PATH_ENV,
+            embeddings._MODEL_URL_ENV,
+        }
+
+    def test_build_pod_env_drops_an_inherited_custom_model_path_with_the_skip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The skip switch gates only the DOWNLOAD; resolve_custom_model reads
+        # KIROCREW_EMBED_MODEL_PATH first. Inherited, it would make the pod load the
+        # operator's GGUF and embed while the journal says it does not -- so the
+        # override must leave the mapping together with the switch arriving.
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        monkeypatch.setenv("KIROCREW_EMBED_MODEL_PATH", str(tmp_path / "custom.gguf"))
+        monkeypatch.setenv("KIROCREW_EMBED_MODEL_URL", "https://mirror.example/m.gguf")
+        cfg = PodConfig.load()
+        env = rt.build_pod_env(
+            cfg, tmp_path / "home", 7999, tmp_path / "co", skip_model_download=True
+        )
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+        assert "KIROCREW_EMBED_MODEL_PATH" not in env
+        assert "KIROCREW_EMBED_MODEL_URL" not in env
+        # Dropped from the pod's mapping only; the operator's shell keeps its model.
+        assert os.environ["KIROCREW_EMBED_MODEL_PATH"] == str(tmp_path / "custom.gguf")
+
+    def test_build_pod_env_keeps_a_custom_model_path_on_a_normal_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Without the option a pod is a normal gateway and inherits the override
+        # like any other setting; the scrub is tied to the switch, not to the env.
+        monkeypatch.setenv("KIROCREW_EMBED_MODEL_PATH", str(tmp_path / "custom.gguf"))
+        cfg = PodConfig.load()
+        env = rt.build_pod_env(cfg, tmp_path / "home", 7999, tmp_path / "co")
+        assert env["KIROCREW_EMBED_MODEL_PATH"] == str(tmp_path / "custom.gguf")
+
+    def test_boot_announces_an_inherited_skip_switch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        # The announce keys on the env the pod RUNS with, not on the env file: a
+        # switch the boot environment already carries produces the same
+        # embedding-light pod with no EMBEDDINGS key, and the journal must say so.
+        env = self._booted_env(tmp_path, monkeypatch, {}, inherit_skip=True)
+        assert env[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+        out = capsys.readouterr().out
+        assert "embeddings off" in out and "inherited from the boot environment" in out
+
+    def test_boot_names_the_env_file_as_the_source_when_it_asked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        self._booted_env(tmp_path, monkeypatch, {"EMBEDDINGS": "0"})
+        assert "EMBEDDINGS=0 in the pod env file" in capsys.readouterr().out
+
+    def test_pod_context_carries_the_embedding_setting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `pod exec` / `pod env` reach the env through this seam. Without the
+        # setting here, a single `pod exec` against an embedding-light pod starts
+        # the download the pod was booted to do without -- and the measurement it
+        # was booted for is then taken against a pod that has the model.
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        cfg = PodConfig.load()
+        rt.pin_checkout(cfg, "x", _ready_worktree(tmp_path, "x"))
+        _, plain = rt.pod_context(cfg, "x")
+        assert rt.SKIP_MODEL_DOWNLOAD_ENV not in plain
+        rt.write_env_file(cfg, "x", {"EMBEDDINGS": "0"})
+        _, embedless = rt.pod_context(cfg, "x")
+        assert embedless[rt.SKIP_MODEL_DOWNLOAD_ENV] == "1"
+
+    def test_up_records_no_embeddings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=True
+            ),
+        )
+        assert rt.read_env_file(c, "demo").get("EMBEDDINGS") == "0"
+
+    def test_up_leaves_the_key_absent_without_the_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=False
+            ),
+        )
+        assert "EMBEDDINGS" not in rt.read_env_file(c, "demo")
+
+    def test_up_audits_no_embeddings(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A pod answering search from the keyword fallback is not the same instance
+        # as a normal pod, so a result measured on one must be attributable.
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        seen: list[tuple] = []
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: seen.append(a))
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=True
+            ),
+        )
+        allowed = [a for a in seen if a[:2] == ("pod.up", "allowed")]
+        assert allowed, "pod.up allowed was never audited"
+        assert "embeddings=off" in allowed[0][2]
+
+    def _up_allowed_row(self, c: PodConfig, monkeypatch: pytest.MonkeyPatch) -> str:
+        seen: list[tuple] = []
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: seen.append(a))
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, no_embeddings=False
+            ),
+        )
+        allowed = [a for a in seen if a[:2] == ("pod.up", "allowed")]
+        assert allowed, "pod.up allowed was never audited"
+        return allowed[0][2]
+
+    def test_up_audits_a_sticky_no_embeddings_on_a_flagless_re_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The env file is merge-preserving, so EMBEDDINGS=0 from an earlier `up`
+        # survives a re-up without the flag and that pod boots embedding-light. The
+        # row keys on what the pod boots with, so it says so although this command
+        # never asked.
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        rt.write_env_file(c, "demo", {"EMBEDDINGS": "0"})
+        assert "embeddings=off" in self._up_allowed_row(c, monkeypatch)
+
+    def test_up_audits_an_inherited_skip_switch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No flag and no key, but the control plane's own environment carries the
+        # switch every `pod exec` and an inheriting boot will run with.
+        monkeypatch.setenv(rt.SKIP_MODEL_DOWNLOAD_ENV, "1")
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        assert "embeddings=off" in self._up_allowed_row(c, monkeypatch)
+
+    def test_up_audit_stays_silent_about_embeddings_on_a_normal_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(rt.SKIP_MODEL_DOWNLOAD_ENV, raising=False)
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        assert "embeddings=off" not in self._up_allowed_row(c, monkeypatch)
+
     def test_up_notes_every_deferred_flag_on_a_running_pod(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
@@ -6016,16 +6385,18 @@ class TestBootTimeSettings:
                 provision=False,
                 approval="yolo",
                 crons=True,
+                no_embeddings=True,
             ),
         )
         err = capsys.readouterr().err
         assert err.count("pod: note:") == 1
-        assert "--approval yolo --crons" in err
+        assert "--approval yolo --crons --no-embeddings" in err
 
     def test_up_merges_all_boot_settings_into_one_env_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # SEED / APPROVAL / CRONS share one write; the pinned CHECKOUT survives it.
+        # SEED / APPROVAL / CRONS / EMBEDDINGS share one write; the pinned CHECKOUT
+        # survives it.
         c = self._prep_up(tmp_path, monkeypatch, active=False)
         pod_cli._up(
             c,
@@ -6037,12 +6408,14 @@ class TestBootTimeSettings:
                 provision=False,
                 approval="reads",
                 crons=True,
+                no_embeddings=True,
             ),
         )
         env = rt.read_env_file(c, "demo")
         assert env.get("SEED") == "/tmp/fixture"
         assert env.get("APPROVAL") == "reads"
         assert env.get("CRONS") == "1"
+        assert env.get("EMBEDDINGS") == "0"
         # Compare path components, not a "/"-joined suffix: str(Path) uses "\"
         # on Windows, so endswith("wts/demo") fails there.
         checkout = Path(env.get("CHECKOUT", ""))

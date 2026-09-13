@@ -7,12 +7,29 @@ concrete subclass, the adapter a shared-runtime session is swapped onto once
 `AcpRuntime` is up.
 `agent.provider` is fixed to `"acp"` (enum `["acp"]`) — the provider is not the
 harness selector. **Which harness that one provider drives is a separate
-decision, taken from `acp_backends.py`**: `agent.acp_backend` names a backend id
+decision, taken from `agent_sdk/backends.py`**: `agent.acp_backend` names a backend id
 and `BASELINE_SELECTABLE_BACKENDS` decides which ids an operator may choose.
 Several are selectable on a plain public build, so "one provider" never meant
 "one backend".
 
 ### Architecture
+
+Private V2 process isolation is a trusted provider preparation decision. The
+synchronous factory leaves identity reads to `AcpProvider.prepare_private_memory`,
+which resolves persisted/protected session memory in a worker before `start`
+chooses a runtime or starts a process. Session allocation also calls preparation
+before its existing pre-start privacy comparison. The result updates provider
+and client flags together on the event loop, removes shared MCP routing for a
+private provider, and retains the original socket for private-path validation.
+Successful preparation is reused by `start` and recovery; failure or cancellation
+does not publish it. `private_memory=True` is preserved through `AcpProvider`,
+`AcpClient` and `AcpRuntime`, including a recovery respawn. Caller extra kwargs and
+environment variables cannot opt into or out of that decision. The actual sandbox
+spawn applies the member-specific Global V1 masks
+and refuses an unenforced mode; the earlier context check is not a substitute.
+Private sessions bypass the global warm/shared runtime inventory. Dedicated
+private consolidation uses the same preparation boundary; V1 factory call shapes
+and background/pool behavior remain unchanged.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -29,12 +46,12 @@ Several are selectable on a plain public build, so "one provider" never meant
             │ AcpProvider │
             │ acp.py      │
             └──────┬──────┘
-                   │  backend id from acp_backends.py
+                   │  backend id from agent_sdk/backends.py
         ┌──────────┼──────────┬──────────┐
      kiro-cli   claude-acp   KAS      codex-acp
 ```
 
-`acp_backends.py` is the selection authority: it defines the ids, the membership
+`agent_sdk/backends.py` is the selection authority: it defines the ids, the membership
 floor (`ACP_BACKENDS_KNOWN`), the selectable baseline, and every capability set a
 backend opts into. Do not re-describe that seam here —
 [harness-parity.md](harness-parity.md) holds the invariants that keep the Kiro
@@ -153,7 +170,7 @@ in [agent-host-contract.md](agent-host-contract.md).
 ```
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); the provider is not a choice.
-- `agent.acp_backend` is the harness choice, resolved through `acp_backends.resolve_selected_backend`.
+- `agent.acp_backend` is the harness choice, resolved through `agent_sdk.backends.resolve_selected_backend` (the top-level `acp_backends` module is a re-export shim kept for existing call sites).
 - `create_provider_factory()` returns a `Callable` that builds an `AcpProvider` for the resolved backend.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
@@ -176,7 +193,6 @@ are always present; user-configured servers from the agent config are merged in.
 
 - Provider-agnostic via factory (one provider, `AcpProvider`, over the resolved backend)
 - Calls `repair_agent_configs()` on gateway startup and periodically
-- context_info() reports model/agent
 - Resume: calls `set_resume_session_id()` before `start()`
 
 ### Subagent Approval Mode Inheritance (`subagent.py`)

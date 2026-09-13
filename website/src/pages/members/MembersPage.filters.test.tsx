@@ -15,7 +15,9 @@ vi.mock('../../api/client', () => ({
     memberActivity: vi.fn(() => Promise.resolve({ slug: '', member: '', capped: false, entries: [] })),
     crons: vi.fn(() => Promise.resolve({ jobs: [] })),
     webhooks: vi.fn(() => Promise.resolve({ tokens: [] })),
-    kirocrewAgents: vi.fn(() => Promise.resolve({ agents: [], default_agent: '' })),
+    // The drawer's wake block reads the default crew through the shared
+    // ['default-agent'] query (defaultAgentQuery), not the whole registry.
+    defaultAgent: vi.fn(() => Promise.resolve({ default_agent: '' })),
     updateKirocrewAgent: vi.fn(() => Promise.resolve({ ok: true })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
   },
@@ -44,7 +46,8 @@ vi.mock('react-router-dom', async (importOriginal) => {
 })
 
 import { api } from '../../api/client'
-import MembersPage, { matchesSource, parseSourceFilter } from './MembersPage'
+import MembersPage from './MembersPage'
+import { matchesSource, parseSourceFilter } from './rosterFilter'
 import { findReport } from '../../utils/errorReport'
 import ErrorNoticeMock from '../../components/ErrorNotice'
 
@@ -80,7 +83,7 @@ async function renderPage(members = ROSTER) {
   await waitFor(() => expect(api.members).toHaveBeenCalled())
   // Scoped to the roster: the first row auto-opens on arrival, so its name
   // also renders in the thread header.
-  await within(await screen.findByTestId('member-roster')).findByText('conductor')
+  await within(await screen.findByTestId('member-roster')).findByText(members[0].name)
   return utils
 }
 
@@ -88,6 +91,14 @@ const names = () =>
   Array.from(document.querySelectorAll('[data-testid^="member-star-"]')).map((el) =>
     el.getAttribute('data-testid')!.replace('member-star-', ''),
   )
+
+/** The filters live in the search row's sort/filter menu (the sidebar's
+ *  idiom), so a test opens it first — Enter on the trigger, as the sidebar's
+ *  own filter tests do — and the rows stay open across toggles. */
+async function openFilters() {
+  fireEvent.keyDown(screen.getByTestId('member-filter-menu'), { key: 'Enter' })
+  await screen.findByTestId('member-filter-starred')
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -119,18 +130,36 @@ describe('MembersPage filters', () => {
     expect(names()).toEqual(['conductor', 'kirocrew', 'legacy-aim', 'pkg-a', 'pkg-b'])
   })
 
-  it('shows per-bucket counts on the origin chips', async () => {
+  it('shows per-bucket counts on the origin rows, as a separate node from the label', async () => {
     await renderPage()
-    // Count is a separate node with a gap, not fused to the label ("Built-in2").
-    expect(screen.getByTestId('member-filter-source-builtin').className).toMatch(/\bgap-1\b/)
-    expect(screen.getByTestId('member-filter-source-mine')).toHaveTextContent('1')
-    expect(screen.getByTestId('member-filter-source-builtin')).toHaveTextContent('1')
-    expect(screen.getByTestId('member-filter-source-package')).toHaveTextContent('3')
+    await openFilters()
+    // Count is its own node, not fused to the label ("Built-in1").
+    expect(within(screen.getByTestId('member-filter-source-mine')).getByText('1')).toBeInTheDocument()
+    expect(within(screen.getByTestId('member-filter-source-builtin')).getByText('1')).toBeInTheDocument()
+    expect(within(screen.getByTestId('member-filter-source-package')).getByText('3')).toBeInTheDocument()
+    expect(screen.getByTestId('member-filter-source-builtin')).toHaveTextContent(/Built-in/)
+  })
+
+  it('the search row is the sidebar\'s shared SearchFilterBar: field, clear button, trailing menu button', async () => {
+    await renderPage()
+    const box = screen.getByTestId('member-search') as HTMLInputElement
+    expect(screen.queryByTestId('member-search-clear')).toBeNull()
+    fireEvent.change(box, { target: { value: 'pkg' } })
+    expect(names()).toEqual(['pkg-a', 'pkg-b'])
+    // The clear button appears with text and clears it, like the sidebar's.
+    fireEvent.click(screen.getByTestId('member-search-clear'))
+    expect(box.value).toBe('')
+    expect(names()).toHaveLength(5)
+    // The menu trigger is the sidebar's 24px filter button, docked in the field.
+    const trigger = screen.getByTestId('member-filter-menu')
+    expect(trigger.className).toMatch(/\bw-6\b/)
+    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter members')
   })
 
   it('header reads "N of M" while a filter narrows the list, plain count otherwise', async () => {
     await renderPage()
     expect(screen.getByTestId('member-count')).toHaveTextContent('5 members')
+    await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 members')
     fireEvent.click(screen.getByTestId('member-filter-starred'))
@@ -141,10 +170,36 @@ describe('MembersPage filters', () => {
 
   it('starred-only keeps just the starred rows and persists the toggle', async () => {
     await renderPage()
+    await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     expect(names()).toEqual(['conductor'])
-    expect(screen.getByTestId('member-filter-starred')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('member-filter-starred')).toHaveAttribute('aria-checked', 'true')
     expect(localStorage.getItem('mc-members-starred-only')).toBe('1')
+  })
+
+  it('active filters show as ONE aggregate chip under the search row; the chip clears them all', async () => {
+    await renderPage()
+    // Nothing narrows the list: no chip row at all, not an empty one.
+    expect(screen.queryByTestId('member-filter-chips')).toBeNull()
+    await openFilters()
+    fireEvent.click(screen.getByTestId('member-filter-starred'))
+    fireEvent.click(screen.getByTestId('member-filter-source-mine'))
+    // One control naming every active filter with its count — never one
+    // button per filter (AUTOSDE max-two-buttons-per-row).
+    const chips = screen.getByTestId('member-filter-chips')
+    expect(chips.querySelectorAll('button')).toHaveLength(1)
+    const chip = screen.getByTestId('member-filter-chip')
+    // The visible text is the click's outcome, the same sentence as the aria name.
+    expect(chip).toHaveTextContent('Clear Starred (1), Mine (1) filter')
+    expect(chip).toHaveAttribute('aria-label', 'Clear Starred and Mine filter')
+    // The search text is not a filter for this purpose: no chip change.
+    fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'con' } })
+    expect(chips.querySelectorAll('button')).toHaveLength(1)
+    // One click clears every filter and persists the clear; the row goes away.
+    fireEvent.click(chip)
+    expect(screen.queryByTestId('member-filter-chips')).toBeNull()
+    expect(localStorage.getItem('mc-members-starred-only')).toBe('0')
+    expect(localStorage.getItem('mc-members-source')).toBe('all')
   })
 
   it('restores a persisted starred-only filter on mount', async () => {
@@ -153,8 +208,9 @@ describe('MembersPage filters', () => {
     expect(names()).toEqual(['conductor'])
   })
 
-  it('source chips filter by origin and clicking the active chip clears it', async () => {
+  it('origin rows filter by origin and choosing the active one clears it', async () => {
     await renderPage()
+    await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-source-package'))
     expect(names()).toEqual(['legacy-aim', 'pkg-a', 'pkg-b'])
     expect(localStorage.getItem('mc-members-source')).toBe('package')
@@ -167,6 +223,7 @@ describe('MembersPage filters', () => {
 
   it('filters compose with the search box', async () => {
     await renderPage()
+    await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-source-package'))
     fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg-b' } })
     expect(names()).toEqual(['pkg-b'])
@@ -174,6 +231,7 @@ describe('MembersPage filters', () => {
 
   it('offers a clear action when the filters hide everyone, not the empty-roster copy', async () => {
     await renderPage()
+    await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     fireEvent.click(screen.getByTestId('member-filter-source-package'))
     expect(names()).toEqual([])
@@ -183,6 +241,55 @@ describe('MembersPage filters', () => {
     expect(names()).toHaveLength(5)
     expect(localStorage.getItem('mc-members-starred-only')).toBe('0')
     expect(localStorage.getItem('mc-members-source')).toBe('all')
+    expect(localStorage.getItem('mc-members-status')).toBe('[]')
+  })
+
+  it('status rows filter on the live state and OR together, persisting the set', async () => {
+    // `running` is the roster snapshot's cold-start value; with no slot frame
+    // for these members it is what isRunning reads.
+    await renderPage([
+      row('conductor', { source: 'kirocrew', starred: true, running: true }),
+      row('kirocrew', { source: 'builtin' }),
+      row('pkg-a', { running: true }),
+      row('pkg-b'),
+    ])
+    await openFilters()
+    // Counts sit right-aligned like the origin rows', 0 included — a zero-count
+    // row is the one that blanks the list, so it is never hidden.
+    expect(within(screen.getByTestId('member-filter-status-working')).getByText('2')).toBeInTheDocument()
+    expect(within(screen.getByTestId('member-filter-status-unread')).getByText('0')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('member-filter-status-working'))
+    expect(names()).toEqual(['conductor', 'pkg-a'])
+    expect(screen.getByTestId('member-filter-status-working')).toHaveAttribute('aria-checked', 'true')
+    expect(JSON.parse(localStorage.getItem('mc-members-status') || '[]')).toEqual(['working'])
+    // A second status widens the set (OR), so a member in either state shows.
+    fireEvent.click(screen.getByTestId('member-filter-status-unread'))
+    expect(names()).toEqual(['conductor', 'pkg-a'])
+    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 members')
+    fireEvent.click(screen.getByTestId('member-filter-status-working'))
+    // Only "unread" left and nothing is unread: the filters, not the roster, emptied the list.
+    expect(names()).toEqual([])
+    expect(screen.getByTestId('member-filtered-out')).toBeInTheDocument()
+  })
+
+  it('sort switches between recent activity and name and persists', async () => {
+    await renderPage([
+      row('zed', { last_active_ts: 300 }),
+      row('alpha', { last_active_ts: 100 }),
+      row('mid', { last_active_ts: 200 }),
+    ])
+    expect(names()).toEqual(['zed', 'mid', 'alpha'])
+    await openFilters()
+    expect(screen.getByTestId('member-sort-recent')).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(screen.getByTestId('member-sort-name'))
+    expect(names()).toEqual(['alpha', 'mid', 'zed'])
+    expect(localStorage.getItem('mc-members-sort')).toBe('name')
+  })
+
+  it('restores a persisted sort on mount', async () => {
+    localStorage.setItem('mc-members-sort', 'name')
+    await renderPage([row('zed', { last_active_ts: 300 }), row('alpha', { last_active_ts: 100 })])
+    expect(names()).toEqual(['alpha', 'zed'])
   })
 })
 
@@ -195,7 +302,10 @@ describe('MembersPage star', () => {
     expect(star.className).toMatch(/\bw-6\b/)
     expect(star.className).toMatch(/\bh-6\b/)
     fireEvent.click(star)
-    expect(api.updateKirocrewAgent).toHaveBeenCalledWith('pkg-a', { starred: true })
+    // The write goes through useMutation: its onMutate first cancels any
+    // in-flight roster refetch (so a stale row cannot land on the optimistic
+    // one), which puts the flip and the PUT a microtask after the click.
+    await waitFor(() => expect(api.updateKirocrewAgent).toHaveBeenCalledWith('pkg-a', { starred: true }))
     expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'true')
     // Does not open the member's thread — the star is a sibling of the row.
     // (The page opened the FIRST row on arrival; pkg-a must not be posted.)
@@ -210,13 +320,15 @@ describe('MembersPage star', () => {
     await renderPage()
     const star = screen.getByTestId('member-star-pkg-a')
     fireEvent.click(star)
-    expect(screen.getByTestId('member-star-pkg-a')).toBeDisabled()
+    await waitFor(() => expect(screen.getByTestId('member-star-pkg-a')).toBeDisabled())
     // A second click while pending is a no-op: exactly one write in flight.
     fireEvent.click(screen.getByTestId('member-star-pkg-a'))
     expect(api.updateKirocrewAgent).toHaveBeenCalledTimes(1)
     settle({ ok: true })
     await waitFor(() => expect(screen.getByTestId('member-star-pkg-a')).not.toBeDisabled())
     expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'true')
+    // No roster refetch after a 2xx: the optimistic row IS the server's state.
+    expect(api.members).toHaveBeenCalledTimes(1)
   })
 
   it('reverts the optimistic flip AND surfaces the failure when the write fails', async () => {
@@ -224,11 +336,11 @@ describe('MembersPage star', () => {
     await renderPage()
     expect(screen.queryByTestId('member-star-error')).toBeNull()
     fireEvent.click(screen.getByTestId('member-star-pkg-a'))
-    await waitFor(() =>
-      expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'false'),
-    )
     // Not a silent revert: the user is told the preference did not save.
-    const notice = screen.getByTestId('member-star-error')
+    // (Wait for the notice, not for aria-pressed=false — the row is false
+    // BEFORE the optimistic flip too, now that the flip rides onMutate.)
+    const notice = await screen.findByTestId('member-star-error')
+    expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'false')
     // Localized copy, not the raw server text.
     expect(notice).toHaveTextContent("Could not update this member's star.")
     expect(notice).not.toHaveTextContent('Forbidden')

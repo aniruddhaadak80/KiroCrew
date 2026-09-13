@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -19,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 from installer_test_helpers import run_bounded
+from skill_script_helpers import load_skill_script
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "packaging" / "signing" / "cli-manifest.py"
@@ -270,7 +270,7 @@ def test_optional_min_version_is_signed_and_round_trips(
     assert verified.returncode == 0, verified.stderr
 
     # Flip the floor after signing: the canonical payload changes, so the
-    # existing signature must no longer verify.
+    # existing signature must fail to verify.
     manifest["min_version"] = "0.0.1"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     tampered = _run_helper(
@@ -780,10 +780,9 @@ def test_kms_signer_requires_matching_non_exportable_key_and_verifies_output(
         stderr=subprocess.DEVNULL,
     ).stdout
 
-    spec = importlib.util.spec_from_file_location("cli_manifest_test_helper", HELPER)
-    assert spec is not None and spec.loader is not None
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
+    # Import-by-path writes bytecode beside the source unless suppressed; the
+    # helper does the suppression, so no __pycache__ lands in packaging/signing/.
+    helper = load_skill_script("cli_manifest_test_helper", HELPER)
 
     key_arn = "arn:aws:kms:us-west-2:000000000000:key/test"
     aws_calls: list[list[str]] = []
@@ -883,7 +882,7 @@ def test_verify_accepts_a_signed_manifest_and_rejects_tampering(
     verified = _verify_manifest(manifest, test_key)
     assert verified.returncode == 0, verified.stderr
 
-    # Tampered field: signature no longer covers the payload.
+    # Tampered field: the signature does not cover the payload.
     data = json.loads(manifest.read_text(encoding="utf-8"))
     data["version"] = "9.9.9"
     tampered = tmp_path / "tampered.json"

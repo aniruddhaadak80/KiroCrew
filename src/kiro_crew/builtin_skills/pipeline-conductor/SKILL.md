@@ -1,6 +1,6 @@
 ---
 name: pipeline-conductor
-description: Operating procedure for the kirocrew-pipeline-conductor agent - run one issue/PR pipeline on one repository as a supervised fleet. Auto-pick items, preflight every candidate to one deterministic claim verdict, stand up one worker session per item in a dedicated folder, probe them each cycle with one script call, verify claimed greens independently, intervene when a worker loops or stalls, adjudicate blocked items under the override protocol, throttle admission on delivery capacity, enforce per-item credit budgets, track the conductor's own obligations in a status file, digest verified greens to the human, and clean up on merge. Use when a pipeline conductor session is being seeded, or when inspecting/debugging one.
+description: Use when a pipeline conductor session is being seeded, or when inspecting/debugging one. Operating procedure for the kirocrew-pipeline-conductor agent - run one issue/PR pipeline on one repository as a supervised fleet. Auto-pick items, preflight every candidate to one deterministic claim verdict, stand up one worker session per item in a dedicated folder, probe them each cycle with one script call, verify claimed greens independently, intervene when a worker loops or stalls, adjudicate blocked items under the override protocol, throttle admission on delivery capacity, enforce per-item credit budgets, track the conductor's own obligations in a status file, digest verified greens to the human, and clean up on merge.
 ---
 
 # Pipeline Conductor
@@ -21,6 +21,8 @@ rather than permission.
   error tails + banned-process scan + host load + delivery counters, in ONE
   call per cycle.
 - `scripts/credit_spend.py` — per-item credit rollup + budget verdict.
+- `scripts/spec_check.py` — the spec's closed-value fields, checked once at
+  startup. Exit 2 refuses the run.
 
 A decision this procedure states as prose rots silently; a decision a script
 computes can be tested. So anything below that cites a script is that script's
@@ -38,7 +40,9 @@ The operator's seed message names a spec file (JSON). Fields you consume now:
   "work_source": {"kind": "gh_issues", "select_labels": ["auto-fixable"],
                    "skip_signals": ["claimed", "in-progress"]},
   "worker_contract": {"branch_pattern": "fix/{slug}-{n}",
-                       "worktree_pattern": "../{repo_name}-fix-{n}"},
+                       "worktree_pattern": "../{repo_name}-fix-{n}",
+                       "max_commits": 2},
+  "verifier": {"repro_gate": "best_effort"},
   "governance": {"max_in_flight": 32, "max_per_cycle": 3,
                   "idle_alert_secs": 900, "session_ceiling": 30,
                   "credit_budget_per_item": 100, "topup_ceiling": 2},
@@ -56,9 +60,53 @@ in the config and it is what makes `cwd=fleet` reachable, so leaving it out
 classifies every banned line as `foreign` or `unknown` and the enforcing row of
 the banned-ops table never fires.
 
+`verifier.repro_gate` has two values, and exactly two — `spec_check.py` refuses
+the run on anything else (`malformed spec: verifier.repro_gate 'pod-required':
+expected 'best_effort' or 'pod_required'`), because a third value engages neither
+branch below and would leave the generic contract in force under a spec that
+reads as gated:
+
+- `best_effort` (default) keeps the generic pipeline behavior: reproduce where
+  cheap, and let the worker justify the narrowest honest verification when a
+  live system adds no signal.
+- `pod_required` is a HARD ADMISSION GATE for a pod-verification campaign. The
+  item is not implementation-eligible until the UNMODIFIED worktree reproduces
+  the reported failure in a live pod running that worktree's code. A unit or
+  structural test, a direct module call, a simulated exception, source reading,
+  or a note that a pod *could* verify the change later does NOT satisfy the
+  gate. No source, test, or documentation edit may precede the live red trace.
+  If the necessary scenario, product route, caller identity, host capability,
+  or externally drivable trigger is absent, the worker reports
+  `STANDDOWN: pod-repro-ineligible — <evidence>; missing=<capability>` without a
+  commit or PR, the conductor releases the claim with that evidence, and the
+  queue advances to the next candidate. After admission, the same live trace
+  must turn green before the worker may report `GREEN`.
+
+A pipeline using `pod_required` is measured by the number of admitted issues,
+not by the number inspected. An issue fixed with unit evidence but no admitted
+pod repro is useful work in another campaign and a FAILED sample in this one;
+never relabel it success in the friction report.
+
 ## Startup (once per run)
 
-1. Read the spec. `chat_folder_create` the pipeline folder.
+1. Run the checker through Kiro Crew's runtime interpreter before reading the
+   spec yourself or doing anything else. On POSIX run
+   `"$KIROCREW_RUNTIME_PYTHON" -I -B "<skill-dir>/scripts/spec_check.py" --spec <path>`;
+   on PowerShell run
+   `& $env:KIROCREW_RUNTIME_PYTHON -I -B "<skill-dir>/scripts/spec_check.py" --spec <path>`.
+   `-I` keeps the current directory, script directory, user site, and inherited
+   Python environment out of the import path before `safe_read_file` loads;
+   `-B` preserves the desktop bundle's no-bytecode-write rule even though
+   isolated mode ignores its `PYTHONDONTWRITEBYTECODE` environment setting.
+   Never substitute bare `python` or `python3`: desktop installs carry their own
+   interpreter and do not require either name on `PATH`. Exit 2 is a REFUSAL TO
+   START, not a warning: it means a field with a closed value set carries a value
+   that is neither of its options, and every such value engages no branch at all
+   — so the mode the operator asked for is silently off while the spec says it is
+   on. Report the message verbatim and stop; do not guess a default, and do not
+   open the folder or claim an item first, because a run that has already
+   dispatched a worker cannot un-dispatch it. Only after exit 0 may you read the
+   spec and use its values. Then `chat_folder_create` the pipeline folder.
 2. Build the queue from the work source (or adopt the operator's seeded
    backlog). **Record the backlog at whatever size it is** — as the queue's
    PROVENANCE, one entry: the work source, its selector, the count, and the item
@@ -70,15 +118,12 @@ the banned-ops table never fires.
    provenance entry and for the whole-map write rule.
 3. Open your own status file beside the spec — `conductor-status/v1`, schema
    below. The ledger tracks the items; the status file tracks YOU.
-4. Arm the patrol: `monitor_start` (interval ~90s) with the standing
-   instruction below. **Patrol with `monitor_start`, never `wait`.** Pass
-   `max_cycles` explicitly — the default is 24, so a 90-second patrol expires in
-   well under an hour, long before a fleet drains, and the loop simply stops
-   with no symptom. Size it to the run, raise it mid-run with `monitor_update`,
-   or pass `max_runtime_secs` when a wall-clock bound fits better than a cycle
-   count. Call
-   `autonudge_stop` yourself when the exit condition fires — coasting into the
-   cycle cap is a failure, not a finish.
+4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
+   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
+   with `monitor_start`, never `wait`.** If live work needs a larger or renewed
+   bound, raise it with `monitor_update` before it expires; `monitor_start` is
+   create-only. Call `autonudge_stop` yourself when the exit condition fires —
+   coasting into the cycle cap is a failure, not a finish.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -430,7 +475,25 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > PREFLIGHT (mandatory): view the item; check open PRs and worktrees for
 > overlap — if anything already covers it, reply `STANDDOWN: <reason>` and
 > stop. Never adopt another session's WIP.
-> CONFIRM the mechanism before fixing: reproduce where cheap; wrong premise →
+> REPRO ADMISSION (`{verifier.repro_gate}`): expand this clause from the spec.
+> In `pod_required` mode, keep the worktree byte-clean and run `kirocrew pod
+> scenarios`, choose the closest shipped state, boot the UNMODIFIED worktree in
+> that scenario, and drive the externally visible failing behavior through
+> `pod api`, pod-e2e/Playwright, or another real product route. Run pod
+> status/token/API commands through the worktree's `./.venv/bin/kirocrew` after
+> provisioning: the globally installed binary may be sandbox-blind to the pod
+> process's sockets and fail closed on ownership proof. If `playwright-cli`
+> cannot launch on the host, the repository's own Playwright runner against the
+> same live pod is equivalent evidence; record the engine and launch flags, and
+> treat a missing REQUIRED engine (for example Safari/WebKit-specific behavior)
+> as `missing=<capability>` rather than silently substituting Chromium.
+> Record the scenario, exact probe, and failing observable. A unit test, direct
+> import, simulated error, or post-fix friction note is NOT admission. No live pod red →
+> `STANDDOWN: pod-repro-ineligible — <evidence>; missing=<capability>` and STOP
+> with no edit, commit, or PR. Live red admitted → implement, then run the SAME
+> pod trace green and tear the pod down to zero residue before `GREEN`.
+> CONFIRM the mechanism before fixing: in `best_effort` mode, reproduce where
+> cheap; wrong premise →
 > `STANDDOWN: premise disproven — <evidence>`. A design decision →
 > `PROPOSAL: <link>` (write the proposal on the item; do not build).
 > IMPLEMENT in your own worktree (`{worktree_pattern}`, branch
@@ -439,7 +502,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > PATH, and nothing else. Name the ban rather than implying it — no `make test`,
 > no `tox`, no `nox`, no `run-tests`/`local-gate`/"run the gates" wrapper of any
 > kind: a wrapper that escalates to the full suite satisfies the letter of a
-> targeted-only brief. Pass `-n0` **explicitly** on every run: omitting `-n`
+> targeted-only brief. The ban is on suite wrappers, NOT on the push gate
+> below — `preflight.py` and `push_guard.py` shell out only to `git` and `gh`
+> and run no test at all, so a targeted-test brief never licenses an unguarded
+> push. Pass `-n0` **explicitly** on every run: omitting `-n`
 > does not mean single process, it inherits whatever the project's pytest
 > `addopts` sets, and `-n auto` is a common default. Canonical line —
 > `timeout 900 python3 -m pytest -n0 <test file> -x -q </dev/null`. Do not
@@ -451,6 +517,35 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > on an interactive prompt indefinitely. If a push exceeds ~2 minutes, time the
 > actual pre-push hook over the real payload before naming a cause: process
 > liveness cannot distinguish a credential prompt from a slow hook.
+> PUSH GATE (mandatory, every push): the scripts live in `<gate>` =
+> `<crew-home>/skills/kirocrew-dev/prepare-pr/scripts`, where `<crew-home>` is
+> `KIROCREW_HOME` when set and `$HOME/.kiro/crew` otherwise. Invoke them through
+> Kiro Crew's runtime interpreter the way Startup invokes `spec_check.py`, and
+> quote the resolved path: on POSIX `"$KIROCREW_RUNTIME_PYTHON" -B
+> "<gate>/preflight.py"`, on PowerShell `& $env:KIROCREW_RUNTIME_PYTHON -B
+> "<gate>/preflight.py"`. `-B` preserves the desktop bundle's no-bytecode-write
+> rule. Do NOT add `-I` here even though Startup passes it: `preflight.py` imports
+> its sibling `push_guard`, and isolated mode drops the script's own directory
+> from the import path, so `-I` turns the gate into a `ModuleNotFoundError` on
+> every push.
+> Run `preflight.py` before the first commit. Then before EVERY push confirm
+> `git status --porcelain` is empty and run `<gate>/push_guard.py
+> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base
+> or a replayed upstream commit. Pass `--max-ahead` explicitly and fill it from
+> the spec, never from memory: the script defaults to 5, which is looser than
+> most repositories' own PR commit-count gate, so omitting it lets a branch read
+> `SAFE TO PUSH` and then fail that gate. Add `--require-single-on-base` only
+> when you actually squashed to one commit; it asserts `HEAD~1 ==
+> origin/<base>` and refuses a legitimate multi-commit branch.
+> Read the exit code, do not just test for zero: `0` proceed; `30`/`40` the gate
+> REFUSED, so do not push and report the code with the branch state; `2` the gate
+> could not RUN — an environment error, not a verdict — so do not push and report
+> `BLOCKED: push gate inoperative` with the code and stderr, because a worker
+> whose sandbox cannot reach the scripts has to surface that once instead of
+> stalling every item silently. A non-empty `git status --porcelain` is also a
+> stop.
+> Unstaged work and a stale base are what otherwise reach the
+> PR and cost a review round to find what a git-only check catches in a second.
 > PR: English body (What/Why/How/Tests/Other), `Closes #{n}`, full URL in
 > your reply. Babysit to green (`monitor_start` ~300s, staggered off a round
 > number so a dozen loops do not poll in lockstep, preferring REST over
@@ -483,7 +578,7 @@ carry **metadata only** — the probe never emits transcript text:
 
 ```
 🔔 <key>  <age>s <TAG> i=<index> d=<digest12>
-BANNED pid=<pid> rule=<regex> cwd=fleet|unknown
+BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s
 OK <n> watched, <m> fired | load/cpu <x> (ok|hot) | mem <n>G | banned <n> | foreign <n> | deliver init-timeout <a>, watchdog <b>
 ```
 
@@ -550,7 +645,7 @@ digest keying, not a defect, and it does not recur.
 | `IDLE` | Intervention ladder (below). |
 | `NOPROGRESS` | The session has produced nothing — no message, no tool row — since you last acted on it, and that mark is at least one `idle_alert_secs` old. Check the **EFFECT, never liveness**: did the artifact appear, did the remote head move, is there a new commit. Effect present → healthy-slow; extend and name the expected completion signal. Effect absent → **route on the line's own age**, because two paths reach this tag and they do not mean the same thing. Within `idle_alert_secs` the transcript is WARM — held alive by inbound traffic the session never answers — and the first move is **not a nudge**, since a nudge is more of the input that produced the reading: enter the intervention ladder at its **Inspect** step. Past `idle_alert_secs` the session is cold as well as unproductive, so `IDLE`'s ladder applies from the top: the classifier ranks this tag below the clock, but the suppression fallback substitutes it for an already-dispositioned report with no age test, so a cold line can carry it. |
 | `GONE` | Transcript missing — treat as reclaim: re-queue the item with evidence. |
-| `BANNED pid=…` | Banned-ops response (below), keyed by the line's OWNERSHIP CLASS: every class is recorded, and a stop is reserved for `cwd=fleet`. Never read this as a single actionable-or-not decision. |
+| `BANNED pid=…` | Banned-ops response (below), keyed by the line's OWNERSHIP CLASS: every class is recorded, and a stop is reserved for `cwd=fleet`. Never read this as a single actionable-or-not decision. Read `age=` to tell the SAME line apart across cycles: an age that GROWS between cycles is one process you have not managed to stop, while a small age under a re-appearing pid is a fresh violation on a recycled number — a bare pid cannot separate those. `age=?s` means the age is unavailable: the process already exited (the expected reading for a short-lived runner), the pid was recycled between the probe's reads (in which case the whole record is stale and `cwd` also drops to `unknown`), or the platform has no `/proc`/`sysconf` to read it from. It never means the process is new. |
 
 The `OK` line's `deliver init-timeout <a>, watchdog <b>` counters are the
 admission instrument, not fleet trivia — see governance.
@@ -725,7 +820,7 @@ a silent drop. Key it on the class instead:
 | Class | Response |
 | --- | --- |
 | `cwd=fleet` | The heavy response: `session_stop` that worker, a ~5min cooldown, then restart it with the targeted-tests directive re-injected in the seed. |
-| `cwd=unknown` | The probe classified, but this one pid's cwd was unreadable. NON-stopping: re-inject the directive to the owning session WITHOUT stopping it, and record the line. Never a stop, never a silent drop. |
+| `cwd=unknown` | The probe could not attribute this line to the fleet: either the pid's cwd was unreadable, or the process incarnation changed between the probe's reads (a recycled pid), so the record's fields cannot be trusted as one process. NON-stopping: re-inject the directive to the owning session WITHOUT stopping it, and record the line. Never a stop, never a silent drop — a stale record can never trigger a stop against an innocent worker. |
 | no `cwd=` field at all | The probe predates classification, so the line carries no ownership. Attempt attribution ONCE at action time (read that pid's cwd): resolved inside a fleet worktree → treat it as `cwd=fleet` and take the stop response above; not resolved → record the count and re-inject the directive fleet-wide as a reminder, stopping nobody. See the legacy-line fallback below. |
 | `cwd=foreign` | Count only. Not the fleet's process to police, and never grounds for stopping a session. |
 

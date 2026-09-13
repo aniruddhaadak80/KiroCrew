@@ -13,14 +13,10 @@ import { api } from '../../api/client'
 import { useChatFileDrop } from '../../components/ChatDropOverlay'
 import { makeRelative } from '../../components/FilePickerMenu'
 import { PREVIEW_SNIP_EVENT } from '../../components/WebPreviewPanel'
+import { PREVIEW_ANNOTATE_EVENT, type PreviewAnnotateDetail } from '../../utils/browserAnnotations'
 import { useMessageSearch } from '../../hooks/useMessageSearch'
 import { usePanelTabDescriptors } from '../../hooks/panelTabRegistry'
-import {
-  clearInlineDraft,
-  getInlineDraft,
-  useAnyLiveAppTab,
-  usePanelTabs,
-} from '../../hooks/usePanelTabs'
+import { useAnyLiveAppTab, usePanelTabs } from '../../hooks/usePanelTabs'
 import {
   captureScreen,
   currentTabCaptureDeps,
@@ -30,11 +26,11 @@ import { useTheme } from '../../hooks/useTheme'
 import { i18nT } from '../../i18n/t'
 import type { AppDispatch } from '../../store'
 import { openActivityPanel } from '../../store/chatSlice'
-import type { Artifact, ChatMessage } from '../../types'
-import { setDraft } from '../../utils/chatDrafts'
+import type { ChatMessage } from '../../types'
+import { setConfigAutolinkRules } from '../../utils/autolinkRules'
+import { mergeIntoDraft, setDraft } from '../../utils/chatDrafts'
 import { setFileDraft } from '../../utils/chatFileDrafts'
 import { classifyDrop } from '../../utils/dropClassify'
-import { fileReadUrl } from '../../utils/fileReadUrl'
 import { spliceDirTokens, VIDEO_EXT } from '../../utils/fileTokens'
 import {
   adoptSourceSelections,
@@ -55,7 +51,7 @@ import {
 import type { ResizeInfo } from '../../utils/resizeImage'
 import { errMessage } from '../../utils/thunkError'
 import { fileLandingSlot } from '../../utils/uploadRouting'
-import { optsForReplace } from './replaceGuard'
+import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
 
 type MutableRef<T> = { current: T }
 
@@ -165,13 +161,28 @@ export function useChatPageResourcesController({
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
+  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[]; link_patterns?: Array<{ pattern: string; url: string }> }>({
     queryKey: ['dashboardConfig'],
     queryFn: () => api.dashboardConfig(),
     staleTime: 30_000,
   })
   const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
   const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
+  // Operator link rules feed the module-level autolink registry the renderer's
+  // remark plugin and inline-code chip already read; the registry validates
+  // each entry the same way an edition-registered rule is validated. Applied
+  // DURING render, before transcript children render, so the pass that
+  // delivers a config change also paints with it — an effect would run after
+  // memoized messages first painted with the previous rule set. The write is
+  // ref-guarded and idempotent, so a re-render or a discarded concurrent pass
+  // re-applying the same serialized value is a no-op.
+  const linkPatternRules = sourceHostCfg?.link_patterns
+  const linkPatternsKey = JSON.stringify(linkPatternRules ?? [])
+  const appliedLinkPatternsRef = useRef('')
+  if (appliedLinkPatternsRef.current !== linkPatternsKey) {
+    appliedLinkPatternsRef.current = linkPatternsKey
+    setConfigAutolinkRules(linkPatternRules ?? [])
+  }
   // Read through refs by callbacks that must stay identity-stable (they are
   // handed to the sidebar, which re-renders every session row).
   const sourceHostsRef = useRef(sourceHosts)
@@ -478,69 +489,39 @@ export function useChatPageResourcesController({
   // mis-injecting the persona.
   const colorThemeRef = useRef(colorTheme)
   useEffect(() => { colorThemeRef.current = colorTheme }, [colorTheme])
-  // Read file content via queryClient.fetchQuery so we get React Query's
-  // caching/deduplication on repeated opens (re-opening the same file is
-  // instant for ~10s) AND proper error semantics (queryFn throws → catch
-  // block runs). useMutation was the wrong tool for a read operation.
-  // The `ok` flag gates whether the file is recorded in history — 404s and
-  // other HTTP failures show a placeholder in the panel but should NOT
-  // pollute the history list with files that don't exist on disk.
-  const handleFileOpen = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => {
-    // Plugin host integration: notify the IntelliJ plugin (if active) so
-    // it can open the file natively in the IDE editor. If the plugin
-    // handles file opens, skip the dashboard's DiffPanel — the user wanted
-    // IDE-native, not in-dashboard.
-    try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* ignore */ }
-    if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
-    try {
-      const [{ text, ok, status }] = await Promise.all([
-        queryClient.fetchQuery({
-          queryKey: ['file-read', filePath],
-          queryFn: async () => {
-            const url = fileReadUrl(filePath)
-            const res = await fetch(url)
-            // A 404 is a real answer about the file (it is not on disk), so the
-            // panel shows that placeholder. Any other failure is an ERROR: it is
-            // reported as one below instead of being rendered as the file's text.
-            const text = res.ok
-              ? await res.text()
-              : res.status === 404 ? i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-              : ''
-            return { text, ok: res.ok, status: res.status }
-          },
-          staleTime: 10_000,
-        }),
-        queryClient.prefetchQuery({
-          queryKey: ['file-diff', filePath],
-          queryFn: () => api.fileDiff(filePath),
-        }),
-      ])
-      if (!ok && status !== 404) {
-        // Read failure — nothing in the viewer to lose, so the notice hands off.
-        showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: i18nT('pages.chatPage.http_status', { status }) }))
-        return
-      }
-      tabsCtl.openFile(filePath, text, activeSlotRef.current ?? null, optsForReplace(opts))
-      dispatch(openActivityPanel())
-      // The right-hand dock is a single slot; the file viewer is render-gated
-      // behind !search.isOpen. Close the find pane so the opened file actually
-      // shows instead of being silently suppressed.
-      search.close()
-    } catch (e) {
-      // The read itself threw (network, aborted). Reported above the composer
-      // rather than as a tab whose "content" is the error sentence.
-      showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: errMessage(e) || i18nT('pages.chatPage.unknown_error') }))
-    }
-    // Depend on the stable member, not the whole hook object: `search.close` is a
-    // useCallback([]) in useMessageSearch, while the `search` object changes
-    // identity on every search-state change (isOpen/term/matches), which would
-    // churn this callback and the onFileOpen prop on every row. (tabsCtl still
-    // churns on tab changes, but those are user actions, not per-chunk.)
-    // The lint rule still asks for the whole object because `close` is INVOKED, and
-    // a called member is attributed to its receiver — not because anything here
-    // reads `search` itself.
+  // Opening a document into the right dock has two page-level consequences the
+  // shared actions do not know about: the dock must be revealed, and the find
+  // pane — which owns that same single dock slot and render-gates the panel
+  // behind !search.isOpen — must close, or the tab we just focused is silently
+  // suppressed underneath it.
+  //
+  // Depends on the stable member, not the whole hook object: `search.close` is
+  // a useCallback([]) in useMessageSearch, while the `search` object changes
+  // identity on every search-state change (isOpen/term/matches), which would
+  // churn this callback and the onFileOpen prop on every row. The lint rule
+  // still asks for the whole object because `close` is INVOKED, and a called
+  // member is attributed to its receiver — not because anything here reads
+  // `search` itself.
+  const revealDockAfterOpen = useCallback(() => {
+    dispatch(openActivityPanel())
+    search.close()
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; depending on the enclosing object instead would churn the onFileOpen prop on every transcript row each render
-  }, [queryClient, tabsCtl, dispatch, search.close, showActionError])
+  }, [dispatch, search.close])
+  // File open / artifact open / file save are the shared SidePanel host actions
+  // (`usePanelDocumentActions`) — one implementation with the Members page, so
+  // the 404-vs-error read contract, the artifact involvement breadcrumb and the
+  // save-baseline reconcile cannot drift between hosts.
+  const {
+    openFile: handleFileOpen,
+    openArtifact: handleArtifactOpen,
+    saveFile: handleFileSave,
+  } = usePanelDocumentActions({
+    tabsCtl,
+    slotRef: activeSlotRef,
+    queryClient,
+    showActionError,
+    onOpened: revealDockAfterOpen,
+  })
 
   /** Open a DIRECTORY as a panel tab.
    *
@@ -555,54 +536,6 @@ export function useChatPageResourcesController({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- same as handleFileOpen above: `search.close` is a useCallback([]) and the enclosing `search` object is a fresh literal every render, so listing it would churn the onFolderOpen prop on every transcript row
   }, [tabsCtl, dispatch, search.close])
 
-  // Open an artifact as a side-panel tab — the artifact twin of
-  // handleFileOpen, and the single entry point every in-chat artifact
-  // affordance routes through (the Artifacts tab's rows and `/artifacts/<slug>`
-  // links inside messages). Routing them here renders the document inline in the
-  // panel instead of hard-navigating to the standalone detail page, which would
-  // tear down the chat and make artifacts the only panel-capable content that
-  // could not be flipped between like files.
-  const handleArtifactOpen = useCallback(async (slug: string) => {
-    if (!slug) return
-    const slot = activeSlotRef.current ?? null
-    // Opening an artifact is an act of session involvement: record the
-    // `referenced` breadcrumb so a merely-read (or merely-linked) artifact
-    // joins "This session" instead of sitting in the library section forever.
-    // Deliberately fire-and-forget and deliberately NOT awaited — the panel
-    // must open at click speed, and the store already enforces
-    // one-breadcrumb-per-session so a double click cannot spam the event log.
-    // The 403 an incognito slot returns is expected, not an error to surface.
-    if (slot) {
-      api.recordArtifactReference(slug, slot)
-        .then(() => {
-          // Re-run the involvement scan so the row moves sections live.
-          queryClient.invalidateQueries({ queryKey: ['session-artifact-records', slot] })
-        })
-        .catch(() => { /* best-effort breadcrumb */ })
-    }
-    // Seed the tab from the artifact list cache when it is already warm so the
-    // body paints immediately; ArtifactPanel's own query is authoritative and
-    // overrides kind/content once it resolves, so a miss here costs a spinner,
-    // not correctness.
-    let kind: Artifact['kind'] = 'markdown'
-    let content = ''
-    try {
-      const art = await queryClient.fetchQuery<Artifact>({
-        queryKey: ['artifact', slug],
-        queryFn: () => api.artifact(slug),
-        staleTime: 10_000,
-      })
-      kind = art.kind
-      content = art.content ?? ''
-    } catch { /* fall through — the panel's own query renders the error state */ }
-    tabsCtl.openArtifact({ slug, kind }, content, slot)
-    dispatch(openActivityPanel())
-    // Same single-slot constraint as handleFileOpen: the right-hand dock is
-    // render-gated behind !search.isOpen, so an open find pane would silently
-    // swallow the tab we just focused.
-    search.close()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryClient, tabsCtl, dispatch, search.close])
 
   // Open the diff panel from a file-change chip click. Closes the
   // markdown viewer and the activity panel so panels stay mutually exclusive.
@@ -634,28 +567,6 @@ export function useChatPageResourcesController({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabsCtl, dispatch, search.close, handleFileOpen])
 
-  const handleFileSave = useCallback(async (filePath: string, content: string) => {
-    // Capture the slot BEFORE awaiting: if the user switches chats mid-save, the
-    // draft we reconcile must be the one that owned this save, not whatever slot
-    // is active when the write resolves.
-    const requestSlot = activeSlotRef.current ?? ''
-    const res = await fetch('/api/file-write', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content }),
-    })
-    if (!res.ok) throw new Error(`Save failed: ${res.status}`)
-    // The saved bytes become the tab's dirty baseline, so a later re-open of
-    // the same path refreshes the buffer instead of (needlessly) preserving it
-    // as if it still held unsaved work. Best-effort: a tab that is not open
-    // right now is simply not found by id.
-    tabsCtl.patchTab(`file:${filePath}`, { savedContent: content })
-    // Reconcile the inline-preview draft for the SAVING slot (drafts are
-    // slot+path keyed). Clear it ONLY if it still equals what we just saved -
-    // if the user typed more while the write was in flight, the draft now holds
-    // newer content and must be preserved, not dropped.
-    if (getInlineDraft(requestSlot, filePath) === content) clearInlineDraft(requestSlot, filePath)
-  }, [tabsCtl, activeSlotRef])
 
   const takeScreenshot = useCallback(async () => {
     // Capture the slot at click-time. If the user switches away before the
@@ -751,6 +662,31 @@ export function useChatPageResourcesController({
     } catch { setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb')) }
     setUploading(false)
   }, [activeSlotRef, setUploadError, setUploadHint, setUploading, setPendingFiles, fileDrafts, saveDrafts, setResizedInfo])
+
+  // The Browser panel's element annotations arrive as a DRAFT plus a marker
+  // screenshot. The text goes into the composer (never sent -- the user adds
+  // a sentence and sends), the PNG through the same attachments pipeline as a
+  // drop or a snip. Both are routed to the slot whose panel produced them:
+  // the panel is session-scoped, the composer is not, so an annotation set
+  // finished after switching sessions lands in that session's draft.
+  useEffect(() => {
+    const onAnnotate = (e: Event) => {
+      const d = (e as CustomEvent<PreviewAnnotateDetail>).detail
+      if (!d) return
+      const slot = d.slot || activeSlotRef.current || ''
+      if (d.draft) {
+        if (slot && slot !== activeSlotRef.current) {
+          setDraft(drafts.current, slot, mergeIntoDraft(drafts.current[slot], d.draft))
+          saveDrafts()
+        } else {
+          setInput(previous => mergeIntoDraft(previous, d.draft))
+        }
+      }
+      if (d.files?.length) void uploadFiles(d.files, slot || undefined)
+    }
+    window.addEventListener(PREVIEW_ANNOTATE_EVENT, onAnnotate)
+    return () => window.removeEventListener(PREVIEW_ANNOTATE_EVENT, onAnnotate)
+  }, [uploadFiles, activeSlotRef, drafts, saveDrafts, setInput])
 
   // Deliver an optimize result to the session that started it when the user
   // navigated away before the request settled. ChatInput only calls this for

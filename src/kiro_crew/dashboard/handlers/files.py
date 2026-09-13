@@ -12,6 +12,7 @@ import logging
 import mimetypes
 import ntpath
 import os
+import posixpath
 import re
 import stat as _stat_mod
 import subprocess
@@ -39,12 +40,21 @@ from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     WorkspaceConfig,
+    WorkspaceDirUnusable,
     coerce_dict_section,
     config_dir,
     data_home,
+    materialize_workspace_dir,
     update_config_locked,
 )
+from kiro_crew.config.sections import (
+    LINK_PATTERN_PATTERN_MAX_LEN,
+    LINK_PATTERN_URL_MAX_LEN,
+    LINK_PATTERNS_MAX,
+    link_pattern_url_ok,
+)
 from kiro_crew.dashboard import part_stream, upload_destination
+from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_utils import (
     dashboard_slot_key,
     drained_to_thread,
@@ -52,8 +62,13 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
 from kiro_crew.dashboard.handlers._shared import _probe_persisted_session, read_bounded_json
+from kiro_crew.dashboard.handlers.messaging import _resolve_session_target
 from kiro_crew.dashboard.origin import is_direct_local_request
-from kiro_crew.dashboard.state import DashboardState, append_and_surface
+from kiro_crew.dashboard.state import (
+    VALID_MEMORY_MODES,
+    DashboardState,
+    append_and_surface,
+)
 from kiro_crew.doc_parser import extract_text
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -66,6 +81,7 @@ from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_path_segments,
 )
 from kiro_crew.slack.handler import is_tracked_channel
 from kiro_crew.validation import (
@@ -93,8 +109,71 @@ mimetypes.add_type(
 
 _INLINE_DISPOSITION_PREFIXES = frozenset({"audio/", "video/", "image/", "application/pdf"})
 
+#: Session-key namespace of a sub-agent run. A sub-agent has no tab of its own, so
+#: its file card belongs to the PARENT's tab — the surface every other sub-agent
+#: output already routes to (``subagent_manager.monitoring``'s completion
+#: injection, ``chat_utils.subagent_event_slot``'s WS frames).
+_SUBAGENT_SESSION_PREFIX = "subagent:"
+
 
 logger = logging.getLogger(__name__)
+
+
+def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str:
+    """The parent session key of the sub-agent running under *session_key*, or ``""``.
+
+    Matches on BOTH spellings a run can be keyed by — its ``conversation_key`` (a
+    continuable run) and ``subagent:<id>`` — the same comparison
+    ``subagent_manager.continuation`` makes, because a continuable run's key is not
+    derivable from its id. Returns ``""`` when the manager is absent or the run is
+    unknown, so the caller SUPPRESSES the card rather than guessing a tab.
+    """
+    manager = getattr(state, "subagents", None)
+    if manager is None:
+        return ""
+    try:
+        # A PROPERTY, not a method (``subagent.py`` ``@property all_agents``).
+        # Calling it invoked the returned LIST, so every lookup raised TypeError,
+        # the except below swallowed it, and the card was suppressed for every
+        # sub-agent -- the routing this function exists to do never happened once.
+        agents = list(manager.all_agents)
+    except Exception:
+        logger.warning("outbox notify: sub-agent roster unavailable", exc_info=True)
+        return ""
+    matches = [
+        info
+        for info in agents
+        if (getattr(info, "conversation_key", "") or f"{_SUBAGENT_SESSION_PREFIX}{info.id}")
+        == session_key
+    ]
+    if not matches:
+        return ""
+    # More than one record can carry ONE key: a continuation is minted as a new run
+    # whose ``conversation_key`` is the original's ``subagent:<id>``, and the
+    # original (spawned with an empty conversation_key) resolves to that same
+    # string. Their parents differ whenever a DIFFERENT session continued the
+    # conversation -- so taking the first match routes the card to whichever chat
+    # happens to sit earlier in the roster, which is the PREVIOUS owner's tab.
+    #
+    # Newest ACTIVE run wins: a live run is the one the card belongs to, and among
+    # equals the most recently started. Ranked rather than filtered so a roster of
+    # only-finished records still answers with the latest instead of nothing.
+
+    def _rank(info: object) -> tuple[int, float]:
+        # Defensive reads: a stubbed manager can hand back non-bool/non-number here,
+        # and a comparison against those raises inside the sort rather than routing.
+        done = getattr(info, "done", False)
+        started = getattr(info, "started", 0.0)
+        return (
+            0 if (done is True) else 1,
+            float(started) if isinstance(started, (int, float)) else 0.0,
+        )
+
+    best = max(matches, key=_rank)
+    parent = getattr(best, "parent_session_key", "")
+    # isinstance, not truthiness: a stubbed manager can hand back a
+    # non-str here and dashboard_slot_key would treat it as a key.
+    return parent if isinstance(parent, str) else ""
 
 
 def _sel():
@@ -115,11 +194,10 @@ def _audit_file_send(
 
     Every record the Slack and channel endpoints emit is the same tool
     invocation under a different ``tool_kind`` (the leg), so the shape lives
-    here rather than being spelled out at each of the dozen decision sites it
-    used to be copied to -- one drifted field was previously a one-line edit
-    away. Optional fields are OMITTED when unset, exactly as the shipped call
-    sites omitted them: skips carry no ``downstream_service``, refusals and
-    deliveries do.
+    here rather than being spelled out at each of the dozen decision sites that
+    write it -- a copy per site puts a drifted field one edit away. Optional
+    fields are OMITTED when unset: skips carry no ``downstream_service``,
+    refusals and deliveries do.
     """
     extra: dict[str, str] = {}
     if error is not None:
@@ -155,7 +233,7 @@ def _body_err_code(body_err: web.Response) -> str:
 
 async def api_reveal_path(request: web.Request) -> web.Response:
     """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
-    # Default cap: the body is a path and an action flag (issue #5587 sweep).
+    # Default cap: the body is a path and an action flag.
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -330,40 +408,98 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
             )
-    # Inject into the caller's chat slot so the card persists in the correct session
-    if state._slots:
-        # Prefer the caller's own slot via X-Session-Key header
-        session_key = request.headers.get("X-Session-Key", "").strip()
-        active = None
-        if session_key.startswith("cron:"):
-            # A cron slot is named cron-<id>, which is not the session key folded.
-            active = state.get_slot(f"cron-{session_key.removeprefix('cron:')}")
-        else:
-            # A channel-born conversation keeps its channel key (slack:<ts>)
-            # while its tab is open, so the slot name comes from the surface
-            # lookup — stripping a "dashboard:" prefix would miss it and drop the
-            # card into whichever tab happened to be active last.
-            slot_key = dashboard_slot_key(session_key)
-            if slot_key:
-                active = state.get_slot(slot_key)
-        # An explicitly header-targeted slot receives the file even when empty
-        header_targeted = active is not None
-        # Fallback: most recently active slot
-        if not active:
-            active = max(
-                state._slots.values(),
-                key=lambda s: s.messages[-1]["ts"] if s.messages else "",
-            )
-        if active and (active.messages or header_targeted):
-            # Route through the context-aware redact() so a loaded companion's
-            # extra credential regexes scrub the broadcast file JSON too — the
-            # same overlay-aware pass the filename/path/description gates use.
-            redacted_file_json = redact(json.dumps(file_data))
-            # append_and_surface = the same conditional-broadcast pattern this
-            # site pioneered, now also stamping ``ts`` + ``meta.mid`` on the
-            # reader-suppressed frame so a client seeing the row through two
-            # doors recognises it instead of rendering a duplicate card.
-            append_and_surface(state, active, "file", redacted_file_json)
+    # Inject the file card into the caller's chat slot so it persists in the
+    # correct session. This runs even when ``state._slots`` is empty: a headless
+    # script cron typically has no dashboard tab open at all, and its origin slot
+    # is rehydrated from history below — gating the whole block on
+    # ``if state._slots`` skipped exactly that case.
+    # Prefer the caller's own slot via X-Session-Key header
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    active = None
+    if session_key.startswith("cron:"):
+        # A cron slot is named cron-<job-id>, which is not the session key folded.
+        # Only the JOB ID: a cron turn's key can carry a further segment
+        # (`cron:<job>:<run>` for a per-run session, `cron:<job>:<agent>` for a
+        # multi-agent one), and folding the whole tail asks for a `cron-<job>:<run>`
+        # slot that never exists — so every suffixed turn missed its own open tab
+        # and fell through to origin resolution or suppression.
+        job_id = session_key.removeprefix("cron:").split(":", 1)[0]
+        active = state.get_slot(f"cron-{job_id}")
+        if active is None:
+            # A headless script cron has no live "cron-<id>" slot. Rather than
+            # leak the card into whichever tab happens to be focused, route it to
+            # the cron's ORIGIN dashboard session — the chat that created the cron
+            # — through the same resolver ``send_message(session="origin")`` uses,
+            # so both delivery paths agree on where a cron's output belongs.
+            origin_slot_key, _origin_job = _resolve_session_target(state, "origin", session_key)
+            if origin_slot_key:
+                # get_slot is the hot path (O(1)); on a miss the origin session
+                # exists on disk but has no tab open, so rehydrate it — with the
+                # transcript read off the loop, the shape the sibling origin path
+                # established, because a large store would otherwise stall the
+                # gateway. A truly-gone session (never persisted, deleted, or
+                # closed) returns None and falls through to suppression below; no
+                # phantom empty tab is ever created.
+                active = state.get_slot(origin_slot_key)
+                if active is None:
+                    active = await rehydrate_slot_from_history_async(state, origin_slot_key)
+    elif session_key.startswith(_SUBAGENT_SESSION_PREFIX):
+        # A sub-agent has no tab of its own, so route its card to the PARENT slot
+        # — the same destination its completion injection and its ``subagent_*`` WS
+        # frames already use. Only the dedicated-process arm arrives here: a
+        # shared-runtime sub-agent's MCP stub carries the parent's own key and is
+        # resolved by the branch below. An unknown run or a parent with no open tab
+        # yields "" and falls through to suppression — never into an unrelated
+        # conversation.
+        parent_key = _subagent_parent_session_key(state, session_key)
+        parent_slot_key = dashboard_slot_key(parent_key) if parent_key else ""
+        if parent_slot_key:
+            active = state.get_slot(parent_slot_key)
+    else:
+        # A channel-born conversation keeps its channel key (slack:<ts>)
+        # while its tab is open, so the slot name comes from the surface
+        # lookup — stripping a "dashboard:" prefix would miss it and drop the
+        # card into whichever tab happened to be active last.
+        slot_key = dashboard_slot_key(session_key)
+        if slot_key:
+            active = state.get_slot(slot_key)
+    # An explicitly header-targeted slot receives the file even when empty
+    header_targeted = active is not None
+    # Fallback: most recently active slot — ONLY for a legacy headerless caller,
+    # the best-effort case it was written for. A key that IS present but resolves
+    # to nothing names a session we could not reach (a cron with no originating
+    # chat, an unknown job, a sub-agent whose parent has no tab, a task-runner or
+    # webhook session that owns no chat, a closed tab); suppress the card rather
+    # than surface it in an unrelated conversation.
+    if not active and not session_key and state._slots:
+        active = max(
+            state._slots.values(),
+            key=lambda s: s.messages[-1]["ts"] if s.messages else "",
+        )
+    delivered = False
+    if active is not None and (active.messages or header_targeted):
+        delivered = True
+        # Route through the context-aware redact() so a loaded companion's
+        # extra credential regexes scrub the broadcast file JSON too — the
+        # same overlay-aware pass the filename/path/description gates use.
+        redacted_file_json = redact(json.dumps(file_data))
+        # append_and_surface = the same conditional-broadcast pattern this
+        # site pioneered, now also stamping ``ts`` + ``meta.mid`` on the
+        # reader-suppressed frame so a client seeing the row through two
+        # doors recognises it instead of rendering a duplicate card.
+        append_and_surface(state, active, "file", redacted_file_json)
+    else:
+        # Suppression is the RIGHT outcome — better nowhere than in an unrelated
+        # conversation — but it is silent, and a caller that reads `ok: true` has
+        # no way to tell a delivered card from a vanished one. So say so once, at
+        # the only point that knows both that a key was supplied and that it
+        # resolved to no destination. The key is logged because it is the whole
+        # diagnosis (which namespace, which id); the file is already named in the
+        # audit event below.
+        logger.info(
+            "outbox notify: no destination for session key %r; file card suppressed",
+            session_key or "<none>",
+        )
 
     _sel().log_tool_invocation(
         session_key="api",
@@ -371,7 +507,11 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
         tool_name="file_send",
         tool_kind="notify",
         outcome="completed",
-        resources=f"filename={file_data['filename']}",
+        # `delivered` distinguishes the two outcomes this endpoint folds into one
+        # 200: the card reached a session, or it was suppressed for want of a
+        # destination. Carried here rather than as a separate SEL outcome so the
+        # existing "completed" consumers keep working.
+        resources=f"filename={file_data['filename']} delivered={int(delivered)}",
     )
     return web.json_response({"ok": True})
 
@@ -712,12 +852,11 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
     restricted-session ceiling, then a request-named channel, a
     session-map-linked thread, or the owner-DM fallback with its tracked-channel
     authorization — next to the non-Slack leg's, so the two cannot drift apart
-    rung by rung (issue #6060). What stays here is what only this leg can
+    rung by rung. What stays here is what only this leg can
     answer: the Slack client, its upload verb, and the response shapes.
 
-    The client-presence check stays AHEAD of the body parse, where it shipped: a
-    gateway with no Slack client answers ``skipped: no_slack`` even for a
-    malformed body.
+    The client-presence check stays AHEAD of the body parse: a gateway with no
+    Slack client answers ``skipped: no_slack`` even for a malformed body.
     """
     state: DashboardState = request.app["state"]
     slack = state.slack_client
@@ -779,8 +918,8 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
     try:
         # The filename was already cleared by the shared admission gate above —
         # same predicate, same value, strictly earlier in this function — so the
-        # leg no longer re-checks it. #6044 made that gate the one site for the
-        # rule; a second copy here could only drift from it.
+        # leg does not re-check it. That gate is the one site for the rule; a
+        # second copy here could only drift from it.
         await slack.upload_file(
             destination.channel,
             destination.thread_ts,
@@ -823,11 +962,11 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
     this file land here": Telegram and Discord today, each via its own
     purpose-built name-preserving ``send_document``; every other channel is a
     skip until its transport grows that verb. The Slack counterpart above
-    resolves through the same module, one rung table away (issue #6060).
+    resolves through the same module, one rung table away.
 
     "Cannot deliver here" is a SKIP (``delivered: false``), not an error: most
     sessions mirror nowhere, and the caller falls back to the dashboard card
-    and the Slack leg exactly as before this endpoint existed.
+    and the Slack leg.
     """
     state: DashboardState = request.app["state"]
     # Default cap: same shape as the Slack leg — a path, a filename, and a
@@ -996,8 +1135,11 @@ _SEARCH_LIMIT_CEILING = 60
 _ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 _ALLOWED_TEXT_EXT = {
     ".txt",
+    ".text",
+    ".xwiki",
     ".md",
     ".json",
+    ".jsonl",
     # Excalidraw scene JSON — the composer's sketch pad attaches one per
     # sketch, and the dashboard has a dedicated read-only renderer for it
     # (FileRenderers routes on this exact extension). Content-wise it is
@@ -1008,6 +1150,7 @@ _ALLOWED_TEXT_EXT = {
     ".yml",
     ".xml",
     ".csv",
+    ".tsv",
     ".log",
     ".py",
     ".js",
@@ -1194,13 +1337,10 @@ async def _stream_video_part(
 
     All the file handling lives in :func:`~kiro_crew.dashboard.part_stream.
     stream_part_to_file`, which owns the temp through a synchronous context
-    manager. This function is now only the translation between that helper's
-    exceptions and this endpoint's audit reasons and error codes -- deliberately,
-    because the hand-rolled version of the streaming here collected SEVEN
-    blocking review findings in seven rounds, three of them introduced while
-    fixing the previous one. That module's docstring carries the ledger and the
-    invariant; the short version is that a cancellable coroutine cannot own a
-    file safely, so it no longer does.
+    manager. This function is only the translation between that helper's
+    exceptions and this endpoint's audit reasons and error codes: a cancellable
+    coroutine cannot own a file safely, so ownership stays in that module,
+    whose docstring carries the invariant.
     """
     ext = dest.suffix.lower()
     try:
@@ -1254,9 +1394,9 @@ async def api_upload_file(request: web.Request) -> web.Response:
         path in a 20-file request may unlink up to 20 paths (a video among them
         up to 512 MB), and `Path.unlink` is a synchronous syscall: on a slow or
         network filesystem doing that inline stalls chat and heartbeat for the
-        whole gateway. It also absorbs the destination itself via *also*, so the
-        sites that previously paired a bare ``dest.unlink()`` with a cleanup call
-        have one call and cannot drift back to unlinking on the loop.
+        whole gateway. It also absorbs the destination itself via *also*, so no
+        site pairs a bare ``dest.unlink()`` with a cleanup call and none can
+        drift back to unlinking on the loop.
         """
         targets = [*paths, *(str(p) for p in also)]
 
@@ -1546,8 +1686,8 @@ class _WorkspaceConflict(Exception):
     name/directory collisions, default-workspace and agent references -- must
     be re-made against the state the mutation actually lands on, inside the
     run_config_write critical section, or two overlapping owner requests can
-    both pass the stale check and persist a conflicting document (#4767 GPT
-    review round 1). Carries the response payload the handler returns.
+    both pass the stale check and persist a conflicting document. Carries the
+    response payload the handler returns.
     """
 
     def __init__(self, status: int, error: str, code: str) -> None:
@@ -1612,8 +1752,11 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # Recursively copy source workspace data to the new directory
         src_path = data_home() / cfg.workspaces[copy_from].dir
         dst_path = data_home() / ws_dir
+        # Resolved once each; both checks below judge these same objects.
+        src_resolved = src_path.resolve()
+        dst_resolved = dst_path.resolve()
         # Guard against path traversal
-        if not dst_path.resolve().is_relative_to(data_home().resolve()):
+        if not dst_resolved.is_relative_to(data_home().resolve()):
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.create",
@@ -1622,7 +1765,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
                 resources=name,
             )
             return web.json_response({"error": "Invalid directory path"}, status=400)
-        if not src_path.resolve().is_relative_to(data_home().resolve()):
+        if not src_resolved.is_relative_to(data_home().resolve()):
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.create",
@@ -1633,7 +1776,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             return web.json_response({"error": "Invalid source directory path"}, status=400)
         # Reject config root itself to avoid copying .env / config.json
         cfg_root = data_home().resolve()
-        if src_path.resolve() == cfg_root or dst_path.resolve() == cfg_root:
+        if src_resolved == cfg_root or dst_resolved == cfg_root:
             _sel().log_api_access(
                 caller=request.get("user", "dashboard"),
                 operation="workspace.create",
@@ -1654,18 +1797,22 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     # is_relative_to + is_sensitive_path guards below reject traversals before
     # the value is stored in config. CodeQL's taint tracker does not model the
     # containment guard as a barrier.
-    final_path = (  # lgtm[py/path-injection]
-        Path(ws_dir).expanduser().resolve() if _abs else data_home() / ws_dir
-    )
+    # Resolved exactly ONCE. Every check below judges this object and the create
+    # below receives this same object: a second resolve after the checks would
+    # follow a parent swapped for a link in between, and the pinned create can
+    # only refuse a swap that happens AFTER the path it is handed was resolved.
+    validated_dir = (  # lgtm[py/path-injection]
+        Path(ws_dir).expanduser() if _abs else data_home() / ws_dir
+    ).resolve()
 
     # Check for directory collision with existing workspaces (resolve both sides)
     existing_resolved = {_resolve_ws_dir(ws.dir) for ws in cfg.workspaces.values()}
-    if _resolve_ws_dir(ws_dir) in existing_resolved:
+    if validated_dir in existing_resolved:
         return web.json_response(
             {"error": f"Directory '{ws_dir}' is already used by another workspace"},
             status=409,
         )
-    if is_sensitive_path(str(final_path.resolve())):
+    if is_sensitive_path(str(validated_dir)):
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -1674,7 +1821,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             resources=name,
         )
         return web.json_response({"error": "Invalid directory path"}, status=400)
-    if not _abs and not final_path.resolve().is_relative_to(data_home().resolve()):
+    if not _abs and not validated_dir.is_relative_to(data_home().resolve()):
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -1683,7 +1830,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             resources=name,
         )
         return web.json_response({"error": "Invalid directory path"}, status=400)
-    if final_path.resolve() == data_home().resolve():
+    if validated_dir == data_home().resolve():
         _sel().log_api_access(
             caller=request.get("user", "dashboard"),
             operation="workspace.create",
@@ -1697,7 +1844,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     if copy_pending:
         # STAGE the copy_from tree only now, after EVERY validation above has
         # passed -- a stage before validation leaks the copied tree on any 4xx
-        # (#4767 review round 3). It is INSTALLED into place inside the locked
+        # It is INSTALLED into place inside the locked
         # persist below, so a losing create never mutates the destination.
 
         def _ignore_sensitive(directory: str, entries: list[str]) -> set[str]:
@@ -1723,7 +1870,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             # drained_to_thread, not bare to_thread: a cancellation at the
             # await would leave the copytree THREAD still writing while the
             # cleanup below rmtrees the same tree -- the race can strand
-            # partial ``.staging-*`` residue (#4767 review round 6). Draining
+            # partial ``.staging-*`` residue. Draining
             # runs the copy to completion first, so the cleanup only ever
             # starts on a quiescent tree, and the cleanup itself is drained so
             # it cannot be abandoned mid-delete either.
@@ -1737,7 +1884,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     # Persist as ONE delta read-modify-write on the raw document, inside a
     # single hold of the sidecar flock (update_config_locked), dispatched off
     # the loop with both locks via run_config_write -- the transaction shape
-    # run_config_write's own docstring prescribes (#4767 review round 3). The
+    # run_config_write's own docstring prescribes. The
     # handler's `cfg` was loaded before awaits above (the copytree can run for
     # seconds), so the state-dependent preconditions are re-decided against
     # the document as read INSIDE the lock, and only the keys this create owns
@@ -1751,7 +1898,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
             for ws in workspaces.values()
             if isinstance(ws, dict)
         }
-        if _resolve_ws_dir(ws_dir) in raw_dirs:
+        if validated_dir in raw_dirs:
             raise _WorkspaceConflict(
                 409,
                 f"Directory '{ws_dir}' is already used by another workspace",
@@ -1765,9 +1912,8 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # directory (even empty: its inode and metadata are not ours to
         # replace) is refused. publish_dir_noreplace, not check-then-rename:
         # POSIX os.rename silently replaces an EMPTY destination, so a racer's
-        # directory created between a check and the rename would be destroyed
-        # (#4767 round 9); the no-replace rename closes that window in the
-        # filesystem itself.
+        # directory created between a check and the rename would be destroyed;
+        # the no-replace rename closes that window in the filesystem itself.
         if staged_path is not None and install_dst is not None:
             if install_dst.exists():
                 raise _WorkspaceConflict(
@@ -1788,6 +1934,17 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
                     "workspace_dir_occupied",
                 ) from exc
             install_state["installed"] = True
+        # A create with no copy source still needs its directory to EXIST: the
+        # config entry alone is a latent fleet-wide outage for private members
+        # (see materialize_workspace_dir). Created through the pinned parent,
+        # adopting a directory already there; a non-directory or a missing parent
+        # is refused. Deliberately NOT rolled back when the config write fails --
+        # a concurrent create can already have adopted and registered it.
+        else:
+            try:
+                materialize_workspace_dir(validated_dir, display=ws_dir)
+            except WorkspaceDirUnusable as exc:
+                raise _WorkspaceConflict(409, str(exc), exc.code) from exc
         workspaces[name] = asdict(WorkspaceConfig(dir=ws_dir))
         return doc
 
@@ -1809,13 +1966,22 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # Nothing to clean: the staged tree was consumed by the install.
         raise
     except BaseException:
-        # The worker itself failed (unreadable config, a failed atomic
-        # write): the workspace was NOT registered, so an installed tree is a
-        # phantom -- roll it back; an uninstalled staging tree is residue --
-        # drop it. Both off the loop. The rollback can only remove a tree
-        # this request created (see the install invariant above).
+        # The worker itself failed (unreadable config, a failed atomic write): the
+        # workspace was NOT registered. An installed tree is left in place, by the
+        # same rule as the plain-create directory: by the time this runs a
+        # concurrent create can have adopted the directory and registered it
+        # (EEXIST is accepted above), so deleting it is the unsafe option -- it
+        # would leave THAT workspace declared with no directory, the exact state
+        # the private-memory layout refuses on. A full copied tree with nothing
+        # pointing at it is indistinguishable from a leak, so say where it is.
+        # An uninstalled staging tree is residue nothing can have adopted; drop it
+        # off the loop.
         if install_state["installed"] and install_dst is not None:
-            await asyncio.to_thread(shutil.rmtree, install_dst, ignore_errors=True)
+            logger.warning(
+                "workspace create failed after its copied tree was installed; %s is "
+                "left in place and no workspace entry names it",
+                install_dst,
+            )
         elif staged_path is not None:
             await asyncio.to_thread(shutil.rmtree, staged_path, ignore_errors=True)
         raise
@@ -1909,17 +2075,35 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
             # the workspace from this handler's older view would undo it.
             raise _WorkspaceConflict(404, f"Workspace '{name}' not found", "workspace_not_found")
         if "dir" in body:
-            new_resolved = _resolve_ws_dir(body["dir"])
+            # `resolved` is the ONE path screened above (is_sensitive_path,
+            # containment, config root); re-resolving the string here would let a
+            # parent swapped for a link between the screen and this check pass a
+            # different directory. Only the OTHER entries resolve fresh -- they are
+            # the state re-decided inside the lock.
             others = {
                 _resolve_ws_dir(str(w.get("dir", "")))
                 for n2, w in workspaces.items()
                 if n2 != name and isinstance(w, dict)
             }
-            if new_resolved in others:
+            if resolved in others:
                 raise _WorkspaceConflict(
                     409,
                     f"Directory '{body['dir']}' is already used by another workspace",
                     "workspace_dir_in_use",
+                )
+            # Same materialize-or-refuse invariant the create path holds: the V2
+            # private-memory layout resolves EVERY declared workspace strictly, so
+            # rebinding to a path that is not a directory arms a refusal for every
+            # private member, including members bound to other workspaces. An
+            # update names a destination the owner already chose, so it refuses
+            # rather than creating one -- creating is the create path's job, and
+            # this transaction has no rollback for a directory it made.
+            if not resolved.is_dir():
+                raise _WorkspaceConflict(
+                    409,
+                    f"Directory '{body['dir']}' does not exist or is not a directory; "
+                    "create it first",
+                    "workspace_dir_unusable",
                 )
             ws["dir"] = body["dir"]
             return doc
@@ -2497,7 +2681,7 @@ async def api_file_download(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid input"}, status=400)
 
-    # Envelope shared with api_file_raw (#4031). No header sniff: this endpoint
+    # Envelope shared with api_file_raw. No header sniff: this endpoint
     # serves attachment + nosniff rather than choosing a content type. Offloaded
     # to a worker thread: the envelope is synchronous file I/O (realpath, open,
     # fstat, full read up to the cap) and must not block the event loop.
@@ -2793,7 +2977,7 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
     # Envelope (validate -> sensitive -> nofollow-open -> bounded read) is
-    # shared with api_file_download so a hardening change lands on both (#4031).
+    # shared with api_file_download so a hardening change lands on both.
     # Offloaded to a worker thread: the envelope is synchronous file I/O and
     # must not block the event loop (same shape as api_file_stream's _open_media).
     opened = await asyncio.to_thread(
@@ -3207,10 +3391,10 @@ def _file_write_blocking(path: str, content: str) -> str | None:
         # always hands back a descriptor, so the mode comes from the same inode
         # the ACL does and neither is re-resolved.
         src_stat = os.fstat(src_fd) if src_fd is not None else os.stat(path)
-        # mode= keeps the previous copymode behaviour (permission bits), and
-        # preserve_access_control_from is ADDITIVE to it: copymode carried BITS
-        # only, so a named POSIX ACL (system.posix_acl_access) the owner set was
-        # silently dropped the moment the replace installed a fresh inode. The
+        # mode= carries copymode's permission bits, and
+        # preserve_access_control_from is ADDITIVE to it: bits alone drop a named
+        # POSIX ACL (system.posix_acl_access) the owner set, silently, the moment
+        # the replace installs a fresh inode. The
         # carry is allowlisted to the ACL and user.* names -- it must NOT replay a
         # privilege-bearing security.capability onto caller-supplied content.
         atomic_write(
@@ -3239,7 +3423,7 @@ async def api_file_write(request: web.Request) -> web.Response:
     )
 
     # max_bytes=None: the body carries the file's whole contents, which has no
-    # defensible byte ceiling (issue #5587 sweep).
+    # defensible byte ceiling.
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -3454,7 +3638,7 @@ async def api_file_search(request: web.Request) -> web.Response:
     # candidates; only skip_dirs below are dropped from both descent and results.
     # skip_dirs is the SAME shared set the indexed fast path uses (imported from
     # file_index), so the two paths of this endpoint cannot diverge on which
-    # directories are suppressed -- see #5677.
+    # directories are suppressed.
     skip_dirs = _WALK_SKIP_DIRS
 
     max_scan = _WALK_MAX_SCAN_SCOPED if scoped else _WALK_MAX_SCAN_UNSCOPED
@@ -3532,8 +3716,6 @@ async def api_file_search(request: web.Request) -> web.Response:
                 dirs_visited += 1
                 # A dot-prefixed directory (.github, .kiro, .claude) should be
                 # OFFERED as a candidate even though we must not DESCEND into it.
-                # These were previously conflated: ``dirnames`` was pruned in
-                # place (dropping dot-dirs) before _collect saw it.
                 #
                 # Build the candidate list (offered AND stat'd) first, then
                 # derive the narrower descent list from it. Both drop skip_dirs
@@ -4051,7 +4233,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             )
             return body_err
         assert body is not None  # read_bounded_json returns (dict, None) on success
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
+        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "default_memory_mode", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "link_patterns", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
         # One-release backward-compat shim for removed key; delete after all clients update.
         deprecated_ignored_keys = {"tail_fork_head_handling"}
         # Read-only keys the GET exposes: both settings surfaces save with
@@ -4104,6 +4286,23 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     {"error": "merge_queued_messages must be a boolean"}, status=400
                 )
             updates["merge_queued_messages"] = val
+        if "default_memory_mode" in body:
+            val = body["default_memory_mode"]
+            if val not in VALID_MEMORY_MODES:
+                _sel().log_tool_invocation(
+                    session_key="dashboard",
+                    tool_name="dashboard_config_write",
+                    outcome="failure",
+                )
+                return web.json_response(
+                    {
+                        "error": "default_memory_mode must be 'persistent', "
+                        "'incognito' or 'temporary'",
+                        "code": "invalid_default_memory_mode",
+                    },
+                    status=400,
+                )
+            updates["default_memory_mode"] = val
         if "widget_density" in body:
             val = body["widget_density"]
             if val not in ("more", "less"):
@@ -4114,6 +4313,64 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     {"error": "widget_density must be 'more' or 'less'"}, status=400
                 )
             updates["widget_density"] = val
+        if "link_patterns" in body:
+            val = body["link_patterns"]
+            cleaned: list[dict[str, str]] = []
+            # Reject (not silently drop) malformed entries: this path serves the
+            # settings editor, and a dropped rule with a 200 would read as saved.
+            # Regex VALIDITY is not checked -- patterns are compiled by the
+            # browser in the JavaScript dialect, which Python cannot arbitrate.
+            ok = isinstance(val, list) and len(val) <= LINK_PATTERNS_MAX
+            if ok:
+                seen_patterns: set[str] = set()
+                for entry in val:
+                    pattern = entry.get("pattern") if isinstance(entry, dict) else None
+                    url = entry.get("url") if isinstance(entry, dict) else None
+                    if not isinstance(pattern, str) or not isinstance(url, str):
+                        ok = False
+                        break
+                    # Pattern text is stored EXACTLY as authored -- whitespace
+                    # in a regex is load-bearing, so strip() only decides
+                    # blankness (mirrors the load coercer). URL edge-trim is
+                    # safe: the template is expanded, never matched.
+                    url = url.strip()
+                    if not pattern.strip() or len(pattern) > LINK_PATTERN_PATTERN_MAX_LEN:
+                        ok = False
+                        break
+                    # http(s) only: these templates become anchors in every
+                    # transcript, so javascript:/file: must not reach disk. The
+                    # shared validator also applies the renderer's
+                    # origin-stability rule, so a rule that saves is a rule
+                    # that linkifies.
+                    if len(url) > LINK_PATTERN_URL_MAX_LEN or not link_pattern_url_ok(url):
+                        ok = False
+                        break
+                    # Duplicate patterns must be rejected here, not deduped:
+                    # the load-time coercer keeps only the first of a pair, so
+                    # accepting both would persist rules that GET then omits —
+                    # and the editor's next whole-list save would silently
+                    # delete the survivor's twin from disk.
+                    if pattern in seen_patterns:
+                        ok = False
+                        break
+                    seen_patterns.add(pattern)
+                    cleaned.append({"pattern": pattern, "url": url})
+            if not ok:
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": (
+                            f"link_patterns must be a list of at most {LINK_PATTERNS_MAX}"
+                            " {pattern, url} objects with distinct non-empty patterns and"
+                            " an absolute http(s) url template containing {match}"
+                        ),
+                        "code": "invalid_link_patterns",
+                    },
+                    status=400,
+                )
+            updates["link_patterns"] = cleaned
         # Apply ONLY when it is the sole submitted setting. The Browser panel
         # sends it alone; the Chat settings panel PUTs the whole config object
         # from its own (possibly stale) cache, and applying it on that path would
@@ -4368,6 +4625,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "restore_sessions": cfg.dashboard.restore_sessions,
             "restore_window_minutes": cfg.dashboard.restore_window_minutes,
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
+            "default_memory_mode": cfg.dashboard.default_memory_mode,
             "widget_density": cfg.dashboard.widget_density,
             "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,
@@ -4391,6 +4649,13 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # withdraws the "Share as image" menu entry; there is no toggle behind
             # it, so nothing here is writable.
             "social_share_enabled": not social_share_denied,
+            # Read-write (unlike the host allowlists above): a rule only changes
+            # how this dashboard RENDERS text -- it grants no fetch and no CLI
+            # any authority -- so the settings editor may manage it.
+            "link_patterns": [
+                {"pattern": rule.pattern, "url": rule.url}
+                for rule in cfg.dashboard.link_patterns
+            ],
         }
     )
 
@@ -5104,6 +5369,10 @@ async def api_project_git_status(request: web.Request) -> web.Response:
             pass
 
         result: dict = {"repo": True, "repoRoot": repo_root, "files": files[:500]}
+        # Status paths are repo-root-relative; when the project directory sits
+        # below the repo root, every path starts with this prefix.
+        rel = os.path.relpath(base, repo_root)
+        result["_prefix"] = "" if rel in (".", "") or rel.startswith("..") else rel.replace(os.sep, posixpath.sep)
         if len(files) > 500:
             result["truncated"] = True
         if branch:
@@ -5123,27 +5392,60 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         result["repoRoot"] = redact(result["repoRoot"])
     if result.get("branch"):
         result["branch"] = redact(result["branch"])
-    # Redact each file path, then drop entries that duplicate an earlier one
-    # (preserving order and first occurrence). Same collision class as
-    # api_project_tree: redact() can collapse two genuinely-different paths to
-    # the same placeholder. This list feeds GitPanel, which keys its rows on
+    # Redact each file path with redact_path_segments over the same
+    # context-aware redact(): each path is redacted segment-wise, and every
+    # redacted segment carries an opaque label keyed per gateway process, so two
+    # genuinely-different paths that collapse to the same tag stay two entries
+    # instead of one placeholder -- the whole-string redact() is still the
+    # floor, never less. The label is stable across responses within this
+    # process, which is what lets the dashboard join this listing with the
+    # tree listing by path.
+    # Then drop entries that duplicate an earlier one (preserving order and
+    # first occurrence): this is the fallback for a collision the helper does
+    # not separate. This list feeds GitPanel, which keys its rows on
     # `${path}:${staged}` and takes its file total from files.length, so a
     # collision would render two indistinguishable rows under one React key and
-    # overstate the count. (It cannot reach @pierre/trees as a duplicate the way
-    # api_project_tree's list can: the tree's "changed" mode already collapses
-    # status entries by path before handing them over.) The files[:500] cap was
-    # already applied to the raw listing above, so this only removes collisions.
+    # overstate the count. (It cannot reach @pierre/trees as a duplicate the
+    # way api_project_tree's list can: the tree's "changed" mode already
+    # collapses status entries by path before handing them over.) The
+    # files[:500] cap was already applied to the raw listing above, so this
+    # only removes collisions.
     #
     # The key is (path, status, staged), NOT path alone: one file with both
     # staged and unstaged changes ("MM", "AM", "MD") legitimately yields two
     # entries sharing a path but differing in status/staged, and GitPanel
-    # renders them as separate rows. Keying on path alone would drop the
+    # renders them as separate rows (identical originals redact identically, so
+    # the pair still shares its path). Keying on path alone would drop the
     # unstaged lane and undercount the file total. A real redaction collision
     # has an identical tuple, so it still collapses.
+    # The project directory's own repo-relative prefix is redacted the same
+    # way the tree root and repoRoot are (whole-string, unlabelled), so a
+    # credential-shaped project directory reads identically on both sides of
+    # the dashboard join; only the part beneath it is labelled per segment.
+    prefix = str(result.pop("_prefix", "") or "")
+    prefix_slash = posixpath.join(prefix, "") if prefix else ""
+    redacted_prefix = redact(prefix) if prefix else ""
+
+    def _redact_status_path(path: str) -> str:
+        if prefix_slash and path.startswith(prefix_slash):
+            below = redact_path_segments(path[len(prefix_slash) :], redact)
+            joined = posixpath.join(redacted_prefix, below)
+            # Same floor redact_path_segments applies to its own assembly: the
+            # prefix and the part beneath it are redacted separately, so a
+            # token that straddles the joining slash is matched by neither
+            # half. The joined result must be a fixed point of the redactor;
+            # when it is not, the whole-path result wins, exactly as it does
+            # inside the helper.
+            return joined if redact(joined) == joined else redact(path)
+        if prefix and path == prefix:
+            return redacted_prefix
+        return redact_path_segments(path, redact)
+
     deduped_files: list[dict] = []
     seen_keys: set[tuple[str, str | None, bool | None]] = set()
-    for f in result.get("files", []):
-        f["path"] = redact(f["path"])
+    files = result.get("files", [])
+    for f in files:
+        f["path"] = _redact_status_path(f["path"])
         key = (f["path"], f.get("status"), f.get("staged"))
         if key in seen_keys:
             continue
@@ -5305,15 +5607,25 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # Egress redaction, same rationale as api_project_git_status: listed names
     # are repo content and this body is rendered by the dashboard.
     result["root"] = redact(result["root"])
-    # De-duplicate after redaction, preserving order and first occurrence.
-    # redact() collapses each matched token to a fixed placeholder, so two
-    # genuinely-different project-relative paths (e.g. a src/ vs target/ Maven
-    # prefix and a credential-shaped filename token) can flatten to the same
-    # redacted string. The dashboard tree hands this list straight to
-    # @pierre/trees, whose appendPresortedPaths throws "Duplicate path" on
-    # adjacent identical entries. dict.fromkeys keeps first occurrence. This
-    # does not affect "truncated": the cap is applied to the raw listing above.
-    result["paths"] = list(dict.fromkeys(redact(p) for p in result["paths"]))
+    # Redact each path with redact_path_segments over the same context-aware
+    # redact(): the whole-string redact() collapses each matched token to a
+    # fixed placeholder, so two genuinely-different project-relative paths
+    # whose only differing segment is credential-shaped redact to the same
+    # string. The helper redacts each path segment-wise and suffixes every
+    # redacted segment with an opaque label keyed per gateway process, so both
+    # stay in the tree; it never emits less redaction than redact() itself, and
+    # the label is stable across responses within this process, so the git
+    # status listing labels the same path identically and the dashboard's join
+    # by path holds.
+    # Then de-duplicate, preserving order and first occurrence, as the fallback
+    # for a collision the helper does not separate: the dashboard tree hands
+    # this list straight to @pierre/trees, whose appendPresortedPaths throws
+    # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
+    # occurrence. This does not affect "truncated": the cap is applied to the
+    # raw listing above.
+    result["paths"] = list(
+        dict.fromkeys(redact_path_segments(p, redact) for p in result["paths"])
+    )
     return web.json_response(result)
 
 

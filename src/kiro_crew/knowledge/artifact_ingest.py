@@ -32,7 +32,7 @@ parallel watcher):
   never runs -- the gap becomes permanent and silent. So the pass runs on EVERY
   :meth:`ArtifactKnowledgeSync.start` and is driven by state comparison instead:
   ingest what the store has and ``artifact_item_state`` lacks or disagrees with,
-  remove state for artifacts that no longer exist. Converged is the common case
+  remove state for artifacts absent from the store. Converged is the common case
   and costs no extraction calls, because :func:`ingest_artifact` already skips
   unchanged content.
 
@@ -372,7 +372,12 @@ async def ingest_artifact(
         # group rather than returning early and leaving obsolete chunks live.
         # Offloaded: remove_artifact -> delete_items_batch -> store._load_graph
         # is a graph rebuild inside a SQLite transaction, never loop-safe work.
-        prev_hash, old_item_ids = _get_state(kstore, source_id, slug)
+        # _get_state is a synchronous kstore.db read; run it off the loop too,
+        # or a contended knowledge DB busy-waits the whole loop (watchdog
+        # heartbeat included) for the connection's busy timeout.
+        prev_hash, old_item_ids = await asyncio.to_thread(
+            _get_state, kstore, source_id, slug
+        )
         if old_item_ids or prev_hash:
             await asyncio.to_thread(remove_artifact, kstore, source_id, slug)
         return None
@@ -383,7 +388,13 @@ async def ingest_artifact(
     title = _redact_for_ingest(art.name)
 
     content_hash = hashlib.sha256(text.encode()).hexdigest()
-    prev_hash, old_item_ids = _get_state(kstore, source_id, slug)
+    # Synchronous kstore.db read on the gateway loop: offload it so a contended
+    # knowledge DB cannot busy-wait the loop (watchdog heartbeat included) past
+    # the stall deadline. Mirrors the art_store.get / remove_artifact offloads
+    # in this same coroutine.
+    prev_hash, old_item_ids = await asyncio.to_thread(
+        _get_state, kstore, source_id, slug
+    )
     if prev_hash == content_hash and old_item_ids:
         # Unchanged since last ingest AND still holding its items -- cheap no-op
         # (per-slug short-circuit). A row with an empty group was left by a refused
@@ -459,6 +470,12 @@ async def ingest_artifact(
             original_name=f"{title}{ext}",
             source_id=source_id,
             old_item_ids=old_item_ids,
+            # Automated artifact synchronization, not a user's one-shot import, so
+            # it is exempt from the explicit-import chunk budget (like the folder
+            # watcher path). Counting it would let an exhausted budget make this
+            # upsert raise -- leaving the old chunks searchable and dropping the
+            # sync event, a worse outcome than the cost the budget prevents.
+            count_toward_import_budget=False,
             # Fires inside the finalize hop, only on the fully-committed branch
             # -- the same branch that reports status 'completed' below -- and
             # persists the ownership row there (see _record_ownership).
@@ -922,7 +939,7 @@ class ArtifactKnowledgeSync:
             # ineligible kind, so re-ingesting alone would leave the chunks from
             # the previous kind searchable -- markdown ingested, switched to svg,
             # obsolete prose still answering queries. Reconcile that here: an
-            # artifact that is no longer eligible is removed rather than skipped.
+            # artifact that is not eligible is removed rather than skipped.
             try:
                 art = await asyncio.to_thread(self.art_store.get, slug)
             except ArtifactNotFoundError:
@@ -954,8 +971,15 @@ class ArtifactKnowledgeSync:
         the row outlives the feature being switched off, so gating on creation
         leaves an opt-in unable to repair the drift from that window. See the
         module docstring.
+
+        The get-or-create runs in a worker thread: this coroutine runs on the
+        gateway loop at every start, and a contended knowledge DB would
+        otherwise busy-wait the whole loop (watchdog heartbeat included) for
+        the connection's busy timeout.
         """
-        source_id, created = ensure_artifact_source(self.kstore)
+        source_id, created = await asyncio.to_thread(
+            ensure_artifact_source, self.kstore
+        )
         logger.info(
             "artifact KB sync started: source=%s created=%s kinds=%s",
             source_id,

@@ -1,6 +1,6 @@
 """A backend-only Pull + Build must not reinstall node_modules or rebuild.
 
-Issue #7132. Dev Fleet's sync appended the ``npm ci`` and ``npm build + stage``
+Dev Fleet's sync must not append the ``npm ci`` and ``npm build + stage``
 steps unconditionally on every non-edition sync, so a sync that moved only
 Python still paid a full ``npm ci`` (which DELETES ``website/node_modules``
 before reinstalling from an unchanged lockfile) and a full vite build that
@@ -28,6 +28,7 @@ These pin the three seams:
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -132,7 +133,7 @@ class TestPreflightEmitsFrontendSkipOnlyWhenProven:
         assert rc == np.EXIT_FRONTEND_SKIP
 
     def test_does_not_emit_skip_when_the_build_fingerprint_is_stale(self, tmp_path, monkeypatch):
-        """The #7132 hole: a prior frontend sync merged new source but its npm ci
+        """The stale-bundle hole: a prior frontend sync merged new source but its npm ci
         failed, so the transaction restored the OLD node_modules. The subtree
         stops changing, but static/dist was built from the OLD tree. The
         fingerprint (old) does not match the incoming website/ tree (new), so the
@@ -218,13 +219,19 @@ class TestPreflightEmitsFrontendSkipOnlyWhenProven:
 
 def _echo_step(label, rc, tmp_path, stash=None):
     """A step that writes a sentinel file then exits rc, so a skip is observable
-    by the sentinel's ABSENCE."""
+    by the sentinel's ABSENCE.
+
+    Invoked through ``sys.executable`` rather than a literal ``python3``: an
+    ordinary Windows install has no ``python3`` on PATH (only ``python.exe``), so
+    the step failed with cmd's 9009 "not recognized" and every verdict below read
+    as a plain failure. The interpreter running the suite is the one program
+    guaranteed to exist on every host."""
     ran = tmp_path / f"ran-{label.replace(' ', '_')}"
     st = {
         "label": label,
         "env": {},
         "argv": [
-            "python3",
+            sys.executable,
             "-c",
             "import sys,pathlib;pathlib.Path(sys.argv[1]).write_text('x');sys.exit(int(sys.argv[2]))",
             str(ran),

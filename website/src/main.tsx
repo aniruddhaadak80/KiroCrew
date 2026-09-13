@@ -16,6 +16,7 @@ import { ThemeProvider } from './hooks/useTheme'
 import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
 import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/NavigationLeaveGuard'
+import { RouteHistoryTracker } from './components/NavHistoryArrows'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
 // i18n must initialize before the first render — a component rendering ahead of
@@ -30,7 +31,13 @@ import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
 import { installStaleShellHeal } from './lib/staleShellHeal'
-import { hydrateUiPrefs, needsHydrate, startUiPrefsSync } from './lib/uiPrefs'
+import {
+  hasUnreconciledKeys,
+  hydrateUiPrefs,
+  needsHydrate,
+  reconcileNewDurableKeys,
+  startUiPrefsSync,
+} from './lib/uiPrefs'
 import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
@@ -160,6 +167,11 @@ const appTree = (
                         and stays out of the history stack entirely until a page
                         publishes work at stake. */}
                     <NavigationBackGuard />
+                    {/* Same placement contract as the guard above: inside the
+                        router so it sees every navigation, outside the routes so
+                        no route change unmounts it. Feeds the position store the
+                        top-bar arrows and the ⌘/Ctrl+←/→ chords read. */}
+                    <RouteHistoryTracker />
                     <Routes>
                       <Route path="/worlds-popout" element={<BrandingProvider><ProviderProvider><Suspense fallback={null}><WorldsPopout /></Suspense></ProviderProvider></BrandingProvider>} />
                       <Route
@@ -215,7 +227,29 @@ const appTree = (
 // localStorage read, so the usual launch renders on the same tick as before. The
 // first-time path is bounded by hydrateUiPrefs' own timeout, and a gateway that
 // never answers renders defaults rather than hanging the boot. See lib/uiPrefs.ts.
+
+// Embedded panes only: tell the parent this bundle EXECUTED, before React renders
+// anything. The parent's pane journal records `boot` for it. Without this line a
+// pane that loads its shell (a 200 the parent can see) and then never announces
+// `mc-embedded-ready` is indistinguishable from one whose bundle never ran; with
+// it the parent can tell "the entry ran but App/its bridge never mounted" from
+// "no JavaScript of ours ever executed in that frame". `stage` names how far
+// this file got. Wildcard target is safe: the payload carries no data and the
+// parent validates the origin. See EmbeddedHostBridge for the ready half.
+function announceBoot(stage: string): void {
+  if (!isEmbeddedPane()) return
+  try {
+    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
+    window.parent?.postMessage({ type: 'mc-embedded-boot', v: 1, stage }, '*')
+  } catch {
+    /* no parent reachable — the ready announce carries its own retries */
+  }
+}
+announceBoot('entry')
+
+// (See the block above announceBoot for why the first-time boot may reload.)
 function boot(startSync: boolean): void {
+  announceBoot('render')
   createRoot(document.getElementById('root')!).render(appTree)
   if (startSync) startUiPrefsSync()
 }
@@ -225,6 +259,22 @@ if (needsHydrate()) {
     (restored) => {
       if (restored > 0) window.location.reload()
       else boot(!needsHydrate())
+    },
+    () => boot(false),
+  )
+} else if (hasUnreconciledKeys()) {
+  // A WARM profile whose build upgrade added keys to DURABLE_PREF_KEYS: read
+  // the host's copy of the new keys before the first flush may run, or a
+  // default a hook persists on mount would overwrite the value another origin
+  // backed up (growth-gap issue 9491). Same shape as the cold path above --
+  // reload when something was written locally (module-scope readers already
+  // captured the pre-restore value), and do NOT sync after a failure (the
+  // next boot retries; flushing unreconciled keys is the clobber itself).
+  // Runs once per allowlist growth, not per boot: success records the roster.
+  void reconcileNewDurableKeys().then(
+    (restored) => {
+      if (restored > 0) window.location.reload()
+      else boot(restored === 0)
     },
     () => boot(false),
   )

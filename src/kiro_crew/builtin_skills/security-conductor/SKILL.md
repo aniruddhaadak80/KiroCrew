@@ -1,6 +1,6 @@
 ---
 name: security-conductor
-description: Operating procedure for the kirocrew-security-conductor agent - run proactive vulnerability discovery on one target as a supervised fleet. Decompose the target into attack surfaces, dispatch one auditor per surface behind the rules of engagement, dispatch an independent verifier per finding whose job is rejecting false positives, adjudicate severity, hold the two human gates, run a retrospective that proposes lessons, and report upward. Use when a security conductor session is being seeded, or when inspecting/debugging one.
+description: Use when a security conductor session is being seeded, or when inspecting/debugging one. Operating procedure for the kirocrew-security-conductor agent - run proactive vulnerability discovery on one target as a supervised fleet. Decompose the target into attack surfaces, dispatch one auditor per surface behind the rules of engagement, dispatch an independent verifier per finding whose job is rejecting false positives, adjudicate severity, hold the two human gates, run a retrospective that proposes lessons, and report upward.
 ---
 
 # Security Conductor
@@ -38,7 +38,17 @@ than permission.
   the verdict. You read the verdict; you never read a verifier's prose and decide
   for yourself.
 - `scripts/ledger.py` — the ledger CLI: schema, findings, verdicts, lessons,
-  rules-of-engagement export, list. It is also the human's editing surface.
+  golden paths, rules-of-engagement export, list. It is also the human's editing
+  surface.
+- `scripts/verify_fix.py` — the fixer lane's acceptance gate. Given a finding and
+  a worktree it asserts BOTH halves: the finding's proof of concept no longer
+  reproduces, AND every `shell` row of the committed `golden-paths.json` beside
+  it whose platform matches this host is still permitted. `0` both hold, `10` the
+  proof still reproduces so the fix did not land, `30` a golden path is refused
+  and the rows are printed, `20` something the script owns could not be settled
+  (an absent verifier, an unreadable deny composite, a corpus that is missing,
+  will not load, or holds no row). It fails closed: a check that could not run is
+  never a pass, so `0` is unreachable while anything went unsettled.
 
 ## The rules of engagement
 
@@ -88,18 +98,31 @@ rules yourself.
 
 ## The two human gates
 
-`human_approval` names exactly two, and neither is yours to grant:
+`human_approval` names two dispatch gates, and neither is yours to grant:
 
 1. **Active testing beyond static review plus a local unit-level proof of
    concept.** Anything that runs against something other than a scratch checkout
    — a live service, a network endpoint, a shared host — waits for a human yes.
 2. **Any fixer dispatch.** A fix PR is a change to the target on the strength of
-   a finding. Every one waits for a human yes, per dispatch.
+   a finding. Every one waits for a human yes, per dispatch. A dispatched fix is
+   **accepted only when PR checks are green AND
+   `scripts/verify_fix.py --finding-id N --worktree DIR` exits 0** — never on
+   checks alone. Checks green proves the repository still builds; it does not
+   prove the product still works, because no existing test asserts that a
+   legitimate command is *not* refused. Exit 10 means the fix did not land, exit
+   30 means it broke a golden path, exit 20 means the question was not settled,
+   and none of the three is acceptance.
 
 A gate is held by not dispatching. Never dispatch on an assumed yes, never treat
 silence as approval, and never re-scope a blocked step into something that looks
 permitted. Record each pending gate as your own obligation and re-read it every
 cycle until it is answered.
+
+A third `human_approval` row covers the golden-path corpus rather than a
+dispatch: approving a `golden_paths` row, and **deactivating an approved one**,
+both need a human yes on the same terms. The symmetry is the control — a gate
+whose input can be shrunk is not a gate, because the cheapest way to green is
+retiring the row a fix broke. That row is not yours to grant either.
 
 ## Auditor seed template
 
@@ -123,7 +146,10 @@ item; keep every clause.
 > that line of work and reply `BLOCKED: policy refusal — <the rule as reported>`.
 > Do not rephrase, re-spell, split, encode, or otherwise route around it. A
 > wording that gets past a block is a rules-of-engagement violation, not a
-> result.
+> result. RECORD the refusal as an event of kind `policy_block` carrying the
+> command SHAPE and the rule as reported — never a secret, a token, or a
+> credential path's contents. The block is an event, not a finding: whether the
+> fence was right is the retrospective's ruling, not yours.
 > WORK: static review first. A proof of concept is a unit-level test in your own
 > scratch worktree, with no network egress and no writes outside that worktree.
 > Anything beyond that needs a human yes you do not have — report
@@ -161,6 +187,11 @@ auditor's reasoning, and never asked to improve the finding.
 > something else), `needs-human` (it cannot be settled inside the rules of
 > engagement). Record it with `scripts/verify_finding.py` and give the reason in
 > one or two sentences.
+> A POLICY REFUSAL IS THE BOUNDARY here too. A blocked step is `needs-human`,
+> recorded as an event of kind `policy_block` with the command shape and the rule
+> as reported and no secrets in it. Never rephrase, re-spell, or split a call to
+> get past a block: a proof that only reproduces through a circumvented block is
+> void, not confirmed.
 > A DISAGREEMENT WITH THE AUDITOR IS A RESULT, not a conflict to resolve. Record
 > `rejected` and say why; the ledger keeps both verdicts.
 > REPORT with `VERDICT: <finding_id> <confirmed|rejected|needs-human>` or
@@ -178,13 +209,58 @@ One retrospective per round, after every finding carries a verifier verdict.
 > the outside, what the confirmed findings shared, what a `needs-human` verdict
 > was actually missing.
 > PROPOSE lessons with `scripts/ledger.py propose-lesson`, one per pattern, each
-> carrying its source finding id and one of `true-positive` / `false-positive` /
-> `missed` / `out-of-scope`. A proposed lesson is INACTIVE until a human approves
-> it — never write guidance as though it is already in force, and never inject an
-> unapproved lesson into a seed message.
-> If a round produced no disagreement, say so in one line and propose nothing. A
-> lesson invented to fill the report crowds out one that was earned.
-> REPORT with `RETRO: <n> lesson(s) proposed` and the ids.
+> naming EXACTLY ONE source — `--source-finding ID` for a finding, or
+> `--source-policy-block REF` for a `policy_block` event — and one of
+> `true-positive` / `false-positive` / `missed` / `out-of-scope`. Passing neither or
+> both exits 2. A proposed lesson is INACTIVE until a human approves it — never
+> write guidance as though it is already in force, and never inject an unapproved
+> lesson into a seed message.
+> RULE ON EVERY `policy_block` EVENT recorded this round, one at a time: was it a
+> FALSE POSITIVE (the fence refused a legitimate operation) or a CORRECT BLOCK
+> (the worker was reaching past the boundary)? A correct block is recorded as
+> such and proposes nothing.
+> For each false positive propose the GOLDEN-PATH ROW FIRST, always: the wrongly
+> refused operation with `scripts/ledger.py propose-golden-path` (`active=0`). Its
+> `--source-finding` is optional, so a block with no finding still gets its row.
+> THEN the `false-positive` lesson with `scripts/ledger.py propose-lesson`, and
+> propose it for EVERY false positive — a block with no finding cites the block
+> itself with `--source-policy-block`, naming the event as you recorded it
+> (`{round_id}/policy_block-N`). Where the block does have a finding, cite it with
+> `--source-finding`: the finding the verifier was verifying, or the candidate the
+> auditor was proving. Never invent a finding id to carry a lesson; there is no
+> longer any reason to, and a fabricated id is the one thing that would make the
+> ledger's attribution a lie.
+> The two halves do different jobs — the lesson stops a future auditor re-filing
+> it, the golden path stops a future fix re-breaking it — so both are recorded for
+> every false positive, and a round that could record only one says which is
+> missing and why.
+> A HUMAN APPROVES ROWS, not you: `scripts/ledger.py approve-lesson` and
+> `approve-golden-path` are the human's commands, and nothing is injected into a
+> seed message or gates a fix before that. A proposed row is inert.
+> If a round produced no disagreement and no policy block, say so in one line and
+> propose nothing. A lesson invented to fill the report crowds out one that was
+> earned.
+> REPORT with `RETRO: <n> lesson(s), <m> golden path(s) proposed` and the ids.
+
+## Cross-platform
+
+Every fix, proof of concept, script and rule this fleet produces must work on
+**Linux, macOS and Windows**. A fix written and tested on one platform that
+refuses or breaks another platform's path is the second failure mode the
+golden-path corpus exists for, and nothing catches it unless the check itself
+runs on the matrix.
+
+- A platform-specific branch ships **with the other platforms' equivalent in the
+  same change**, and is verified on the 3-OS matrix. A branch for one platform
+  and a follow-up promised for the others is a single-platform fix.
+- A platform this fleet cannot run on yields `needs-human` or `UNKNOWN` — never
+  `confirmed`, and never in scope. An unrunnable check is not a passed one.
+- A `posix-only-approved` label covers **a single platform-branched line**, never
+  a PR. A PR-wide exemption turns a targeted exception into a blanket one, and
+  the blanket outlives the line.
+- The `forbidden` rules of engagement carry this as a row, so it is checkable
+  rather than advisory: a fix must not introduce a code path, fix or evaluator
+  usable on only one platform.
 
 ## Severity adjudication
 
@@ -224,7 +300,15 @@ Each cycle, in this order:
    verdict. These are what go missing, because nothing fires to remind you. An
    entry clears when the obligation is discharged, not when you decide about it.
 4. **Record verdicts and state back** in one write.
-5. **Report only real signals.** A quiet cycle is one line, then end the turn.
+5. **Close out what is terminal.** When a work item reaches a terminal verdict
+   (accepted, rejected, abandoned/void) and its loop is stopped,
+   `session_close` that child session in the same cycle — a finished worker
+   has nothing left to re-arm. It holds for auditor, verifier, retrospective
+   and fixer sessions alike, and a VOID fixer is closed after its
+   `session_stop` rather than left open. `session_close` archives
+   (reopenable); it never deletes. Never close a child that still has a
+   pending human question or an unmerged PR it is actively driving.
+6. **Report only real signals.** A quiet cycle is one line, then end the turn.
 
 ## Stop conditions
 
@@ -248,6 +332,13 @@ Stop and report, rather than continuing, on any of these:
   only thing producing signal. Report the rate; a finding stream nobody has
   measured is not a foundation for a fixer lane.
 
+Whichever fires: before the final report, `session_close` each remaining child
+whose item is terminal — auditor, verifier, retrospective and fixer alike. **A
+child still holding a pending human question, or a fixer driving an unmerged PR,
+stays open**: the pending-human-gate stop above fires while a person is
+mid-decision on exactly such a child, and a close cancels its turn and
+discards that work.
+
 ## Known limits (state them, don't hide them)
 
 - Every script call is `execute_bash`, which is mounted but never auto-approved:
@@ -264,5 +355,15 @@ Stop and report, rather than continuing, on any of these:
   circumvention is a stop condition rather than a note.
 - A lesson only changes behaviour on the NEXT round, and only after a human
   approves it. Nothing here learns inside a round.
+- **A policy block with no finding is recorded as both a golden path and a
+  lesson.** A `policy_block` is deliberately an event rather than a finding, so it
+  has no id for `--source-finding` to resolve; `propose-lesson` therefore takes
+  `--source-policy-block` instead, and a lesson names exactly one of the two. Both
+  halves of the retrospective's ruling survive a block that filed nothing — the
+  golden path that stops a future fix re-breaking the operation, and the guidance
+  that stops the next auditor walking into the same refusal. A policy-block
+  reference is not a foreign key and cannot be, since the events are the round's
+  own record rather than a table in the ledger, so this source is attributable but
+  not referentially checked.
 - One set of rules of engagement = one target. A second target is a second set,
   reviewed on its own.

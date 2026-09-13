@@ -182,8 +182,8 @@ def _audit(session_key: str, kind: str, outcome: str) -> None:
     """Emit a SEL tool-invocation event for one directive application.
 
     AUTOSDE ``backend-security-controls`` requires every tool invocation AND
-    permission decision to emit a SEL event — the effect now runs here (not in
-    the tool body or an HTTP endpoint), so the audit must too. Best-effort: a
+    permission decision to emit a SEL event — the effect runs here (not in the
+    tool body or an HTTP endpoint), so the audit does too. Best-effort: a
     telemetry failure must never break the turn.
     """
     try:
@@ -208,6 +208,7 @@ async def apply_session_directive(
     *,
     producer_is_user_facing: bool = False,
     producer_is_self_wake: bool = False,
+    producer_is_channel: bool = False,
 ) -> str:
     """Apply directive *kind* with *args* to *slot*/*session_key*; return a
     confirmation string for the model. Fail-soft: any error is returned as a
@@ -273,14 +274,30 @@ async def apply_session_directive(
     try:
         if kind == "monitor_start":
             result = await _monitor_start(
-                state, session_key, args, slot=slot, self_arm_ok=self_arm_ok
+                state,
+                session_key,
+                args,
+                slot=slot,
+                self_arm_ok=self_arm_ok,
+                producer_is_channel=producer_is_channel,
             )
         elif kind == "monitor_watch":
             result = await _monitor_watch(
-                state, session_key, args, slot=slot, self_arm_ok=self_arm_ok
+                state,
+                session_key,
+                args,
+                slot=slot,
+                self_arm_ok=self_arm_ok,
+                producer_is_channel=producer_is_channel,
             )
         elif kind == "monitor_update":
-            result = await _monitor_update(state, session_key, args, self_arm_ok=self_arm_ok)
+            result = await _monitor_update(
+                state,
+                session_key,
+                args,
+                self_arm_ok=self_arm_ok,
+                producer_is_channel=producer_is_channel,
+            )
         elif kind == "monitor_stop":
             result = await _monitor_stop(session_key, args)
         elif kind == "autonudge_stop":
@@ -342,9 +359,11 @@ async def _monitor_start(
     *,
     slot: Any = None,
     self_arm_ok: bool = False,
+    producer_is_channel: bool,
 ) -> str:
     from kiro_crew.autonudge import get_instance
     from kiro_crew.autonudge_authz import authorize_and_add_nudge
+    from kiro_crew.monitoring.models import MonitorCreationSurface
 
     svc = get_instance()
     # Not-applied paths RAISE so the wrapper audits them as denied — a plain
@@ -392,6 +411,11 @@ async def _monitor_start(
         # the same session without being it, and a loop such a turn armed would
         # be the outsider's loop wearing the member's key; those pass "".
         initiator_slot_key=binding if self_arm_ok else "",
+        creation_surface=(
+            MonitorCreationSurface.CHANNEL
+            if producer_is_channel
+            else MonitorCreationSurface.DASHBOARD
+        ),
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record
@@ -441,10 +465,15 @@ async def _monitor_watch(
     *,
     slot: Any = None,
     self_arm_ok: bool = False,
+    producer_is_channel: bool,
 ) -> str:
     from kiro_crew.autonudge import get_instance
     from kiro_crew.autonudge_authz import authorize_and_add_nudge
-    from kiro_crew.monitoring.models import MonitorBudgets, MonitorState
+    from kiro_crew.monitoring.models import (
+        MonitorBudgets,
+        MonitorCreationSurface,
+        MonitorState,
+    )
 
     svc = get_instance()
     if svc is None:
@@ -484,6 +513,11 @@ async def _monitor_watch(
         monitor=monitor,
         # Self-arm provenance, same rule as _monitor_start: human-started turns only.
         initiator_slot_key=binding if self_arm_ok else "",
+        creation_surface=(
+            MonitorCreationSurface.CHANNEL
+            if producer_is_channel
+            else MonitorCreationSurface.DASHBOARD
+        ),
     )
     if error is not None:
         raise _DirectiveDenied(f"Failed to start structured monitor: {error} [status {status}]")
@@ -505,7 +539,12 @@ async def _monitor_watch(
 
 
 async def _monitor_update(
-    state: Any, session_key: str, args: dict[str, Any], *, self_arm_ok: bool = False
+    state: Any,
+    session_key: str,
+    args: dict[str, Any],
+    *,
+    self_arm_ok: bool = False,
+    producer_is_channel: bool = False,
 ) -> str:
     from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
     from kiro_crew.autonudge_authz import (
@@ -530,7 +569,12 @@ async def _monitor_update(
         if _structured_binding(session_key) != binding:
             raise _DirectiveDenied("monitor_update is not supported from this session type.")
         return await _structured_monitor_update(
-            state, svc, loop, patch, initiator=binding if self_arm_ok else ""
+            state,
+            svc,
+            loop,
+            patch,
+            initiator=binding if self_arm_ok else "",
+            producer_is_channel=producer_is_channel,
         )
     structured_only = sorted(
         set(patch)
@@ -581,8 +625,8 @@ async def _monitor_update(
     # cycle-count heuristic stays only as a legacy fallback for stores written
     # before the field existed, and the budget side has NO heuristic at all —
     # elapsed time keeps growing after a manual pause, so "budget looks spent"
-    # cannot distinguish a pause from an expiry (GPT review on #2116: a
-    # budget raise must never resume a loop the user paused).
+    # cannot distinguish a pause from an expiry: a budget raise must never
+    # resume a loop the user paused.
     if not getattr(loop, "active", True):
         reason = str(getattr(loop, "stopped_reason", "") or "")
         stopped_at_cap = reason == "cycle_cap" or (
@@ -608,8 +652,8 @@ async def _monitor_update(
         # already merged -- the wasted fresh loop this branch exists to prevent.
         #
         # Expressed ONCE, as a term in the revival decision itself, rather than as a
-        # guard per branch: the notice next door lost this same precedence three
-        # times because each new bound was added ahead of it.
+        # guard per branch: a per-branch guard loses this precedence as soon as a
+        # new bound is added ahead of it.
         monitor = getattr(loop, "monitor", None)
         owed = str(getattr(monitor, "terminal_pending", "") or "") if monitor else ""
         terminal = reason == MONITOR_TERMINAL_REASON or bool(owed)
@@ -752,14 +796,23 @@ def _no_loop_message(svc: Any, binding: str) -> str:
 
 
 async def _structured_monitor_update(
-    state: Any, svc: Any, loop: Any, patch: dict[str, Any], *, initiator: str = ""
+    state: Any,
+    svc: Any,
+    loop: Any,
+    patch: dict[str, Any],
+    *,
+    initiator: str = "",
+    producer_is_channel: bool = False,
 ) -> str:
     from kiro_crew.autonudge_authz import authorize_and_update_monitor
+    from kiro_crew.dashboard.handlers.source_providers import ensure_gitlab_hosts_loaded
+    from kiro_crew.monitoring.models import MonitorCreationSurface
+    from kiro_crew.monitoring.targets import normalize_pull_request_target
 
     # ``banner`` is a message-loop-only field (a structured monitor shows its
     # objective as the transcript row), so it belongs with the legacy fields the
-    # structured path refuses. Without it here, ``monitor_update`` accepted a
-    # banner into the patch, dropped it, and reported success -- a silent no-op.
+    # structured path refuses. Without it here, ``monitor_update`` would accept a
+    # banner into the patch, drop it, and report success -- a silent no-op.
     legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner"})
     if legacy_only:
         raise _DirectiveDenied(
@@ -771,7 +824,18 @@ async def _structured_monitor_update(
         raise _DirectiveDenied("No structured monitor on this session to update.")
     structured: dict[str, Any] = {}
     if "target" in patch:
-        structured["target"] = str(patch["target"])
+        try:
+            gitlab_hosts = await ensure_gitlab_hosts_loaded()
+            target = normalize_pull_request_target(
+                monitor_state.kind,
+                str(patch["target"]),
+                gitlab_hosts=tuple(gitlab_hosts),
+            )
+            structured["target"] = target
+            if producer_is_channel and target != monitor_state.target:
+                structured["creation_surface"] = MonitorCreationSurface.CHANNEL
+        except ValueError as exc:
+            raise _DirectiveDenied(str(exc)) from exc
     if "objective" in patch:
         structured["objective"] = str(patch["objective"])
     if "idle_secs" in patch:
@@ -874,7 +938,8 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
     # shape, while the slot's persisted app provenance cannot be user-selected.
     # Ordinary dashboard/channel monitors have no tombstone consumer, so retain
     # their historical removal behavior instead of leaving a paused loop.
-    if is_structured_monitor_loop(loop):
+    structured = is_structured_monitor_loop(loop)
+    if structured:
         from kiro_crew.autonudge_authz import authorize_and_stop_monitor
 
         _loop, error, _status = await authorize_and_stop_monitor(
@@ -891,6 +956,12 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:
         await svc.remove(loop_id)
+    if structured:
+        return (
+            f"Structured monitor {loop_id} stopped and retained for inspection"
+            + (f" (reason: {reason})" if reason else "")
+            + ". No further monitor wakes will fire."
+        )
     return (
         f"Auto-nudge loop {loop_id} stopped on this session"
         + (f" (reason: {reason})" if reason else "")
@@ -941,7 +1012,7 @@ async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
         raise _DirectiveDenied("Error: access denied (sensitive path).")
     if not is_dir:
         return f"Error: not a directory: {rp}"
-    # #7392 pre-flight, mirrored from the HTTP project endpoint: this directive
+    # Pre-flight, mirrored from the HTTP project endpoint: this directive
     # is the OTHER user/agent-driven moment of choice that sets slot.project
     # (set_project MCP routes here in-process, never through the endpoint), so
     # without this check the overlap refusal would still land at spawn time,

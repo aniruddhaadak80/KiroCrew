@@ -10,6 +10,7 @@
  * a lazy boundary (see `./tree.tsx`) so the eager bundle stays clean.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
 import type { GitStatus, GitStatusEntry } from '@pierre/trees'
 // The package root re-exports the tree's context-menu types under shorter
@@ -26,6 +27,7 @@ import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { i18nT } from '../i18n/t'
 import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel, type ContributedFileMenuItem, type ReportFileMenuError } from '../apps/fileMenuContributions'
 import { normalizeWindowsPath } from '../utils/fileTokens'
+import { recallExpandedPaths, rememberExpandedPaths } from './treeExpansionMemory'
 import { TreeSkeleton } from './tree'
 
 /** The kind vocabulary the composer's `@`-mention plumbing speaks: a file is
@@ -33,12 +35,15 @@ import { TreeSkeleton } from './tree'
  *  Pierre's `'directory' | 'file'`, so map at the boundary. */
 type TreeEntryKind = 'file' | 'dir'
 
-/** Row-level right-click menu projected into Pierre's `context-menu` slot.
- *  Pierre owns the anchor, the outside-click wash, and open/close; this renders
- *  only the item list: the built-in "Add to chat" action, plus any row an installed
- *  app contributes for the `tree-context` surface (row click already opens a file, so
- *  the menu deliberately carries no Open duplicate). Every action closes the menu
- *  itself so focus returns to the row. */
+/** Row-level right-click menu for Pierre's `context-menu` slot -- rendered via a
+ *  `document.body` PORTAL rather than into the slot itself. Pierre owns the
+ *  anchor, the outside-click wash, and open/close (the portal root's
+ *  `data-file-tree-context-menu-root` marker is the library's documented way to
+ *  keep a portaled surface counting as "inside"); this renders only the item
+ *  list: the built-in "Add to chat" action, plus any row an installed app
+ *  contributes for the `tree-context` surface (row click already opens a file,
+ *  so the menu deliberately carries no Open duplicate). Every action closes the
+ *  menu itself so focus returns to the row. */
 function TreeContextMenu({ item, context, root, onAddToContext, contribItems, onError }: {
   item: FileTreeContextMenuItem
   context: FileTreeContextMenuOpenContext
@@ -114,15 +119,90 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   // content); letting the hook also focus would be a redundant second move.
   const menuRef = useRef<HTMLDivElement>(null)
   useMenuKeyboard({ enabled: true, containerRef: menuRef, focusFirstOnOpen: false })
+  // PORTALED to document.body, positioned from the open context's anchorRect
+  // (#10100). Pierre's default slot placement puts the menu in a width-0 slot
+  // hung at the row's trailing edge, inside the tree root -- and that root is
+  // `overflow: hidden`, so with this app's `--trees-padding-inline-override:
+  // 0px` the slot sits ~7px from the panel's right edge and the menu clips to
+  // a sliver flush against the border at EVERY panel width (it reads as a
+  // truncated, unclickable "..." control; the same in-slot growth is what shifted
+  // the trigger vertically while open). The library documents the escape
+  // hatch: a portaled menu marked `data-file-tree-context-menu-root="true"`
+  // still counts as inside for Pierre's outside-click wash and Escape close.
+  //
+  // Placement: below the anchor, right edges aligned for the "..." button (its
+  // rect has width; a right-click anchor is a zero-width point and aligns
+  // left), clamped into the viewport and flipped above when the bottom would
+  // overflow -- measured in a layout effect so the first painted frame is
+  // already at its final position (hidden until measured).
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  useLayoutEffect(() => {
+    const menu = menuRef.current
+    if (!menu) return
+    const a = context.anchorRect
+    const m = menu.getBoundingClientRect()
+    const margin = 8
+    let left = a.width > 0 ? a.right - m.width : a.left
+    left = Math.min(left, window.innerWidth - m.width - margin)
+    left = Math.max(margin, left)
+    let top = a.bottom + 2
+    if (top + m.height > window.innerHeight - margin) {
+      top = Math.max(margin, a.top - m.height - 2)
+    }
+    setPos({ top, left })
+    // `rows.length` is a dep because a contributed-row refetch while the menu
+    // is open changes the menu's height, and a stale measurement would let the
+    // grown menu run past the bottom clamp.
+  }, [context, rows.length])
+  // DISMISS when the row can move out from under the fixed-position menu.
+  // The tree renders inside a SHADOW ROOT and `scroll` is a non-composed
+  // event, so a window listener never sees the virtualized tree's own
+  // scroller (the drift source that matters) while it DOES fire for
+  // unrelated light-DOM scrolls -- a streaming reply auto-scrolling the chat
+  // transcript would snatch a just-opened menu with no action taken. So the
+  // scroll listener goes capture-phase on the ANCHOR'S OWN root node (the
+  // tree's shadow root), which sees every scroll container inside the tree
+  // and nothing outside it. Row movement without a scroll -- the rail or
+  // panel being drag-resized -- is covered by a ResizeObserver on the shadow
+  // host (skipping its mandatory initial delivery), and window resize stays
+  // as the cheap catch-all. Close rather than re-track: it is the native
+  // context-menu convention, and a right-click anchor is a pointer POINT
+  // that no element rect can re-derive after the rows have moved.
+  useEffect(() => {
+    const onDismiss = () => context.close()
+    const root = context.anchorElement.getRootNode()
+    root.addEventListener('scroll', onDismiss, true)
+    let ro: ResizeObserver | null = null
+    const host = root instanceof ShadowRoot ? root.host : null
+    if (host && typeof ResizeObserver !== 'undefined') {
+      let initialDelivery = true
+      ro = new ResizeObserver(() => {
+        if (initialDelivery) {
+          initialDelivery = false
+          return
+        }
+        context.close()
+      })
+      ro.observe(host)
+    }
+    window.addEventListener('resize', onDismiss)
+    return () => {
+      root.removeEventListener('scroll', onDismiss, true)
+      ro?.disconnect()
+      window.removeEventListener('resize', onDismiss)
+    }
+  }, [context])
   // Render nothing rather than an empty bordered popup: with no host row AND no
   // app row that its `when` admits for this node, there is nothing to show and
   // no menuitem for the focus effect to land on.
   if (!onAddToContext && rows.length === 0) return null
-  return (
+  return createPortal(
     <div
       ref={menuRef}
       role="menu"
-      className="min-w-[176px] max-w-[min(420px,calc(100vw-2rem))] rounded-lg border border-border bg-bg-elevated p-1 shadow-lg"
+      data-file-tree-context-menu-root="true"
+      style={pos ? { top: pos.top, left: pos.left } : { top: context.anchorRect.bottom + 2, left: context.anchorRect.left, visibility: 'hidden' }}
+      className="fixed z-50 min-w-[176px] max-w-[min(420px,calc(100vw-2rem))] rounded-lg border border-border bg-bg-elevated p-1 shadow-lg"
     >
       {onAddToContext && (
         <div
@@ -169,7 +249,8 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
           </div>
         )
       })}
-    </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -185,7 +266,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   }
 }
 
-export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, searchQuery, mode = 'all', selectedPath }: {
+export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, searchQuery, mode = 'all', selectedPath, persistExpansion = false }: {
   projectDir: string
   onFileOpen?: (absPath: string) => void
   /** Right-click "Add to context" on a row: hands the host the ABSOLUTE path
@@ -204,6 +285,11 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
    *  selection (and scrolled into view). Selection changes caused by this
    *  prop never re-fire `onFileOpen`. */
   selectedPath?: string | null
+  /** Remember and restore the expanded directories across remounts (keyed by
+   *  `projectDir`, see `./treeExpansionMemory`). Opt-in per host so the other
+   *  hosts of this shared tree keep their collapsed-by-default behavior.
+   *  Applies to `all` mode only: `changed` mode starts fully open by design. */
+  persistExpansion?: boolean
 }) {
   // Whether any app contributes a 'tree-context' row at all — gates whether the
   // tree wires a context menu (per-node `when` filtering happens in the menu).
@@ -299,15 +385,114 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // the same pre-paint pass so the first visible frame is already correct.
   const pathsKey = useMemo(() => paths.join('\n'), [paths])
   const lastPathsKey = useRef<string | null>(null)
+  // Expansion persists for `all` mode only: `changed` mode starts fully open
+  // by design and holds a handful of paths, so there is nothing to remember.
+  const remembersExpansion = persistExpansion && mode === 'all'
+  // Directory set of the current payload, for the capture below: remembered
+  // directories NOT in this set are temporarily absent (truncated payload,
+  // another branch checked out) and must survive a snapshot rather than be
+  // erased by it.
+  const payloadDirsRef = useRef<Set<string> | null>(null)
   useLayoutEffect(() => {
     if (!ready) return
     if (lastPathsKey.current === pathsKey) return
     lastPathsKey.current = pathsKey
-    model.resetPaths(paths)
-  }, [ready, paths, pathsKey, model])
+    if (!remembersExpansion) {
+      model.resetPaths(paths)
+      return
+    }
+    const dirs = new Set<string>()
+    for (const p of paths) {
+      const segments = p.split('/')
+      for (let i = 1; i < segments.length; i++) dirs.add(segments.slice(0, i).join('/'))
+    }
+    payloadDirsRef.current = dirs
+    // Restore the remembered expansion (see `./treeExpansionMemory`): the rail
+    // remounts on in-place tab navigation and the model is created per mount,
+    // so without this every file open collapses the tree back to the root.
+    // The ARGUMENT is filtered to directories present in this payload (the
+    // controller tolerates unknown paths, but there is nothing to expand);
+    // the remembered set itself keeps absent entries — see the capture below.
+    const remembered = recallExpandedPaths(projectDir)
+    const alive = remembered.filter(d => dirs.has(d))
+    if (alive.length > 0) {
+      model.resetPaths(paths, { initialExpandedPaths: alive })
+    } else {
+      model.resetPaths(paths)
+    }
+  }, [ready, paths, pathsKey, model, remembersExpansion, projectDir])
   useEffect(() => {
     model.setGitStatus(statusEntries)
   }, [statusEntries, model])
+
+  // Capture the expanded directory set on every model notification so the next
+  // mount can restore it. Skipped while a search is active: the search session
+  // expands matches transiently, and persisting that would restore an
+  // unrelated expansion after the filter is cleared. Known limitation, noted
+  // deliberately: a directory expanded under a collapsed ancestor is not
+  // visible, so it drops out of the remembered set — acceptable, since
+  // re-expanding the ancestor is what the user does on return anyway.
+  const searchQueryRef = useRef(searchQuery)
+  searchQueryRef.current = searchQuery
+  const lastSnapshotKey = useRef<string | null>(null)
+  const lastVisibleCount = useRef<number | null>(null)
+  useEffect(() => {
+    if (!remembersExpansion) return
+    const unsubscribe = model.subscribe(() => {
+      if (searchQueryRef.current) {
+        // A search session expands matches transiently, so nothing is
+        // captured while it is active — and the count on exit may match the
+        // count on entry, so the pre-filter below must not swallow the first
+        // post-search notification.
+        lastVisibleCount.current = null
+        return
+      }
+      const count = model.getVisibleCount()
+      // A model that currently holds no rows — a transient empty `project-tree`
+      // payload, or the window before the first payload lands — carries no
+      // expansion information: writing its empty set would erase the memory.
+      // In `all` mode a non-empty payload always keeps top-level rows visible,
+      // so zero visible rows can only mean an empty model, never the user
+      // collapsing everything.
+      if (count === 0) return
+      // Focus, selection, and git-status notifications far outnumber
+      // expansion changes, and materializing every visible row on each one
+      // defeats the tree's virtualization on a large workspace. With
+      // `flattenEmptyDirectories` an expand/collapse always changes the
+      // visible count, so an unchanged count means an unchanged expansion —
+      // skip the O(visible rows) scan entirely.
+      if (lastVisibleCount.current === count) return
+      lastVisibleCount.current = count
+      const rows = model.getVisibleRows(0, count)
+      const expanded: string[] = []
+      for (const row of rows) {
+        // Directory rows come back with the library's canonical trailing
+        // slash; strip it so the remembered paths compare equal to the
+        // payload-derived directory prefixes on restore.
+        if (row.kind === 'directory' && row.isExpanded) expanded.push(row.path.replace(/\/$/, ''))
+      }
+      // A visible-row scan can only see directories the current payload
+      // holds. A remembered directory absent from the payload — beyond the
+      // backend's truncation cap, or gone on the currently checked-out
+      // branch — is not evidence of a collapse: carry it forward so a
+      // transient absence cannot permanently erase it. A genuinely deleted
+      // directory is carried indefinitely and dropped only when the
+      // per-project path cap truncates the tail — the cost of never being
+      // able to tell "deleted" from "temporarily absent" here.
+      const payloadDirs = payloadDirsRef.current
+      if (payloadDirs) {
+        for (const d of recallExpandedPaths(projectDir)) {
+          if (!payloadDirs.has(d)) expanded.push(d)
+        }
+      }
+      // Skip the write when the set is unchanged to avoid storage churn.
+      const key = expanded.join('\n')
+      if (lastSnapshotKey.current === key) return
+      lastSnapshotKey.current = key
+      rememberExpandedPaths(projectDir, expanded)
+    })
+    return unsubscribe
+  }, [remembersExpansion, model, projectDir])
 
   // Forward the panel's shared search box into the tree's search session.
   useLayoutEffect(() => {

@@ -26,8 +26,22 @@ from kiro_crew.pod.config import EXIT_REFUSED_UNRECOVERABLE, PodConfig
 
 
 @pytest.fixture
-def cfg() -> PodConfig:
-    return PodConfig.load()
+def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PodConfig:
+    """A pod plane under ``tmp_path``.
+
+    ``PodConfig.load()`` roots ``pods_dir`` at the DEFAULT data home on purpose
+    (a pod process must find the host's plane, not its own ``KIROCREW_HOME``), so
+    the data-home pin does not reach it. Unpinned, the refusal tests below wrote
+    ``<name>.refused`` notes into the operator's real ``~/.kiro/crew/pods`` -- and
+    failed on a host where that directory did not exist yet, because the note is
+    written best-effort and its absence reads as "no refusal".
+    """
+    monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+    monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "envs"))
+    (tmp_path / "envs").mkdir()
+    loaded = PodConfig.load()
+    assert loaded.pods_dir == tmp_path / "envs", "the pod plane must be this test's own"
+    return loaded
 
 
 def _fake_cli(tmp_path: Path, body: str) -> Path:
@@ -350,7 +364,7 @@ class TestTheProbeIsConfined:
         gateway, so its ambient ``KIROCREW_HOME`` is the HOST's while the real spawn
         -- inside the pod gateway process -- reads the POD's. Config resolves through
         that variable at call time, so an operator with ``sandbox_allow_unsandboxed_exec``
-        set in HOST config and not in POD config previously got a probe that PASSED
+        set in HOST config and not in POD config would get a probe that PASSED
         and an agent that could never spawn: healthy status, dead pod.
         """
         from kiro_crew import sandbox

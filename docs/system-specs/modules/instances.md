@@ -11,7 +11,7 @@ per-instance (`connection_method`) — see §13.
 > top-header switcher group ("Remote Instances" / "Switch instance"), and the
 > keyboard shortcuts. This is deliberately distinct from the product name
 > **Kiro Crew** and from an agent **crew** (an assistant with its own
-> workspace/memory — `kiroCrewAgentsPage`, "Crew Mode"). Earlier UI copy called
+> workspace/memory — `kiroCrewAgentsPage`, the Crew Members page). Earlier UI copy called
 > this feature "Remote Crew"; that wording was retired in favour of "instance" to
 > match the code and config it already sits on (`/api/instances`,
 > `instances.json`, `InstancesPanel`, EC2 `instance_id` / `ssm_target`). Only the
@@ -173,7 +173,14 @@ simultaneously-connected instance use a distinct remote port. The shipped
 defaults contradicted it — a stock gateway binds the same default port on both
 ends, so a stock hub already held the port a stock remote reported and two stock
 installs could never connect (#1972). Reconnects reuse the instance's own
-previous port so the iframe origin and its cookie stay stable.
+previous port so the iframe origin and its cookie stay stable — with one
+deliberate exception: a **rebuild** (`connect?rebuild=1`, §4 step 1) excludes the
+port it just freed from the allocation, so the rebuilt forwarder lands on a
+different port. Rebuild exists to escape a tunnel that passes every probe yet
+never finishes serving one stream, and the field evidence for that stall is
+port-correlated (every case so far sat on the first allocated port), so a new
+origin is the point rather than a cost; the pane's Retry reloads at the new
+origin and mints its own port-scoped cookie.
 
 **Platform note.** The hub side of this feature assumes a POSIX host with an
 OpenSSH `ssh` client on `PATH`, and run-marker port discovery refuses outright on
@@ -189,7 +196,33 @@ non-POSIX (§12). Treat a Windows hub as unverified.
    dashboard token on the remote over SSH, and returns the live status plus the
    token. Connect is **idempotent**: an already-connected instance returns its
    current status, and the handler then *probes* the stored token before handing
-   it over (see below). The browser loads
+   it over (see below). Two opt-in query flags bend that in opposite directions,
+   and they are mutually exclusive (`400` together):
+   - `?rebuild=1` — the pane's Retry after a load watchdog fired on a document
+     that DID navigate. Every probe says the tunnel is healthy, so the idempotent
+     connect would hand back the same forwarder and the pane would reload into
+     the same stalled stream. Rebuild tears the CONNECTED tunnel down under the
+     manager lock with `keep_intent=True`, then runs the normal connect with the
+     freed port excluded from allocation (§3). A teardown whose stop raises is
+     returned as an ERROR status / `502`, the old tunnel left intact and tracked.
+     Audited as `connect/rebuild`. One consumer: `InstancesViewport`'s Retry.
+     **Provisional.** The recovery rests on a hypothesis — that a fresh
+     forwarder on a new port clears the stalled stream — which the
+     `[pane-assets]` journal exists to confirm or refute. Until a field
+     `STALLED → retry rebuild=true → ready` trace is on record the flag is not a
+     stability commitment: if the trace shows the stall recur on the new port,
+     the flag, the §3 port exclusion and the mutual-exclusion `400` are removed
+     together rather than kept as API.
+   - `?only_if_connected=1` — the viewport's auto-warm. Answers a CONNECTED
+     tunnel exactly like a plain connect but, for a tunnel that is not up, spawns
+     nothing, mints nothing and leaves `was_connected` untouched: `200` with
+     `state=disconnected`, `code=instance_not_connected`, audited
+     `connect/declined`. Decided under the same lock `disconnect` holds, so an
+     auto-warm racing an explicit disconnect can never re-open the tunnel the
+     user just closed. Auto-warm pre-mounts panes for tunnels that are already
+     up; bringing one up is the fan-out's and the click's job.
+
+   The browser loads
    `http://<dashboard-hostname>:<local>/?token=...` in an iframe, deliberately
    reusing the parent's own hostname so the pane is same-site with the parent and
    `SameSite=Lax` auth cookies are not withheld.
@@ -222,7 +255,14 @@ non-POSIX (§12). Treat a Windows hub as unverified.
    capped-exponential backoff (`recover_backoff_max_secs`, 30s; the wait grows
    1, 2, 4, 8, 16 then holds at the cap), which spans roughly a two-minute
    window: long enough to outlast a transient drop (screen lock, proxy warmup).
-   The counter resets on a successful rebuild or a successful `connect()`. If it
+   The counter resets on a successful rebuild or a successful `connect()`. A
+   successful rebuild records the replacement child's `local_port` alongside its
+   `forwarder_pid` / `forwarder_start` / `forwarder_sig` in one write — the same
+   field set `connect()` persists. A rebuild takes its port from the live
+   tunnel, and `forwarder_sig` is a MAC over that port, so the port travels with
+   the identity that signs it; recording one without the other points both the
+   pane URL and the reclaim's signature check at a port the recorded child is
+   not bound to. If it
    gives up, the diagnosis ladder runs automatically. The slow SSH I/O runs
    *without* the manager lock so self-heal cannot stall a concurrent
    connect/disconnect/shutdown.
@@ -285,6 +325,32 @@ kirocrew config set instances.mint_timeout_secs 60
 Constants that are **not** user-configurable: the probe interval (30s), the token
 refresh fraction (0.8), and the stored-token probe timeout (2s).
 
+**Which of these a config write reaches (`SshTunnelManager.apply_config`).** The
+manager registers `live.watch_section(self, "instances", method="apply_config",
+fail_closed=False)` in its own `__init__` — `method` because the `reconfigure`
+name is already taken here, and `fail_closed=False` because the section carries
+no authorization, so a degraded document's defaults are the right answer. A config
+write pushes `connect_timeout_secs`, `mint_timeout_secs`, `ssh_compression`,
+`max_recovery_attempts`, `recover_backoff_max_secs` and `probe_failure_threshold`
+onto the running manager. Every one of those is consulted per operation — per
+connect, per mint, per recovery attempt — so pushing it is a genuine hot apply
+rather than a value that only mattered at construction. The probe threshold is
+additionally propagated into the tunnels ALREADY running: each one copied it when
+it was built, and would otherwise keep tearing itself down on the old count. The
+push is an attribute set on the live tunnel, not a restart, because the threshold
+is compared against a running counter — so the new value takes effect on the next
+probe without dropping a healthy forward.
+
+`tunnel_base_port` is deliberately left alone. The allocator has already handed out
+ports from the old base and live tunnels hold them, so moving the base mid-flight
+would only fragment the range; it applies to a manager built after the change.
+`instances.enabled` stays a startup read (§1), and `warm_set_cap` is applied by the
+warm table rather than here.
+
+`apply_config` is not `reconfigure`: the latter is the per-instance edit barrier
+described under `PATCH /api/instances/{id}`, which tears one tunnel down and
+rewrites its coordinates under the manager lock. They share no code.
+
 ### 5.2 `instances.ssh_compression`
 
 Adds `-C` (zlib transport compression) to the supervised `ssh -N -L` argv. It is
@@ -298,11 +364,12 @@ reached over a higher-latency link, where spending remote CPU to save bandwidth
 is the right trade. On a fast or local link the CPU cost can outweigh the
 bandwidth win, which is why it stays tunable.
 
-The flag is read once, at startup, into the `SshTunnelManager`, and each
-`_SshTunnel` inherits it; changing it takes effect on the next gateway restart.
-Only the *tunnel* argv is affected. The token-mint and diagnostics `ssh`
-invocations do not compress (they are single short commands, so there is nothing
-to gain).
+The flag is held on the `SshTunnelManager` and re-read from config on every write
+(§5.1), but each `_SshTunnel` copies it into its argv when the child is spawned, so
+a change applies to tunnels built AFTER it — a live forward keeps the setting it
+started with until it reconnects. Only the *tunnel* argv is affected. The
+token-mint and diagnostics `ssh` invocations do not compress (they are single short
+commands, so there is nothing to gain).
 
 ### 5.3 Registry file
 
@@ -395,7 +462,7 @@ request with no `request["user"]` with `401`, and rejects a disabled feature wit
 | `POST /api/instances` | Add an instance. A rejection carries a machine-readable `code` beside its human message, so a client can branch without parsing prose: `invalid_json` / `invalid_body` (unreadable request), `invalid_field` (a named field failed validation), `instance_duplicate` (the name is taken), `instance_invalid` (the record as a whole is not addressable) and `instances_manager_unavailable`. The dashboard forwards the code into its error → agent hand-off, which is why it has to be on the wire rather than derived from the message. |
 | `PATCH /api/instances/{id}` | Edit `name`/`ssh_host`/`remote_port`/`ttl`/`remote_bin`/`connection_method`/`ssm_target`/`ssm_run_as`/`aws_profile`/`aws_region` (`id` and internal hints are not editable). Editing a field the tunnel is BUILT from (everything except `name` and `ttl`) disconnects a live tunnel first, because it would otherwise keep forwarding the old port to the old host under the new label; the teardown passes `keep_intent=True` so it does not touch `was_connected` — that flag records a USER disconnect, so a reconfiguration leaves it alone and a real disconnect arriving mid-edit still wins. The crew therefore keeps its switcher entry and reconnects in one click. The teardown and the coordinate rewrite happen as ONE operation, `SshTunnelManager.reconfigure()`, which holds the manager lock across both. Done as two steps a `connect` can read the OLD record in between, and whether its tunnel is already CONNECTED or still CONNECTING when the write lands decides whether any after-the-fact sweep would notice it — so the window is removed rather than narrowed: a racing `connect` either completes before (and is torn down inside the section) or starts after (and reads the new coordinates). It also cancels and AWAITS that instance's in-flight self-heal first: recovery reads the record before it takes the lock, so a recovery already running carries the pre-edit coordinates and would reinstall a tunnel to the old machine. Because that cancellation itself awaits, a reconfiguration additionally raises a per-instance BARRIER before its first await; while the barrier is up the scheduling seams refuse to start work — `_on_tunnel_exit` will not begin a self-heal, a backed-off one returns without acting, and `_schedule_token_refresh` will not restart a mint loop — so nothing can slip into the window. Self-heal is cancelled AND awaited before the coordinates move, because it rebuilds from the record it read. The token-refresh loop is unwound by the teardown instead — after the stop succeeds — so a REJECTED edit leaves the live tunnel holding both its credential and its refresh; in both cases the cancellation is awaited, since a mint already in flight would otherwise store a token for a tunnel that is being replaced. A teardown that raises ABORTS the edit with `503` / `code: tunnel_teardown_failed` and persists nothing: a stop that failed leaves the old forward live, so advancing the record would describe one machine while the still-open tunnel serves another — and that tunnel is the one the user reaches. Nothing is discarded unless the stop succeeded — the tunnel keeps its place in `_tunnels` along with its token and refresh task — so a failed stop can neither leave an untracked process holding the port nor a live forward without a credential. The registry write is also shielded from cancellation: a client hanging up mid-write must not unwind the `async with` and free the lock while the write is still in flight. An edit sends only the fields that DIFFER from an IMMUTABLE snapshot of the record taken when its form opened (not the live polled record, which a concurrent CLI edit would move under the user), so the later of two concurrent saves cannot revert the earlier one's corrections; optional fields travel as explicit empty values, so emptying one clears it instead of being read as "leave as-is". The dashboard does NOT reconnect afterwards: any automatic reconnect races an explicit Disconnect arriving mid-save, so the row offers **Connect** instead. A crew CORRELATED to a cloud stack has its `connection_method`/`ssm_target`/`aws_profile`/`aws_region` frozen in the edit form and omitted from the request — Stop/Start/Delete resolve the machine through those, so editing them would strand a billing instance. That freeze is now enforced **server-side too**: this endpoint rejects the four addressing fields for a correlated cloud instance with `400` / `code: cloud_instance_addressing_locked`, so a non-dashboard caller (CLI, script, the agent driving this owner-only API) can no longer rewrite the coordinates and strand a billing instance. Correlation is resolved against the cloud launch store via `_is_correlated_cloud_instance()`, checked against the record already fetched for the edit. An SSM crew that cannot be correlated is offered no lifecycle action, so its fields stay editable — that identity is how the dashboard finds the machine to stop or delete, and editing it away would strand a billing instance. |
 | `DELETE /api/instances/{id}` | Disconnect then remove. |
-| `POST /api/instances/{id}/connect` | Open tunnel + mint token. Returns the token. A failure carries a machine-readable `code`, and that code is the failure-diagnosis ladder's OWN verdict (`ssh_unreachable`, `remote_down`, `tunnel_down`, …) promoted to the top level, so a client reads which link broke without walking into `diagnosis`. Only a verdict that is present AND **negative** is promoted: the stored diagnosis is the last ladder RUN, so a stale `ok` from before the failure would otherwise be published as this call's reason. With no usable verdict the stage that failed names itself — `instance_connect_failed`, or `instance_token_unconfirmed` when the tunnel came up but its credential did not confirm. The frontend applies the same present-AND-negative rule before quoting a verdict or its probe chain into the agent hand-off, for the same staleness reason. |
+| `POST /api/instances/{id}/connect` | Open tunnel + mint token. Returns the token. Idempotent by default; `?rebuild=1` (Retry after a load-watchdog verdict: tear down and re-spawn on a different local port) and `?only_if_connected=1` (auto-warm: answer an up tunnel, never bring one up — a down tunnel is a `200` with `code: instance_not_connected`) are the two opt-in exceptions, mutually exclusive (`400`), described in §4 step 1. A failure carries a machine-readable `code`, and that code is the failure-diagnosis ladder's OWN verdict (`ssh_unreachable`, `remote_down`, `tunnel_down`, …) promoted to the top level, so a client reads which link broke without walking into `diagnosis`. Only a verdict that is present AND **negative** is promoted: the stored diagnosis is the last ladder RUN, so a stale `ok` from before the failure would otherwise be published as this call's reason. With no usable verdict the stage that failed names itself — `instance_connect_failed`, or `instance_token_unconfirmed` when the tunnel came up but its credential did not confirm. The frontend applies the same present-AND-negative rule before quoting a verdict or its probe chain into the agent hand-off, for the same staleness reason. |
 | `POST /api/instances/{id}/refresh-token` | Force a fresh mint and return the new token. See below. |
 | `POST /api/instances/{id}/disconnect` | Tear down one tunnel. |
 | `GET /api/instances/{id}/status[?diagnose=1]` | Live status; `?diagnose=1` runs the failure ladder and merges the result. |
@@ -506,7 +573,13 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
 - **Untrusted ssh stderr.** A proxy banner is ANSI-stripped, credential- and
   exfiltration-redacted, and truncated before it is surfaced in status, and it is
   a secondary detail only: failure *classification* keys on real ssh signals, so
-  banner prose can never be read as an auth verdict.
+  banner prose can never be read as an auth verdict. When a classification phrase
+  matched, the fixed-width truncation window is centered on the matched phrase
+  rather than the head of the buffer -- on the phrase itself, not its line, since
+  the proxy controls the buffer and can make a single line arbitrarily long -- so
+  benign stderr written earlier (e.g. arbitrary `LocalCommand` output) cannot
+  consume the budget and truncate the classified reason out of the surfaced
+  detail.
 - **Trust root.** `<data-home>/run/` (the run-marker dir) is on the
   `is_sensitive_path` floor, so agent file tools can neither read nor write it.
   See §12 and [security.md](security.md).
@@ -778,8 +851,9 @@ its real jobs.
 |---|---|
 | `GET /api/cloud/preflight?profile=&region=` | AWS reachability + the prerequisite checklist (the doctor checks as JSON). |
 | `GET /api/cloud/iam-policy` | The minimum IAM policy document to paste into the user's account. |
+| `GET /api/cloud/provisioners` | The lanes the Set-up tab may offer: `{id, kind, label, posix_only, steps}` per provisioner, from the CPP `remote_provisioners` seam ([platform-context.md](platform-context.md)). The stock build lists the single `aws_ec2` lane. Answers on every platform, like the two history routes: the tab needs it to pick a form, and each row's `posix_only` carries the platform answer for that lane. Adding a lane: [adding-a-remote-provisioner.md](../../guides/adding-a-remote-provisioner.md). |
 | `GET /api/cloud/launch` | List launch jobs, in progress and finished. |
-| `POST /api/cloud/launch` | Start a launch job; returns the job immediately. `409` when one is already in flight. |
+| `POST /api/cloud/launch` | Start a launch job; returns the job immediately. `409` when one is already in flight. Body `{provider_id?, profile, region, size_key}`; `provider_id` defaults to `aws_ec2`, and an id the seam does not list or cannot back answers `400 unknown_provisioner` before any job file exists. The job carries `provider_id`, and its step labels are the provisioner's. |
 | `GET /api/cloud/launch/{id}` | Poll one job: per-step state plus the device-code prompt while signing in. |
 | `POST /api/cloud/launch/{id}/cancel` | Request cancellation; honored between steps and inside the sign-in wait. A cancel during provisioning is acted on when the deploy returns, and the stack it created is rolled back. |
 | `POST /api/cloud/launch/{id}/signin` | Acknowledge the device-code prompt (`409` when none is pending). |
@@ -1312,7 +1386,7 @@ existing session, on either side. Consequences worth stating:
 | **`project`** | **no** | The headline decision. The source's checkout path almost never exists on the target (a Mac worktree path on a Linux dev desk), and a slot pointing at a missing directory scopes file search and steering to nothing. The session arrives **unscoped** and the user re-picks a project. |
 | `model` | no | Accounts differ in entitlement, so an id the source is served can fail at runtime on the target. The target resolves its own default ([model-selection](../common/model-selection.md)). |
 | `workspace` | no | Workspaces are per-instance memory scopes; a matching name still means a different memory. |
-| `folder_id`, `tags`, `pinned`, `artifact`, `app`, `linked_session_key`, `forked_from` | no | Local-graph references that would dangle. |
+| `folder_id`, `tags`, `tags_revision`, `pinned`, `artifact`, `app`, `linked_session_key`, `forked_from` | no | Local-graph references that would dangle (`tags_revision` is the per-instance change identity of `tags`; it travels with them). |
 
 `bundle_version` is refused when **outside the supported set** (`{1, 2}`) rather
 than best-effort parsed: the two ends are independently-updated installs, and a
@@ -1324,6 +1398,7 @@ versions is what lets a v2 instance still receive a copy from a v1 one.
 | Method and path | Purpose |
 |---|---|
 | `POST /api/instances/{id}/send-session` | Sending side. Body `{"slot": "<local slot key>"}`. Bundles the local session and delivers it over that instance's open tunnel. |
+| `GET /api/chat/slots/{slot}/export` | Sending side, file hop. Streams the SAME bundle as a gzipped download instead of over a tunnel — see §14.7. |
 | `POST /api/chat/slots/import` | Receiving side. Accepts a bundle and materialises a new slot. |
 
 `send-session` goes through the same `_guard()` as every other route in §6
@@ -1379,6 +1454,147 @@ other direction is therefore done by registering the peers you want on each host
 that should originate a transfer, and a hub-initiated **pull** (read a peer's
 session over the same forward) is the natural follow-on that would make
 remote → hub and remote → remote work without any reverse reachability.
+
+### 14.7 The file hop (`GET /api/chat/slots/{slot}/export`)
+
+The same bundle, written to a file instead of pushed down a tunnel. Code:
+`src/kiro_crew/dashboard/session_export.py`, with the menu action
+`ExportSessionItem` mounted beside `SendToInstanceSubmenu` in the shared
+`SessionActionsMenu`.
+
+**Why the hop exists.** §14.4's send is a request/response between two live
+gateways, so it needs both machines up at the same moment, reachable from one
+account, with a working tunnel between them. A laptop that is asleep can receive
+nothing, and two machines that never see each other have no path at all. A file
+needs none of that.
+
+**It adds no format.** `bundle_version` stays **2**. The keys the export adds are
+additive, which is what keeps §14.3's compatibility promise: `_validate_bundle`
+refuses an unrecognised version outright but drops an unknown KEY silently, so a
+version bump would stop every instance that has not updated from receiving
+anything, while a new optional key costs it nothing.
+
+The response is `application/gzip` with
+`Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>` and
+`X-Content-Type-Options: nosniff`. The name is `<title-slug>-<stamp>.kcsession.json.gz`.
+The slug is script-PRESERVING — a CJK, Cyrillic or accented title keeps its
+characters, because the header carries them percent-encoded, which is the spelling
+every other download handler already ships (`handlers/files.py`,
+`handlers/diagnostics.py`, `handlers/wakatime.py`). Percent-encoding is also what
+makes the header injection-proof: a title cannot contribute a quote, a semicolon,
+a CR or an LF.
+
+Status codes: `404` unknown slot, a slot an app token does not own, or a
+CHANNEL-LINKED slot named by an app token — all three answer the same code,
+because a distinguishable 403 would let an app enumerate slots, or learn which of
+its own slots carry a channel link, across the isolation boundary (CWE-204);
+`400` an incognito or
+temporary session (`export_slot_not_persistent`), one with no visible messages
+(`export_bundle_empty`), or one whose bundle the importer itself would refuse
+(`export_bundle_rejected`, carrying the importer's own code); `503` no consistent
+view of the transcript could be taken (`export_snapshot_unstable`, retryable);
+`500` any other assembly failure (`export_failed`). SEL-audited as
+`chat.slot_export`.
+
+**Owning the slot is not owning the transcript.** A channel-linked slot displays a
+conversation that lives on the channel's own session, and `get_or_create_slot`
+auto-binds that link from a channel-shaped slot NAME, which the creating caller
+supplies. So an app can hold a slot it legitimately owns whose transcript belongs
+to a channel it does not. An app token is therefore refused on any channel-linked
+slot rather than the handler reasoning about the binding — fail closed, because
+the cost of being wrong is a foreign conversation leaving the app sandbox. The
+dashboard owner is unaffected, being entitled to both.
+
+**A producer never emits a document its own reader would refuse.** Before
+compressing, the handler runs the bundle through `_validate_bundle` — the
+importer's own validator — and refuses the export if it would be rejected. The
+bounds (5,000 messages, 1 MB per message, 20 MB of content) are therefore
+consulted rather than restated, so the producer and the reader cannot drift apart.
+Only the VERDICT is used: the validated payload is discarded, because validation
+rebuilds a normalised allowlist that would strip the optional keys the export adds
+on purpose.
+
+Three properties worth stating because they are easy to lose:
+
+- **Layer A only — the context window does not travel in a file.** §14.1a's
+  byte-exact, unredacted Layer B is justified by its DESTINATION, not by its
+  payload: a send reaches the operator's own authenticated peer, which stores it
+  `0600`, so the context never leaves their trust boundary. A file has no
+  destination — it can sit in a download, a bucket or on a USB stick — so that
+  justification does not carry over: an export withholds Layer B and sets
+  `layer_b_skipped`, so the loss is stated rather than inferred from an absent
+  key. Redacting it instead is not available, because the thinking-block
+  signatures inside it are validated on replay (§14.1a) and redacting and
+  transplanting cannot both hold. The cost is real and accepted — a session
+  installed from a file resumes from its transcript rather than through
+  `session/load`.
+- **The filename is an egress surface, not decoration.** A name is displayed by
+  whatever holds the file — a share, a bucket listing, a chat attachment — so the
+  slug is built from the bundle's **already-redacted** title and never from
+  `slot.title`.
+- **An incognito or temporary session cannot be exported.** Those transcripts
+  exist under a promise that nothing is kept, so writing one into a file is
+  refused rather than best-effort served.
+- **No conversation changes, and nothing installs.** An export creates, moves and
+  deletes nothing, so a repeat costs the source nothing and the action needs no
+  confirm step. It is not a pure read of the disk, though: like `send-session` it
+  FLUSHES a dirty slot first, because slicing a stale transcript would ship a
+  superseded turn — so an export can persist pending session state and fails
+  rather than exporting when that write fails. Reading such a file back is
+  separate work that does not exist yet: today a file is installed by POSTing its
+  decompressed contents to `/api/chat/slots/import` with a dashboard credential.
+
+### 14.8 The `source` provenance record — recorded, never applied
+
+An export carries an optional `source` object so a reader can answer "what was
+this session running under?". Present on the file hop; the tunnel's bundle does
+**not** carry it, because a send is an existing working flow and there is no
+reason for this to change what it puts on the wire.
+
+| Field | Meaning |
+|---|---|
+| `model` | the model the source session was pinned to |
+| `reasoning_effort` | the source's effort setting |
+| `approval_policy` | `""` interactive, `"auto"` auto-approve every tool |
+| `workspace`, `project` | named as text only; both are local scopes §14.3 drops. Credential- and exfiltration-redacted like the title, being the only free text in the record |
+| `exported_at` | ISO instant the file was written |
+| `producer` | the exporting gateway's version, for diagnosis only |
+
+`origin` and `agent` are NOT repeated here — both already sit at the top level
+of the bundle, where the importer reads them.
+
+**The reader is a person, not a caller.** An export is a user-facing artifact
+whose whole point is being inspectable (§14.7), and somebody deciding whether to
+install a session needs to know what model produced it, at what effort, and above
+all whether the transcript was produced under auto-approval. Every field earns
+its place against THAT reader. A field only a future caller would want does not
+go in, which is why `mode` and `autocompact_pct` are absent: both are re-derived
+per turn, so they are pointless to apply and there is nothing for a human to do
+with them either.
+
+**Every field is display and diagnosis only. None of it is applied.**
+`approval_policy` is why that has to be stated rather than left to taste:
+`"auto"` means auto-approve every tool, so a bundle that carried it as an
+*applied* setting would let a session arrive on another machine pre-authorised to
+run tools without prompting — a privilege escalation across a trust boundary, and
+the same class of defect `subagent._validate_agent` refuses when it declines to
+default an unknown agent name. An imported session always lands interactive.
+
+**No field is ever required.** A reader asks whether a key is present and
+well-formed, never whether a version implies it must be there. That is the real
+compatibility mechanism, because a version number only coordinates a linear
+history: two forks can each add their own fields and each stamp the same number,
+and a reader that trusted the number would then look for fields its own branch
+associates with it. So `producer` records which code wrote a file for diagnosis
+and is **never read as a gate**.
+
+`approval_policy` has one wrinkle the others do not. It has no durable copy
+anywhere — the live session object is its only home — so a conversation whose
+session is gone (evicted, or not re-opened since a gateway restart) has no policy
+to report. Absence therefore means "not known" while `""` means "interactive",
+and the two are kept distinguishable on purpose: collapsing them would make the
+field's only interesting reading, that a transcript was produced under
+auto-approval, indistinguishable from a gateway with nothing to say.
 
 ## 15. Federated session search (search every connected instance at once)
 

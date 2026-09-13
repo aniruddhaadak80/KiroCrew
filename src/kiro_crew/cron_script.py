@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import _read_agent_spec
@@ -332,7 +332,7 @@ def grant_epoch_ids() -> set[str]:
 #: the cross-process half of the guarantee is the flock in
 #: :func:`_grant_epochs_guard`. Both are needed: job-removal paths bump
 #: epochs and removals also run from the CLI (``kirocrew cron remove``), so
-#: the writer set is no longer one gateway process — a thread lock alone
+#: the writer set is not one gateway process — a thread lock alone
 #: would let a gateway revoke and a CLI removal read one epoch map and
 #: overwrite each other's bump, reviving a revoked pin.
 _GRANT_EPOCHS_LOCK = threading.Lock()
@@ -742,9 +742,9 @@ def _begin_spawn(job_id: str | None) -> bool:
     cancelled sees no flag and executes.
 
     Refusing the overlap makes the per-job cancellation contract well defined.
-    It also closes a pre-existing hazard: a second concurrent run used to
-    overwrite the ``_RUNNING_PROCS`` entry, orphaning the first child from
-    cancellation entirely.
+    It also closes a standing hazard: a second concurrent run would overwrite
+    the ``_RUNNING_PROCS`` entry, orphaning the first child from cancellation
+    entirely.
 
     An unidentified run (``job_id is None``) is never registered or cancellable,
     so it is always allowed and claims nothing.
@@ -1484,6 +1484,28 @@ def _resolve_internal_secret(port: int) -> str:
     return read_local_secret(port)
 
 
+def _child_internal_secret(
+    provider: Callable[[], str] | None,
+    port: int,
+) -> str:
+    """The secret the script child sends as ``X-Internal-Secret``.
+
+    A ``provider`` returns the gateway's LIVE in-memory secret and takes
+    precedence: the in-process scheduler runs inside the gateway that minted
+    that value, so handing back its own secret is authoritative. Only when it
+    yields nothing (or no provider was given — a runner constructed outside a
+    gateway process, or a gateway with no dashboard) does resolution fall back
+    to the env/file derivation. The provided value is used only to write the
+    0600 temp file the child reads; it is never logged, put in the env, or
+    placed in an error string.
+    """
+    if provider is not None:
+        live = provider()
+        if live:
+            return live
+    return _resolve_internal_secret(port)
+
+
 def _resolve_dial_port() -> int:
     """The ONE port this cron dials, used for both the credential and the child.
 
@@ -1510,10 +1532,23 @@ def run_script_sandboxed(
     secret_env: dict[str, str] | None = None,
     secret_env_pin: str = "",
     delivery: str = "",
+    internal_secret_provider: Callable[[], str] | None = None,
 ) -> dict:
     """Run a cron script in a sandboxed subprocess via wrap_argv().
 
     Returns: {"status": "ok"|"skip"|"done"|"error", "message": "...", "error": "..."}
+
+    ``internal_secret_provider`` returns the gateway's LIVE in-memory internal
+    secret — the one the auth middleware actually compares against. The
+    in-process cron scheduler passes it so the child's ``notify()`` credential
+    is the running gateway's own value rather than one re-derived from the
+    environment or a per-port file. Env/file derivation
+    (``_resolve_internal_secret``) is the fallback for a runner constructed
+    OUTSIDE a gateway process (tests, ``kirocrew cron preview``) or a gateway
+    started with no dashboard (``--no-dashboard`` / API-only), where there is
+    no live secret to hand over. A stale ``KIROCREW_INTERNAL_SECRET`` in an
+    operator shell or a stale per-port ``.secret`` file otherwise wins the
+    derivation and every ``notify()`` 403s.
 
     ``secret_env``/``secret_env_pin`` carry an operator grant of vault secrets
     (see the grant block near ``_CRON_ENV_DENY``). When a grant is present the
@@ -1666,6 +1701,13 @@ def run_script_sandboxed(
     # --port auto bind between two resolutions would pair a credential with the
     # wrong port and 403 the callback.
     dial_port = _resolve_dial_port()
+    # Prefer the gateway's LIVE in-memory secret (the value the auth middleware
+    # compares against) when the in-process scheduler supplied a provider;
+    # otherwise derive it from env/file. Deriving is correct only OUTSIDE a
+    # gateway process (tests, cron preview) or when no dashboard started —
+    # inside a live gateway a stale KIROCREW_INTERNAL_SECRET or a stale per-port
+    # .secret file would win the derivation and 403 every notify().
+    internal_secret = _child_internal_secret(internal_secret_provider, dial_port)
     # Write secret to temp file for ScriptContext (scrubbed from env)
     secret_fd, secret_path = tempfile.mkstemp(prefix="kirocrew_secret_")
     try:
@@ -1683,7 +1725,7 @@ def run_script_sandboxed(
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)
-            os.write(secret_fd, _resolve_internal_secret(dial_port).encode())
+            os.write(secret_fd, internal_secret.encode())
         finally:
             os.close(secret_fd)
         try:
@@ -1724,7 +1766,23 @@ def run_script_sandboxed(
             )
         else:
             hidden = ()
-        sandbox_mode = "strict" if stdin_payload is not None else "standard"
+        # Same tier as ``run_command_sandboxed`` below: a script body is
+        # agent-written, so it is the HIGHER-capability cron surface, and it
+        # ran the WIDER profile — ``standard`` leaves ~/.aws/credentials, the
+        # SSO cache, ~/.kube, ~/.netrc, ~/.git-credentials, ~/.npmrc and
+        # ~/.pypirc open to the child, while a fixed command has always run
+        # ``cc``. The static body vet cannot be the fence (its own docstring
+        # says so and names the sandbox as the runtime control), so the two
+        # cron spawn paths are aligned on ``cc`` here. ``cc`` is the Claude
+        # Code provider's tier, and on macOS it deliberately leaves ``~/.aws``
+        # readable for that provider's Bedrock ``credential_process`` auth
+        # (see ``sandbox._seatbelt_profile``); a cron borrowing the tier
+        # inherits that residual, which is the same exposure the command path
+        # has always had there. A script that needs a host credential takes
+        # the existing route an operator already approves per job: a vault
+        # secret_env grant, which runs ``strict`` and injects the one approved
+        # secret instead of exposing a store.
+        sandbox_mode = "strict" if stdin_payload is not None else "cc"
         sandboxed_argv, sandbox_cleanup = wrap_argv(
             argv, mode=sandbox_mode, extra_hidden_dirs=hidden
         )
@@ -1787,7 +1845,7 @@ def run_script_sandboxed(
         #
         # A refusal means this job is already spawning or running. Return WITHOUT
         # touching any spawn or cancellation state: that state belongs to the
-        # other run, and clearing it here is exactly how a rerun used to eat the
+        # other run, and clearing it here is exactly how a rerun eats the
         # cancel aimed at a run still in its backoff.
         #
         # Status is "skipped", NOT "error". This is a second overlap guard behind

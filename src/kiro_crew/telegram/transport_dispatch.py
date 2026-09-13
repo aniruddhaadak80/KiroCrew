@@ -35,10 +35,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew.acp.client import AcpError
 from kiro_crew.agent_discovery import list_agents
+from kiro_crew.config import live
 from kiro_crew.config.loader import ACTIVATION_MENTION, ACTIVATION_OFF
+from kiro_crew.config.sections import _clamp_pct
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging import auto_title, privacy_mode
 from kiro_crew.messaging.attachments import IngestLimits, append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
@@ -55,6 +59,7 @@ from kiro_crew.messaging.commands import (
     stop_running_turn,
     task_arg_reply,
 )
+from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
     build_auto_approve,
     build_directive_consumer,
@@ -115,6 +120,7 @@ from kiro_crew.telegram.session_resume import TelegramSessionResume
 from kiro_crew.telegram.transport import (
     TELEGRAM_CAPABILITIES,
     TelegramInboundMessage,
+    _coerce_id_set,
     forum_gate_outcome,
 )
 from kiro_crew.voice_reply import synthesis_settings, synthesize_and_deliver
@@ -128,6 +134,7 @@ if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
     from kiro_crew.subagent import SubagentManager
+    from kiro_crew.telegram.transport import TelegramTransport
     from kiro_crew.taskrunner import TaskRunner
     from kiro_crew.telegram.client import TelegramCallback, TelegramClient
 
@@ -212,7 +219,7 @@ _FAILURE_REASON_MAX_CHARS = 500
 def _user_safe_failure_reason(exc: BaseException) -> str | None:
     """A bounded, user-safe reason for a failed turn, or None for the generic text.
 
-    Only a *permanent* :class:`AcpError` (``transient is False``) yields a
+    A private-memory refusal or *permanent* :class:`AcpError` yields a
     reason: its message is already user-facing and actionable (e.g. names the
     models the account does include), and the generic "please try again"
     placeholder would be actively wrong for it. Transient and unclassified
@@ -222,7 +229,9 @@ def _user_safe_failure_reason(exc: BaseException) -> str | None:
     The text is untrusted output: credentials/exfil URLs and local filesystem
     paths are redacted, newlines are collapsed, and the length is hard-capped.
     """
-    if not isinstance(exc, AcpError) or exc.transient is not False:
+    if not isinstance(exc, UnknownMemoryStore) and (
+        not isinstance(exc, AcpError) or exc.transient is not False
+    ):
         return None
     try:
         text = redact_local_paths(redact(str(exc)))[0]
@@ -395,6 +404,16 @@ class TelegramDispatcher:
         # over-permissive.
         self.bot_id: int = 0
         self._conv = ConversationState(seed_fn=self._seed_gen)
+        # Set by maybe_start_telegram after construction (same construction-cycle
+        # reason as ``client``); the config applier pushes reloaded authorization
+        # fields at it.
+        self.transport: "TelegramTransport | None" = None
+        # Held on self: the watcher holds the owner WEAKLY, so a subscription
+        # dropped here would be collected and the applier would silently stop
+        # firing.
+        self._config_sub = live.watch_section(
+            self, "telegram", "messaging", name="TelegramDispatcher"
+        )
         # The mid-turn queue receipt: one in-place "queued" bubble per session,
         # plus the lock that serializes check-then-send-then-store against the
         # end-of-turn drain. Both now live in messaging/queue_receipt.py so
@@ -449,6 +468,56 @@ class TelegramDispatcher:
     def dashboard_state(self, state: Any) -> None:
         self._dashboard_state = state
         self._session_resume.dashboard_state = state
+
+    # ── Live config ────────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when it is armed, else a fingerprint-cached
+        ``load()`` (two stats on a hit), else the boot copy. Falling back to
+        ``self.cfg`` rather than raising keeps a turn running when the config
+        file is momentarily unreadable: a threshold or a render toggle is not an
+        authorization decision, and the boot value is the one the operator last
+        had in force.
+        """
+        return live.current(self.cfg, log_prefix="telegram")
+
+    def _soft_threshold(self) -> int:
+        """The context-nudge threshold from the live config.
+
+        Re-runs the loader's own clamp, because a reloaded value read straight
+        off the section can sit outside the valid range and either nudge on every
+        turn or never nudge at all. Telegram has no hard threshold, so there is
+        no pair to order.
+        """
+        return _clamp_pct(int(getattr(self._live_cfg().telegram, "soft_threshold_pct", 80)))
+
+    def reconfigure(self, section: Any) -> None:
+        """Push a reloaded ``telegram.allowed_user_ids`` at all three holders.
+
+        This dispatcher keeps its OWN roster: callbacks bypass
+        ``transport.receive``, so ``_authorized`` re-checks against ``_allowed``,
+        and the ``/sessions`` owner rule counts it. The set is mutated IN PLACE
+        because ``TelegramSessionResume`` was handed this same object, and the
+        resume owner is re-derived from it -- a removed operator must lose the
+        callback surface and the session list on the same reload, not at the next
+        restart. A transport that is not up yet is skipped: it reads the section
+        fresh when it connects.
+        """
+        ids = _coerce_id_set(getattr(section, "allowed_user_ids", None), int)
+        if ids is None:
+            logger.warning(
+                "telegram: allowed_user_ids is unusable in the reloaded config; the dispatcher "
+                "keeps its previous roster (%d id(s))",
+                len(self._allowed),
+            )
+        else:
+            self._allowed.clear()
+            self._allowed.update(ids)
+            self._session_resume.reconfigure(self._allowed)
+        if self.transport is not None:
+            self.transport.reconfigure(section)
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
@@ -579,9 +648,17 @@ class TelegramDispatcher:
                 await self._reply(chat_id, _RELEASE_FAILURE, thread=reply_thread)
                 return
             self._conv.bump_gen(route)
+            new_session_key = self._session_key(route)
+            saved = await reserve_new_generation(
+                self.sessions,
+                new_session_key,
+                channel_type="Telegram",
+            )
             message = "✅ New conversation started."
             if left_resumed is not None:
                 message = "✅ New conversation started — left the resumed session."
+            if not saved:
+                message += "\n⚠️ The new conversation could not be saved for restart."
             await self._reply(chat_id, message, thread=reply_thread)
             return
         if cmd == "compact":
@@ -684,6 +761,7 @@ class TelegramDispatcher:
                 getattr(msg, "chat_type", "private"),
                 reply_thread,
                 query=parse_command_argument(text),
+                native_key=self._session_key(route),
             )
             return
         if cmd == "title":
@@ -815,7 +893,7 @@ class TelegramDispatcher:
             TELEGRAM_CAPABILITIES,
             session_key=session_key,
             message_thread_id=reply_thread,
-            show_thinking=self.cfg.telegram.show_thinking,
+            show_thinking=bool(self._live_cfg().telegram.show_thinking),
             uploads_allowed=not await self._uploads_restricted(session_key),
             reply_to_message_id=self._reply_target(msg, interpret_commands=interpret_commands),
         )
@@ -857,6 +935,7 @@ class TelegramDispatcher:
             # Skipped when muted, as in the Discord twin.
             if not muted:
                 await renderer.on_turn_start()
+            _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
             provider, is_new, resumed = await self.sessions.get_or_create(
                 session_key,
                 agent=agent,
@@ -902,6 +981,11 @@ class TelegramDispatcher:
             # Publish this turn's session identity so managed MCP tools resolve
             # X-Session-Key; one shared writer lives in messaging.identity.
             await publish_turn_identity(self.sessions, session_key)
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``agent``: that value is a kiro agent name, a namespace
+            # disjoint from ``cfg.agents``, so a store derived from it resolves to
+            # ``default`` for exactly the crew that configured otherwise. Private
+            # memory was prepared before provider acquisition and fails closed.
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message,
@@ -910,6 +994,7 @@ class TelegramDispatcher:
                 session_key,
                 channel_id=channel_id,
                 agent=agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 runtime_source="telegram",
                 # Temporary mode reads NO memory, which is the half the transcript
@@ -937,8 +1022,12 @@ class TelegramDispatcher:
                     agent=agent,
                     tool_kind=getattr(event, "tool_kind", "") or "",
                     raw_params=getattr(event, "raw_tool_params", None),
+                    diff_path=getattr(event, "diff_path", "") or "",
                     command=getattr(event, "shell_command", None),
                     is_shell=bool(getattr(event, "is_shell", False)),
+                    mcp_server_name=getattr(event, "mcp_server_name", "") or "",
+                    mcp_tool_name=getattr(event, "tool_name", "") or "",
+                    mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
                 )
                 if result.action == TOOL_DENY:
                     return "deny"
@@ -1109,7 +1198,7 @@ class TelegramDispatcher:
                 "Telegram: aborting dispatch for %s — gateway is shutting down",
                 session_key,
             )
-            # Durable inbound spool (issue #2217). Written HERE and nowhere else:
+            # Durable inbound spool. Written HERE and nowhere else:
             # this is the one point where the payload is still in memory AND the
             # turn is provably unopened, so a replay on the next start cannot
             # double-answer a turn that actually ran. Telegram cannot recover this
@@ -1229,7 +1318,7 @@ class TelegramDispatcher:
         """
         assert self.client is not None
         chat_id = int(msg.conversation_id)
-        mode = override_mode or self.cfg.messaging.queue_mode
+        mode = override_mode or str(self._live_cfg().messaging.queue_mode)
         # An attachment-bearing message can never take the steer path: ``steer``
         # forwards TEXT ONLY, so steering a photo/document message would deliver
         # its caption and silently drop every file. Such a message always goes to
@@ -1368,7 +1457,7 @@ class TelegramDispatcher:
                         if isinstance(requested, str) and requested:
                             privacy_requests.append(requested)
                     else:
-                        # Once one message no longer fits, defer it AND everything
+                        # Once one message does not fit, defer it AND everything
                         # behind it, so queue order stays exact.
                         defer_rest = True
                         remainder.append(item)
@@ -1599,7 +1688,7 @@ class TelegramDispatcher:
         pref = self._voice_pref.get(route)
         if pref is not None:
             return pref
-        return bool(getattr(self.cfg.telegram, "voice_replies", False))
+        return bool(getattr(self._live_cfg().telegram, "voice_replies", False))
 
     async def _handle_voice(
         self, route: tuple[str, str], chat_id: int, arg: str, thread: int | None
@@ -2028,7 +2117,7 @@ class TelegramDispatcher:
         # because this bot posted it.
         if getattr(msg, "from_widget", False):
             return None
-        activation = self.cfg.telegram.forum_activation
+        activation = str(self._live_cfg().telegram.forum_activation)
         if activation == ACTIVATION_OFF:
             return "denied_activation_off"
         if activation == ACTIVATION_MENTION and not self._addresses_this_bot(msg):
@@ -2056,8 +2145,8 @@ class TelegramDispatcher:
         self._conv.maybe_rotate(
             route,
             time.time(),
-            idle_minutes=self.cfg.messaging.idle_reset_minutes,
-            daily_reset_hour=self.cfg.messaging.daily_reset_hour,
+            idle_minutes=int(self._live_cfg().messaging.idle_reset_minutes),
+            daily_reset_hour=int(self._live_cfg().messaging.daily_reset_hour),
         )
         return self._session_key(route)
 
@@ -2434,15 +2523,19 @@ class TelegramDispatcher:
         # NEVER honor a callback from an ordinary group, a non-allow-listed
         # supergroup, or the supergroup General chat (no thread). This gate is
         # ADDITIONAL to the owner/user authorization above, not a replacement.
-        # The allow-list source here is LIVE cfg (self.cfg.telegram.*), whereas
-        # the transport uses its construction-time frozen copy; that source
-        # difference is DELIBERATE (see forum_gate_outcome).
+        # Both sides now follow the SAME reloaded config: this site reads it at
+        # point of use, and the transport's frozen copy is replaced wholesale by
+        # ``reconfigure`` from the config applier. The transport still freezes
+        # rather than reading live so one inbound decision cannot see the set
+        # change under it; the two can differ only for the instant between a
+        # reload and the applier's push.
+        forum_cfg = self._live_cfg().telegram
         outcome = forum_gate_outcome(
             cb.chat_type,
             cb.chat_id,
             getattr(cb, "message_thread_id", None),
-            allow_forum=self.cfg.telegram.allow_forum,
-            allowed_forum_chat_ids=self.cfg.telegram.allowed_forum_chat_ids,
+            allow_forum=bool(forum_cfg.allow_forum),
+            allowed_forum_chat_ids=forum_cfg.allowed_forum_chat_ids,
         )
         if outcome is not None:
             sel().log_api_access(
@@ -2575,7 +2668,7 @@ class TelegramDispatcher:
             else:
                 # No pending decision to resolve — the request already timed out
                 # (decider denies by default and pops the key), was answered, or the
-                # press came from a STALE keyboard whose nonce no longer matches
+                # press came from a STALE keyboard whose nonce does not match
                 # (request ids restart at 1 per provider process, so an old button can
                 # name an id that is live again for a different tool).
                 # Don't imply the press took effect: a post-timeout "Approve" on
@@ -2806,7 +2899,7 @@ class TelegramDispatcher:
         ``"{chat_id}:{thread}"`` -> the Topic id; a DM (direct) route -> None.
         An authorized forum turn always carries a Topic (General is denied at
         the gate), so the threadless-``comp`` -> None case is only the defensive
-        fallback. Used to thread every dispatcher-originated send back into the
+        fallback. Threads every dispatcher-originated send back into the
         SAME Topic the turn came from.
         """
         slot, comp = route
@@ -2962,7 +3055,7 @@ class TelegramDispatcher:
             self._resolve_agent(route),
             comp,
             gen=gen,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
             chat_type=slot,
         )
 
@@ -2973,7 +3066,7 @@ class TelegramDispatcher:
             channel="telegram",
             agent=self._resolve_agent(route),
             user_id=comp,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
             chat_type=slot,
         )
 
@@ -3154,9 +3247,9 @@ class TelegramDispatcher:
         (``session.autocompact_pct``).
         """
         pct = self.sessions.check_context_usage(session_key, provider)
-        soft_pct = self.cfg.telegram.soft_threshold_pct
+        soft_pct = self._soft_threshold()
         if pct >= soft_pct and compact_unsupported_backend(provider):
-            # Capability gate (#8156): the nudge advises /compact, which this
+            # Capability gate: the nudge advises /compact, which this
             # backend refuses — it compacts on its own as context fills, so
             # there is nothing for the user to act on.
             return
@@ -3207,7 +3300,7 @@ class TelegramDispatcher:
                 await self._reply(chat_id, "No active session to compact.", thread=thread)
                 return
 
-            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # Capability gate (mirrors the dashboard's compact gate): a
             # backend that cannot serve a manual /compact treats the prompt as
             # ordinary text and never answers, so dispatching would strand the
             # 120s wait below. Informational, never an error.

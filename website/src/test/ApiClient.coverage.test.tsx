@@ -33,6 +33,7 @@ import {
   __resetAuthRecoveryStateForTests,
   SEARCH_MIN_CHARS,
 } from '../api/client'
+import { STALE_OWNER_SESSION_CODE, __resetStaleOwnerHandlerForTests, installStaleOwnerHandler } from '../api/staleOwnerSignal'
 import { recentErrors, __resetErrorJournalForTests } from '../utils/errorReport'
 import { copyToClipboard } from '../utils/clipboard'
 import { resizeImageForModel } from '../utils/resizeImage'
@@ -68,6 +69,7 @@ function res(
     json: async () => (typeof body === 'string' ? JSON.parse(body) : body),
     text: async () => text,
     blob: async () => new Blob([text]),
+    clone: () => res(status, body, opts),
   } as unknown as Response
 }
 
@@ -157,6 +159,28 @@ describe('client transport', () => {
     // so a restricted (incognito) slot was never recognised as restricted.
     await api.setArtifactPinned('cr-queue', true, 'dashboard:chat-3')
     expect(call().headers['X-Session-Key']).toBe('dashboard:chat-3')
+  })
+
+  it('the feature-video routes put the caller\'s session key on the wire', async () => {
+    // Both routes are gated server-side by `_is_restricted_session`, which treats
+    // the shared `dashboard:ui` placeholder as NOT restricted -- so a key that never
+    // reaches the header makes that guard unreachable and lets a session which keeps
+    // nothing record a PERMANENT verdict.
+    await api.featureVideoNext('dashboard:chat-4')
+    expect(call().url).toBe('/api/feature-videos/next')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.featureVideoFeedback('vid-1', 'seen', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/feature-videos/feedback')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+    expect(call(1).body).toEqual({ id: 'vid-1', status: 'seen' })
+  })
+
+  it('the feature-video routes fall back to the placeholder when no key is passed', async () => {
+    await api.featureVideoNext()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
+    await api.featureVideoFeedback('vid-1', 'dismissed')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:ui')
   })
 
   it('createArtifact derives the session key from origin_session_key when none is passed', async () => {
@@ -577,6 +601,22 @@ describe('session-expired banner', () => {
 /* ──────────────────── 2. URL and body construction ──────────────────── */
 
 describe('query-string builders', () => {
+  it('memory records preserve the chosen store, filter and page without leaking query delimiters', async () => {
+    await api.memoryRecords('member-reviewer', { q: 'owner+team@example.com & release', kind: 'fact' }, 50, 25)
+    const query = new URL(call().url, 'http://localhost').searchParams
+    expect(Object.fromEntries(query)).toEqual({ store: 'member-reviewer', q: 'owner+team@example.com & release', kind: 'fact', offset: '50', limit: '25' })
+    await api.memoryRecords('', { q: '', kind: 'all' })
+    expect(call(1).url).toBe('/api/memory/records?store=default&q=&kind=all&offset=0&limit=50')
+  })
+
+  it('memory history encodes record identity and keeps later pages in the same store', async () => {
+    await api.memoryRecordHistory('member-reviewer', { kind: 'fact', id: 'user.contact+team&release' }, 25, 50)
+    const query = new URL(call().url, 'http://localhost').searchParams
+    expect(Object.fromEntries(query)).toEqual({ store: 'member-reviewer', kind: 'fact', id: 'user.contact+team&release', limit: '25', offset: '50' })
+    await api.memoryRecordHistory('', { kind: 'fact', id: 'user.contact' })
+    expect(call(1).url).toBe('/api/memory/records/history?store=default&kind=fact&id=user.contact&limit=25')
+  })
+
   it('wakatimeExportUrl builds the export href with encoded dates and the format', () => {
     expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'csv')).toBe(
       '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=csv',
@@ -779,6 +819,11 @@ describe('query-string builders', () => {
 })
 
 describe('path encoding', () => {
+  it('uses the legacy slot route for one session automation snapshot', async () => {
+    await api.autonudgeForSlot('chat/1')
+    expect(call().url).toBe('/api/autonudge/slot/chat%2F1')
+  })
+
   it('percent-encodes single-segment ids', async () => {
     await api.artifact('a/b')
     expect(call().url).toBe('/api/artifacts/a%2Fb')
@@ -852,13 +897,16 @@ describe('path encoding', () => {
 })
 
 describe('request bodies with conditionally-omitted keys', () => {
-  it('createChatSlot sends only the fields it was given', async () => {
+  it('createChatSlot resolves an omitted mode and preserves explicit fields', async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ default_memory_mode: 'temporary' }))
     await api.createChatSlot()
-    expect(call().body).toEqual({})
-    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', false, 'slug', 'f1')
-    expect(call(1).body).toEqual({
+    expect(call().url).toBe('/api/dashboard/config')
+    expect(call(1).body).toEqual({ memory_mode: 'temporary' })
+
+    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', 'slug', 'f1')
+    expect(call(2).body).toEqual({
       name: 'n', agent: 'a', model: 'm', mode: 'mode', memory_mode: 'mem',
-      title: 't', clean_mode: false, artifact: 'slug', folder_id: 'f1',
+      title: 't', artifact: 'slug', folder_id: 'f1',
     })
   })
 
@@ -1105,10 +1153,52 @@ describe('sendChat theme consent', () => {
     expect(call().init?.signal).toBe(ctl.signal)
   })
 
-  it('steerChat always injects into the running turn', async () => {
-    await api.steerChat('now', 'chat-1')
-    expect(call().url).toBe('/api/chat?ws=1')
-    expect(call().body).toEqual({ message: 'now', slot: 'chat-1', steer: true })
+  it('hands the raw response back but still runs session-expiry recovery on a 403 auth challenge', async () => {
+    // The transport reads the receipt itself, so a 4xx must RESOLVE -- but an
+    // expired session must not degrade into a bare "refused" send: the same
+    // silent-refresh path every `j`-parsed call takes runs first. (The steer
+    // helper this wire replaced went through `j` and had it.)
+    __resetAuthRecoveryStateForTests()
+    fetchMock.mockResolvedValueOnce(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+    fetchMock.mockResolvedValue(okJson({ ok: true }))
+    const r = await api.sendChat('hi', 'chat-1')
+    expect(r.status).toBe(403)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/auth/refresh', expect.anything()))
+  })
+
+  it('clears a stale session-expired banner when the send itself succeeds', async () => {
+    // `j` dismisses the banner on any 2xx; the raw-response wire must too, or a
+    // steer that succeeds after auth was restored in another tab leaves the
+    // banner up until some unrelated parsed request happens to land.
+    __resetAuthRecoveryStateForTests()
+    fetchMock.mockResolvedValue(res(401, 'revoked'))
+    checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+    await vi.waitFor(() => expect(document.getElementById('mc-session-expired')).not.toBeNull())
+    try {
+      fetchMock.mockResolvedValue(okJson({ ok: true }))
+      const r = await api.sendChat('hi', 'chat-1')
+      expect(r.ok).toBe(true)
+      expect(document.getElementById('mc-session-expired')).toBeNull()
+    } finally {
+      document.getElementById('mc-session-expired')?.remove()
+    }
+  })
+
+  it('raises the stale-owner prompt on a 401 stale-session body, and the receipt stays readable', async () => {
+    // The stale-owner code travels in the BODY, which the pre-body hook cannot
+    // read; the wire reads it off a clone so the transport's own `json()` still
+    // works. (`steerChat` reached this through `j`; the transport must too.)
+    const onStale = vi.fn()
+    installStaleOwnerHandler(onStale)
+    try {
+      fetchMock.mockResolvedValueOnce(res(401, { error: 'sign in again', code: STALE_OWNER_SESSION_CODE }))
+      const r = await api.sendChat('hi', 'chat-1')
+      expect(r.status).toBe(401)
+      await expect(r.json()).resolves.toMatchObject({ code: STALE_OWNER_SESSION_CODE })
+      await vi.waitFor(() => expect(onStale).toHaveBeenCalled())
+    } finally {
+      __resetStaleOwnerHandlerForTests()
+    }
   })
 })
 
@@ -1491,6 +1581,10 @@ describe('every api method issues one well-formed /api request', () => {
   // URL from `undefined` — a harness artifact, not a defect in the method — so
   // each one names the minimal shape its URL is read from.
   const ARGS: Record<string, unknown[]> = {
+    // Memory reads take typed objects; positional strings do not satisfy the
+    // query/record contract and would manufacture undefined URL parameters.
+    memoryRecords: ['member-reviewer', { q: 'contact', kind: 'fact' }, 0, 50],
+    memoryRecordHistory: ['member-reviewer', { kind: 'fact', id: 'user.contact' }, 25, 0],
     // `invokeFileMenuItem(item, ctx)`: the URL is `item.endpoint`.
     invokeFileMenuItem: [
       { id: 'send', app: 'doc-store', endpoint: '/api/apps/doc-store/send' },
@@ -1509,8 +1603,9 @@ describe('every api method issues one well-formed /api request', () => {
     // botched template literal shows up as `undefined` inside the path.
     await Promise.resolve(fn(...(ARGS[name] ?? ['sw-1', 'sw-2', 'sw-3', 'sw-4'])))
 
-    expect(fetchMock, `${name} issued no request`).toHaveBeenCalledTimes(1)
-    const { url, init } = call()
+    const expectedRequests = name === 'createChatSlot' ? 2 : 1
+    expect(fetchMock, `${name} issued the wrong request count`).toHaveBeenCalledTimes(expectedRequests)
+    const { url, init } = call(expectedRequests - 1)
     expect(typeof url, `${name} did not pass a string URL`).toBe('string')
     expect(url.startsWith('/api/'), `${name} escaped the /api prefix: ${url}`).toBe(true)
     for (const junk of ['undefined', '[object Object]', 'NaN', '/null']) {

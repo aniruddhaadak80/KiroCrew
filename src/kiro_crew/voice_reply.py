@@ -74,7 +74,7 @@ def resolve_polly_cli() -> str | None:
 
     Routes through the deploy engine's shared well-known-dirs resolver so a
     GUI-launched gateway's minimal PATH still finds the CLI instead of silently
-    skipping TTS / degrading to an empty voice list (#4770). The trailing
+    skipping TTS / degrading to an empty voice list. The trailing
     ``shutil.which`` turns the resolver's bare-name fallback into the ``None``
     these probe sites already treat as "unavailable", and confirms an absolute
     hit is still actually executable.
@@ -379,7 +379,7 @@ def strip_markdown(text: str) -> str:
     t = re.sub(r"```[\s\S]*?```", _code_block, t)
     # Remove HTML/XML tags and their content for block-level elements
     t = re.sub(r"<mcwidget[^>]*>[\s\S]*?</mcwidget>", " (widget) ", t)
-    # Strip RECOGNIZED control-tag comments (keep-visible #7948, deliver
+    # Strip RECOGNIZED control-tag comments (keep-visible, deliver
     # routing, plan_task_id anchors) — never all comments, and never inside
     # inline code, which renders literally and must survive to speech. The
     # generic tag regex below deliberately excludes "<!". Shared
@@ -434,7 +434,7 @@ def strip_markdown(text: str) -> str:
     # halves of a secret contiguous (a control comment, `**` emphasis, or an
     # HTML tag interposed inside a key id), so a credential scan that ran on
     # the raw text has not necessarily seen the string TTS will speak.
-    # Idempotent on clean text; placeholders survive re-scanning. (#7960)
+    # Idempotent on clean text; placeholders survive re-scanning.
     t, _ = redact_exfiltration_urls(t)
     t, _ = redact_credentials(t)
     return t.strip()
@@ -605,7 +605,11 @@ async def _run_tts_subprocess(
             exc.kind,
             exc,
         )
-        return False
+        # Re-raised rather than collapsed to False: this exception carries the ONLY
+        # actionable diagnosis, and a bool cannot be told apart from a broken
+        # binary, a rejected voice or a muted device. Each caller decides what its
+        # own surface can show; the dashboard endpoint relays the prose.
+        raise
     except Exception:
         logger.exception("%s synthesis error", label)
         return False
@@ -913,7 +917,7 @@ async def _synthesize_piper(
     """
     bin_path = _resolve_piper_binary(piper_binary)
     if not bin_path:
-        logger.error("piper binary not found (configured=%r)", piper_binary)
+        logger.warning("piper binary not found (configured=%r)", piper_binary)
         return None
     model = os.path.expanduser(piper_model) if piper_model else ""
     if not model or not os.path.isfile(model):
@@ -1045,7 +1049,7 @@ async def _synthesize_polly(
     # On a vanilla machine without the CLI installed, degrade gracefully here
     # instead of raising FileNotFoundError from create_subprocess_exec. Resolved
     # absolutely (shared deploy-engine resolver) so a GUI-launched gateway's
-    # minimal PATH does not silently skip TTS (#4770); resolution probes the
+    # minimal PATH does not silently skip TTS; resolution probes the
     # filesystem, so it runs in a thread rather than on the event loop.
     aws_bin = await asyncio.to_thread(resolve_polly_cli)
     if aws_bin is None:
@@ -1163,7 +1167,11 @@ async def _synthesize_polly(
                 exc.kind,
                 exc,
             )
-            return None
+            # Re-raised for the same reason as the shared subprocess helper: the
+            # sentinel loses the one fact that resolves this. The ``finally`` below
+            # still discards the owned temp file, which matters MORE once the
+            # exception travels instead of a return value.
+            raise
         except Exception:
             logger.exception("Polly synthesis error")
             return None
@@ -1768,21 +1776,31 @@ async def synthesize_and_deliver(
     Returns False when synthesis produced nothing, so a caller can post its
     unavailable notice rather than silently sending only text.
     """
-    audio_path = await synthesize_speech(
-        response_text,
-        provider=provider,
-        voice_id=voice_id,
-        engine=engine,
-        rate=rate,
-        pitch=pitch,
-        aws_profile=aws_profile,
-        region=region,
-        piper_binary=piper_binary,
-        piper_model=piper_model,
-        piper_model_config=piper_model_config,
-        length_scale=length_scale,
-        system_voice=system_voice,
-    )
+    try:
+        audio_path = await synthesize_speech(
+            response_text,
+            provider=provider,
+            voice_id=voice_id,
+            engine=engine,
+            rate=rate,
+            pitch=pitch,
+            aws_profile=aws_profile,
+            region=region,
+            piper_binary=piper_binary,
+            piper_model=piper_model,
+            piper_model_config=piper_model_config,
+            length_scale=length_scale,
+            system_voice=system_voice,
+        )
+    except SandboxUnavailableError:
+        # This path delivers audio to a chat surface and has no channel for remedy
+        # prose, so a refusal is still just "no audio" here. Both current callers
+        # drop that signal — Slack's wrapper discards the bool entirely and
+        # Telegram only logs it — so on those surfaces a refusal stays silent,
+        # unchanged by this function. Caught explicitly all the same, so it cannot
+        # escape as an unhandled error on a voice reply; the dashboard synthesis
+        # endpoint is the surface that relays the remedy.
+        return False
     if not audio_path:
         return False
     try:

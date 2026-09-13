@@ -24,7 +24,6 @@
 3 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/narrate.py
 1 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/record_template.py
 3 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/verify_align.py
-3 src/kiro_crew/apps/builtins/file_explorer/server.py
 1 src/kiro_crew/apps/builtins/issue_radar/backend/azure_client.py
 3 src/kiro_crew/apps/builtins/md_notebook/server.py
 1 src/kiro_crew/apps/builtins/pptx_maker/backend/engine.py
@@ -57,7 +56,6 @@
 2 src/kiro_crew/service/apparmor.py
 4 src/kiro_crew/service/linux.py
 1 src/kiro_crew/service/macos.py
-1 test/installer_test_helpers.py
 2 test/test_acp_backend_kas.py
 1 test/test_agent_home_isolation.py
 1 test/test_agent_import_hoist.py
@@ -75,7 +73,6 @@
 1 test/test_config_paths.py
 3 test/test_connections_mint.py
 1 test/test_connections_tool_aliases.py
-2 test/test_crew_chat.py
 1 test/test_deploy_round16_fixes.py
 1 test/test_deploy_round1_fixes.py
 1 test/test_deploy_round29_fixes.py
@@ -115,7 +112,6 @@
 6 test/test_sandbox_argv.py
 1 test/test_sandbox_probe.py
 9 test/test_security.py
-1 test/test_seed.py
 1 test/test_ship_report_issues.py
 2 test/test_source_launcher.py
 3 test/test_spawn_exec_shim.py

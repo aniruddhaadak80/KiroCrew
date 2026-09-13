@@ -251,7 +251,7 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
 # caller here must be a conscious edit paired with a test, never a silent
 # widen — the point of the header is that a NEW internal caller surfaces as
 # ``unknown-internal`` in the audit until someone decides what to call it,
-# instead of silently inheriting another component's label (#3503).
+# instead of silently inheriting another component's label.
 _KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard"})
 
 
@@ -333,12 +333,12 @@ def _validate_project_dir(raw: str) -> tuple[str, str | None]:
 def _folder_project_overlap_denied(resolved: str) -> str | None:
     """Pre-flight the voice-runtime workspace guard for a folder's project_dir.
 
-    #7392 review round 3: a folder's linked project lands on slots verbatim, so
-    without this check "link a folder to ~" is refused only at agent spawn.
+    A folder's linked project lands on slots verbatim, so without this check
+    "link a folder to ~" is refused only at agent spawn.
     Same shared scan and message as the project endpoint and set_project — the
     user-driven moments of choice agree. Returns the refusal message or None.
 
-    Synchronous on purpose (realpath/mkdir priming on first use — round 4):
+    Synchronous on purpose (realpath/mkdir priming on first use):
     callers on the event loop MUST run it via ``asyncio.to_thread``, exactly
     like the project endpoint does. It is deliberately NOT part of
     ``_validate_project_dir``: that validator also re-checks STORED values on
@@ -882,7 +882,7 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         if err:
             return web.json_response({"error": err}, status=400)
         if pd:
-            # Off-loop: the shared scan primes runtime paths on first use (round 4).
+            # Off-loop: the shared scan primes runtime paths on first use.
             conflict = await asyncio.to_thread(_folder_project_overlap_denied, pd)
             if conflict is not None:
                 return web.json_response(
@@ -1194,13 +1194,11 @@ def _effective_request_app(state: DashboardState, request: web.Request) -> str:
     Reads the claim ``token_auth_middleware`` publishes, and re-derives through
     the SAME shared rule (``token_auth.derive_caller_app``) when it is absent.
 
-    This route used to carry its own copy of the derivation, because the
-    internal-secret transport (the managed MCP set) carries no app claim of its
-    own and this was the only route compensating. The middleware now derives it
-    once for every route on that transport (issue #3690); the re-derivation here
-    is defense-in-depth for a caller that reaches the handler without having
-    passed that branch, and it calls the shared function rather than restating
-    the rule so the two can never disagree.
+    The internal-secret transport (the managed MCP set) carries no app claim of
+    its own, so the middleware derives one for every route on that transport.
+    The re-derivation here is defense-in-depth for a caller that reaches the
+    handler without having passed that branch, and it calls the shared function
+    rather than restating the rule so the two can never disagree.
 
     Never read from request BODY or tool arguments — a caller that could name
     its own scope could name someone else's.
@@ -1450,7 +1448,7 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "pinned": slot.pinned})
 
 
-_VALID_MODES = ("", "orchestrator", "crew")
+_VALID_MODES = ("", "orchestrator")
 
 
 async def api_chat_slot_mode(request: web.Request) -> web.Response:
@@ -1510,10 +1508,10 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
         )
     # A crew-bound (remote) session runs PLAIN chat only — the same rule
     # api_chat_slot_create enforces at birth, applied here to the post-create
-    # switch that would otherwise reopen it. A non-plain mode (crew,
-    # orchestrator, design-critique) is consumed by an earlier dispatch branch in
-    # api_chat that runs its tools and filesystem work on THIS machine, not on the
-    # peer the session is bound to (finding F3). Keyed on ``executor`` rather than
+    # switch that would otherwise reopen it. A non-plain mode (orchestrator,
+    # design-critique) is consumed by an earlier dispatch branch in api_chat that
+    # runs its tools and filesystem work on THIS machine, not on the peer the
+    # session is bound to. Keyed on ``executor`` rather than
     # ``is_remote`` so even a half-bound slot can never be switched into one.
     if slot.executor == "remote" and mode:
         return web.json_response(
@@ -1522,24 +1520,6 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 "code": "remote_mode_unsupported",
             },
             status=409,
-        )
-    # Crew keeps its durable queue in a directory named after the slot, and a
-    # key that folds to nothing but dots has no such directory (see
-    # `CrewStore`). That refusal would otherwise land on the first crew MESSAGE
-    # — an unhandled 500 on a tab the switch had already reported as crew, and
-    # on every message after it. Refuse the switch instead, while it is still a
-    # request with an answer.
-    # Deferred import: this module is reachable from the gateway's boot path
-    # (gateway -> kiro_crew.dashboard -> chat_folders), and crew is a
-    # dashboard-only subsystem, so importing it at module scope made
-    # `--no-dashboard` pay for it before the API was ready to serve. Inside a
-    # mode-switch handler the cost is a sys.modules hit.
-    from kiro_crew.crew_chat import CrewOrchestrator, is_crew_capable_slot_key
-
-    if mode == "crew" and not is_crew_capable_slot_key(slot.key):
-        return web.json_response(
-            {"error": "this session name cannot run crew mode", "code": "crew_unsupported_slot"},
-            status=400,
         )
     # Serialize the busy-check/re-check/mutate/persist/rollback span under
     # the state-wide metadata txn lock — same rationale as
@@ -1565,15 +1545,10 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
             )
         # Work in SUBAGENTS keeps `slot.running` false the whole time, so that
         # flag alone lets the mode flip mid-flight and interleave two execution
-        # models in one session. Two separate questions are needed, because the
-        # risk is not symmetric:
-        #  * ANY direction — a plain-chat subagent may be running on this slot
-        #    right now, and its completion follows the default `_run_chat`
-        #    path, so ENTERING crew mode has to be refused for that too, not
-        #    just leaving it. (Gating the whole check on `slot.mode == "crew"`
-        #    missed exactly this.)
-        #  * LEAVING crew — the orchestrator may still hold crew topics or a
-        #    live queue, which only it can answer for.
+        # models in one session: a plain-chat subagent may be running on this
+        # slot right now, and its completion follows the default `_run_chat`
+        # path, so the switch has to be refused in EITHER direction while one
+        # is pending.
         busy = False
         subs = getattr(state, "subagents", None)
         if subs is not None:
@@ -1587,17 +1562,6 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 busy = bool(subs.has_pending_work_for(effective_session_key(slot)))
             except Exception:
                 busy = True  # fail closed: refuse rather than risk the flip
-        if not busy and slot.mode == "crew":
-            # isinstance, not `is not None` — matching gateway.py's own check
-            # on this attribute. A stand-in object passes an identity check and
-            # then answers `has_live_work` with something truthy, refusing a
-            # switch that is fine.
-            crew = getattr(state, "crew", None)
-            if isinstance(crew, CrewOrchestrator):
-                try:
-                    busy = bool(await crew.has_live_work(name))
-                except Exception:
-                    busy = True
         if slot.running or busy:
             sel().log_api_access(
                 caller="dashboard",

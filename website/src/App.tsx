@@ -1,3 +1,5 @@
+import { WorkspacePanelContext, WorkspaceFullscreenContext } from './components/WorkspacePanelContext'
+import PanelToggles from './components/PanelToggles'
 import { useEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
@@ -16,7 +18,7 @@ import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/arti
 import { applyNavIntentInMain, chatDeepLinkSlot } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
 import { agentSwitchFailureMessage } from './utils/agentSwitchFeedback'
-import { readSendReceipt } from './utils/sendDelivery'
+import { sendTurn } from './chat-core/transport/sendTurn'
 import { updateAffordance } from './utils/updateAffordance'
 import { isNewSection } from './utils/releaseVersion'
 import { metricColor } from './utils/metricColor'
@@ -52,12 +54,13 @@ import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
 import AgentImportFlow from './components/AgentImportFlow'
+import ErrorNotice from './components/ErrorNotice'
 import PrivacyChapter from './components/PrivacyChapter'
 import { OnboardingShellHost } from './components/OnboardingChapterShell'
 import { PREVIEW_EXPAND_EVENT } from './components/WebPreviewPanel'
 import { canRenderMobileConnectKind } from './components/mobileConnectRenderers'
 import { useMayLeaveForNavigation, useIsCurrentUrl, useGuardedLeave } from './components/NavigationLeaveGuard'
-import { motion, AnimatePresence, useMotionValue, useTransform } from 'framer-motion'
+import { motion, AnimatePresence, useMotionValue, useTransform, useReducedMotion } from 'framer-motion'
 import { useDrawerSwipe, animateDrawer, registerDrawerTargets, takeOverDrawer, safeAreaLeft } from './hooks/useDrawerSwipe'
 
 /** Mobile nav drawer travel: its 220px width + the 8px mx-2 inset + border. */
@@ -92,6 +95,7 @@ import AppIcon from './components/AppIcon'
 import Clickable from './components/Clickable'
 import MarkdownRenderer, { Lightbox } from './components/MarkdownRenderer'
 import NotificationsPage from './pages/NotificationsPage'
+const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 import NotificationDetailPanel from './components/notifications/NotificationDetailPanel'
 import NotificationFeed from './components/notifications/NotificationFeed'
 import LogsPage from './pages/LogsPage'
@@ -116,7 +120,7 @@ import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
 import DeveloperPage from './pages/DeveloperPage'
 import SchedulePage from './pages/SchedulePage'
-import { useUpdateSubscription } from './hooks/useUpdateSubscription'
+import { useUpdateSubscription, type UpdateState } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
@@ -149,7 +153,13 @@ import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
 import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
 import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
+import { NavHistoryArrows } from './components/NavHistoryArrows'
 
+import {
+  canShowStartupVideo,
+  markStartupVideoHandled,
+  startupVideoHandledThisLaunch,
+} from './components/startupVideoGate'
 import { i18nT } from './i18n/t'
 import { appNavTarget } from './appNav'
 import { appNotificationBadges, isAppNavId, mergeAppBadges } from './appNotificationBadges'
@@ -169,6 +179,11 @@ import { countUpdatables, registryQueryFn, type UpdatableInstalledRow } from './
 // mount gate at the render site means the chunk is fetched exactly when it
 // can render.
 const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
+// Lazy for the same reason as the popup above: the startup feature clip pulls in
+// a video element and the whole share-card graph, and most launches never show
+// it. The policy that decides whether this chunk is ever fetched lives in
+// `startupVideoGate`, which is eagerly imported and tiny.
+const StartupVideoModal = lazy(() => import('./components/StartupVideoModal'))
 // The dialog is lazy; the renderer registry it consults is NOT (imported at the
 // top of this file). The nav rail decides whether to show the "Connect your
 // phone" row before this chunk is ever fetched, so a predicate hiding inside it
@@ -326,6 +341,9 @@ const UPDATE_STEPS: Record<string, { icon: ReactNode }> = {
   installing: { icon: <Package className="lucide-inline" /> },
   restarting: { icon: <Rocket className="lucide-inline" /> },
   failed:     { icon: <XCircle className="lucide-inline" /> },
+  // The per-step handlers report their failure as `error`; without an entry
+  // the header fell back to the spinning glyph over a failure card.
+  error:      { icon: <XCircle className="lucide-inline" /> },
 }
 
 /**
@@ -342,6 +360,7 @@ const UPDATE_STEP_LABEL_KEY: Record<string, string> = {
   installing: 'app.installing_packages',
   restarting: 'app.restarting_server',
   failed: 'app.update_failed_2',
+  error: 'app.update_failed_2',
 }
 
 const STEP_ORDER = ['pulling', 'syncing', 'building', 'installing', 'restarting']
@@ -368,7 +387,11 @@ export function UpdateOverlay({ onCancel }: { onCancel: () => void }) {
   const detail = progress?.detail || ''
   const info = UPDATE_STEPS[step]
   const currentIdx = STEP_ORDER.indexOf(step)
-  const isFailed = step === 'failed'
+  // Both spellings are terminal: the apply path pushes `failed` from its
+  // outer handler and `error` from its per-step handlers (pull, pip), and a
+  // step the overlay does not recognise as final renders as a stall until the
+  // stuck timer fires five minutes later.
+  const isFailed = step === 'failed' || step === 'error'
   const [elapsed, setElapsed] = useState(0)
   const startRef = useRef(Date.now())
 
@@ -402,7 +425,8 @@ export function UpdateOverlay({ onCancel }: { onCancel: () => void }) {
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/80 backdrop-blur-sm animate-rise">
       <div className="bg-card border border-border rounded-xl p-8 max-w-md w-full mx-4 shadow-xl text-center">
-        <div className="text-4xl mb-4 animate-pulse">{info?.icon || <RefreshCw className="lucide-inline" />}</div>
+        {/* A terminal step is not in progress, so it does not pulse. */}
+        <div className={`text-4xl mb-4 ${isFailed ? 'text-danger' : 'animate-pulse'}`} data-testid="update-overlay-step-icon">{info?.icon || <RefreshCw className="lucide-inline" />}</div>
         <div className="text-lg font-bold text-text-strong mb-2">{i18nT('app.updating_kirocrew')}</div>
         <div className="text-sm text-muted mb-5">{detail || i18nT('app.starting_update')}</div>
         {/* Step progress */}
@@ -422,7 +446,18 @@ export function UpdateOverlay({ onCancel }: { onCancel: () => void }) {
         </div>
         {isFailed ? (
           <div className="flex flex-col gap-3 items-center">
-            <div className="text-sm text-danger">{detail || i18nT('app.check_logs_for_details')}</div>
+            {/* askAgent ON: a failed step has already stopped the worker, so
+                the hand-off can destroy nothing; the causes (pull refused,
+                pip refusing the merged revision) are diagnosable by the agent.
+                The hand-off navigates to chat UNDER this z-[100] overlay, so
+                it also dismisses the overlay -- the same clear as Dismiss. */}
+            <ErrorNotice
+              askAgent
+              className="text-left"
+              message={detail || i18nT('app.check_logs_for_details')}
+              onHandoff={handleCancel}
+              testId="update-overlay-error"
+            />
             <button className="px-4 py-1.5 rounded-lg text-[13px] font-medium cursor-pointer bg-card border border-border text-text hover:border-border-strong transition-colors" onClick={handleCancel}>
               {i18nT('app.dismiss')}
             </button>
@@ -1303,11 +1338,27 @@ export default function App() {
   // every mousemove during a grip-drag, and a primitive snapshot lets
   // useSyncExternalStore's Object.is check skip those re-renders of App.
   const bottomTerminalOpen = useBottomTerminalOpen()
+  const workspacePanelOpen = useAppSelector(s => s.chat.activityOpen)
+  const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false)
+  const reducePanelMotion = useReducedMotion()
+  const [workspaceFullscreen, setWorkspaceFullscreen] = useState(false)
+  const exitWorkspaceFullscreen = useCallback(() => setWorkspaceFullscreen(false), [])
+  const toggleWorkspaceFullscreen = useCallback(() => setWorkspaceFullscreen(value => !value), [])
   // "Connect your phone" rail entry. The methods come from the CPP
   // mobile_connect seam filtered by governance; an empty list (edition
   // returned none, policy denied all, seam degraded) hides the row entirely —
   // the endpoint is the authority, the frontend never guesses.
   const [mobileConnectOpen, setMobileConnectOpen] = useState(false)
+  // The dialog is a transient overlay opened from a rail row that does not
+  // navigate (path="#"), so a navigation — clicking another nav tab or
+  // switching chat sessions — must dismiss it, the same as Escape or a
+  // backdrop click. Its open flag lives here at the owner rather than in the
+  // modal, so nothing inside the modal sees navigation. Key this off
+  // location.key, not location.pathname: switching between untitled /chat
+  // sessions changes only the key/query, so a pathname dep would leave the
+  // dialog stranded over the newly selected session. location.key changes on
+  // every history entry, so this closes it on ANY navigation at once.
+  useEffect(() => { setMobileConnectOpen(false) }, [location.key])
   const mobileConnectQuery = useQuery({
     queryKey: ['mobile-connect-methods'],
     queryFn: api.mobileConnectMethods,
@@ -1321,6 +1372,13 @@ export default function App() {
   const mobileConnectKinds = (mobileConnectQuery.data?.methods ?? [])
     .map(m => m.kind)
     .filter(canRenderMobileConnectKind)
+  const hasRenderableMobileConnect = mobileConnectKinds.length > 0
+  // A methods refresh can revoke or replace every previously renderable kind
+  // while the overlay is open. Close it rather than preserving state that would
+  // remount the dialog if a future refresh happens to add a method back.
+  useEffect(() => {
+    if (!hasRenderableMobileConnect) setMobileConnectOpen(false)
+  }, [hasRenderableMobileConnect])
   // Selected session's project directory: a terminal opened from the nav row
   // starts there (server default when no session is selected or it has none).
   const activeSlotProject = useAppSelector(selectActiveSlotProject)
@@ -1337,7 +1395,7 @@ export default function App() {
     return setArtifactNavIntentHandler((intent) =>
       applyNavIntentInMain(intent, {
         navigate,
-        switchSlot: (slotKey) => { dispatch(switchSlot(slotKey)) },
+        switchSlot: (slotKey) => { dispatch(switchSlot({ key: slotKey, announceOnMissing: true })) },
       }),
     )
   }, [isPopout, isEmbed, navigate, dispatch])
@@ -2168,6 +2226,10 @@ export default function App() {
   const [kiroUsageOpen, setKiroUsageOpen] = useState(false)
   const [changes, setChanges] = useState('')
   const [showChangelog, setShowChangelog] = useState(false)
+  // Has the changelog effect below reached a verdict for this launch? It decides
+  // asynchronously, so "no changelog is showing" is not the same claim as "no
+  // changelog is going to show" — the startup-video gate needs the second one.
+  const [changelogDecided, setChangelogDecided] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
   const [fullChangelog, setFullChangelog] = useState('')
   const [showFull, setShowFull] = useState(false)
@@ -2389,7 +2451,7 @@ export default function App() {
     // close the terminal in the MAIN window, out of sight of the person pressing
     // the key.
     onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
-      ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
+      ? () => { exitWorkspaceFullscreen(); if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
       : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
@@ -2659,7 +2721,7 @@ export default function App() {
           // NavIntent carries no query string, and ChatPage writes `?sid=` back
           // into the URL itself once the session is active.
           { path: '/chat', slotKey },
-          { navigate, switchSlot: (key) => { dispatch(switchSlot(key)) } },
+          { navigate, switchSlot: (key) => { dispatch(switchSlot({ key, announceOnMissing: true })) } },
         )
         return
       }
@@ -2705,9 +2767,9 @@ export default function App() {
   useEffect(() => {
     if (!version || version === '—') return
     const lastSeen = localStorage.getItem('mc-last-version')
-    if (lastSeen === version) return
+    if (lastSeen === version) { setChangelogDecided(true); return }
     // First visit — no baseline to diff, just record current version
-    if (!lastSeen) { safeSetItem('mc-last-version', version); return }
+    if (!lastSeen) { safeSetItem('mc-last-version', version); setChangelogDecided(true); return }
     // Version changed — show the sections in `lastSeen < v <= version`, and
     // nothing else. Both bounds are load-bearing, and the missing UPPER one is
     // the reported bug: `main` is bumped a minor ahead of the released line and a
@@ -2738,8 +2800,117 @@ export default function App() {
       // is the normal state on a dev build. Say nothing: the modal exists to
       // deliver notes, and one carrying someone else's is worse than none.
       if (text) { setChanges(text); setShowChangelog(true) }
-    }).catch(() => {}).finally(() => safeSetItem('mc-last-version', version))
+    }).then(() => {
+      // Stamp the version ONLY on a response we actually read. The old `finally`
+      // stamped it either way, so a single failed fetch retired that version's
+      // release notes for good -- there is no second chance once the baseline says
+      // the user has seen them.
+      safeSetItem('mc-last-version', version)
+      setChangelogDecided(true)
+    }).catch(() => {
+      // A failure is not an answer. The notes may still be waiting, so leave the
+      // baseline alone for the next launch to retry, and do NOT mark the changelog
+      // decided: the startup video yields this launch rather than opening on a
+      // guess about what the user was owed.
+      setChangelogDecided(false)
+    })
   }, [version])  
+
+  // ---------------------------------------------------------------- Startup
+  // feature-intro video. Sequencing policy lives in `startupVideoGate`; this is
+  // the wiring that feeds it and the two pieces of state it drives.
+
+  // Whether UpdateModal is claiming the screen. It self-gates on the shared
+  // ['update-state'] cache rather than on a prop, so the only honest way to ask
+  // is to read the same cache with the same condition it uses.
+  const { data: desktopUpdateState } = useQuery<UpdateState | null>({
+    queryKey: ['update-state'],
+    queryFn: () => null,
+    enabled: false, // populated by useUpdateSubscription, below
+    staleTime: Infinity,
+  })
+  const updateStaged = !!desktopUpdateState
+    && desktopUpdateState.state === 'downloaded'
+    && !desktopUpdateState.replayed
+
+  // Governance for the share entry: the SAME query key and the same `=== true`
+  // test the chat surface uses, so one policy answer drives both and a
+  // mid-session swap invalidates both at once. No new scope, no new flag.
+  const { data: startupShareCfg } = useQuery<{ social_share_enabled?: boolean }>({
+    queryKey: ['dashboardConfig'],
+    queryFn: () => api.dashboardConfig(),
+    staleTime: 30_000,
+  })
+  const socialShareOn = startupShareCfg?.social_share_enabled === true
+
+  // A verdict is a durable per-user write, so a session that keeps nothing does
+  // not get asked. Read off the ACTIVE slot, matching where `memory_mode` is
+  // authoritative everywhere else.
+  const activeSlotMemoryMode = useAppSelector(
+    s => s.dashboard.slots.find(x => x.key === s.chat.activeSlot)?.memory_mode,
+  )
+  // The slot list is filled by a fetch that lands AFTER mount. Until it does, the
+  // active slot resolves to nothing and `activeSlotMemoryMode` is undefined --
+  // which reads as "not incognito" and is the wrong answer to act on. This flag is
+  // the store's own record that the list is authoritative.
+  const slotsLoaded = useAppSelector(s => s.dashboard.slotsLoaded)
+
+  // Is any part of first-run still owed? Read from the AUTHORITATIVE flags rather
+  // than from `showOnboarding` / `showAgentImport` / `showPrivacy`, which an effect
+  // sets. In the commit that flips `themeBootReady` that effect has only SCHEDULED
+  // its update, so those three still read false while first-run is about to claim
+  // the launch -- and the video would open beside Agent Import on a brand-new
+  // install's first screen. These three are what that effect derives from, so they
+  // are already correct in the same commit.
+  const onboardingOwed = !importOnboarded || !privacyAcked || !onboarded
+
+  // Latched, not sampled: an interruption that has already been dismissed still
+  // spends the launch. Sampling would let the video open the instant the user
+  // closed the changelog, which is the back-to-back pair the policy forbids.
+  const [startupInterruptionSeen, setStartupInterruptionSeen] = useState(false)
+  // The LIVE reading of the same conditions the latch is fed from. The gate reads
+  // both, and the live one is load-bearing: the latch is written by the effect
+  // below, which runs AFTER the commit that showed the changelog, while
+  // `changelogDecided` is set one microtask later on the same fetch chain. When
+  // that microtask lands between the commit and its passive effects, the gate's
+  // own effect runs in a render where `changelogDecided` is already true and the
+  // latch still false: and opened the video beside the changelog (flaked in 2
+  // of 5 frontend runs). Same shape as `onboardingOwed` above: derive from the
+  // authoritative flags in the same commit, keep the latch for after they clear.
+  const startupInterruptionLive = showChangelog || updateAvailable || updateStaged
+    || showOnboarding || showAgentImport || showPrivacy
+  useEffect(() => {
+    if (startupInterruptionLive) {
+      setStartupInterruptionSeen(true)
+    }
+  }, [startupInterruptionLive])
+
+  const [startupVideoOpen, setStartupVideoOpen] = useState(false)
+  const [startupVideoDone, setStartupVideoDone] = useState(false)
+  // The gate is consulted ONLY while the modal is closed, and the decision is
+  // latched into state. Re-evaluating it against a live condition would let a
+  // late-arriving update notice unmount a clip the user is in the middle of
+  // watching — worse than the collision the policy is protecting against.
+  useEffect(() => {
+    if (startupVideoOpen || startupVideoDone) return
+    if (!canShowStartupVideo({
+      // Either an interruption already appeared this launch, or first-run is still
+      // owed and is about to. Both spend the launch.
+      interruptionShown: startupInterruptionSeen || startupInterruptionLive || onboardingOwed,
+      // Three separate authorities, and the video waits for ALL of them: onboarding's
+      // three modals are decided by the `themeBootReady` effect above, the changelog
+      // decides across its own fetch, and the slot list decides whether this session
+      // keeps anything. An absent answer from any of them is not a negative one.
+      settled: themeBootReady && changelogDecided && slotsLoaded,
+      memoryMode: activeSlotMemoryMode,
+      handledThisLaunch: startupVideoHandledThisLaunch(),
+    })) return
+    markStartupVideoHandled()
+    setStartupVideoOpen(true)
+  }, [
+    startupVideoOpen, startupVideoDone, startupInterruptionSeen, startupInterruptionLive,
+    onboardingOwed, themeBootReady, changelogDecided, slotsLoaded, activeSlotMemoryMode,
+  ])
 
   // Browser tab title badge — sums every built-in surface's badge (chat,
   // orchestrated, notifications, secretary, ...) plus the orthogonal
@@ -2828,17 +2999,20 @@ export default function App() {
       // feature-request workflow to a later, unrelated message.
       await api.chatSlotContext(slot, FEATURE_REQUEST_PROMPT_FALLBACK, { source: 'feature-request', maxAge: 60 })
     } catch { /* Send the visible request even if hidden context is unavailable. */ }
-    try {
-      const r = await api.sendChat(visibleMessage, slot, colorTheme)
-      const { body, outcome } = await readSendReceipt(r)
-      // Resolution is not success: the server accepted neither `ok` nor
-      // `queued`, so no turn started and no WS response is coming. An UNKNOWN
-      // outcome (a 2xx whose body would not parse) is deliberately silent — the
-      // request WAS accepted, so a turn may be running, and this row is the only
-      // signal the pill has: claiming a failure it cannot prove tells the user to
-      // resend a request that already went out.
-      if (outcome === 'refused') reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
-    } catch { reportFailedSend() }
+    // The chat-core transport owns the receipt contract (`?ws=1` JSON receipt,
+    // HTTP 4xx/5xx RESOLVE rather than reject, deadline) and never rejects.
+    const receipt = await sendTurn({ message: visibleMessage, slot, colorTheme })
+    // Resolution is not success: `refused` means the server accepted neither
+    // `ok` nor `queued`, so no turn started and no WS response is coming, and
+    // `transport-error` means the request never left. Both get the error row.
+    // The indeterminate statuses are deliberately silent -- `unknown` (a 2xx
+    // whose body would not parse) means the request WAS accepted, and
+    // `response-late` (deadline before a receipt) means it may have been; in
+    // both a turn may be running, and this row is the only signal the pill
+    // has: claiming a failure it cannot prove tells the user to resend a
+    // request that already went out.
+    if (receipt.status === 'refused') reportFailedSend(receipt.reason)
+    else if (receipt.status === 'transport-error') reportFailedSend()
   }, [dispatch, navigate, colorTheme, appStore])
 
   const toggleNav = () => {
@@ -2903,6 +3077,11 @@ export default function App() {
   const libraryNavActive = activePath === '/apps/library' || activePath.startsWith('/apps/library/')
   const discoverNavActive = activePath === '/apps' || activePath.startsWith('/apps/-/') || activePath.startsWith('/apps/detail/') || activePath.startsWith('/apps/migrate/')
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
+  const panelFullscreen = workspaceFullscreen && isChat && workspacePanelOpen && !workspaceSearchOpen
+  const workspaceFullscreenControls = useMemo(() => ({ fullscreen: panelFullscreen, exit: exitWorkspaceFullscreen, toggle: toggleWorkspaceFullscreen }), [panelFullscreen, exitWorkspaceFullscreen, toggleWorkspaceFullscreen])
+  useEffect(() => {
+    if (!isChat || !workspacePanelOpen || workspaceSearchOpen) setWorkspaceFullscreen(false)
+  }, [isChat, workspacePanelOpen, workspaceSearchOpen])
   // /webhooks is a full-height rail-and-detail shell (like /capabilities), so it
   // owns its own scrolling and must not sit inside <main>'s scroll container.
   const needsFixedHeight = isChat || activePath === '/settings' || activePath.startsWith('/settings/') || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
@@ -3013,6 +3192,8 @@ export default function App() {
     <div
       ref={shellRef}
       data-testid="dashboard-shell"
+      data-workspace-fullscreen={panelFullscreen || undefined}
+      data-panel-toggle-owner={isChat ? (panelFullscreen ? 'workspace' : workspacePanelOpen && !workspaceSearchOpen && !bottomDock ? 'workspace' : bottomTerminalOpen && terminalPosition === 'right' && !terminalPoppedOut ? 'terminal' : workspaceSearchOpen ? 'search' : 'chat') : undefined}
       className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
       // pane cannot replay it. Guarded on BOTH the keyframe name and the event
@@ -3023,6 +3204,10 @@ export default function App() {
         if (e.target === e.currentTarget && e.animationName === 'rise') setShellEntered(true)
       }}
       style={{
+        // The fixed group is the workspace toggle plus the terminal toggle when
+        // terminals are enabled; fullscreen belongs to the workspace panel's own
+        // action group and reserves nothing here.
+        ...{ '--workspace-panel-control-count': Number(terminalEnabled) + 1 },
         gridTemplateAreas: isMobile ? '"topbar" "content"' : bottomDock ? '"topbar topbar" "nav content" "nav actbar"' : '"topbar topbar topbar" "nav content actbar"',
         ...(!isMobile && {
           gridTemplateColumns: bottomDock
@@ -3065,7 +3250,17 @@ export default function App() {
           Activity panel here on desktop so it spans the window top-to-bottom
           instead of sitting below the header row. Empty (0 width) when the
           panel is closed or on non-chat routes. */}
-      {!isMobile && <div id="activity-bar-slot" className="h-full min-h-0 min-w-0" style={{ gridArea: 'actbar' }} />}
+      {!isMobile && <motion.div id="activity-bar-slot" layout layoutDependency={panelFullscreen}
+        transition={{ layout: { duration: reducePanelMotion ? 0 : 0.18 } }}
+        className="h-full min-h-0 min-w-0" style={{ gridArea: 'actbar' }} />}
+
+      {isChat && (
+        <div data-workspace-panel-controls className="absolute top-0 right-safe-offset-2 z-[60] flex items-center h-[var(--panel-toolbar-height)] focus-caption-reserve"
+          style={{ gridArea: '2 / 1 / 3 / -1' }}>
+          <PanelToggles showWorkspace workspaceOpen={workspacePanelOpen && !workspaceSearchOpen}
+            exitFullscreen={panelFullscreen ? exitWorkspaceFullscreen : undefined} />
+        </div>
+      )}
 
       {/* Skip to content — visible only on focus for keyboard users */}
       <a href="#main-content" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[9999] focus:px-4 focus:py-2 focus:rounded-lg focus:bg-accent focus:text-accent-fg focus:text-sm focus:font-medium">{i18nT('app.skip_to_content')}</a>
@@ -3156,6 +3351,13 @@ export default function App() {
               query responds to -- instead of eating the centred search's. */}
           {!isMobile && isWinElectron && <WindowsTitlebarMenu />}
 
+          {/* Route-history Back/Forward (#8258). Desktop layout only: on mobile
+              the platform owns Back (left-edge swipe), and the drill-in surfaces
+              navigate by component state that pushes nothing, so arrows there
+              would walk an unrelated stack. Order: after the Windows app menu,
+              before the instance selector — the leftmost NAVIGATION control,
+              matching where every browser puts it. */}
+          {!isMobile && <NavHistoryArrows />}
           {isMobile && (
             <button className="group p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
               {/* The product logo, not a generic menu glyph. A narrow layout has exactly
@@ -3602,10 +3804,6 @@ export default function App() {
               />
             </span>
           )}
-          {/* Notifications bell — borderless icon button, rightmost control.
-              (The activity-panel open toggle now lives in the session header,
-              beside the pop-out control — see ChatPage — so opening the panel
-              no longer narrows this full-width header.) */}
           <NotificationsBellButton />
         </div>
       </header>
@@ -3705,7 +3903,15 @@ export default function App() {
           <UpdateFoundModal />
         </Suspense>
       )}
-      {mobileConnectOpen && (
+      {startupVideoOpen && !startupVideoDone && (
+        <Suspense fallback={null}>
+          <StartupVideoModal
+            shareEnabled={socialShareOn}
+            onClose={() => setStartupVideoDone(true)}
+          />
+        </Suspense>
+      )}
+      {mobileConnectOpen && hasRenderableMobileConnect && (
         <Suspense fallback={null}>
           <MobileConnectModal kinds={mobileConnectKinds} onClose={() => setMobileConnectOpen(false)} />
         </Suspense>
@@ -4079,10 +4285,10 @@ export default function App() {
                   /* While popped out: focus only (a refused programmatic
                      focus is a harmless no-op). Explicit re-dock lives in the
                      TerminalDetachedBar below -- never a timing heuristic. */
-                  onClickOverride={() => { if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
+                  onClickOverride={() => { exitWorkspaceFullscreen(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
                 />
               )}
-              {mobileConnectKinds.length > 0 && (
+              {hasRenderableMobileConnect && (
                 <NavItem
                   path="#"
                   label={i18nT('app.connect_your_phone')}
@@ -4281,11 +4487,15 @@ export default function App() {
               on the page the user was on when it happened. */}
           <CrashReportNotice />
           <Routes>
-            <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
+            <Route path="/chat/:slug?" element={<WorkspacePanelContext.Provider value={setWorkspaceSearchOpen}><WorkspaceFullscreenContext.Provider value={workspaceFullscreenControls}><ErrorBoundary><ChatPage /></ErrorBoundary></WorkspaceFullscreenContext.Provider></WorkspacePanelContext.Provider>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
             <Route path="/notifications" element={<ErrorBoundary><NotificationsPage /></ErrorBoundary>} />
+            {/* Bookmarkable session chooser: neutral list, no auto-select; rows
+                open the full /chat/<key> experience inside this same shell. */}
+            <Route path="/sessions" element={<ErrorBoundary><Suspense fallback={null}><SessionsPage /></Suspense></ErrorBoundary>} />
             {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
             <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
+
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/schedule" element={<SchedulePage />} />

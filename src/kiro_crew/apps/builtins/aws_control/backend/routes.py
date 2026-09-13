@@ -37,6 +37,7 @@ MUTATIONS (also restricted-session refused + SEL-audited)
 ``POST /backup/{account}/run``                 run a backup (snapshot | sessions)
 ``POST /backup/{account}/nightly``             toggle the nightly snapshot
 ``POST /backup/{account}/restore``             download an archive to the staging dir
+``POST /install/label``                        rename THIS install (display only, local)
 
 GUARDS, in order, and why each exists:
 
@@ -136,7 +137,7 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 #: an out-of-band delete + hostile re-creation of the same name. Numbers can
 #: be stale; the identity of the bucket we write to cannot.
 #: Serializes drive creation (see _handle_drive_bootstrap). LoopBoundLock so
-#: the module global never binds an import-time loop (#4800).
+#: the module global never binds an import-time loop.
 #: How long the RENDER path waits for the Library lock before giving up on the
 #: reconcile. The lock is also held across a push, whose upload allows up to 600s,
 #: so waiting on it unbounded would let one large push hang every Library page
@@ -162,7 +163,7 @@ _bootstrap_lock = LoopBoundLock()
 #: surface where a human clicks buttons, so the contention is theoretical, and a
 #: per-slug map would need eviction to stay bounded. LoopBoundLock for the same
 #: reason ``_bootstrap_lock`` uses it: a module global must not bind an
-#: import-time loop (#4800).
+#: import-time loop.
 _library_lock = LoopBoundLock()
 
 #: Per-object-key write locks for the drive surface. A move promises "never
@@ -238,7 +239,7 @@ class _SectionRWLock:
 
     Writer-preferent: a waiting sweep blocks NEW shared holders, so a steady
     stream of uploads cannot starve a folder delete forever. State lives in
-    a per-loop map for the same reason ``LoopBoundLock`` exists (#4800): a
+    a per-loop map for the same reason ``LoopBoundLock`` exists: a
     module-global asyncio primitive must not bind an import-time loop.
     """
 
@@ -369,12 +370,34 @@ def _conflict(message: str, code: str) -> web.Response:
     return web.json_response({"error": message, "code": code}, status=409)
 
 
+def _unavailable(message: str, code: str) -> web.Response:
+    """A probe this handler depends on could not run. Distinct from an empty result.
+
+    503 rather than 200-with-nothing: the client has to be able to tell "this
+    machine has none" from "we could not look", and rather than 500 because
+    nothing here is broken -- the host is simply not answering the question
+    today, so the honest instruction is to retry.
+    """
+    return web.json_response({"error": message, "code": code}, status=503)
+
+
+def _unsupported(message: str, code: str) -> web.Response:
+    """This platform cannot serve the request at all, so retrying never helps.
+
+    The pair with ``_unavailable`` is the point: 503 invites a retry, which is
+    right for a scan that failed and wrong for one that cannot run here. 501
+    with an ``unsupported_*`` code is the shape spec_builder and meetings
+    already answer with, so a client that learned it there reads this too.
+    """
+    return web.json_response({"error": message, "code": code}, status=501)
+
+
 def _ledger_corrupt(code: str) -> web.Response:
     """Map a ledger reader's corruption refusal to a coded response.
 
     The share and library ledger update readers refuse a corrupt document
-    rather than replacing it (#7805), so mutation handlers can see a
-    ``json.JSONDecodeError`` that previously could not happen. Letting it
+    rather than replacing it, so mutation handlers can see a
+    ``json.JSONDecodeError`` at all. Letting it
     escape gives aiohttp's bare 500 -- no ``code`` for the UI to branch on --
     and letting a handler's ``except ValueError`` arm claim it (it IS a
     ``ValueError``) reports corruption as a client mistake. 500 rather than
@@ -668,11 +691,24 @@ async def _handle_profiles_available(request: web.Request) -> web.Response:  # n
     snapshot redacts its own.
     """
     available = await asyncio.to_thread(deploy_profiles.discover_aws_profiles)
+    # Discovery is POSIX-only, so the two reasons it returns nothing get
+    # different answers. On Windows the platform is the more useful thing to
+    # report and the payload already carries it, so that case keeps its 200 and
+    # its own copy (which names WSL). Anywhere else, `None` means the scan could
+    # not run: the frontend has a retryable notice for a failed scan and reads a
+    # 200 as the authoritative list, so returning one here is what turns "could
+    # not look" into "you have no profiles".
+    supported = os.name != "nt"
+    if available is None and supported:
+        return _unavailable(
+            "could not list this machine's AWS profiles",
+            "profiles_unavailable",
+        )
     reg = await asyncio.to_thread(deploy_profiles.load_registry)
     registered = {str(p.get("name", "")) for p in reg.get("profiles", [])}
     rows = [
         {"name": accounts_mod._safe_field(name), "registered": name in registered}
-        for name in available
+        for name in (available or [])
         if aws_consent._PROFILE_RE.match(name)
     ]
     return web.json_response(
@@ -680,10 +716,13 @@ async def _handle_profiles_available(request: web.Request) -> web.Response:  # n
             "profiles": rows,
             "registeredCount": len(registered),
             "max": _MAX_REGISTERED,
-            # An empty list on a host that HAS profiles is the Windows case
-            # (discovery is POSIX-only), and the UI must say so rather than
-            # implying the operator has none.
-            "supported": os.name != "nt",
+            # `profiles` is empty in two cases, and `supported` is what tells
+            # them apart. False: Windows, where discovery cannot run at all, so
+            # the UI says that instead of implying the operator has none. True:
+            # the scan ran and the machine really has nothing left to register.
+            # A scan that could NOT run where it should have never reaches here,
+            # because it answered 503 above.
+            "supported": supported,
         }
     )
 
@@ -696,7 +735,10 @@ async def _handle_profiles_register(request: web.Request) -> web.Response:
     * A name must be one ``aws configure list-profiles`` actually reports. The
       registry is agent-writable and its names reach an argv, so accepting an
       arbitrary string here would let a caller plant one -- the same class the
-      read-side validation in ``accounts.py`` closes from the other end.
+      read-side validation in ``accounts.py`` closes from the other end. When
+      that listing could not run at all the batch is refused on that fact, not
+      as unknown: an unchecked name and an absent one are different refusals,
+      and only one of them tells the operator something true.
     * The name must match the shared profile pattern, checked before it is
       compared against anything.
     * The registry cap is enforced across the whole batch, so a partial batch
@@ -715,7 +757,27 @@ async def _handle_profiles_register(request: web.Request) -> web.Response:
         return _bad_request("names must be a non-empty list", "invalid_names")
     requested = [str(n) for n in raw][:_MAX_REGISTERED]
 
-    available = set(await asyncio.to_thread(deploy_profiles.discover_aws_profiles))
+    discovered = await asyncio.to_thread(deploy_profiles.discover_aws_profiles)
+    if discovered is None:
+        # Nothing can be checked against a scan that did not run, and refusing
+        # the names as absent is the one answer the operator cannot act on: the
+        # profiles ARE on the machine, and the message would say they are not.
+        # Refuse the batch on the real reason instead, split the way the listing
+        # above splits it -- 503 asks for a retry, which clears a failed scan and
+        # never clears a platform that cannot scan at all. The listing answers
+        # Windows with a 200 because a list plus `supported: false` is a complete
+        # answer; registering is an action this platform cannot perform, so here
+        # it is an error either way and only the retry semantics differ.
+        if os.name == "nt":
+            return _unsupported(
+                "profile discovery is not supported on Windows, so no name can be checked",
+                "unsupported_platform",
+            )
+        return _unavailable(
+            "could not list this machine's AWS profiles, so no name can be checked",
+            "profiles_unavailable",
+        )
+    available = set(discovered)
     unknown = [n for n in requested if n not in available]
     if unknown:
         # Deliberately does not echo the rejected names: they are caller-supplied
@@ -1041,7 +1103,7 @@ async def _handle_drive_download(request: web.Request) -> web.Response:
     if isinstance(section, web.Response):
         return section
     if section == "backup":
-        # Backups stay owner-only by construction: no share (round 8) and no
+        # Backups stay owner-only by construction: no share and no
         # download presign either — a bearer URL to raw gateway state is the
         # same exposure class regardless of which route mints it. Recovery
         # goes through the restore endpoint, which downloads server-side.
@@ -1052,9 +1114,9 @@ async def _handle_drive_download(request: web.Request) -> web.Response:
         return _bad_request(err, "invalid_key")
     try:
         # Presigning is LOCAL signing - S3 is never consulted - so a stale or
-        # typo'd key mints a URL that looks fine and 404s when opened. Share has
-        # required this head-object since round 3; download mints the same kind
-        # of bearer URL and needs the same precondition. The same HEAD carries
+        # typo'd key mints a URL that looks fine and 404s when opened. Share
+        # requires this head-object; download mints the same kind of bearer URL
+        # and needs the same precondition. The same HEAD carries
         # the stored Content-Type, returned so the preview can tell a real PDF
         # from a `.pdf`-named object served as octet-stream (uploaded before
         # content types were set), which a sandboxed iframe shows as blank.
@@ -1320,7 +1382,7 @@ async def _handle_drive_upload(request: web.Request) -> web.Response:
             # Same per-key lock the move handler holds across its probe+copy:
             # an upload put inside the lock either finishes before a move's
             # destination probe (the probe then answers 409) or starts after
-            # the move released — it can no longer land inside the move's
+            # the move released — it cannot land inside the move's
             # probe-to-copy window and be silently overwritten. Only the
             # re-authorization and the put are inside the lock; the spool
             # transfer above must not hold it.
@@ -1614,8 +1676,8 @@ async def _handle_drive_share(request: web.Request) -> web.Response:
     note = str(body.get("note", ""))
     try:
         # The mint joins the coordination net: holding the KEY for the whole
-        # exists-check -> presign -> ledger-record sequence means a share can
-        # no longer land on a file mid-move (the race: move checks the share
+        # exists-check -> presign -> ledger-record sequence means a share cannot
+        # land on a file mid-move (the race: move checks the share
         # ledger, THEN this mints a share for the source, THEN the move
         # deletes it — a broken URL the ledger reports live until expiry).
         # With the lock, the mint either completes before the move's ledger
@@ -1696,7 +1758,7 @@ async def _drive_object_keys(request: web.Request, account: str) -> tuple[set[st
         # failing: the profile became unavailable or now names another account.
         # `_guarded`'s rule is that such a decision reaches SEL, and degrading
         # quietly would drop the one event an incident review asks about.
-        # `_audit` routes the SEL write off the loop itself (issue #8139).
+        # `_audit` routes the SEL write off the loop itself.
         await _audit("shares_list", request.path, "denied", error="account_unavailable")
         return None, "no working connection for this account"
     _account, profile, region = target
@@ -1825,7 +1887,7 @@ async def _reauthorize_in_lock(
     can be disabled, the profile can be repointed at another account, consent
     can be withdrawn, publish governance can start denying, or the drive tags
     can move to a different bucket -- and the call would then run on an
-    authorization that no longer holds.
+    authorization that does not hold.
 
     The order is deliberate: app, then IDENTITY, then consent. Consent is asked
     ABOUT a profile and region, so verifying it against a stale pair proves
@@ -1959,7 +2021,7 @@ async def _reconciled_remote_slugs(request: web.Request) -> tuple[set[str] | Non
         try:
             await asyncio.to_thread(library_mod.reconcile, account, slugs, observed_at=observed_at)
         except json.JSONDecodeError:
-            # The strict update reader refused a corrupt ledger (#7805). Same
+            # The strict update reader refuses a corrupt ledger. Same
             # degradation as the OSError arm below -- this route is best-effort by
             # contract and the LIST must keep rendering (its rows come from the
             # lenient display read) -- but the reason differs on the axis the
@@ -2100,7 +2162,7 @@ async def _handle_library_push(request: web.Request) -> web.Response:
         return _not_found("unknown artifact", "unknown_artifact")
     except json.JSONDecodeError:
         # MUST precede the ``ValueError`` arm below: ``JSONDecodeError`` subclasses
-        # ``ValueError``, so without this the ledger's corruption refusal (#7805)
+        # ``ValueError``, so without this the ledger's corruption refusal
         # would be reported as ``not_pushable`` -- a 400 blaming the artifact for a
         # store the operator has to repair. The objects may already be in the
         # bucket (upload precedes the ledger write); the honest answer is that the
@@ -2219,6 +2281,10 @@ async def _handle_backup_status(request: web.Request) -> web.Response:
         "nightly": await asyncio.to_thread(backup_mod.nightly_enabled, account),
         "runs": await asyncio.to_thread(backup_mod.last_runs, account),
         "jobs": await asyncio.to_thread(_account_jobs, account),
+        # This install's own identity, so every row can be told from every other
+        # install's. Local and free -- no AWS call -- so it rides on the unpolled
+        # payload rather than waiting for the opt-in remote half.
+        "install": await asyncio.to_thread(backup_mod.install_identity),
         "remote": None,
     }
     # The remote listing is OPT-IN, because this endpoint is now polled. Its
@@ -2229,13 +2295,24 @@ async def _handle_backup_status(request: web.Request) -> web.Response:
     # open, which is the same condition it already gates the display behind.
     if request.query.get("remote") != "1":
         return web.json_response(payload)
+    # A second opt-in inside the first. Enumerating the OTHER installs' prefixes
+    # costs a list call each per kind plus one label read, so it is asked for
+    # separately -- and it is asked for at all because a replacement machine owns
+    # no archives, so without it a fresh install would see an empty list on the one
+    # occasion the bucket holds the only surviving copy.
+    include_others = request.query.get("others") == "1"
     denied = await _consent(aws_consent.SERVICE_S3, profile, region)
     if denied is None:
         try:
             bucket = await _drive_bucket(account, profile, region)
             if bucket:
                 payload["remote"] = await asyncio.to_thread(
-                    backup_mod.list_remote_backups, profile, region, bucket, account=account
+                    backup_mod.list_remote_backups,
+                    profile,
+                    region,
+                    bucket,
+                    account=account,
+                    include_others=include_others,
                 )
         except AWSError as exc:
             payload["remoteError"] = _safe_error(exc)
@@ -2254,15 +2331,15 @@ async def _handle_backup_run(request: web.Request) -> web.Response:
     ``_jobs`` surface, which withholds ``dedupe_key`` and so cannot answer
     "is a backup running for THIS account".
 
-    The pre-flight below stays, but its job has changed. It is no longer the
-    authorization gate -- ``backup._authorize_upload`` is, inside the worker,
+    The pre-flight below is not the authorization gate --
+    ``backup._authorize_upload`` is, inside the worker,
     immediately before the upload, and it holds for a run started through the
     generic ``_jobs`` surface too. What the pre-flight buys is a FAST, specific
     refusal: an unreconnected account, unconfirmed S3, or a missing drive answers
     409 with a code the UI can localise, instead of accepting the run and
     reporting the same thing thirty seconds later as a failed record.
 
-    The terminal record is no longer in this response, because there is no
+    There is no terminal record in this response, because there is no
     terminal record yet. It reaches the client through ``GET /backup/{account}``,
     whose ``runs`` ledger the worker writes on success -- unchanged, and still
     the app's own record of what a backup PRODUCED (key, size, when). The Job SDK
@@ -2276,6 +2353,18 @@ async def _handle_backup_run(request: web.Request) -> web.Response:
     kind = str(body.get("kind", ""))
     if kind not in backup_mod.JOB_KINDS:
         return _bad_request("kind must be snapshot or sessions", "invalid_kind")
+    # A kind this HOST cannot run is refused HERE, before a run record exists.
+    # The worker would refuse too -- `run_sessions_backup` fail-closes without
+    # `openat` rather than walking agent-writable directories by name -- but it
+    # would do so as a `failed` record carrying a raised exception, which reads
+    # like a broken backup rather than a platform that never offered the feature.
+    # 501 and not 400: the request is well-formed and would be honoured on
+    # another host, so it is this server that does not implement it.
+    unavailable = backup_mod.kind_unavailable_reason(kind)
+    if unavailable is not None:
+        return web.json_response(
+            {"error": unavailable, "code": "kind_unavailable_on_platform"}, status=501
+        )
     sdk = get_job_sdk(backup_mod.APP_NAME)
     if sdk is None:
         # Enabled, but no SDK was published for it: the `jobs` grant is missing
@@ -2352,13 +2441,78 @@ async def _handle_backup_restore(request: web.Request) -> web.Response:
     err = storage_mod.validate_key(key)
     if err or not (key.startswith("snapshots/") or key.startswith("sessions/")):
         return _bad_request("key must name a backup archive", "invalid_key")
+    # NOT bool(): the same rule the nightly toggle states. This flag waives a
+    # guard that stands between the owner and overwriting this machine's memory
+    # with another machine's, and `bool("false")` is True -- so a stringly-typed
+    # caller asking NOT to override would be granted the override. Absent means
+    # not overridden; present means it has to be a real boolean.
+    raw_foreign = body.get("foreignOk", False)
+    if not isinstance(raw_foreign, bool):
+        return _bad_request("foreignOk must be a boolean", "invalid_foreign_ok")
     try:
         result = await asyncio.to_thread(
-            backup_mod.restore_download, profile, region, bucket, key, account=account
+            backup_mod.restore_download,
+            profile,
+            region,
+            bucket,
+            key,
+            account=account,
+            foreign_ok=raw_foreign,
+        )
+    except backup_mod.UnprovenArchive as exc:
+        # 409, not 403: nothing about the caller's authority is in question -- the
+        # request conflicts with the state of the thing it names, and the same
+        # request with the override succeeds. The ORIGIN travels with the refusal
+        # because the three cases need different words: a co-tenant's archive, one
+        # under this install's own prefix with no upload record, and one predating
+        # install ids are three different things to tell an operator. The owning id
+        # comes too, so "another install" is never the whole answer.
+        return web.json_response(
+            {
+                "error": str(exc),
+                "code": "foreign_install_archive",
+                "origin": exc.origin,
+                "install": exc.install_id,
+            },
+            status=409,
         )
     except AWSError as exc:
         return _aws_failed(exc)
     return web.json_response({"downloaded": True, **result})
+
+
+async def _handle_install_label(request: web.Request) -> web.Response:
+    """Rename THIS install. Local only — no AWS call, no account.
+
+    Not under ``/backup/{account}``: the install is the same install whichever
+    account it backs up to, so scoping the rename to one account would imply a
+    name per account and mint the confusion the id exists to remove. The new name
+    reaches the drive on the next backup, which already holds a bucket and a live
+    authorization decision; making a cosmetic rename depend on the network would
+    let it fail for no benefit.
+
+    The label changes what is DISPLAYED and nothing else. Ownership, the restore
+    refusal and the nightly's shared-drive notice all read the id in the object
+    key, so no name an owner (or another install) chooses can move an archive
+    across that line.
+    """
+    body = await _body(request)
+    raw = body.get("label")
+    if not isinstance(raw, str):
+        return _bad_request("label must be a string", "invalid_label")
+    try:
+        identity = await asyncio.to_thread(backup_mod.set_install_label, raw)
+    except OSError:
+        # Same posture as the nightly toggle: a setting that did not persist is
+        # reported as a failure rather than echoed back as if it had. The message
+        # is fixed because the OSError's own text carries the absolute path of the
+        # state file, which has no business in a response body.
+        logger.exception("aws-control: the install label could not be persisted")
+        return web.json_response(
+            {"error": "the install name could not be saved", "code": "state_persist_failed"},
+            status=500,
+        )
+    return web.json_response({"install": identity})
 
 
 # --------------------------------------------------------------------------
@@ -2452,4 +2606,8 @@ def register_routes(app: web.Application) -> None:
     r.add_post(
         f"{_BASE}/backup/{{account}}/restore",
         _guarded(_mutating("backup_restore")(_handle_backup_restore)),
+    )
+    r.add_post(
+        f"{_BASE}/install/label",
+        _guarded(_mutating("install_label")(_handle_install_label)),
     )

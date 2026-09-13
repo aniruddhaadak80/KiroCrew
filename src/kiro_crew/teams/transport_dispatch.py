@@ -36,6 +36,8 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+from kiro_crew.config import live
+from kiro_crew.config.sections import _normalize_threshold_pair
 from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
@@ -48,7 +50,10 @@ from kiro_crew.messaging.commands import (
     run_yolo_command,
     stop_running_turn,
 )
-from kiro_crew.messaging.conversation import ConversationState
+from kiro_crew.messaging.conversation import (
+    ConversationState,
+    reserve_new_generation,
+)
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     build_directive_consumer,
@@ -97,7 +102,7 @@ from kiro_crew.teams.session_resume import (
     RoutingDecision,
     TeamsSessionResume,
 )
-from kiro_crew.teams.transport import TEAMS_CAPABILITIES
+from kiro_crew.teams.transport import TEAMS_CAPABILITIES, allowed_emails_from_config
 
 if TYPE_CHECKING:
     from kiro_crew.config.loader import KiroCrewConfig
@@ -105,6 +110,7 @@ if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
     from kiro_crew.teams.client import TeamsClient, TeamsInbound
+    from kiro_crew.teams.transport import TeamsTransport
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +168,10 @@ class TeamsDispatcher:
         self.conv_log = conv_log
         self.approval_mode = approval_mode
         self.client: "TeamsClient | None" = None
+        # Set by maybe_start_teams after construction (the client<->transport
+        # construction cycle forbids doing it here); the config applier pushes
+        # the reloaded allow-list at it.
+        self.transport: "TeamsTransport | None" = None
         self._conv = ConversationState(seed_fn=self._seed_gen)
         # Mid-turn queue receipts. Teams can edit a bot's own activity, so unlike
         # WeCom/Weixin (whose reply is bound to the inbound request) it can carry
@@ -175,6 +185,59 @@ class TeamsDispatcher:
         # here (not in the gateway) so `handle_message` can route every message through
         # it; the gateway only attaches `dashboard_state` afterwards.
         self._session_resume = TeamsSessionResume(sessions, conv_log, set(allowed_emails or ()))
+        # The dispatcher's own copy of the roster, kept so the applier can hand
+        # the same normalized set to every holder from one place.
+        self._allowed_emails: frozenset[str] = frozenset(allowed_emails or ())
+        # Held on self: the watcher holds the owner WEAKLY, so a subscription
+        # dropped here would be collected and the applier would silently stop
+        # firing. No ``target``: this dispatcher owns the apply, because the
+        # roster has three holders rather than one.
+        self._config_sub = live.watch_section(self, "teams", "messaging", name="TeamsDispatcher")
+
+    # ── Live config ────────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when it is armed, else a fingerprint-cached
+        ``load()`` (two stats on a hit), else the boot copy. Falling back to
+        ``self.cfg`` rather than raising keeps a turn running when the config
+        file is momentarily unreadable -- a threshold or a rotation window is
+        not an authorization decision, and the boot value is the one the
+        operator last had in force.
+        """
+        return live.current(self.cfg, log_prefix="teams")
+
+    def _thresholds(self) -> tuple[int, int]:
+        """``(soft, hard)`` context thresholds from the live config.
+
+        Re-runs the loader's own pair normalization, because reading the two
+        fields live without it can leave ``soft > hard`` and make the soft nudge
+        unreachable -- ``_maybe_notice`` tests ``pct >= hard`` first.
+        """
+        section = self._live_cfg().teams
+        return _normalize_threshold_pair(
+            int(getattr(section, "soft_threshold_pct", 80)),
+            int(getattr(section, "hard_threshold_pct", 95)),
+        )
+
+    def reconfigure(self, section: Any) -> None:
+        """Push a reloaded ``teams.allowed_emails`` at all three holders.
+
+        The transport's frozen roster, this dispatcher's copy and the session-
+        resume owner all derive from one field, so one applier updates all three
+        from one normalization -- two of them agreeing and the third stale is
+        exactly the state that lets a removed identity keep listing sessions.
+        Every other Teams field this dispatcher reads is read at point of use.
+        A transport that is not up yet is skipped: it reads the section fresh
+        when it connects.
+        """
+        emails = allowed_emails_from_config(getattr(section, "allowed_emails", None))
+        if emails is not None:
+            self._allowed_emails = frozenset(emails)
+            self._session_resume.reconfigure(set(self._allowed_emails))
+        if self.transport is not None:
+            self.transport.reconfigure(section)
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
@@ -254,6 +317,7 @@ class TeamsDispatcher:
                     inbound.conversation_id,
                     inbound.service_url,
                     command_argument(text),
+                    native_key=self._session_key(email),
                 )
                 return
             if cmd == "new":
@@ -351,8 +415,8 @@ class TeamsDispatcher:
             self._conv.maybe_rotate(
                 email,
                 time.time(),
-                idle_minutes=self.cfg.messaging.idle_reset_minutes,
-                daily_reset_hour=self.cfg.messaging.daily_reset_hour,
+                idle_minutes=self._live_cfg().messaging.idle_reset_minutes,
+                daily_reset_hour=self._live_cfg().messaging.daily_reset_hour,
             )
         # Decided ONCE, upstream, and not re-resolved: re-reading the binding here would
         # let it change between the decision and its use.
@@ -468,7 +532,7 @@ class TeamsDispatcher:
             # than stranding it.
             await self.handle_message(inbound)
             return
-        mode = override_mode or self.cfg.messaging.queue_mode
+        mode = override_mode or self._live_cfg().messaging.queue_mode
         # An attachment-bearing message is never steered: a steer carries TEXT into
         # the running turn, so the files would be dropped on the floor while the
         # user is told their message was folded in. Queue it instead -- the drained
@@ -611,6 +675,7 @@ class TeamsDispatcher:
                 inbound.reply_to_id or inbound.activity_id,
                 payload["nonce"],
                 int(payload["index"]),
+                native_key=self._session_key(identity),
             )
             return
         # An option chip: resolve the label from what this turn actually offered,
@@ -740,7 +805,7 @@ class TeamsDispatcher:
                         texts.append(item[1])
                         attachments.extend(queued_files)
                     else:
-                        # Once one message no longer fits, defer it AND everything
+                        # Once one message does not fit, defer it AND everything
                         # behind it, so the queue keeps exact FIFO order.
                         defer_rest = True
                         remainder.append(item)
@@ -971,6 +1036,12 @@ class TeamsDispatcher:
             self.sessions.clear_queue(session_key)
             await self._queue.finish_cancelled_locked(session_key, self._receipt_surface(inbound))
         self._conv.bump_gen(identity)
+        new_session_key = self._session_key(identity)
+        saved = await reserve_new_generation(
+            self.sessions,
+            new_session_key,
+            channel_type="Teams",
+        )
         # Retire the OLD generation's renderer here. A renderer kept alive for
         # outstanding chips is keyed by the pre-bump session key, and the next turn
         # assigns under the new one -- so nothing else ever pops this entry, and each
@@ -981,6 +1052,8 @@ class TeamsDispatcher:
         message = "✅ Started a fresh conversation."
         if left_resumed is not None:
             message = "✅ Started a fresh conversation — left the resumed dashboard session."
+        if not saved:
+            message += "\n⚠️ The new conversation could not be saved for restart."
         await self._reply(inbound, message)
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -1027,7 +1100,7 @@ class TeamsDispatcher:
             self._resolve_agent(),
             email,
             gen=gen,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _seed_gen(self, email: str) -> int:
@@ -1036,7 +1109,7 @@ class TeamsDispatcher:
             channel="teams",
             agent=self._resolve_agent(),
             user_id=email,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _persist_turn(
@@ -1068,15 +1141,16 @@ class TeamsDispatcher:
         assert self.client is not None
         email = self._identity(inbound)
         pct = self.sessions.check_context_usage(session_key, provider)
-        if pct >= self.cfg.teams.soft_threshold_pct:
-            # Capability gate (#8156): no forced compaction to run and the
+        soft, hard = self._thresholds()
+        if pct >= soft:
+            # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
             # on its own as context fills.
             unsupported = compact_unsupported_backend(provider)
             if unsupported:
                 logger.debug("Teams: context notice skipped — %s compacts itself", unsupported)
                 return
-        if pct >= self.cfg.teams.hard_threshold_pct:
+        if pct >= hard:
             self._conv.clear_awaiting(email)
             try:
                 await provider.compact()
@@ -1087,7 +1161,7 @@ class TeamsDispatcher:
                 )
             except Exception:
                 logger.debug("Teams hard-threshold compaction failed", exc_info=True)
-        elif pct >= self.cfg.teams.soft_threshold_pct and not self._conv.is_awaiting(email):
+        elif pct >= soft and not self._conv.is_awaiting(email):
             self._conv.set_awaiting(email)
             await self._reply(
                 inbound,
@@ -1120,7 +1194,7 @@ class TeamsDispatcher:
             if provider is None:
                 await self._reply(inbound, "ℹ️ There's no conversation to compact yet.")
                 return
-            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # Capability gate, mirroring the dashboard's compact gate: a
             # backend that cannot serve a manual /compact treats the prompt as
             # ordinary text and never answers, so dispatching would strand the
             # unbounded wait below. Informational, never an error.

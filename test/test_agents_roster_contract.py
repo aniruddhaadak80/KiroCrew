@@ -1,11 +1,11 @@
 """``GET /api/agents`` ships an explicit allowlist, never the whole record.
 
-The endpoint used to build each row with ``{**dataclasses.asdict(agent_cfg)}``,
-which made its response contract "every field ``KiroCrewAgentConfig`` has now,
-plus every field anyone adds later", automatically — a field added by someone
-who never looked at this endpoint shipped to the browser by omission. #8454
-converted both row sources to an explicit allowlist, mirroring the rule
-``handlers/members.py`` already documents for ``GET /api/members``.
+Building each row with ``{**dataclasses.asdict(agent_cfg)}`` would make its
+response contract "every field ``KiroCrewAgentConfig`` has, plus every field
+anyone adds later", automatically — a field added by someone who never looked
+at this endpoint would ship to the browser by omission. Both row sources use an
+explicit allowlist instead, mirroring the rule ``handlers/members.py`` already
+documents for ``GET /api/members``.
 
 These tests are the half that keeps it converted. The key set is pinned as a
 literal, and a separate ratchet compares that literal against the live record
@@ -153,7 +153,7 @@ class TestRosterRowKeySet:
     async def test_project_row_ships_the_same_key_set(self, monkeypatch) -> None:
         """A project-scope row carries the SAME keys as a global row.
 
-        The two sources were separate spreads before #8454, so they could drift
+        The two sources are separate spreads, so they could drift
         into different key sets; pinning both is what makes one allowlist the
         answer for the whole response.
         """
@@ -248,7 +248,7 @@ class TestRosterRowIsAnAllowlistNotASpread:
         # The withheld set must name real fields — a typo there would silently
         # stop classifying anything and let the next added field through.
         assert WITHHELD_RECORD_FIELDS <= record_fields
-        # And the allowlist must not claim a record field that no longer exists.
+        # And the allowlist must not claim a record field that does not exist.
         assert ROSTER_ROW_KEYS - {"name", "scope"} <= record_fields
 
     def test_an_attribute_the_allowlist_does_not_name_is_dropped(self) -> None:
@@ -440,7 +440,50 @@ class TestAvatarIsShapeAllowlistedNotMasked:
         assert self.PROBE not in json.dumps(row)
 
     def test_a_credential_shaped_expression_value_is_masked(self) -> None:
-        """The per-state axes carry user text too, so they mask like traits."""
+        """The per-state axes carry user text too, so they mask like traits.
+
+        ``expressions`` is legal on every tier and its ``eyes``/``mouth`` values
+        are free strings (32-char truncation is the only pin), so they are the
+        one reaction leaf that can carry what a trait can, and they go through
+        ``_roster_mask`` the same way. A pack record carries the same key, so the
+        mask is checked on both tiers.
+        """
+        for record in (
+            {"kind": "ghost", "expressions": {"working": {"eyes": self.PROBE}}},
+            {"kind": "pack", "id": "aurora", "expressions": {"error": {"mouth": self.PROBE}}},
+        ):
+            row = _agent_roster_row(
+                "probe",
+                "global",
+                cast(
+                    KiroCrewAgentConfig,
+                    types.SimpleNamespace(
+                        **{
+                            **{f.name: "" for f in dataclasses.fields(KiroCrewAgentConfig)},
+                            "avatar": record,
+                        }
+                    ),
+                ),
+                redact=False,
+            )
+            avatar = cast(dict, row["avatar"])
+            state = next(iter(record["expressions"]))
+            axis = next(iter(record["expressions"][state]))
+            assert _carries_mask(avatar["expressions"][state][axis]), record["kind"]
+            assert self.PROBE not in json.dumps(row), record["kind"]
+
+    def test_the_pinned_reaction_names_survive_intact(self) -> None:
+        """The direction that rots. A reaction NAMES a shipped animation or preset.
+
+        ``_safe_motions`` and ``_safe_sounds`` pin both to a closed vocabulary, so
+        neither is user-authored text: masking one would break the reaction and
+        buy nothing, the same reason the regex-pinned ``file`` is left alone. A
+        credential-shaped value cannot survive validation to reach the roster at
+        all -- it is dropped, which is stronger than masking it.
+
+        The two keys differ in WHERE they are legal, not in how they are handled:
+        ``motions`` is ghost-only, ``sounds`` is legal on every tier.
+        """
         row = _agent_roster_row(
             "probe",
             "global",
@@ -451,7 +494,7 @@ class TestAvatarIsShapeAllowlistedNotMasked:
                         **{f.name: "" for f in dataclasses.fields(KiroCrewAgentConfig)},
                         "avatar": {
                             "kind": "ghost",
-                            "expressions": {"working": {"eyes": self.PROBE}},
+                            "motions": {"done": "bounce", "error": self.PROBE},
                             "sounds": {"working": "chime"},
                         },
                     }
@@ -460,11 +503,9 @@ class TestAvatarIsShapeAllowlistedNotMasked:
             redact=False,
         )
         avatar = cast(dict, row["avatar"])
-        assert _carries_mask(avatar["expressions"]["working"]["eyes"])
-        assert self.PROBE not in json.dumps(row)
-        # The direction that rots: a cue name is pinned to a shipped preset by
-        # `_safe_sounds`, so masking it would break the cue and buy nothing.
+        assert avatar["motions"] == {"done": "bounce"}
         assert avatar["sounds"] == {"working": "chime"}
+        assert self.PROBE not in json.dumps(row)
 
     def test_the_pinned_file_and_kind_survive_intact(self) -> None:
         """The direction that rots. `file` is regex-pinned, so it needs no mask.

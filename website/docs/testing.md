@@ -174,6 +174,13 @@ or a weakened assertion. Poll for the condition you actually care about.
 
 ## Determinism: establish the state you assert on
 
+Reset owned API mocks before reseeding per-test defaults. `vi.clearAllMocks()`
+clears call history but preserves queued `mockResolvedValueOnce` and
+`mockRejectedValueOnce` responses. If a test stops before consuming one, that
+response can override the next test's default implementation. Call `mockReset()`
+on those API mocks, then supply the next test's defaults, preserving unrelated
+shared setup mocks.
+
 Every CI-only failure this suite has produced so far reduces to one mistake: **the
 test asserted against a state it did not establish**, and got away with it locally
 because the component happened to be slower than the assertion. The shard runs four
@@ -303,6 +310,57 @@ one is a rule:
   those tests an explicit `it(name, { timeout }, fn)` ceiling, say in a comment why
   the work is real and how it is bounded (the frame budgets), and leave the file-wide
   `testTimeout` alone for everything else.
+
+A later audit ran the Electron `node:test` suite five times on Node 22 — the declared
+floor (`engines.node >=22`), while CI runs 24 — and added two rules:
+
+- **A backstop timer the caller awaits must keep the loop alive.**
+  `stopGatewayGracefully` raced a never-settling tree kill against
+  `setTimeout(...).unref()`. An unref'd timer cannot hold the event loop on its own, so
+  the moment nothing else was pending the loop drained and the surrounding
+  `Promise.race` never resolved; `node --test` then reported "Promise resolution is
+  still pending but the event loop has already resolved" and cancelled every later
+  test in the file (26 of 38). It passed on Node 24 only because that runner happened
+  to keep something else alive. `unref()` a timer only when the process exiting early
+  is the desired outcome — never on a path that is itself awaited.
+- **`require("electron")` in a Node test process downloads the binary.** Outside
+  Electron, `node_modules/electron/index.js` returns the executable path and, when
+  `dist/` is absent, runs `install.js` — a network download and an extract into
+  `node_modules`. Electron 43 has no postinstall, so a fresh `npm ci` leaves `dist/`
+  absent and four test files raced the download concurrently ("File exists (os error
+  17)"). The `test` script preloads `website/electron/test/_preload.cjs` via
+  `node --require`, which sets `ELECTRON_OVERRIDE_DIST_PATH` before any source loads;
+  with that variable set `index.js` returns a path without touching the network. A test
+  never needs the real binary — if yours seems to, it is testing Electron, not our code.
+
+### What a second set of full runs found
+
+Four more `vitest run --coverage` passes two days later, again on a loaded Windows host,
+found no deterministic failure and twelve intermittent cases — each red in exactly one
+of the four runs. Nine were the "real async chain behind the 1000ms default" shape
+above, and got a **named** ceiling next to the helper that owns the wait (`TREE_READY`,
+`PANE_READY`, `NOTICE_READY`; the approval ghost's 150ms settle-guard timer; the
+`['artifact', slug]` fetch). Two were new shapes, and each one is a rule:
+
+For Testing Library's bound `findBy*` queries, pass a named timeout as the third
+argument, for example `screen.findByTestId(id, undefined, PANE_READY)`. The second
+argument configures matching and does not change the wait timeout.
+
+- **A wait that resolves on a row from the WRONG query.** The path bar's `complete` mock
+  answers every key with the same entry, so the suggestion row first rendered for the
+  PRE-debounce key (fetched on focus); 150ms later the debounced draft flipped the query
+  key, `data` reset to `undefined`, and the list was EMPTY for a tick until the new fetch
+  resolved. A Tab that landed in that tick found no suggestions. `findByText` had proved
+  a row existed, not that it was the row the assertion was about. Wait for the debounced
+  key's fetch to have been ISSUED (`toHaveBeenCalledWith`), then for its row.
+- **A one-shot rejection armed after the edit races the autosave debounce.** The
+  notebook test edited, then armed `saveNote.mockRejectedValueOnce`; under load the
+  `SAVE_DEBOUNCE_MS` autosave fired first against the default resolved mock, the buffer
+  read clean, and the vault was legitimately forgotten. Arm the outcome BEFORE the action
+  that starts the timer, and make it persistent when either of two paths may consume it.
+
+The remaining case was pure CPU (201 real sidebar rows in one synchronous render,
+4–18 s across the four runs) and got its own `it(name, { timeout }, fn)` ceiling.
 
 ## Manual procedures
 

@@ -328,7 +328,7 @@ class TestFfmpegInstallCommands:
     def test_present_ffmpeg_asks_for_nothing(self, monkeypatch) -> None:
         # Stubbed at `_find_ffmpeg`, which is the seam the production code now asks:
         # ffmpeg is resolved from fixed directories rather than from PATH, so a
-        # `shutil.which` stub no longer decides the answer (and, being a module-global
+        # `shutil.which` stub does not decide the answer (and, being a module-global
         # patch, the real resolver would receive it and reject its `path=` argument).
         monkeypatch.setattr(core_mod, "_find_ffmpeg", lambda: "/usr/local/bin/ffmpeg")
         assert core_mod._ffmpeg_install_commands() == []
@@ -374,7 +374,7 @@ class TestFfmpegInstallCommands:
     def test_without_a_build_script_there_is_nothing_to_tell_a_terminal(self, monkeypatch) -> None:
         """No fallback command, because the fallback was a dead end.
 
-        A distribution with no ffmpeg package and no build script in reach used to
+        A distribution with no ffmpeg package and no build script in reach would
         be handed ``echo 'Build ffmpeg from source: …'``, which a user pasted into a
         terminal and got a URL echoed back. An empty list is what makes the Settings
         page offer the decoder fetch, or the agent hand-off, instead.
@@ -574,8 +574,17 @@ class TestSttPrereqCommands:
 class TestPipInstallChannel:
     @pytest.fixture(autouse=True)
     def _not_bundled(self, monkeypatch):
-        """Pin the desktop-bundle probe; the bundled case has its own test."""
+        """Pin the desktop-bundle and pip-module probes so this class describes
+        the environment it claims to test rather than inheriting the host's —
+        a uv-created venv (the default for `uv venv`) ships no `pip` module, so
+        an unpinned `find_spec("pip")` returns None on this host and every test
+        below that isn't otherwise exercising that branch would misfire."""
         monkeypatch.setattr(shared_mod.platform_compat, "is_bundled_interpreter", lambda: False)
+        monkeypatch.setattr(
+            shared_mod.importlib.util,
+            "find_spec",
+            lambda name, *a, **kw: object() if name == "pip" else None,
+        )
 
     def test_bundled_desktop_interpreter_has_no_channel(self, monkeypatch) -> None:
         """A pip install into the desktop app's code-signed bundle breaks
@@ -587,11 +596,10 @@ class TestPipInstallChannel:
     def test_pipless_interpreter_has_no_channel(self, monkeypatch) -> None:
         """uv tool installs and some pipx layouts ship no `pip` module, so
         `<python> -m pip` fails immediately — the command must not be shown."""
-        real = shared_mod.importlib.util.find_spec
         monkeypatch.setattr(
             shared_mod.importlib.util,
             "find_spec",
-            lambda name, *a: None if name == "pip" else real(name, *a),
+            lambda name, *a, **kw: None,
         )
         assert core_mod._pip_install_channel_available() is False
 
@@ -608,6 +616,7 @@ class TestPipInstallChannel:
         resolves to the BASE interpreter's directory where distro pythons put
         the marker — the recommended install layout (venv on a Debian/brew
         python) must not be misread as unsupported."""
+        monkeypatch.setattr(shared_mod.importlib.util, "find_spec", lambda name: object())
         monkeypatch.setattr(shared_mod.sys, "prefix", str(tmp_path / "venv"))
         monkeypatch.setattr(shared_mod.sys, "base_prefix", str(tmp_path / "base"))
         (tmp_path / "EXTERNALLY-MANAGED").write_text("", encoding="utf-8")
@@ -615,6 +624,7 @@ class TestPipInstallChannel:
         assert core_mod._pip_install_channel_available() is True
 
     def test_ordinary_venv_has_a_channel(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(shared_mod.importlib.util, "find_spec", lambda name: object())
         monkeypatch.setattr(shared_mod.sys, "prefix", shared_mod.sys.base_prefix)
         monkeypatch.setattr(shared_mod.sysconfig, "get_path", lambda name: str(tmp_path))
         assert core_mod._pip_install_channel_available() is True
@@ -829,7 +839,11 @@ class TestSttConfigEndpoint:
         assert not isinstance(stt["idle_evict_secs"], bool)
 
     @pytest.mark.asyncio
-    async def test_get_advertises_capabilities(self, seeded_config) -> None:
+    async def test_get_advertises_capabilities(self, seeded_config, monkeypatch) -> None:
+        # The unsupported flag folds in the venv's own packaging: a uv-created venv
+        # ships no `pip` module, so the channel probe reads False there and the
+        # flag flips True on every uv host. Pin the probe, as the sibling tests do.
+        monkeypatch.setattr(core_mod, "_pip_install_channel_available", lambda: True)
         async with TestClient(TestServer(_stt_app())) as client:
             resp = await client.get("/api/config/stt")
             assert resp.status == 200
@@ -849,8 +863,8 @@ class TestSttConfigEndpoint:
         assert "en-US" in body["language_codes"]
         assert body["available"] is False
         assert body["prereqs"] == []
-        # This test venv has a working pip channel, so the unsupported flag
-        # must be False regardless of installed extras.
+        # The pip channel is pinned open above, so the unsupported flag must be
+        # False regardless of installed extras.
         assert body["transcribe_unsupported"] is False
         # Cause discriminator for the unsupported notice: the desktop bundle
         # needs different guidance than a pip-less/PEP 668 interpreter. A test
@@ -895,7 +909,7 @@ def _availability(ok: bool, code: str = "", detail: str = ""):
 def _seed_stt(path: Path, **fields) -> None:
     """Merge *fields* into the ``stt`` section of the config at *path*.
 
-    Used to give a test a configured value that is NOT the default, so "used the
+    Gives a test a configured value that is NOT the default, so "used the
     configured model" is distinguishable from "fell back to the catalog default".
     """
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -1432,6 +1446,7 @@ class TestSttTranscribe:
         with the ``voice`` extra installed than on one without.
         """
         monkeypatch.setattr(core_mod, "availability_detail", lambda _cfg: _availability(True))
+        monkeypatch.setattr(core_mod, "audio_exceeds_secs", AsyncMock(return_value=False))
 
     @pytest.mark.asyncio
     async def test_unavailable_backend_is_503_naming_the_reason(self, monkeypatch) -> None:
@@ -1489,6 +1504,45 @@ class TestSttTranscribe:
         body = json.loads(resp.body)
         assert body["error"] == "audio too large"
         assert body["code"] == "stt_audio_too_large"
+
+    @pytest.mark.asyncio
+    async def test_over_duration_upload_is_refused_before_transcription(self, monkeypatch) -> None:
+        monkeypatch.setattr(core_mod, "batch_duration_cap_secs", lambda _cfg: 3600)
+        probe = AsyncMock(return_value=True)
+        monkeypatch.setattr(core_mod, "audio_exceeds_secs", probe)
+        transcribe = AsyncMock()
+        monkeypatch.setattr("kiro_crew.transcribe.transcribe_audio", transcribe)
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"audio-bytes", b""]),
+        )
+
+        resp = await core_mod.api_stt_transcribe(_multipart_req(field))
+
+        assert resp.status == 422
+        body = json.loads(resp.body)
+        assert body["code"] == "stt_audio_too_long"
+        assert "60-minute" in body["error"]
+        transcribe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unverified_duration_is_retryable_and_not_transcribed(self, monkeypatch) -> None:
+        monkeypatch.setattr(core_mod, "batch_duration_cap_secs", lambda _cfg: 3600)
+        monkeypatch.setattr(core_mod, "audio_exceeds_secs", AsyncMock(return_value=None))
+        transcribe = AsyncMock()
+        monkeypatch.setattr("kiro_crew.transcribe.transcribe_audio", transcribe)
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"audio-bytes", b""]),
+        )
+
+        resp = await core_mod.api_stt_transcribe(_multipart_req(field))
+
+        assert resp.status == 503
+        assert json.loads(resp.body)["code"] == "stt_audio_duration_unverified"
+        transcribe.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_transcript_is_returned_and_redacted(self, monkeypatch) -> None:
@@ -1727,7 +1781,9 @@ class TestAgentSettingsPut:
         async with TestClient(TestServer(_agent_cfg_app())) as client:
             resp = await _put_agent(client, {"max_subagents": 0})
             assert resp.status == 200
-            assert (await resp.json())["restart_required"] is True
+            # The cap follows config live (SubagentManager.reconfigure), so the
+            # auto sentinel is applied at the next reload rather than at restart.
+            assert (await resp.json())["restart_required"] is False
         assert json.loads(seeded_config.read_text(encoding="utf-8"))["agent"]["max_subagents"] == 0
 
     @pytest.mark.asyncio

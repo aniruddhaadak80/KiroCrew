@@ -23,8 +23,10 @@ from chat_test_helpers import (
     _make_ready_kiro_prerequisite,
     _make_state,
 )
+from member_memory_helpers import patch_private_memory_supported
 
-from kiro_crew.acp.types import TurnUsage
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, TurnUsage
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard.chat_runner import _tool_call_ws_payload
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
@@ -165,7 +167,7 @@ class TestChatSlot:
         counter is a POSITION base with no disk contract: if evicted durable
         rows were uncounted, every later absolute position would shift down and
         a poller's ``since`` guard would pass while rows were silently skipped
-        — the silent failure the deleted blanket refusal used to make loud.
+        — the silent failure a blanket refusal would make loud.
         Counting them makes such a cursor refuse loudly (``since < base``).
 
         Mutation guard: restricting the durable count to the persisted slice
@@ -747,7 +749,7 @@ class TestBroadcastCompactionResultBackoff:
     def test_enriched_title_replaces_unknown_error(self, tmp_path, monkeypatch):
         """The notice reads the event title. kiro-cli sends no summary on
         failure, so the ACP layer now carries the notification's own reason
-        there (issue #3583) — the row must name it instead of collapsing to
+        there — the row must name it instead of collapsing to
         "unknown error"."""
         from kiro_crew.dashboard.chat_utils import _broadcast_compaction_result
 
@@ -811,6 +813,45 @@ class TestBroadcastCompactionResultBackoff:
         assert not [
             c for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "context_usage"
         ]
+
+    def test_notice_prefixes_pin_the_frontend_parser_contract(self, tmp_path, monkeypatch):
+        """The dashboard folds the compaction row by parsing its TEXT: the
+        frontend (``website/src/pages/chat/CompactionCard.tsx``,
+        ``parseCompactionNotice``) keys on the exact ``✅ Conversation compacted``
+        lead (colon or period) for the folded card and on a ``❌`` lead for the
+        error notice, and the row is tagged ``kind="compaction"`` so the registry
+        can claim it. Nothing else pins the writer side, so a wording change here
+        would silently unfold a multi-KB summary back into a plain notice. This
+        test is that pin — change both sides together."""
+        from kiro_crew.dashboard.chat_utils import _broadcast_compaction_result
+
+        state, slot = self._make_slot_and_state(tmp_path, monkeypatch)
+
+        with_summary = _broadcast_compaction_result(
+            state, slot, self._completed_event("## Goal\nship")
+        )
+        assert with_summary == "\u2705 Conversation compacted: ## Goal\nship"
+        without_summary = _broadcast_compaction_result(state, slot, self._completed_event(""))
+        assert without_summary == "\u2705 Conversation compacted."
+        failed = _broadcast_compaction_result(state, slot, self._failed_event("too large"))
+        assert failed is not None and failed.startswith("\u274c Compaction failed: ")
+
+        tagged = [m for m in slot.messages if m.get("role") == "assistant"]
+        assert tagged and all((m.get("meta") or {}).get("kind") == "compaction" for m in tagged)
+
+    def test_state_notice_glyphs_pin_the_frontend_status_regex(self):
+        """The other half of the same contract: ``state.py`` writes three more
+        ``kind="compaction"`` shapes whose LEAD GLYPH the frontend strips
+        (``STATUS_LEAD_RE`` in ``CompactionCard.tsx``: 🔄 U+1F504, ♻ U+267B,
+        ⏳ U+23F3) and one ⚠-led failure it routes to the error surface. A glyph
+        swap here (⏳ U+23F3 vs ⌛ U+231B was a real review-round slip) would
+        leave a raw emoji beside the card's icon with nothing red on this side."""
+        from kiro_crew.dashboard import state as st
+
+        assert st._AUTO_COMPACT_NOTICE.startswith("\U0001f504 ")
+        assert st._SESSION_RECYCLED_NOTICE.startswith("\u267b\ufe0f ")
+        assert st.stuck_turn_notice(120).startswith("\u23f3 ")
+        assert st._AUTO_COMPACT_FAILED_NOTICE.startswith("\u26a0 Auto-compact failed")
 
 
 @pytest.mark.asyncio
@@ -1022,9 +1063,9 @@ class TestApiChatModeForwarding:
         assert slot is not None
         assert slot.mode == "design-critique"
         # The leak this guards against: the sidebar allowlist admits surfaces
-        # "", "orchestrator" and "crew" — the recreated worker must not
+        # "" and "orchestrator" — the recreated worker must not
         # serialize one of those.
-        assert slot.mode not in ("", "orchestrator", "crew")
+        assert slot.mode not in ("", "orchestrator")
 
     async def test_bogus_mode_is_dropped(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -1052,22 +1093,22 @@ class TestApiChatModeForwarding:
         assert slot is not None
         assert slot.mode == ""
 
-    async def test_crew_mode_dropped_for_crew_incapable_name(self, tmp_path, monkeypatch):
-        """Same boundary api_chat_slot_create enforces with a 400: a name whose
-        normalized key cannot host a crew store (e.g. a Win32 device basename)
-        must not become a crew slot via auto-create. Here it is dropped, not
-        refused — the slot is created with the default mode instead."""
+    async def test_retired_crew_mode_is_dropped(self, tmp_path, monkeypatch):
+        """Crew Mode retired: a caller still sending ``mode: "crew"`` (an old
+        client, a saved script) gets an ordinary slot, not an error — the mode
+        is absent from ``_CREATABLE_MODES``, so it is dropped like any other
+        unknown value."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
 
         await self._post_chat(
             state,
-            {"message": "hello", "slot": "CON", "mode": "crew"},
+            {"message": "hello", "slot": "old-crew-client", "mode": "crew"},
         )
 
-        created = [s for k, s in state._slots.items() if k.lower() == "con"]
-        assert created, "slot should still be created, just without crew mode"
-        assert created[0].mode == ""
+        slot = state._slots.get("old-crew-client")
+        assert slot is not None, "slot should still be created, just as plain chat"
+        assert slot.mode == ""
 
     async def test_mode_ignored_for_existing_slot(self, tmp_path, monkeypatch):
         """Repeating mode on send() must be safe when the slot survived: an
@@ -1241,7 +1282,7 @@ class TestSlotDetailPagination:
 
     @pytest.mark.asyncio
     async def test_limit_below_one_is_rejected_not_clamped_up(self, tmp_path, monkeypatch):
-        """limit=0 used to return an empty page reporting has_more true — forever."""
+        """limit below 1 is rejected, not an empty page with has_more true forever."""
         state = await self._slot_with_history(tmp_path, monkeypatch, "zerolimit")
         async with TestClient(TestServer(_make_app(state))) as client:
             for bad in ("0", "-1", "-5"):
@@ -1745,7 +1786,7 @@ class TestSlotDetailPagination:
         """A disk window holding BOTH id-carrying and id-less rows must not duplicate.
 
         The dual-write injectors stamp both copies of an injection with one id, so
-        a NEW injection no longer produces this state — but transcripts written
+        a NEW injection does not produce this state — but transcripts written
         before the append path accepted an id hold exactly it, as does any caller
         that passes no id: earlier saved rows WITH ids plus a durable row WITHOUT
         one. The id-less ``append_if_absent`` call below is that legacy writer
@@ -2012,7 +2053,7 @@ class TestSlotDetailPagination:
         # append and the second window row in the same tick, and a ``ts`` carried
         # by exactly one unmatched window entry and one unmatched disk line is the
         # save's UNAMBIGUOUS in-place-edit case, so the second save DROPS the
-        # foreign line and the region is no longer mixed. Do not collapse these
+        # foreign line and the region is not mixed. Do not collapse these
         # back to clock defaults; the sibling interleave test pins them for the
         # same reason.
         slot.append("user", "q1", ts="2020-01-01T00:00:00.000000+00:00")
@@ -2180,7 +2221,7 @@ class TestSlotDetailPagination:
     ):
         """An un-flushed row BEFORE a persisted one must still reach the response.
 
-        The id walk used to record a prefix boundary: on a match it set
+        Recording a prefix boundary on the id walk would fail here: on a match it set
         ``start = i + 1``, and a miss simply did not advance. So an un-flushed row
         followed by a matching row had the boundary moved PAST it, and the bounded
         response omitted it entirely — a drop, not a duplicate.
@@ -2581,7 +2622,7 @@ class TestHistoryPersistence:
 
 
 class TestSaveDoesNotResurrectDeletedSession:
-    """#6677: a save must not recreate a session whose permanent delete committed.
+    """A save must not recreate a session whose permanent delete committed.
 
     ``delete_session`` unlinks under the same ``_locked`` region the save
     holds, leaves no tombstone, and reports success. A save routed through
@@ -2959,7 +3000,7 @@ class TestSaveDoesNotResurrectDeletedSession:
     async def test_fork_aborts_when_the_source_was_deleted(self, tmp_path, monkeypatch):
         """A fork must not republish a permanently deleted conversation.
 
-        The fork's pre-copy flush runs with ``best_effort=False`` and used to
+        The fork's pre-copy flush runs with ``best_effort=False`` and must not
         treat any non-raising return as a confirmed durable write. A delete-won
         skip raises nothing, and the fork's DESTINATION slot is brand new — it
         carries no delete evidence, so its save would proceed and the destroyed
@@ -3076,7 +3117,7 @@ class TestSaveDoesNotResurrectDeletedSession:
     ):
         """The probe is lock-free, so a delete can land in the middle of it.
 
-        ``get_metadata_status`` reports a file that no longer exists as
+        ``get_metadata_status`` reports a file that does not exist as
         ``({}, True)`` -- by its own contract a GENUINE empty answer, not an
         unreadable one. So a delete committing between the probe's ``stat`` and
         its metadata read leaves an empty ``created_at`` that must not be read
@@ -3622,14 +3663,94 @@ class TestPrepareMessages:
 
 class TestKiroReadinessQueueHandoff:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("wait_end", ["stop", "deadline"])
+    async def test_memory_preparation_wait_precedes_turn_identity_and_survives_stop(
+        self, tmp_path, monkeypatch, wait_end
+    ):
+        """A transient startup fence delays a turn without becoming its failure."""
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        release = asyncio.Event()
+
+        async def prepare_memory():
+            await release.wait()
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        state.push_slots_update = MagicMock()
+        state.push_refresh = MagicMock()
+        state.refresh_slot_source_status = MagicMock()
+        state.context_builder = None
+        state.consolidator = None
+        state._hook_store = None
+        state._yolo = False
+
+        async def stream(_message):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="ready")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        client = MagicMock()
+        client.stream = stream
+        client.stream_command = stream
+        client.context_usage_pct = MagicMock(return_value=1.0)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions.record_failure = AsyncMock()
+        state.conversation_log = MagicMock()
+        state.conversation_log.read_messages.return_value = []
+        if wait_end == "deadline":
+            monkeypatch.setattr("kiro_crew.memory_startup.MEMORY_ADMISSION_WAIT_SECONDS", 0.0)
+        state.memory_startup_task = asyncio.create_task(prepare_memory())
+        slot = state.get_or_create_slot("memory-startup-admission")
+        slot.queue_append("keep queued during startup")
+        turn = asyncio.create_task(_run_chat(state, slot, "first message"))
+        slot.task = turn
+        try:
+            await asyncio.sleep(0)
+            assert slot._active_turn_session_key == ""
+            state.sessions.get_or_create.assert_not_awaited()
+
+            if wait_end == "stop":
+                turn.cancel()
+            await turn
+            assert not state.memory_startup_task.cancelled()
+            assert not state.memory_startup_task.done()
+            assert slot.task is None
+            assert slot.messages[-1]["role"] == "done"
+            assert [item["content"] for item in slot._queue] == ["keep queued during startup"]
+            assert any(call.args[0] == "chat_done" for call in state.broadcast_ws.call_args_list)
+            assert slot._active_turn_session_key == ""
+            state.sessions.get_or_create.assert_not_awaited()
+            state.sessions.record_failure.assert_not_awaited()
+            state.conversation_log.update_metadata.assert_not_called()
+            if wait_end == "deadline":
+                error = next(message for message in slot.messages if message["role"] == "error")
+                assert error["meta"]["code"] == "memory_unavailable"
+                assert "Retry shortly" in error["content"]
+
+            slot._queue.clear()
+            release.set()
+            await state.memory_startup_task
+            await _run_chat(state, slot, "retry after preparation")
+            state.sessions.get_or_create.assert_awaited_once()
+            state.sessions.record_failure.assert_not_awaited()
+            assert any(
+                message.get("role") == "assistant" and message.get("content") == "ready"
+                for message in slot.messages
+            )
+        finally:
+            release.set()
+            await state.memory_startup_task
+
+    @pytest.mark.asyncio
     async def test_dequeued_turn_runs_without_a_readiness_probe(
         self,
         tmp_path,
     ):
         """A queued item is never lost to a readiness check.
 
-        Readiness used to be probed on turn entry AND again before dequeueing,
-        so a third false answer could drop an item already popped off the queue.
+        Probing readiness on turn entry AND again before dequeueing would let
+        a third false answer drop an item already popped off the queue.
         Both probes are gone — readiness is latched at boot and the ACP attempt
         reports auth failures — so the successor turn simply runs. This pins the
         no-loss invariant that outlives the probes.
@@ -4117,9 +4238,7 @@ class TestInMemoryAuthority:
         rapid appends with an IDENTICAL ``datetime.now().isoformat()``. The
         append-safe save must still match each on-disk window-region line to its
         own window entry one-for-one — never mis-classifying a real window line
-        as a phantom "foreign append" and duplicating it. Regression for the
-        Windows ``Backend Tests`` failure in
-        ``test_append_only_preserves_full_disk_history``.
+        as a phantom "foreign append" and duplicating it.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         # Freeze history.py's clock so every on-disk append shares ONE ts,
@@ -4167,7 +4286,7 @@ class TestInMemoryAuthority:
 
     def test_append_only_colliding_ts_edit_preserves_foreign(self, tmp_path, monkeypatch):
         """Colliding ts + in-place edit + foreign append must NOT drop the
-        foreign line (regression for GPT 5.6 HIGH on the count-bounded matcher).
+        foreign line.
 
         The on-disk window region holds, sharing ONE coarse-clock ts: unchanged
         ``A``, an acknowledged cross-process foreign append ``X``, and the
@@ -5442,7 +5561,7 @@ class TestRunChatSegmentFlush:
     async def test_idle_turn_boundary_refreshes_source_status(self, tmp_path, monkeypatch):
         """Reaching idle at a turn boundary must re-read the slot's PR/MR status.
 
-        Regression for the production wiring: `_run_chat`'s idle branch calls
+        This pins the production wiring: `_run_chat`'s idle branch calls
         `state.refresh_slot_source_status(slot.key)` so the sidebar chips and the
         detail panel re-read after a turn that may have opened/pushed/merged a
         PR. The state-level tests exercise `refresh_slot_source_status` directly
@@ -5594,6 +5713,111 @@ class TestRunChatSegmentFlush:
         for i in range(1, len(seq_values)):
             assert seq_values[i] > seq_values[i - 1], f"seq not monotonic: {seq_values}"
         assert "".join(contents) == "abcd", f"content lost in stream buffer: {contents}"
+
+    @pytest.mark.asyncio
+    async def test_chunk_seq_continues_across_turns(self, tmp_path, monkeypatch):
+        """The seq counter is the SLOT's, not the turn's: the second turn's first
+        chunk is numbered above the first turn's last. A client's replay floor
+        (the newest seq its transcript holds) then orders every later chunk above
+        it, whether or not the client saw the turn boundary -- a snapshot or a
+        `_done` lost to a reconnect cannot make the next turn's chunks read as
+        replays of the finished one."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        from kiro_crew.dashboard.chat import _run_chat
+
+        def seqs() -> list[int]:
+            return [
+                c.args[1]["seq"]
+                for c in state.broadcast_ws.call_args_list
+                if c.args[0] == "chat_chunk"
+            ]
+
+        client = self._make_mock_client(
+            [LLMEvent(kind=EVENT_TEXT_CHUNK, text="one"), LLMEvent(kind=EVENT_COMPLETE)]
+        )
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        await _run_chat(state, slot, "first")
+        first_turn = seqs()
+        assert first_turn, "no chat_chunk broadcasts in the first turn"
+
+        client = self._make_mock_client(
+            [LLMEvent(kind=EVENT_TEXT_CHUNK, text="two"), LLMEvent(kind=EVENT_COMPLETE)]
+        )
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        await _run_chat(state, slot, "second")
+        second_turn = seqs()[len(first_turn) :]
+        assert second_turn, "no chat_chunk broadcasts in the second turn"
+        assert second_turn[0] > first_turn[-1], (first_turn, second_turn)
+        # Every frame names the process generation that numbered it, so a client
+        # can drop a floor from before a gateway restart instead of comparing.
+        from kiro_crew.dashboard.chat_utils import chunk_generation
+
+        gens = {
+            c.args[1].get("gen")
+            for c in state.broadcast_ws.call_args_list
+            if c.args[0] == "chat_chunk"
+        }
+        assert gens == {chunk_generation()}
+
+    @pytest.mark.asyncio
+    async def test_window_chunk_rows_carry_the_wire_seq(self, tmp_path, monkeypatch):
+        """Each window ``chunk`` row is stamped with its wire frame's ``seq``.
+
+        A slot snapshot taken mid-stream folds those rows into one ``streaming``
+        row carrying the newest seq (chat_utils), which the client seeds its
+        replay guard from; a row without the stamp would leave the snapshot
+        unable to say how far the stream it holds has advanced.
+        """
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            LLMEvent,
+        )
+
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="a"),
+            LLMEvent(kind=EVENT_TOOL_CALL, title="read_file", tool_kind="read"),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="b"),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        # Wrapped on the CLASS: `_ChatSlot` is slotted, and the window list is
+        # rebuilt at the segment flush (chunk rows are dropped from it), so
+        # neither an instance patch nor reading `slot.messages` afterwards sees
+        # every chunk row the runner appended.
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        appended: list[dict] = []
+        real_append = _ChatSlot.append
+
+        def recording_append(self_slot, role, content, cls="", *args, **kwargs):
+            row = real_append(self_slot, role, content, cls, *args, **kwargs)
+            if role == "chunk":
+                appended.append(row)
+            return row
+
+        monkeypatch.setattr(_ChatSlot, "append", recording_append)
+
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        wire = [
+            (c.args[1]["seq"], c.args[1]["content"])
+            for c in state.broadcast_ws.call_args_list
+            if c.args[0] == "chat_chunk"
+        ]
+        assert wire, "no chat_chunk broadcasts"
+        assert [(r["seq"], r["content"]) for r in appended] == wire
 
 
 class TestRunChatNativeSubagentAttribution:
@@ -5762,8 +5986,8 @@ class TestRunChatCompactDeferredWait:
 
     @pytest.mark.asyncio
     async def test_claude_backend_skips_wait_for_compaction(self, tmp_path, monkeypatch):
-        """When ``is_claude_backend(client)`` is True, the dashboard must
-        report success immediately and never call ``wait_for_compaction``."""
+        """When the backend compacts INLINE, the dashboard must report success
+        immediately and never call ``wait_for_compaction``."""
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
 
         events = [LLMEvent(kind=EVENT_COMPLETE)]
@@ -5772,11 +5996,12 @@ class TestRunChatCompactDeferredWait:
         slot = state.get_or_create_slot("s1")
 
         client = self._make_mock_client(events)
+        # The claude backend finishes compaction inside the prompt turn, so the
+        # double carries that backend's capability record. Set on the client, not
+        # patched at module scope: ``capabilities_of`` serves three call sites in
+        # ``_run_chat`` and patching it would answer for all three.
+        client.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        # Patch the binding chat_runner imported at module load.
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: True
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5795,7 +6020,7 @@ class TestRunChatCompactDeferredWait:
         # The appended row carries a minted ``meta.mid``: the live copy is
         # delivered through append's own identity-carrying door (_on_message),
         # so no hand-built duplicate ``chat_message`` frame may fire — a
-        # mid-less manual frame rendered the notice twice (#5981 family).
+        # mid-less manual frame rendered the notice twice.
         assert all(m.get("meta", {}).get("mid") for m in compaction_msgs)
         assistant_broadcasts = [
             c
@@ -5825,10 +6050,8 @@ class TestRunChatCompactDeferredWait:
         # (AcpPromptStats.reset_after_compaction) — model that so the
         # end-of-turn payload broadcast reflects the post-compaction state.
         client.context_usage_pct = MagicMock(return_value=0.0)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5870,10 +6093,8 @@ class TestRunChatCompactDeferredWait:
         client.context_usage_pct = MagicMock(return_value=5.0)
         client.context_window_tokens = MagicMock(return_value=1_000_000)
         client.context_used_tokens = MagicMock(return_value=50_000)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5909,10 +6130,8 @@ class TestRunChatCompactDeferredWait:
         client.wait_for_compaction = AsyncMock(return_value={"type": "failed"})
         client.context_window_tokens = MagicMock(return_value=200_000)
         client.context_used_tokens = MagicMock(return_value=150_000)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5956,10 +6175,8 @@ class TestRunChatCompactDeferredWait:
         client.wait_for_compaction = AsyncMock(return_value=result)
         client.context_window_tokens = MagicMock(return_value=200_000)
         client.context_used_tokens = MagicMock(return_value=150_000)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6327,25 +6544,23 @@ class TestTokenPersistenceBackfill:
         # 'opus-4.8-1m'. Under the acp label the backfill (correctly) leaves a
         # kiro/acp model unchanged.
         #
-        # The provider is now resolved from the LIVE CLIENT via is_claude_backend,
-        # not from cfg.agent.provider: that field is declared enum=["acp"] and
-        # validate_config_data deletes an out-of-enum value, so no real config can
-        # ever say "claude_code" and this branch was unreachable in production
-        # while the test mocked it green. The client here is a bare AsyncMock, so
-        # the predicate is patched at the seam instead -- a real CC session's
-        # client answers True.
+        # The provider label is resolved from the LIVE CLIENT's
+        # ``SessionCapabilities.provider_seam``, not from cfg.agent.provider: that
+        # field is declared enum=["acp"] and validate_config_data deletes an
+        # out-of-enum value, so no real config can ever say "claude_code" and this
+        # branch was unreachable in production while the test mocked it green. The
+        # client here is a bare AsyncMock, so it is given the claude backend's
+        # record below -- a real CC session's client resolves the same one.
         _cc_cfg = MagicMock()
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _client: True
-        )
 
         # Build a mock whose inner._model starts EMPTY so the early backfill
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
         # blank. Then mutate inner._model mid-stream — just before yielding
         # EVENT_COMPLETE — so only the late backfill branch can populate it.
         client = AsyncMock()
+        client.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at session-create time
@@ -6552,7 +6767,7 @@ class TestCostOnlyTurnPersistGate:
     A claude-seam turn ending via a synthetic EVENT_COMPLETE (timeout,
     tool-stall, cancel-unacked) can carry cost with zero tokens and zero
     credits; the footer already reads ``_u.cost_usd`` off the same event, so
-    only the gate stood between the cost and the usage store (#6758).
+    only the gate stood between the cost and the usage store.
     """
 
     @pytest.mark.asyncio
@@ -6726,14 +6941,19 @@ class TestPinnedModelWithheld:
     downgrade (chip read ``claude-opus-5``; every turn ran on auto). The runner
     reports the dead pin using the same predicate the withhold uses, and carries
     the verdict in the slots payload so the frontend reads it instead of
-    inferring it from picker-list membership (#1819).
+    inferring it from picker-list membership.
     """
 
     @staticmethod
     def _client(advertised, *, claude_backend=False):
         client = MagicMock()
         client.available_models = MagicMock(return_value=[{"modelId": m} for m in advertised])
-        client.is_claude_backend = claude_backend
+        # The verdict is skipped for a backend that resolves its wire id from its
+        # OWN advertised list, so the double carries that backend's record rather
+        # than an identity flag.
+        client.capabilities = capabilities_for(
+            ACP_BACKEND_CLAUDE if claude_backend else ACP_BACKEND_KIRO
+        )
         return client
 
     def test_pin_absent_from_advertised_is_withheld(self):
@@ -6782,21 +7002,21 @@ class TestPinnedModelWithheld:
 
         client = MagicMock()
         del client.available_models
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         assert _pinned_model_verdict(client, "claude-opus-5", "acp") is None
 
     def test_getter_raising_keeps_the_pin(self):
         from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
 
         client = MagicMock()
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(side_effect=RuntimeError("boom"))
         assert _pinned_model_verdict(client, "claude-opus-5", "acp") is None
 
     def test_namespaced_pin_matches_bare_advertised(self):
         from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
 
-        # Regression #8521: a persisted pin can carry a `<namespace>::<bare-id>`
+        # A persisted pin can carry a `<namespace>::<bare-id>`
         # qualifier from the catalog that advertised it when it was stored,
         # while the session being judged advertises the BARE id. The literal
         # comparison missed for every such pin and the banner claimed a fully
@@ -6860,6 +7080,24 @@ class TestPinnedModelWithheld:
         slot.record_model_withheld(False)
         assert slot.to_dict()["model_withheld"] is False
 
+    def test_served_model_is_unknown_until_a_session_reports_one(self):
+        slot = _ChatSlot("s1")
+        # Nothing has run, so nothing can name the model a turn would use. The
+        # frontend keeps showing `auto` on this.
+        assert slot.to_dict()["served_model"] == ""
+
+    def test_served_model_is_carried_and_forgotten_with_the_session(self):
+        """It describes the SESSION, so a teardown drops it.
+
+        Unlike the withhold verdict it is not pinned to `slot.model`: an
+        inheriting slot has no pin to pin it to.
+        """
+        slot = _ChatSlot("s1")
+        slot.record_served_model("gpt-5.6-sol")
+        assert slot.to_dict()["served_model"] == "gpt-5.6-sol"
+        slot.record_served_model(None)
+        assert slot.to_dict()["served_model"] == ""
+
     def test_verdict_is_reported_only_for_the_model_it_was_computed_for(self):
         """Re-pinning must invalidate the verdict without anyone remembering to.
 
@@ -6919,9 +7157,10 @@ class TestPinnedModelWithheld:
                 # returns False when a turn is in flight), so the trailing half is
                 # the wider one.
                 window = "\n".join(lines[max(0, i - 12) : i + 23])
-                assert "record_model_withheld(None)" in window, (
+                assert "forget_session_model_state()" in window, (
                     f"{module.__name__}:{i + 1} replaces the session the withhold "
-                    f"verdict describes without dropping it -> {lines[i].strip()}"
+                    f"verdict and served model describe without dropping them -> "
+                    f"{lines[i].strip()}"
                 )
 
     @pytest.mark.asyncio
@@ -7006,7 +7245,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The live session advertises the free tier only.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-sonnet-5"}]
@@ -7063,9 +7302,66 @@ class TestPinnedModelWithheld:
         ), f"expected a persisted notice naming the withheld model, got {notices}"
         # And the verdict is CARRIED, not left for the frontend to re-derive: the
         # slots payload states it, so the chip does not have to read "absent from
-        # GET /api/models" as "not entitled" (#1819).
+        # GET /api/models" as "not entitled".
         assert slot.model_withheld is True
         assert slot.to_dict()["model_withheld"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_chat_records_the_served_model_of_an_unpinned_slot(
+        self, tmp_path, monkeypatch
+    ):
+        """The inheriting slot is the one whose chip has nothing else to name.
+
+        `slot.model == ""` takes the backfill branch (which keeps the slot
+        unpinned on purpose), so the served model must be recorded OUTSIDE the
+        pinned-verdict branch. And it must be read through the provider's public
+        `served_model` accessor: `client` is the AcpProvider wrapper, which has
+        no `_resolved_model_id` — a private-field read would store `""` forever
+        and the chip would keep saying `auto`.
+        """
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        events = [LLMEvent(kind=EVENT_COMPLETE, usage=TurnUsage(input_tokens=3, output_tokens=4))]
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.model = ""  # inheriting: no pin
+
+        client = AsyncMock()
+        client.context_usage_pct = MagicMock(return_value=10.0)
+        client.is_claude_backend = False
+        client.available_models = MagicMock(
+            return_value=[{"modelId": "auto"}, {"modelId": "gpt-5.6-sol"}]
+        )
+        # The wrapper's public accessor is the ONLY thing that names the served
+        # model; the ACP-private field is not on this shape.
+        client.served_model = "gpt-5.6-sol"
+        del client._resolved_model_id
+        inner = MagicMock()
+        inner._model = ""  # the session still inherits; only the wire was fixed
+        client.client = inner
+
+        async def _stream(msg):
+            del msg
+            for ev in events:
+                yield ev
+
+        client.stream = _stream
+        client.stream_command = _stream
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        async def _fake_persist(k, m, e, provider="", **kwargs):
+            del k, m, e, provider, kwargs
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.persist_token_record_async", _fake_persist
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        assert slot.model == "", "an inheriting slot must stay unpinned"
+        assert slot.to_dict()["served_model"] == "gpt-5.6-sol"
 
     @pytest.mark.asyncio
     async def test_run_chat_records_an_entitled_pin_as_not_withheld(self, tmp_path, monkeypatch):
@@ -7091,7 +7387,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The session serves the replacement the pin normalizes to.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-opus-4.6"}]
@@ -7149,7 +7445,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[])  # advertises nothing
         inner = MagicMock()
         inner._model = ""
@@ -7222,7 +7518,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
         inner = MagicMock()
         inner._model = ""
@@ -7266,7 +7562,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # This account CAN run the pin, so nothing is withheld.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-opus-5"}]
@@ -7321,7 +7617,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
         inner = MagicMock()
         inner._model = ""
@@ -7378,7 +7674,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-sonnet-5"}]
         )
@@ -7532,7 +7828,7 @@ class TestRuntimeWiring:
 
         The handler logs and proceeds when resolve_agent_bindings raises, and
         slot.workspace keeps its previous value — so the response must name
-        THAT value. Since #5120 the acting tab writes the response's workspace
+        THAT value. The acting tab writes the response's workspace
         into its store optimistically; a fabricated 'default' would pin the
         chip to a workspace the slot does not hold, and with the websocket
         down (the optimistic write's whole premise) nothing corrects it.
@@ -7567,7 +7863,7 @@ class TestRuntimeWiring:
         """A throwing teardown reports SUCCESS with a warning; the agent stays.
 
         The reset pops the session before its shutdown can fail, so by the
-        failure point the old binding's session no longer exists — every
+        failure point the old binding's session does not exist — every
         future or replacement session cold-starts on the NEW agent. The
         switch therefore succeeded: answering 500 would make the acting
         tab's performSlotSwitch keep the OLD store value for a switch that
@@ -8048,7 +8344,7 @@ class TestRuntimeWiring:
         kiro-cli resolves --agent against $PWD/.kiro/agents, so clobbering the
         project here makes the just-selected agent unresolvable on the next
         turn: the slot advertises it while the default answers — the
-        silent-substitution bug #1684 exists to remove.
+        silent-substitution bug this exists to remove.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -8227,7 +8523,10 @@ class TestRuntimeWiring:
         assert state.get_or_create_slot("ws-default").mode == ""
 
     @pytest.mark.asyncio
-    async def test_run_chat_passes_memory_store_to_build_message(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("binding_change", ["none", "project", "replacement", "unavailable"])
+    async def test_run_chat_passes_memory_store_to_build_message(
+        self, tmp_path, monkeypatch, binding_change
+    ):
         """_run_chat resolves agent bindings and passes memory_store to build_message.
 
         Requirements: 3.1
@@ -8241,14 +8540,25 @@ class TestRuntimeWiring:
             build_message_calls.append({"text": text, "session_key": session_key, "kwargs": kwargs})
             return text, MagicMock(action=None, text="")
 
-        # Mock config loading
-        mock_cfg = MagicMock()
-        mock_cfg.agents = {"oncall": MagicMock(workspace="oncall-ws", memory_store="oncall-mem")}
-        mock_cfg.default_agent = "default"
+        from kiro_crew.config.loader import (
+            KiroCrewAgentConfig,
+            KiroCrewConfig,
+            WorkspaceConfig,
+            resolve_agent_bindings,
+        )
+        from kiro_crew.memory_stores import provision_member_memory
 
-        mock_bindings = MagicMock()
-        mock_bindings.memory_store_name = "oncall-mem"
-        mock_bindings.model = ""
+        mock_cfg = KiroCrewConfig.load()
+        mock_cfg.agents["oncall"] = KiroCrewAgentConfig(
+            kiro_agent="kirocrew", workspace="oncall-ws"
+        )
+        mock_cfg.workspaces["oncall-ws"] = WorkspaceConfig(dir=str(tmp_path / "oncall-ws"))
+        private_store = provision_member_memory(mock_cfg, "oncall")
+        mock_cfg.save()
+        mock_bindings = resolve_agent_bindings(mock_cfg, "oncall")
+        # The provider and context are doubles; model a supported runtime while
+        # keeping member ownership and persisted conversation metadata real.
+        patch_private_memory_supported(monkeypatch)
 
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
         monkeypatch.setattr(
@@ -8273,11 +8583,18 @@ class TestRuntimeWiring:
         monkeypatch.setattr(
             ctx_builder, "build_message", lambda *a, **kw: mock_build_message(ctx_builder, *a, **kw)
         )
+        monkeypatch.setattr(ctx_builder, "ensure_store", AsyncMock(return_value=object()))
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._maybe_auto_title", AsyncMock())
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.generate_session_summary", AsyncMock())
 
         state = _make_state(tmp_path, context_builder=ctx_builder)
 
         # Create a slot with retained history, then verify a cold start replays it.
         slot = state.get_or_create_slot("mem-test", agent="oncall")
+        if binding_change == "none":
+            from kiro_crew.member_memory_auth import bind_private_session_store
+
+            await asyncio.to_thread(bind_private_session_store, "dashboard:mem-test", private_store)
         conversation_log = ConversationLog(base_dir=tmp_path / "sessions")
         conversation_log.init()
         await asyncio.to_thread(
@@ -8299,21 +8616,71 @@ class TestRuntimeWiring:
         slot.append("user", "test message", "msg msg-u")
 
         # Mock session manager to return a mock client
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
         mock_client = MagicMock()
-        mock_client.stream = MagicMock(return_value=AsyncIterator([]))
+        mock_client.stream = MagicMock(
+            return_value=AsyncIterator(
+                [LLMEvent(kind=EVENT_TEXT_CHUNK, text="done"), LLMEvent(kind=EVENT_COMPLETE)]
+            )
+        )
         state.sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
         state.sessions.get_pid = MagicMock(return_value=None)
         state.sessions.consume_replay_suppression = MagicMock(return_value=False)
+        state.sessions.record_failure = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        binding_reads = []
+
+        def checked_bindings(cfg, name, project_dir=None):
+            from kiro_crew.memory_stores import UnknownMemoryStore
+
+            with pytest.raises(RuntimeError, match="no running event loop"):
+                asyncio.get_running_loop()
+            binding_reads.append((name, project_dir))
+            if binding_change == "unavailable":
+                raise UnknownMemoryStore("member identity offline")
+            resolved = resolve_agent_bindings(cfg, name, project_dir)
+            if binding_change == "project":
+                loop.call_soon_threadsafe(setattr, slot, "project", str(tmp_path / "new-project"))
+            elif binding_change == "replacement":
+                loop.call_soon_threadsafe(state._slots.__setitem__, slot.key, _ChatSlot(slot.key))
+            return resolved
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.resolve_agent_bindings", checked_bindings
+        )
 
         # Import and run _run_chat
         from kiro_crew.dashboard.chat import _run_chat
 
         await _run_chat(state, slot, "test message")
+        await asyncio.gather(*state._background_tasks)
+
+        assert len(binding_reads) == 1
+        assert binding_reads[0][0] == "oncall"
+        if binding_change != "none":
+            from kiro_crew.member_memory_auth import read_private_session_store
+
+            state.sessions.get_or_create.assert_not_awaited()
+            state.sessions.record_failure.assert_awaited_once_with("dashboard:mem-test")
+            assert build_message_calls == []
+            assert read_private_session_store("dashboard:mem-test") is None
+            assert any(
+                message.get("role") == "error"
+                and message.get("meta", {}).get("code") == "memory_unavailable"
+                for message in slot.messages
+            )
+            return
 
         # Verify build_message was called with memory_store
+        state.sessions.record_failure.assert_not_awaited()
         assert len(build_message_calls) == 1
-        assert build_message_calls[0]["kwargs"].get("memory_store") == "oncall-mem"
+        assert build_message_calls[0]["kwargs"].get("memory_store") == private_store
         assert build_message_calls[0]["session_key"] == "dashboard:mem-test"
+        metadata = conversation_log.get_metadata("dashboard:mem-test")
+        assert metadata["memory_store"] == private_store
+        assert metadata["agent"] == "oncall"
         replay = build_message_calls[0]["kwargs"].get("compressed_history")
         assert "frozen retained question" in replay
         assert "frozen retained answer" in replay
@@ -9984,13 +10351,53 @@ class TestApiChatAgentPassing:
 class TestApiChatSendReceiptMid:
     """The immediate-dispatch receipt carries the user row's server-minted `mid`.
 
-    The dashboard renders the user turn optimistically and no `chat_message`
-    user echo is broadcast for a dashboard send (`append` defaults
-    `broadcast_user=False`), so the send receipt is the only channel that can
-    hand the client the row's stable id before the chat_done refresh. The
-    message-pin control is gated on `meta.mid`, so a missing id keeps the
-    just-sent message unpinnable for the whole turn.
+    Correlated dashboard sends also echo the row before their reply starts.
+    The receipt and echo must agree on identity regardless of arrival order.
     """
+
+    @pytest.mark.asyncio
+    async def test_idle_steer_echoes_user_before_the_reply(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("echo-slot")
+        echoed: list[dict] = []
+        broadcast_ws = state.broadcast_ws
+
+        def record_echo(kind, data):
+            if kind == "chat_message":
+                echoed.append(data)
+            broadcast_ws(kind, data)
+
+        monkeypatch.setattr(state, "broadcast_ws", record_echo)
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            # The frontend can see this turn's first chunk before the HTTP
+            # receipt. Its user row must already be on the ordered event stream.
+            assert [(row["slot"], row["role"]) for row in echoed] == [("echo-slot", "user")]
+            sl.append("assistant", "reply")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat?ws=1",
+                json={
+                    "message": "pasted\ttable\r\n1\t42",
+                    "slot": "echo-slot",
+                    "steer": True,
+                    "meta": {"sendId": "s-echo", "pastes": [{"seq": 1, "content": "table"}]},
+                },
+            )
+            assert resp.status == 200
+            receipt = await resp.json()
+            await slot.task
+
+        assert len(echoed) == 1
+        assert [row["role"] for row in slot.messages] == ["user", "assistant"]
+        user = echoed[0]
+        assert user["content"] == "pasted\ttable\r\n1\t42"
+        assert user["meta"]["sendId"] == "s-echo"
+        assert user["meta"]["mid"] == receipt["mid"]
+        assert user["meta"]["pastes"][0]["content"] == "table"
 
     @pytest.mark.asyncio
     async def test_immediate_dispatch_receipt_carries_the_user_row_mid(self, tmp_path, monkeypatch):
@@ -10815,7 +11222,7 @@ class TestPythonStageLoop:
 
     @pytest.mark.asyncio
     async def test_deleted_slot_skips_handoff(self, tmp_path, monkeypatch):
-        """If the slot was deleted mid-plan (no longer registered), the finally
+        """If the slot was deleted mid-plan (not registered), the finally
         must NOT launch its held queue on the torn-down slot."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
@@ -10900,7 +11307,7 @@ class TestPythonStageLoop:
     async def test_queued_receipt_carries_the_entry_queue_id(self, tmp_path, monkeypatch):
         """The `queued: true` receipt names the entry it created: `queue_id`
         must equal the queue entry's id, because the sender binds its pre-send
-        composer state to that id for the cancel-queued restore (#560) — a
+        composer state to that id for the cancel-queued restore — a
         content-based key cannot do this (serialization is not injective and
         other tabs can queue colliding content)."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -12032,7 +12439,7 @@ class TestFolderCRUD:
             )
 
             async def _both_queued() -> None:
-                # _folders_lock is a LoopBoundLock (#4800); the waiter queue
+                # _folders_lock is a LoopBoundLock; the waiter queue
                 # lives on this loop's inner asyncio.Lock.
                 inner = state._folders_lock._bound()
                 while len(getattr(inner, "_waiters", None) or ()) < 2:
@@ -12117,7 +12524,7 @@ class TestFolderCRUD:
     ):
         """A PATCH mixing a VALID field (name) with an INVALID one (bad parent_id)
         must be all-or-nothing: the 400 rejection must NOT persist the name change
-        (validate-all-before-mutate). Regression for the partial-mutation bug."""
+        (validate-all-before-mutate)."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
         app = _make_folder_app(state)
@@ -12659,7 +13066,7 @@ class TestFolderCRUD:
 
 class TestFolderTags:
     """Folder `tags` — vocabulary-constrained list persisted on create/update,
-    and stripped from folders when a tag is deleted (issue #5419)."""
+    and stripped from folders when a tag is deleted."""
 
     @staticmethod
     def _seed_vocabulary(state, tag_ids):
@@ -13019,7 +13426,7 @@ class TestFolderAssignmentPersistence:
         # A genuinely resumed slot's file exists on disk (the restore read it).
         # Persist first so the fixture matches reality — a slot claiming
         # on-disk history whose file is missing is the delete-won state the
-        # save now refuses to recreate (#6677).
+        # save now refuses to recreate.
         from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 
         _save_slot_to_history(state, slot, force=True)
@@ -13059,7 +13466,7 @@ class TestFolderAssignmentPersistence:
         slot.drain()
         # Persist first: a resumed slot's file exists on disk (see the folder
         # regression above — the missing-file variant is the delete-won state
-        # the save refuses to recreate, #6677).
+        # the save refuses to recreate).
         from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 
         _save_slot_to_history(state, slot, force=True)
@@ -13093,7 +13500,7 @@ class TestFolderAssignmentPersistence:
         slot.drain()
         # Persist first: a genuinely resumed slot's file exists on disk. (The
         # missing-file variant is the delete-won state the save refuses to
-        # recreate, #6677.)
+        # recreate.)
         _save_slot_to_history(state, slot, force=True)
         path = tmp_path / "dashboard_forceslot.jsonl"
         assert path.exists()
@@ -13705,6 +14112,42 @@ class TestForkSlot:
         assert len(visible) == 4
 
     @pytest.mark.asyncio
+    async def test_fork_inherits_tags_under_a_fresh_revision(self, tmp_path, monkeypatch):
+        """The fork is constructed with an empty tag list under its birth
+        revision, then inherits the parent's tags. Those two states must never
+        share a `tags_revision`: a slot fetch racing the fork could snapshot the
+        empty newborn, and a client seeing that frame under the same revision as
+        the inherited list would take it as the next toggle base and erase the
+        inherited tags on its first write."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src")
+        slot.tags = ["tag-a", "tag-b"]
+        slot.append("user", "hello", "msg msg-u")
+        slot.drain()
+        birth_revisions: list[str] = []
+        original_init = _ChatSlot.__init__
+
+        def _recording_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            birth_revisions.append(self.tags_revision)
+
+        monkeypatch.setattr(_ChatSlot, "__init__", _recording_init)
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            assert resp.status == 200
+            data = await resp.json()
+
+        new_slot = state._slots.get(data["key"])
+        assert new_slot.tags == ["tag-a", "tag-b"]
+        assert new_slot.tags is not slot.tags
+        assert new_slot.tags_revision not in birth_revisions
+        assert new_slot.tags_revision > max(birth_revisions)
+
+    @pytest.mark.asyncio
     async def test_fork_at_message_id(self, tmp_path):
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src")
@@ -13808,8 +14251,8 @@ class TestForkSlot:
 
     @pytest.mark.asyncio
     async def test_fork_preserves_meta(self, tmp_path):
-        # Regression: chat_fork.py previously dropped the `meta` dict when copying
-        # messages into the new slot, silently breaking every meta-based feature
+        # chat_fork.py must preserve the `meta` dict when copying messages into
+        # the new slot; dropping it silently breaks every meta-based feature
         # (knowledge chips, paste refs, future inline-comment rewrite badges).
         # Fork must preserve meta verbatim on copied messages.
         state = _make_state(tmp_path)
@@ -13861,7 +14304,7 @@ class TestForkSlot:
     async def test_fork_handles_messages_without_meta(self, tmp_path):
         # The mirror of test_fork_preserves_meta: fork must not INVENT meta keys
         # the parent row did not have. Since `_ChatSlot.append` now stamps
-        # `meta.mid` on every row, "no meta at all" is no longer the observable
+        # `meta.mid` on every row, "no meta at all" is not the observable
         # invariant; the equivalent one is that the forked row's meta matches the
         # parent's exactly -- nothing added, nothing dropped.
         state = _make_state(tmp_path)
@@ -14287,19 +14730,67 @@ class TestForkSlot:
         assert "prompt_len=0" in kw["resources"]
 
     @pytest.mark.asyncio
-    async def test_fork_rejects_ephemeral_slot(self, tmp_path):
+    async def test_fork_of_incognito_parent_inherits_incognito(self, tmp_path):
+        """A restricted session forks; the child is born restricted.
+
+        A refusal would buy no privacy -- the parent's transcript is already on
+        disk for tab recovery -- and would only cost the user the conversation.
+        What must hold is that the child never LOOSENS the mode: it is registered
+        restricted at birth, so consolidation and lessons stay closed to the
+        copied content.
+        """
         state = _make_state(tmp_path)
-        slot = state.get_or_create_slot("src")
-        slot.memory_mode = "incognito"
+        slot = state.get_or_create_slot("src", memory_mode="incognito")
         slot.append("user", "secret", "msg msg-u")
+        slot.append("assistant", "kept between us", "msg msg-a")
         slot.drain()
 
         app = _make_app(state)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post("/api/chat/slots/src/fork", json={})
-            assert resp.status == 400
+            assert resp.status == 200
             data = await resp.json()
-            assert "persistent" in data["error"].lower()
+
+        assert data["ok"] is True
+        assert data["memory_mode"] == "incognito"
+        child = state._slots[data["key"]]
+        assert child.memory_mode == "incognito"
+        assert child.is_restricted is True
+        assert child.blocks_reads is False
+        assert f"dashboard:{data['key']}" in state._restricted_keys
+        assert [m["content"] for m in child.messages] == ["secret", "kept between us"]
+
+    @pytest.mark.asyncio
+    async def test_fork_of_temporary_parent_stays_temporary_with_its_history(self, tmp_path):
+        """Temporary blocks memory READS, not the session's own thread history.
+
+        ``build_session_context`` assembles the thread-history block from the
+        child's conversation log before any ``blocks_reads`` gate, so a temporary
+        fork still hands the copied turns to its fresh kiro-cli process -- the
+        fork is useful, and the child is as blank to memory as its parent.
+        """
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src", memory_mode="temporary")
+        slot.append("user", "parent question", "msg msg-u")
+        slot.append("assistant", "parent answer", "msg msg-a")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            assert resp.status == 200
+            data = await resp.json()
+
+        child = state._slots[data["key"]]
+        assert child.memory_mode == "temporary"
+        assert child.blocks_reads is True
+        assert f"dashboard:{data['key']}" in state._restricted_keys
+
+        from kiro_crew.dashboard.chat import _history_key_for
+
+        recent = state.conversation_log.recent(_history_key_for(data["key"]))
+        visible = [m["content"] for m in recent if m.get("role") in ("user", "assistant")]
+        assert visible == ["parent question", "parent answer"]
 
     @pytest.mark.asyncio
     async def test_fork_history_visible_to_new_kiro_via_context_builder(self, tmp_path):
@@ -14506,29 +14997,34 @@ class TestForkSlot:
             assert [m["content"] for m in visible] == ["q1", "a1", "q2", "a2"]
 
     @pytest.mark.asyncio
-    async def test_fork_audits_denied_on_ephemeral(self, tmp_path, monkeypatch):
-        """M-1 regression: ephemeral rejection must emit a denied SEL event."""
+    async def test_fork_audit_records_inherited_memory_mode(self, tmp_path, monkeypatch):
+        """The SEL event for a restricted fork is ``allowed`` and names the mode.
+
+        A restricted parent is not a denial ground, but the boundary the child
+        inherited must still be visible in the audit log.
+        """
         from unittest.mock import MagicMock
 
         mock_sel = MagicMock()
         monkeypatch.setattr("kiro_crew.dashboard.chat_fork.sel", lambda: mock_sel)
 
         state = _make_state(tmp_path)
-        slot = state.get_or_create_slot("src")
-        slot.memory_mode = "incognito"
+        slot = state.get_or_create_slot("src", memory_mode="incognito")
         slot.append("user", "hi", "msg msg-u")
         slot.drain()
 
         app = _make_app(state)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post("/api/chat/slots/src/fork", json={})
-            assert resp.status == 400
+            assert resp.status == 200
 
-        mock_sel.log_api_access.assert_called_once()
-        kw = mock_sel.log_api_access.call_args[1]
-        assert kw["operation"] == "chat.slot_fork"
-        assert kw["outcome"] == "denied"
-        assert "memory_mode=incognito" in kw["resources"]
+        calls = [c[1] for c in mock_sel.log_api_access.call_args_list]
+        assert calls, "fork emitted no SEL event"
+        assert all(kw["operation"] == "chat.slot_fork" for kw in calls)
+        assert not [kw for kw in calls if kw["outcome"] == "denied"]
+        allowed = [kw for kw in calls if kw["outcome"] == "allowed"]
+        assert len(allowed) == 1
+        assert "memory_mode=incognito" in allowed[0]["resources"]
 
     @pytest.mark.asyncio
     async def test_fork_app_isolation_rejects_cross_app(self, tmp_path, monkeypatch):
@@ -14630,7 +15126,7 @@ class TestForkSlot:
     async def test_fork_at_index_spans_chained_session_files(self, tmp_path):
         """Index space must match the frontend (chained), not the current file alone.
 
-        Regression for the slot detail endpoint returns
+        The slot detail endpoint returns
         ``read_messages_chained`` (all sibling session files sharing the
         slot's ``tab_id``), and the frontend builds its fork-button index
         against that list. Pre-fix, fork called ``read_messages`` and
@@ -14809,7 +15305,7 @@ class TestInstalledPackConsentInjection:
         assert self.PERSONA in result
 
     def test_stale_sha_not_injected(self):
-        # Reinstall rewrote persona.md; the stored hash no longer matches the
+        # Reinstall rewrote persona.md; the stored hash does not match the
         # on-disk text -> the new, never-consented persona must NOT be injected.
         from kiro_crew.dashboard.chat import _maybe_inject_persona
 
@@ -15577,7 +16073,7 @@ class TestStopDuringSessionPrep:
     so ``SessionManager.stop_turn`` answers ``"idle"`` and the stop resolves
     without cancelling anything. The dispatch gate in ``_run_chat`` is what
     honors that stop: it compares ``slot._stop_generation`` against the
-    turn-entry snapshot and refuses to open the turn (#5464 — [Stopped] card
+    turn-entry snapshot and refuses to open the turn ([Stopped] card
     shown while the response streams to completion).
     """
 
@@ -15846,7 +16342,7 @@ class TestAcpProcessDiedRecovery:
                 # A continuation, not the user's request: the turn had emitted, so
                 # this text is the runner's and must not mirror as user speech.
                 "payload": RecoveryPayload.CONTINUATION,
-                # Admission stamp (#5911): recovery requeues record the containment
+                # Admission stamp: recovery requeues record the containment
                 # that held at requeue so the drain can re-validate the retry.
                 "meta": slot._queue[0]["meta"],
             }
@@ -15896,7 +16392,7 @@ class TestAcpProcessDiedRecovery:
                 # A continuation, not the user's request: the turn had emitted, so
                 # this text is the runner's and must not mirror as user speech.
                 "payload": RecoveryPayload.CONTINUATION,
-                # Admission stamp (#5911): recovery requeues record the containment
+                # Admission stamp: recovery requeues record the containment
                 # that held at requeue so the drain can re-validate the retry.
                 "meta": slot._queue[0]["meta"],
             }
@@ -15942,7 +16438,7 @@ class TestAcpProcessDiedRecovery:
                 "content": _CONN_RECOVER_MSG,
                 "kind": SYNTHETIC_RECOVERY_KIND,
                 "payload": RecoveryPayload.CONTINUATION,
-                # Admission stamp (#5911): recovery requeues record the containment
+                # Admission stamp: recovery requeues record the containment
                 # that held at requeue so the drain can re-validate the retry.
                 "meta": slot._queue[0]["meta"],
             }
@@ -16261,8 +16757,8 @@ class TestAcpProcessDiedRecovery:
         """A pipe-death AcpError ('process exited') at _prompt_depth>0 must STILL reset
         the dead session and increment the pipe-death counter (mirrors AcpProcessDied /
         PromptBusyExhaustedError), and surface a 'Connection lost — please retry' card —
-        but NOT re-queue (re-queue is depth-0 only). Previously the whole reset/counter
-        block was gated on `_prompt_depth == 0`, so a depth>0 pipe-death fell through to
+        but NOT re-queue (re-queue is depth-0 only). Gating the whole reset/counter
+        block on `_prompt_depth == 0` makes a depth>0 pipe-death fall through to
         the generic else: no session reset (the next turn hit the dead process) and the
         failure never counted toward the exhaustion threshold."""
         from kiro_crew.acp.client import AcpError
@@ -16352,6 +16848,7 @@ class TestEmptyResponseRetry:
         calls = []
         callbacks = []
         directive_origins = []
+        directive_channel_origins = []
         on_consumed = MagicMock()
         orig = _ChatSlot.queue_insert
 
@@ -16359,6 +16856,7 @@ class TestEmptyResponseRetry:
             calls.append(a)
             callbacks.append(kw.get("on_consumed"))
             directive_origins.append(kw.get("directive_user_origin"))
+            directive_channel_origins.append(kw.get("directive_channel_origin"))
             return orig(self_slot, *a, **kw)
 
         with (
@@ -16381,6 +16879,7 @@ class TestEmptyResponseRetry:
                 slot,
                 "test message",
                 _directive_user_origin=True,
+                _directive_channel_origin=True,
                 _on_consumed=on_consumed,
             )
             background_tasks = list(state._background_tasks)
@@ -16394,6 +16893,7 @@ class TestEmptyResponseRetry:
         assert (0, "test message") in calls
         assert callbacks[0] is on_consumed
         assert directive_origins == [True]
+        assert directive_channel_origins == [True]
         assert [args.args for args in on_consumed.call_args_list] == [(True,), (False,)]
         # No notice card shown on first attempt — the empty is silently re-queued
         notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
@@ -16517,6 +17017,87 @@ class TestEmptyResponseRetry:
         assert slot._empty_response_retries == 0
 
     @pytest.mark.asyncio
+    async def test_productive_giveup_notice_does_not_claim_nothing_happened(
+        self, tmp_path: Path
+    ) -> None:
+        """A PRODUCTIVE turn reaching give-up (its one continuation also ended
+        without a closing reply) must not be described as "returned nothing":
+        the card is read by the model via the transcript, and telling it the
+        completed work produced no output invites a redo of side effects that
+        already landed. Same distinction the continue rung draws one rung up."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        slot._empty_response_retries = 2  # the single continuation is spent
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="tc-1", title="send_message")
+            yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", text="sent")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+        await _run_chat(state, slot, "test message")
+        await self._cancel_background_tasks(state)
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert notice_msgs, "give-up produced no notice card"
+        assert not any("returned nothing" in m.get("content", "") for m in notice_msgs), (
+            "the give-up card claims the turn produced nothing, but this turn "
+            "ran a tool whose side effects already landed"
+        )
+        assert any("without a closing reply" in m.get("content", "") for m in notice_msgs)
+        # The card reassures rather than inviting a redo: completed steps stay done.
+        assert any("will not re-run" in m.get("content", "") for m in notice_msgs)
+        # Terminal rung still resets the budget for the next genuine user turn.
+        assert slot._empty_response_retries == 0
+
+    @pytest.mark.asyncio
+    async def test_giveup_without_recoveries_drops_retry_claim(self, tmp_path: Path) -> None:
+        """A give-up reached with the recovery counter still at zero (here: a
+        nested depth>0 turn) must not assert that a retry and an auto-continue
+        ran — neither did. The counter is the evidence, not the rung."""
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        self._make_empty_stream(client)
+
+        await _run_chat(state, slot, "test message", _prompt_depth=1)
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
+        assert not any("retried" in m.get("content", "") for m in notice_msgs), (
+            "the give-up card claims a retry ran, but slot._empty_response_retries "
+            "is still 0 on this path"
+        )
+        assert not any("auto-continued" in m.get("content", "") for m in notice_msgs)
+        assert not any("recovery was attempted" in m.get("content", "") for m in notice_msgs)
+
+    @pytest.mark.asyncio
+    async def test_giveup_after_spent_recoveries_reports_recovery(self, tmp_path: Path) -> None:
+        """When the recovery budget was actually spent (counter exhausted, turn
+        not productive), the card reports that automatic recovery was
+        attempted. Phrased phase-neutrally on purpose: the counter counts
+        budget spent, not which rungs ran."""
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        slot._empty_response_retries = 2  # re-queue + nudge both spent
+        self._make_empty_stream(client)
+
+        await _run_chat(state, slot, "test message")
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert any("automatic recovery was attempted" in m.get("content", "") for m in notice_msgs)
+        # The counter alone cannot prove WHICH rungs ran (a productive turn's
+        # continuation arrives here at 2 with no verbatim retry), so the card
+        # must not name specific recovery phases.
+        assert not any("auto-continued automatically" in m.get("content", "") for m in notice_msgs)
+
+    @pytest.mark.asyncio
     async def test_second_empty_flag_off_shows_notice(self, tmp_path: Path) -> None:
         """With session.empty_response_auto_continue disabled, the second empty
         surfaces the terminal notice immediately (pre-feature behavior)."""
@@ -16530,6 +17111,66 @@ class TestEmptyResponseRetry:
         # loader dropped the field — the exact regression this test guards).
         cfg_file = tmp_path / "flag-off-config.json"
         cfg_file.write_text('{"session": {"empty_response_auto_continue": false}}')
+        with patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
+            await _run_chat(state, slot, "test message")
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
+        # Counter is 1 here: ONLY the silent verbatim re-queue ran (rung 1's
+        # guard ignores the gate); the auto-continue was forbidden by config.
+        # The card reports budget spent phase-neutrally and must not assert
+        # the auto-continue that provably did not run. This is also the
+        # boundary case for the counter gate: budget WAS spent, so the bare
+        # zero-recoveries wording would be wrong too.
+        assert any("automatic recovery was attempted" in m.get("content", "") for m in notice_msgs)
+        assert not any("auto-continued" in m.get("content", "") for m in notice_msgs)
+        assert slot._empty_response_retries == 0
+
+    @pytest.mark.asyncio
+    async def test_max_continues_config_extends_the_ladder(self, tmp_path: Path) -> None:
+        """With session.empty_response_max_continues=3, the second consecutive
+        continuation failure keeps continuing — numbered so the transcript
+        reads as advancing, not looping — instead of giving up after one.
+        Exercises the REAL config path like the flag-off test above, so a
+        loader that drops the field fails this test too."""
+        from kiro_crew.dashboard.chat_runner import _EMPTY_AUTO_CONTINUE_MSG
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        slot._empty_response_retries = 2  # replay + first continue spent
+        self._make_empty_stream(client)
+
+        calls = []
+        orig = _ChatSlot.queue_insert
+
+        def spy(self_slot, *a, **kw):
+            calls.append(a)
+            return orig(self_slot, *a, **kw)
+
+        cfg_file = tmp_path / "max-continues-config.json"
+        cfg_file.write_text('{"session": {"empty_response_max_continues": 3}}')
+        with (
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
+            patch.object(_ChatSlot, "queue_insert", spy),
+        ):
+            await _run_chat(state, slot, "test message")
+            await self._cancel_background_tasks(state)
+
+        assert (0, _EMPTY_AUTO_CONTINUE_MSG) in calls
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert any("(recovery 2 of 3)" in m.get("content", "") for m in notice_msgs)
+        assert slot._empty_response_retries == 3
+
+    @pytest.mark.asyncio
+    async def test_max_continues_budget_still_terminates(self, tmp_path: Path) -> None:
+        """The raised budget is still a budget: with max=3 and the replay plus
+        all three continues spent, the give-up card fires and the counter
+        resets for the next independent user turn."""
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        slot._empty_response_retries = 4  # replay + 3 continues spent
+        self._make_empty_stream(client)
+
+        cfg_file = tmp_path / "max-continues-config.json"
+        cfg_file.write_text('{"session": {"empty_response_max_continues": 3}}')
         with patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
             await _run_chat(state, slot, "test message")
 
@@ -17335,7 +17976,7 @@ class TestRunChatTransientRetry:
         assert any("ok-result" in t for t in self._assistant_texts(slot))
         assert not any(t.startswith("❌") for t in self._err_texts(slot))
         # The transient branch fired (status surfaced) ...
-        assert any("Backend hiccup" in t for t in self._err_texts(slot))
+        assert any("Connection unstable" in t for t in self._err_texts(slot))
         # ... and the notice is TAGGED, which is the only thing telling the UI a
         # recovery is pending; without it a stale pill re-runs the queued choice.
         from kiro_crew.dashboard.chat_utils import TRANSIENT_RETRY_KIND
@@ -17343,7 +17984,7 @@ class TestRunChatTransientRetry:
         _hiccups = [
             m
             for m in slot.messages
-            if m.get("role") == "error" and "Backend hiccup" in m.get("content", "")
+            if m.get("role") == "error" and "Connection unstable" in m.get("content", "")
         ]
         assert _hiccups, "no hiccup row to inspect"
         assert all((m.get("meta") or {}).get("kind") == TRANSIENT_RETRY_KIND for m in _hiccups)
@@ -17397,7 +18038,7 @@ class TestRunChatTransientRetry:
 
         assert call_count == 2  # one post-token retry
         # The recovery notice surfaced and no ❌ error was raised.
-        assert any("Backend hiccup" in t for t in self._err_texts(slot))
+        assert any("Connection unstable" in t for t in self._err_texts(slot))
         assert not any(t.startswith("❌") for t in self._err_texts(slot))
         # APPEND-ONLY: the partial is PRESERVED as a finalized assistant message,
         # AND the continued retry answer is appended below it. Both are present;
@@ -17470,7 +18111,7 @@ class TestRunChatTransientRetry:
         assert not any(m.get("role") == "chunk" for m in slot.messages)
         # The retry notice is shown (append-only: partial + notice regardless of
         # eligibility); no ❌ terminal error is raised here.
-        assert any("Backend hiccup" in t for t in self._err_texts(slot))
+        assert any("Connection unstable" in t for t in self._err_texts(slot))
         assert not any(t.startswith("❌") for t in self._err_texts(slot))
         # No chat_stream_reset broadcast — that event was removed entirely.
         assert not any(
@@ -17481,8 +18122,8 @@ class TestRunChatTransientRetry:
 
     @pytest.mark.asyncio
     async def test_transient_post_toolcall_recovers(self, tmp_path, monkeypatch):
-        """A transient 5xx AFTER a TOOL CALL fired now RECOVERS (no longer
-        fail-fast). Because the retry re-queues a CONTINUE instruction onto the
+        """A transient 5xx AFTER a TOOL CALL fired RECOVERS instead of failing
+        fast. Because the retry re-queues a CONTINUE instruction onto the
         SAME live session — which still holds the completed tool results — the
         model resumes from where it stopped instead of blindly re-running the
         tool. Exactly one post-token recovery fires, the partial is preserved,
@@ -17529,7 +18170,7 @@ class TestRunChatTransientRetry:
 
         assert call_count == 2  # post-tool transient now RECOVERS via continue
         # Recovery notice surfaced, no ❌ terminal error.
-        assert any("Backend hiccup" in t for t in self._err_texts(slot))
+        assert any("Connection unstable" in t for t in self._err_texts(slot))
         assert not any(t.startswith("❌") for t in self._err_texts(slot))
         # The partial text is preserved and the continued answer appended below.
         assert any("working" in t for t in self._assistant_texts(slot)), "partial must be preserved"
@@ -17577,6 +18218,24 @@ class TestRunChatTransientRetry:
 
         # Allowance untouched — the suppressed path never enqueued a recovery.
         assert slot._posttoken_retry_used is False
+        # And the row says so: nothing resumes, so it is the TERMINAL notice
+        # (give-up text + token, no retry kind) — never a pending "resuming…"
+        # the dashboard would draw as a soft notice with no way to continue.
+        from kiro_crew.dashboard.chat_utils import (
+            TRANSIENT_GIVE_UP_TEXT,
+            TRANSIENT_NOTICE_GIVE_UP,
+            TRANSIENT_RETRY_KIND,
+        )
+
+        _terminal = [
+            m
+            for m in slot.messages
+            if m.get("role") == "error" and "Connection unstable" in m.get("content", "")
+        ]
+        assert len(_terminal) == 1
+        assert _terminal[0]["content"] == TRANSIENT_GIVE_UP_TEXT
+        assert _terminal[0]["meta"].get("notice") == TRANSIENT_NOTICE_GIVE_UP
+        assert _terminal[0]["meta"].get("kind") != TRANSIENT_RETRY_KIND
 
         # ── Turn 2: Stop cleared → a genuine turn recovers once. ──
         call_count = 0
@@ -17675,7 +18334,7 @@ class TestRunChatTransientRetry:
         assert call_count == 1  # fail-fast, no retry
         assert slot._transient_5xx_retries == 0
         assert any(t.startswith("❌") for t in self._err_texts(slot))
-        assert not any("Backend hiccup" in t for t in self._err_texts(slot))
+        assert not any("Connection unstable" in t for t in self._err_texts(slot))
         state.sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -17776,7 +18435,7 @@ class TestRunChatTransientRetry:
         tail = slot.messages[n_before:]
         tail_errs = [m["content"] for m in tail if m.get("role") == "error"]
         tail_answers = [m["content"] for m in tail if m.get("role") == "assistant"]
-        assert any("Backend hiccup" in t for t in tail_errs)
+        assert any("Connection unstable" in t for t in tail_errs)
         assert not any(t.startswith("❌") for t in tail_errs)
         assert any("ok-result" in t for t in tail_answers)
         # Completed cycle → budget back to 0 via the happy-path reset.
@@ -18241,7 +18900,7 @@ class TestRunChatTransientRetry:
         # Recovered cleanly on the live session (no reset, no ❌).
         assert any("ok-result" in t for t in self._assistant_texts(slot))
         assert not any(t.startswith("❌") for t in self._err_texts(slot))
-        assert any("Backend hiccup" in t for t in self._err_texts(slot))
+        assert any("Connection unstable" in t for t in self._err_texts(slot))
         state.sessions.reset.assert_not_awaited()
         assert slot._transient_5xx_retries == 0
 
@@ -18292,6 +18951,33 @@ class TestRunChatModelFallback:
     turn start."""
 
     _TRANSIENT = "Prompt error: {'message': 'Internal error: API Error: Internal server error'}"
+
+    @pytest.mark.asyncio
+    async def test_fallback_swap_refreshes_the_served_model_cache(self, tmp_path, monkeypatch):
+        """The swap moves the LIVE session onto the candidate without a spawn,
+        so the spawn-time cache would keep naming the primary; it must follow
+        the provider's served model instead."""
+        from kiro_crew.dashboard.chat_runner import _fallback_swap_for_turn
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._agent_fallback_chain",
+            lambda: ("fallback-model",),
+        )
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.record_served_model("primary-model")
+
+        class _Client:
+            served_model = "primary-model"
+
+            async def set_model(self, target):
+                self._model = target
+                self.served_model = target
+
+        client = _Client()
+        candidate = await _fallback_swap_for_turn(slot, client)
+        assert candidate == "fallback-model"
+        assert slot.served_model == "fallback-model"
 
     @pytest.mark.asyncio
     async def test_fallback_swap_serialises_on_the_pick_lock(self, tmp_path, monkeypatch):
@@ -18556,7 +19242,7 @@ class TestRunChatModelFallback:
 
     @pytest.mark.asyncio
     async def test_candidate_budget_routes_through_shared_rewind_body(self, tmp_path, monkeypatch):
-        """DRIFT PIN (#5447 item 2): the post-swap counter rewind must come
+        """DRIFT PIN: the post-swap counter rewind must come
         from llm_helpers.fallback_rewound_transient_budget — not a re-encoded
         local constant. Patching the shared body to grant no extra pass drops
         the candidate to a single attempt."""
@@ -18633,7 +19319,7 @@ class TestRunChatModelFallback:
 
     @pytest.mark.asyncio
     async def test_restore_probe_skipped_when_session_moved_on(self, tmp_path, monkeypatch):
-        """If the session is no longer on our fallback (explicit user pick),
+        """If the session is not on our fallback (explicit user pick),
         the stale sticky state is dropped WITHOUT touching the model."""
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
@@ -18788,7 +19474,7 @@ class TestRunChatModelFallback:
 
 
 class TestSlotProbeWrapsSharedRestoreBody:
-    """DRIFT PIN (#5447 item 3): the slot restore probe is a thin adapter over
+    """DRIFT PIN: the slot restore probe is a thin adapter over
     llm_helpers.probe_fallback_restore — only the slot pick-gen/heal/clear
     logic lives locally. These tests pin the delegation and the slot-specific
     hooks it hands over; the probe mechanics themselves are pinned in
@@ -18886,7 +19572,7 @@ class TestSlotProbeWrapsSharedRestoreBody:
         assert slot._fallback_slot_model == ""
 
     def test_sticky_clear_keeps_slot_record_when_marker_clear_fails(self):
-        """DRIFT PIN (review round 3): a failed provider-marker clear must NOT
+        """DRIFT PIN: a failed provider-marker clear must NOT
         blank the slot fields — the slot probe keys on _active_fallback_model,
         so keeping the record is what makes the clear retryable next turn.
         Blanking the fields around a surviving marker would orphan it."""
@@ -19367,11 +20053,16 @@ class TestSlotModelLiveSwitch:
         supports_effort: bool = False,
         change_effort: bool = True,
     ):
-        """A live AcpProvider double. ``spec=`` keeps isinstance() working."""
+        """A live AcpProvider double. ``spec=`` keeps isinstance() working.
+
+        Carries the real capability record for the backend it stands in for:
+        ``capabilities_of`` requires a genuine ``SessionCapabilities``, so an
+        attribute-shaped flag on a spec'd mock would claim every capability at once.
+        """
         from kiro_crew.providers.acp import AcpProvider
 
         provider = MagicMock(spec=AcpProvider)
-        provider.is_claude_backend = claude
+        provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO)
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort
@@ -19670,7 +20361,7 @@ class TestSlotModelLiveSwitch:
     async def test_unavailable_model_is_4xx_and_keeps_the_session(self, tmp_path):
         """An entitlement refusal must NOT take the reset fallback.
 
-        Design Review on #1596: the generic ``except Exception`` here treats
+        The generic ``except Exception`` here treats
         every set_model failure as "the call didn't land" and recovers with a
         reset. For a model the account cannot use that recovery is wrong twice
         over — it destroys the live conversation AND cold-starts on a different
@@ -19782,8 +20473,8 @@ class TestSlotModelLiveSwitch:
 
     @pytest.mark.asyncio
     async def test_two_refused_picks_leave_the_slot_untouched(self, tmp_path):
-        """REGRESSION (verifier finding on 84fc7961): two UNAVAILABLE picks
-        overlapping used to fail out of order — the later rollback restored
+        """Two UNAVAILABLE picks overlapping must not fail out of order: without
+        serialisation the later rollback would restore
         the earlier pick's already-refused model, leaving the slot advertising
         a rejected model with a phantom pick generation. Serialised, each
         transaction unwinds itself and the slot ends exactly where it began."""
@@ -19951,6 +20642,50 @@ class TestSlotModelSwitchContextBroadcast:
                 "reset": True,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_live_switch_to_auto_refreshes_the_served_model_cache(self, tmp_path):
+        """REGRESSION (GPT finding on 33ef1122e): ``slot.served_model`` was
+        written only at spawn, so selecting Auto on a warm, preserved session
+        left the concrete id the session was spawned with in the cache and the
+        composer chip kept naming the OLD model as "the default". After the live
+        switch lands the cache follows the provider -- ``""`` here, because
+        AcpProvider collapses the ``auto`` sentinel (chip reads "auto")."""
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(models=("auto", "claude-opus-4.8"))
+        provider.served_model = ""
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.record_served_model("claude-opus-4.8")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "auto"})
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("auto")
+        state.sessions.reset.assert_not_awaited()
+        assert slot.served_model == ""
+
+    @pytest.mark.asyncio
+    async def test_live_switch_to_a_pin_refreshes_the_served_model_cache(self, tmp_path):
+        # Pin -> pin: the cache names the model the live session runs NOW.
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(models=("auto", "claude-opus-4.8", "gpt-5.6-sol"))
+        provider.served_model = "gpt-5.6-sol"
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.record_served_model("claude-opus-4.8")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.6-sol"})
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.6-sol")
+        assert slot.served_model == "gpt-5.6-sol"
 
     @pytest.mark.asyncio
     async def test_reset_fallback_broadcasts_token_clearing_event(self, tmp_path):
@@ -20974,7 +21709,7 @@ class TestUnflushedTailOrderingAndSnapshot:
         """An owed row must not make the id-less arm re-emit later persisted rows.
 
         The arm forward-scans the disk slice for each window row. When a row was NOT
-        found the loop used to ``break`` outright, which left ``start`` pointing AT that
+        found the loop would ``break`` outright, which left ``start`` pointing AT that
         row -- so ``window[start:]`` carried it AND every later window row, including
         rows the disk slice already holds. Those came back a second time, and out of
         order, which is the duplication this function exists to remove.

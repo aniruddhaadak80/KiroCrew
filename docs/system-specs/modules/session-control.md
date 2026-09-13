@@ -156,7 +156,6 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Target is app-scoped | 403 | App sessions are the app's, not a peer's |
 | Target is channel-linked (`linked_session_key` set) | 403 | Its conversation is mirrored to Slack/Telegram, so reaching it crosses a surface boundary both ways — and its stop cannot be honoured, because the stop path addresses `dashboard:<slot>` while a linked slot's turns run under its linked key |
 | Target or caller has an outbound channel mirror (`get_mirror_link`) | 403 | The same boundary reached by the other mechanism. `linked_session_key` marks a channel-BORN slot; a dashboard-born slot given a mirror link republishes its turns to a channel just as surely, and the link lives in the session store rather than on the slot, so the slot-side check reads empty on exactly the session that mirrors |
-| Target is a crew-mode session (`mode == "crew"`) | 403 | A crew session's turn lifecycle is not the dashboard's: `/api/chat` routes its input to `state.crew.ingest`, which makes a durable queue entry and fans it out to topic sub-sessions. Refused rather than emulated — a target whose lifecycle differs needs its own handling, not a second copy of the orchestrator's rules |
 | Target is in another workspace | 403 | Workspaces are the memory boundary |
 | Target names no open session | 404 | A mistake, not an authorization failure |
 | Title matches more than one session | 409 | Guessing means acting on the wrong conversation |
@@ -242,8 +241,18 @@ default backend, so a warm hit would skip both the member backend route and
 the mount. The member backend is `agent.member_acp_backend` (default `kas`),
 and requires a wire-capable backend (`ACP_BACKENDS_MEMBER_DISPATCH`: the
 claude seam and KAS); kiro-cli v2 reads its template from disk and exposes no
-per-session channel, so a member session on it runs as plain chat — the tools
-are simply not mounted, never mounted-and-refused. Because the mount is
+per-session channel, so a member session on it runs as plain chat — the
+tools are simply not mounted, never mounted-and-refused. Codex is excluded by a
+scope decision rather than a capability gap: it HAS the per-session mount
+(`providers/mirrors/codex.py`), and its precondition needs no gate of its own —
+`tool_gate.is_enforced` is true for codex because its routing is
+`SESSION_CONFIG`, the one member of `ENFORCED_ROUTINGS`, so
+`_apply_session_permission_routing` refuses the session outright when
+`mode=read-only` cannot be armed. Claude's routing is `SEEDED_SETTINGS`, which
+this core declares and does not enforce, which is why claude must instead OWN
+the `settings.local.json` that decides whether a call asks
+(`_claude_settings_authored`). Mounting session control into a codex DM thread
+is a separate capability and needs its own decision. Because the mount is
 session-scoped, no other session on the same agent template gains the tools,
 preserving the two-part grant for ordinary agents (the switch AND the
 per-agent server assignment).
@@ -587,7 +596,7 @@ follow-up.
 
 - **No delivery to a target outside the addressable set.** `session_send` writes
   into another session's conversation, but only one the same `authorize_target`
-  guard admits: a channel-linked, channel-mirrored, crew-mode, incognito,
+  guard admits: a channel-linked, channel-mirrored, incognito,
   app-scoped, unattended or cross-workspace target is refused, so the verb cannot
   reach a conversation other people are party to. The residual is the queued arm's
   second authorization moment, recorded above and tracked as #5911.

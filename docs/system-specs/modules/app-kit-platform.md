@@ -107,6 +107,33 @@ design: `_enrich_with_install_status` and `_apply_trust_fields` run afterwards
 and stamp them server-side, so an index-supplied value for one of them can
 never be read before it is replaced.
 
+The fetched `app.json` that feeds this merge is cached on disk
+(`cache/app-manifests/`), and the cache identity is the row's FULL source
+coordinates, not its name: `_manifest_cache_path` digests the normalized
+credential-free clone origin, the effective ref (always the configured
+branch, plus the pinned commit when the row carries one — non-catalog pins
+are data fidelity, not what the listing fetch resolves, so the branch must
+stay in the key), the repository subdirectory, and the app name into the
+file name. Changing the configured branch is therefore a cache MISS by
+construction, two same-name apps from different repositories never share (or
+poison) each other's cached metadata, and a failed fetch cannot silently
+attach a manifest cached for another branch or repo — the name-keyed
+predecessor could not establish provenance and did all three (#10145). The
+registry-refresh sweep expires caches through the same path derivation, so a
+row whose coordinates changed in the new index expires the OLD coordinates'
+file via the prior index's row. Coordinate churn orphans the old files
+themselves — no reader ever derives their path again — so the write path
+garbage-collects files older than every TTL plus a grace window
+(`_gc_manifest_cache_dir`; the grace is derived from the expiry backdate
+slack so an expired-but-preserved file is never GC-eligible in the same
+breath), which bounds what an index that rotates its coordinates can
+accumulate while staying invisible to reads. Manifest files live in the
+`by-source/` subdirectory and only that subdirectory is swept: registry
+index caches stay at the cache-dir root, making the GC boundary structural —
+an index cannot spell a directory into an app name, where a name-prefix
+convention (skip `_registry_*`) would be imitable by an app literally named
+`_registry_x` and hand a hostile index files the sweep never reclaims.
+
 The client
 (`isVerified`/`sourceLabel` in `website/src/components/appstore/types.ts`)
 reads the server fields, still rejects a `_registry`-tagged row first (so
@@ -722,6 +749,20 @@ are reported in separate lists precisely so "absent" stays distinguishable from
 
 Writers: `apps/dependency_ledger.py`, `apps/dependencies.py`;
 `apps/routes.py::handle_uninstall_preview`.
+
+### 11.1 Python runtime dependency installation is serialized
+
+Separately from capability resolution, `apps/backend.py::provision_app_deps`
+serializes each app's Python dependency install with `data/.kirocrew-deps.lock`.
+The installer and the data-preserving uninstall path in `apps/manager.py` both
+first create that lock with `O_CREAT | O_EXCL`. Only `FileExistsError`
+permits reopening the existing file, without creation or truncation flags.
+Both opens retain `O_RDWR`, `O_NOFOLLOW` where supported, and the same pinned
+parent directory descriptor. This avoids concurrent first-create `openat`
+returning `ENOENT` on macOS before callers can reach the file lock. A lock that
+vanishes before reopen is refused, not recreated. The file is never unlinked
+on release; contenders acquire the same lock and reuse the completed install's
+stamp instead of running pip twice.
 
 ## 12. Store visibility is a manifest flag, not a code removal
 

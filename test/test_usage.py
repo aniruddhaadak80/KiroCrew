@@ -61,7 +61,7 @@ class TestParseSessions:
             "avg_tools_per_session": 0,
             # An empty history is COMPLETE data, not incomplete: nothing was
             # dropped, so the did-not-load total is a present zero rather than
-            # an absent key (#6733). Omitting it would make "complete" and
+            # an absent key. Omitting it would make "complete" and
             # "unknown" indistinguishable on the wire -- the adapter's
             # ``s.refused_transcripts ?? 0`` would synthesise the promise of
             # completeness the payload never made.
@@ -83,6 +83,40 @@ class TestParseSessions:
             assert result["error"] == "cannot read sessions directory"
             assert result["code"] == "sessions_dir_unreadable"
 
+    def test_iterdir_oserror_keeps_the_whole_statistics_shape(self, tmp_path):
+        """An unreadable directory reports the reason WITHOUT changing the shape.
+
+        Consumers read the period keys unconditionally --
+        ``website/src/providers/adapters/acp.ts`` goes straight to
+        ``s.today.sessions`` on the 200 -- so an error-ONLY object is not a
+        degraded answer, it is a differently-shaped one, and it raises a
+        ``TypeError`` in the client instead of showing the message this branch
+        exists to produce. The zeros are a shape, not a measurement, which is why
+        ``error`` has to travel WITH them.
+        """
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with patch.object(usage_mod, "_SESSIONS_DIR", empty):
+            baseline = _parse_sessions()
+        # Guard the guard: a baseline that lost its period keys would make the
+        # comparison below pass while proving nothing.
+        assert {"today", "this_week", "this_month", "daily_history"} <= set(baseline)
+
+        d = tmp_path / "cli"
+        d.mkdir()
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch(
+            "pathlib.Path.iterdir", side_effect=OSError("boom")
+        ):
+            result = _parse_sessions()
+
+        assert result["error"] == "cannot read sessions directory"
+        assert result["code"] == "sessions_dir_unreadable"
+        assert "boom" not in result["error"]
+        # Exactly the successful key set plus the two error keys, so a statistic
+        # added later cannot go missing from this branch without failing here.
+        assert set(result) - {"error", "code"} == set(baseline)
+        assert {k: v for k, v in result.items() if k in baseline} == baseline
+
     def test_skips_non_jsonl(self, tmp_path):
         d = tmp_path / "cli"
         d.mkdir()
@@ -103,14 +137,13 @@ class TestParseSessions:
             assert r["total_sessions"] == 0
 
     def test_refused_transcripts_are_reported_not_swallowed(self, tmp_path, caplog):
-        """#6733: a refused transcript is skipped, and the skip must be visible.
+        """A refused transcript is skipped, and the skip must be visible.
         Before this, a home whose every transcript the path validator refused
         rendered as a legitimate "zero sessions" with nothing to say why.
 
         Asserted on BOTH the payload field and the log: the count is now carried
         in ``refused_transcripts`` so the usage page can render a warning instead
-        of a confident zero (the earlier #7285 review kept it log-only while no
-        renderer read it; UsageTab now does).
+        of a confident zero; UsageTab renders that warning.
         """
         d = tmp_path / "cli"
         d.mkdir()
@@ -162,13 +195,13 @@ class TestParseSessions:
         ), patch.object(Path, "stat", stat_side_effect):
             r = _parse_sessions()
             assert r["all_time_sessions"] == 0
-            # #6733 First Principles: a stat failure is a did-not-load branch, so
+            # First Principles: a stat failure is a did-not-load branch, so
             # it feeds the incomplete-data count -- otherwise the transcript
             # vanishes with no trace and the warning stays silent.
             assert r["refused_transcripts"] == 1
 
     def test_all_three_did_not_load_branches_feed_the_count(self, tmp_path, caplog):
-        """#6733 First Principles: the warning's ABSENCE promises complete data,
+        """First Principles: the warning's ABSENCE promises complete data,
         so every branch that drops a transcript must feed refused_transcripts --
         not just the validator refusal. Three transcripts, one lost to each of
         the three branches (validator refusal, stat failure, read failure);
@@ -521,6 +554,43 @@ class TestApiKiroUsage:
                 assert "error" in data
                 # Cache should NOT be set
                 assert usage_mod._CACHE == {}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_directory_still_answers_the_full_shape(self, tmp_path):
+        """The reason rides WITH the statistics, and billing is unaffected.
+
+        A file where the transcript directory should be makes ``iterdir()`` raise
+        a real ``NotADirectoryError`` -- no mock -- which is the branch a
+        roaming-profile or permission-denied home takes. The route answers 200
+        because billing is a separate half of the payload, so the sessions half
+        has to stay readable by a client that goes straight to ``today``.
+        """
+        invalid_directory = tmp_path / "cli"
+        invalid_directory.write_text("not a directory", encoding="utf-8")
+        billing = {"credits_used": 10, "credits_plan": 100, "plan": "Pro"}
+        with (
+            patch.object(usage_mod, "_SESSIONS_DIR", invalid_directory),
+            patch.object(usage_mod, "get_usage_cache", return_value=billing),
+        ):
+            app = web.Application()
+            app.router.add_get("/api/usage/kiro", api_kiro_usage)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/usage/kiro")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["error"] == "cannot read sessions directory"
+        assert data["sessions"]["code"] == "sessions_dir_unreadable"
+        assert data["sessions"]["total_sessions"] == 0
+        for period in ("today", "this_week", "this_month"):
+            assert data["sessions"][period] == {
+                "sessions": 0,
+                "messages": 0,
+                "tool_calls": 0,
+            }
+        assert data["sessions"]["daily_history"] == []
+        assert data["billing"]["plan"] == "Pro"
+        assert usage_mod._CACHE == {}
 
     @pytest.mark.asyncio
     async def test_unavailable_sentinel_yields_empty_billing(self, tmp_path):
@@ -995,7 +1065,7 @@ class TestBuildTokenRecordCredits:
         assert rec["credits"] == 0.0
 
 
-# ── read_context_tokens / context-occupancy row fields (issue #647) ──────────
+# ── read_context_tokens / context-occupancy row fields ──────────────────────
 
 
 class TestReadContextTokens:

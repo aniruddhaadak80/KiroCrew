@@ -1,7 +1,7 @@
 """Tests for kiro_crew.apps.hook_reconcile — reload app hooks on out-of-process CLI mutation.
 
-Feature: issue #7880 (CLI enable/disable/install/uninstall does not reach the
-running gateway, so backend.hooks are never reloaded).
+Feature: the CLI enable/disable/install/uninstall does not reach the
+running gateway, so backend.hooks are never reloaded.
 
 The in-process teardown/reimport itself (on_app_enable / on_app_disable /
 unload_app_modules / the detached-startup machinery) is covered by
@@ -49,6 +49,22 @@ def _app_info(name: str, *, enabled: bool = True, version: str = "1.0.0", hooks:
         "version": version,
         "manifest": {"backend": backend, "permissions": {}},
     }
+
+
+async def _await_until(predicate, *, timeout: float = 5.0, message: str = "") -> None:
+    """Poll ``predicate`` until true, failing loudly past a generous deadline.
+
+    The wall-clock-races convention: a watchdog window patched tight enough to
+    trip the genuinely-hung app is a real deadline for the fast app too on a
+    loaded runner, so assertions about the fast app's OUTCOME must await the
+    observable state rather than race that window (the tripped task is never
+    cancelled and always finishes on its own).
+    """
+    loop = asyncio.get_running_loop()
+    give_up_at = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < give_up_at, message or "condition never became true"
+        await asyncio.sleep(0.01)
 
 
 @pytest.fixture
@@ -248,7 +264,9 @@ async def test_hung_teardown_does_not_wedge_the_pass(_harness, monkeypatch):
     the pass must complete and quick must be reconciled despite hang never
     returning."""
     calls, (set_current, _, _) = _harness
-    monkeypatch.setattr(hr, "PER_APP_PASS_WATCHDOG_SECS", 0.1)  # trip fast in-test
+    monkeypatch.setattr(
+        hr, "PER_APP_PASS_WATCHDOG_SECS", 0
+    )  # deterministic trip, no clock dependency
     hang_cancelled = {"v": False}
 
     async def maybe_hang_disable(name, app_info, **kwargs):
@@ -273,8 +291,23 @@ async def test_hung_teardown_does_not_wedge_the_pass(_harness, monkeypatch):
     await asyncio.wait_for(hr.reconcile_once([]), timeout=2.0)
 
     # quick was reconciled; hang's teardown was left running, NOT cancelled.
-    assert hi.loaded_hook_signature("quick") is None, "quick must reconcile despite hang"
+    # On a loaded runner the 0.1s watchdog can trip quick too (two to_thread
+    # hops precede on_app_disable), but a trip never cancels: quick's task keeps
+    # running and clears the signature on its own. Await that observable state
+    # instead of racing the watchdog window.
+    await _await_until(
+        lambda: hi.loaded_hook_signature("quick") is None,
+        message="quick must reconcile despite hang",
+    )
     assert hi.loaded_hook_signature("hang") is not None, "hung teardown left pending -> retried"
+    # A wrongly-issued task.cancel() is visible synchronously via cancelling()
+    # even before the CancelledError is delivered; the flag alone would miss it
+    # when no later await yields. Check both: the request count, then the
+    # delivered exception after one explicit yield.
+    hang_task = hr._inflight_app_tasks.get("hang")
+    assert hang_task is not None and not hang_task.done()
+    assert hang_task.cancelling() == 0, "watchdog must NOT request cancellation"
+    await asyncio.sleep(0)  # let any wrongly-requested cancel be delivered
     assert hang_cancelled["v"] is False, "watchdog must NOT cancel the hung teardown"
 
 
@@ -286,7 +319,9 @@ async def test_hung_teardown_is_not_respawned_next_tick(_harness, monkeypatch):
     an app that still has a live one -- so a hung teardown produces exactly ONE
     outstanding task no matter how many ticks run."""
     calls, (set_current, _, _) = _harness
-    monkeypatch.setattr(hr, "PER_APP_PASS_WATCHDOG_SECS", 0.05)
+    monkeypatch.setattr(
+        hr, "PER_APP_PASS_WATCHDOG_SECS", 0
+    )  # deterministic trip, no clock dependency
 
     async def hang_disable(name, app_info, **kwargs):
         calls.append(("disable", name))
@@ -302,8 +337,16 @@ async def test_hung_teardown_is_not_respawned_next_tick(_harness, monkeypatch):
         await asyncio.wait_for(hr.reconcile_once([]), timeout=2.0)
 
     # Only ONE teardown was ever spawned; later ticks skipped the in-flight app.
+    # The 0.05s watchdog can return a pass before the spawned task has even
+    # reached on_app_disable (two to_thread hops precede it), so await the one
+    # recorded call rather than racing that window. Exactly-once still holds:
+    # ticks 2-3 skip the live in-flight task synchronously, so no later append
+    # can arrive after this settles.
+    await _await_until(lambda: len(calls) >= 1, message="teardown was never spawned")
     assert calls == [("disable", "hang")], "hung app must not be re-spawned each tick"
-    assert len([t for t in hr._inflight_app_tasks.values() if not t.done()]) == 1
+    live = [t for t in hr._inflight_app_tasks.values() if not t.done()]
+    assert len(live) == 1
+    assert live[0].cancelling() == 0, "the straggler must not have been cancel-requested"
 
 
 @pytest.mark.asyncio
@@ -328,7 +371,7 @@ async def test_stop_final_drain_is_bounded(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stop_does_not_reawait_a_hung_in_flight_pass(monkeypatch):
-    """GPT round-10 [BLOCKING]: when a pass is already IN FLIGHT and hung, stop's
+    """When a pass is already IN FLIGHT and hung, stop's
     bounded drain expires -- but the loop's cancel handler then re-awaits the same
     pass. That second await must ALSO be bounded, or it blocks up to the 60s pass
     watchdog and blows the ~10s graceful-shutdown budget before backend cleanup.
@@ -501,7 +544,7 @@ async def test_denied_app_teardown_runs_no_shutdown_hook(_harness):
 @pytest.mark.asyncio
 async def test_denied_reinstall_of_loaded_app_is_torn_down_first(_harness):
     """Opus [BLOCKING]: a LOADED (running) hook app reinstalled out-of-process
-    from a source that no longer matches its execution grant lands on the
+    from a source that does not match its execution grant lands on the
     "signature changed + now denied" branch. The denied enable path deregisters
     routes + records anti-churn + drops the manifest, but does NOT stop the
     already-loaded module or the background task its on_startup spawned -- so the
@@ -626,7 +669,7 @@ async def test_uninstall_drops_the_apps_in_process_hook_registries(_harness):
     so a CLI uninstall reached this reconciler's teardown and left the registries
     behind. The stale hook closes over a store the uninstall deleted, and
     ``notify_slot_closed`` reporting its failure is what ``api_chat_slot_delete``
-    turns into a tab the user cannot dismiss for an app that no longer exists.
+    turns into a tab the user cannot dismiss for an app that does not exist.
     """
 
     async def _stale(_key: str) -> None:
@@ -867,7 +910,7 @@ async def test_reimport_failure_leaves_signature_unset_for_retry(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failed_shutdown_is_unsettled_and_retained(monkeypatch):
-    """GPT round-11 [BLOCKING]: a failed on_shutdown means the app's own stop
+    """A failed on_shutdown means the app's own stop
     routine did not complete, so its worker may still be live. _disable_loaded
     must treat hooks_shutdown=='failed' as UNSETTLED -- return False and RETAIN
     the loaded record so the reconciler retries, rather than clearing the
@@ -891,7 +934,7 @@ async def test_failed_shutdown_is_unsettled_and_retained(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_settled_teardown_unloads_modules_for_clean_reimport(monkeypatch):
-    """GPT round-11 [BLOCKING]: a CLI reinstall (disable/enable without a process
+    """A CLI reinstall (disable/enable without a process
     restart) that does not unload the app's modules reuses stale transitive
     helper modules via relative imports, so old code stays active. A SETTLED
     teardown must call unload_app_modules so the next enable re-imports fresh."""

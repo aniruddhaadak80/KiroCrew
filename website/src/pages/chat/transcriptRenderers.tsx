@@ -4,8 +4,12 @@
  * This is the ONE dashboard row set (chat-core P5-b): the single-chat surface
  * (ChatPage) spreads this factory into its host list and adds only its
  * page-only entries (the conversational bubble with fork/pin/footer chrome,
- * the undrawn/permission rows, the stop-event and OAuth banners); ChatPane
- * calls it with fewer options. Behaviour a surface cannot supply is an
+ * the undrawn/permission rows); ChatPane calls it with fewer options. Rows the
+ * SDK default registry already draws from the same component and the same
+ * inputs -- the stop-event card, the notice card, the MCP OAuth banner -- are
+ * registered NOWHERE else: not here (a second copy is what the "leaves the
+ * stop row to the SDK default" test pins shut) and, since P5-c, not on the
+ * page either. Behaviour a surface cannot supply is an
  * OPTION with the pane's default -- the tool row's disclosure key, its
  * "animating" rule, the hot-transcript hint, the completion cards' session
  * hand-offs -- so the two surfaces differ only in what they wire, never in
@@ -32,7 +36,10 @@ import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
-import { ErrorCard } from './ErrorCard'
+import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
+import { ErrorCard, isAuthRequired, isModelUnentitled } from './ErrorCard'
+import NoticeCard from './NoticeCard'
+import { resolveTransientNotice } from './transientNotice'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './SubagentRunCard'
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
@@ -40,7 +47,10 @@ import SubagentCompletionCard from './SubagentCompletionCard'
 import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './subagentCompletion'
 import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
-import type { MessageRenderer, MessageRenderContext } from '../../app-sdk/messageRenderers'
+import UserMessage from './UserMessage'
+import { formatTs, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
+import { renderUserContent } from './ChatPageMessageContent'
+import { fmtMessageTimeFull } from './messageTime'
 import type { ChatMessage } from '../../types'
 
 /** Disclosure-map identity for a tool row (#8204). messageRowKey is
@@ -114,6 +124,23 @@ export interface TranscriptRendererOptions {
   interrupted?: boolean
   continuing?: boolean
   onContinue?: () => void
+  /** Fix affordances for a model-entitlement error row (`model_unentitled`
+   *  kind): open this surface's model picker, and deep-link to the Default
+   *  Model setting. Omitted → the row renders as plain prose, which is correct
+   *  for a surface with no picker of its own (a pane). Offered on EVERY such
+   *  row, not only the newest: an entitlement error is settled state the user
+   *  still has to act on, whereas Continue resumes a turn and so is unique. */
+  onPickModel?: () => void
+  onOpenDefaultModel?: () => void
+  /** Draw confirmed steers as ordinary user messages (no "Steered into the
+   *  running turn" badge). A `steer-only` composer host sets it: every busy
+   *  send on that surface is a steer, so the badge would label each one with
+   *  the very mechanics the surface hides. Off (default) the SDK's `user`
+   *  entry is used unchanged. */
+  hideSteerBadge?: boolean
+  /** Fix affordance for an `auth_required` row: deep-link to the Kiro sign-in
+   *  card in Settings. Omitted on a surface with no settings route. */
+  onOpenSignIn?: () => void
 }
 
 /** Index of the last `error` row, so only that one offers Continue. Derived
@@ -282,6 +309,21 @@ export function createTranscriptRenderers(
       },
     },
     {
+      // Refines `assistant`: a gateway system notice (kind=compaction or
+      // kind=session_reload, the SYSTEM_NOTICE_KINDS set the last-real-message
+      // scans already skip) is a status card, not a reply. The gateway writes
+      // them as assistant rows (chat_utils._append_compaction_notice,
+      // chat_handlers' reload confirmation); the compaction row's content is the
+      // backend's whole context summary, so the bubble fallback painted
+      // kilobytes of machine digest as if the model had said it — on this page
+      // AND in every ChatPane (Crew DM) that shares this factory. Must precede
+      // any assistant-keyed bubble.
+      id: 'system_notice',
+      roles: ['assistant'],
+      match: isSystemNoticeRow,
+      render: (m, ctx) => ctx.row(<SystemNoticeRow key={ctx.key} message={m} disclosureKey={ctx.key} />),
+    },
+    {
       // Refines `assistant`: an injected workflow completion is a compact
       // status card, not a full markdown reply.
       id: 'workflow_completion',
@@ -306,18 +348,59 @@ export function createTranscriptRenderers(
       // affordance on the LAST error when a turn was interrupted.
       id: 'error',
       roles: ['error'],
-      render: (m, ctx) =>
-        ctx.row(
+      render: (m, ctx) => {
+        // A transient-5xx notice the gateway is already retrying against is
+        // routine status, not a failure: localized copy on a soft NoticeCard.
+        // Only its terminal shape ("please try again") stays a red ErrorCard,
+        // with the same localized text.
+        const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+        if (transient?.card === 'notice') {
+          return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
+        }
+        const unentitled = isModelUnentitled(m)
+        const authRequired = isAuthRequired(m)
+        return ctx.row(
           <ErrorCard
-            content={m.content}
+            content={transient ? transient.text : m.content}
+            meta={m.meta}
+            // A rejection the backend says no retry can fix never offers Continue,
+            // even when this row is the newest and the turn was interrupted:
+            // resuming would replay the identical rejection (or the same
+            // signed-out wall).
             onContinue={
-              o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
+              !unentitled && !authRequired && o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
                 ? o.onContinue
                 : undefined
             }
             continuing={o.continuing}
+            onPickModel={unentitled ? o.onPickModel : undefined}
+            onOpenDefaultModel={unentitled ? o.onOpenDefaultModel : undefined}
+            onOpenSignIn={authRequired ? o.onOpenSignIn : undefined}
+            unentitledElsewhere={unentitled}
           />,
-        ),
+        )
+      },
     },
+    // Replaces the SDK's `user` entry (same id) ONLY when the host asks for it:
+    // identical content path (renderUserContent — paste chips, inline images
+    // and file cards included), one prop different. Absent the flag no entry is emitted, so every other
+    // surface keeps the SDK row byte-for-byte.
+    ...(o.hideSteerBadge
+      ? [{
+          id: 'user',
+          roles: ['user'],
+          render: (m: ChatMessage, ctx: MessageRenderContext) => ctx.wrapper(
+            <UserMessage
+              content={m.content}
+              meta={m.meta}
+              timestamp={formatTs(m.ts)}
+              timestampTitle={fmtMessageTimeFull(m.ts)}
+              renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+              hideSteerBadge
+            />,
+            true,
+          ),
+        } satisfies MessageRenderer]
+      : []),
   ]
 }

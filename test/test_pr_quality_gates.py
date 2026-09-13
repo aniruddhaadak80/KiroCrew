@@ -4,7 +4,7 @@ These pin the behaviours that are easy to break silently by editing YAML:
 the triggers a gate needs to be fixable without a code push, the
 added-lines-only scoping that keeps a gate from blaming a PR for
 pre-existing code, the advisory-vs-blocking contract of each lane, and --
-most importantly -- that `pr-readiness.yml` no longer force-passes a failing
+most importantly -- that `pr-readiness.yml` does not force-pass a failing
 Design Review.
 """
 
@@ -80,6 +80,34 @@ class TestScreenshotEvidence:
         assert (
             "::warning::'<!-- no-visual-delta -->' marker present" in wf
         ), "waiver must emit a warning annotation naming the marker"
+
+    def test_remediation_sends_evidence_through_gh_attach_not_the_tree(self):
+        # Evidence is a GitHub attachment on the description, uploaded with
+        # `gh pr create|edit --attach` (or dragged into the web editor); the
+        # remediation must name that procedure, with the local-path convention
+        # the description uses and the size limits, and must not send an
+        # author to commit files or to pin a raw URL to a commit.
+        wf = _read("screenshot-evidence.yml")
+        assert "gh pr edit $PR --body-file <body.md> --attach" in wf
+        # The create-time hint names the subcommand without spelling out the
+        # full command: test_workflow_pr_create_handoff.py treats any run block
+        # containing that literal as a step that opens pull requests.
+        assert "works the same way on the \\`create\\` subcommand" in wf
+        assert "gh >= 2.99" in wf
+        assert "![alt](./evidence/after.png)" in wf
+        assert "![](./evidence/demo.mp4)" in wf
+        assert "https://github.com/user-attachments/assets/... URL" in wf
+        assert "Dragging the file into the" in wf
+        assert "10 MB per image/GIF, 100 MB per video" in wf
+        assert "raw/<sha>" not in wf
+        assert "Commit the images under" not in wf
+        # The accepted-evidence check itself is unchanged: an attachment URL,
+        # a markdown image, an HTML tag and a still-linked committed path all
+        # satisfy the gate.
+        assert (
+            "'!\\[[^]]*\\]\\([^)]+\\)|<img[[:space:]]|<video[[:space:]]|temp-screenshots/|user-attachments/'"
+            in wf
+        )
 
     def test_body_reaches_grep_via_here_strings_not_pipes(self):
         # Under `set -uo pipefail` a `printf '%s' "$body" | grep -q` pipeline
@@ -272,12 +300,17 @@ class TestScreenshotEvidenceBodyLogic:
         # branches (unreadable body, marker without justification, no evidence)
         # and only the last one is the verdict under test.
         assert "carries no screenshot or recording" in result.stdout, result.stdout
+        # The remediation the author reads is the attach procedure, with this
+        # PR's number already in the command.
+        summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+        assert "gh pr edit 1 --body-file <body.md> --attach" in summary, summary
+        assert "temp-screenshots/<feature>/" not in summary, summary
 
     def test_unreadable_body_is_not_reported_as_missing_evidence(self, tmp_path):
-        # A failed API read is not an absent screenshot. The step used to
-        # discard both gh's status and its stderr, so a transient failure left
-        # the body empty and the run told the author their description carried
-        # no evidence -- sending them to fix a description that was already
+        # A failed API read is not an absent screenshot. Discarding both gh's
+        # status and its stderr makes a transient failure leave the body empty,
+        # so the run tells the author their description carries no evidence,
+        # sending them to fix a description that is already
         # correct. It must still fail closed (this gate is required) while
         # naming the read as the cause.
         body = "![shot](https://example.test/x.png)\n"
@@ -383,10 +416,10 @@ class TestScreenshotEvidenceSurfaceDetection:
         assert "visual=false" in outputs, outputs
 
     def test_uncomputable_diff_fails_instead_of_skipping_the_gate(self, tmp_path):
-        # The failure this pins: a failed `git diff` used to be swallowed into
-        # the same empty string as "nothing visual changed", so the step wrote
-        # visual=false, the evidence step's `if:` went false, and a REQUIRED
-        # check reported green having examined nothing. Failing open on a gate
+        # The failure this pins: a failed `git diff` swallowed into the same
+        # empty string as "nothing visual changed" makes the step write
+        # visual=false, the evidence step's `if:` go false, and a REQUIRED
+        # check report green having examined nothing. Failing open on a gate
         # is worse than a false red, so the diff failure must surface.
         result, outputs = self._run_detect(tmp_path, git_status=128)
         assert result.returncode == 1, result.stdout + result.stderr
@@ -403,8 +436,8 @@ class TestCrossPlatform:
         assert "grep -vE '^\\+\\+\\+'" in wf
 
     def test_filters_prose_before_matching(self):
-        # Verified against commit 1d78b24e3: a docstring quoting ``shell=True``
-        # to explain why it is avoided must not fail the gate.
+        # A docstring quoting ``shell=True`` to explain why it is avoided must
+        # not fail the gate.
         wf = _read("cross-platform.yml")
         assert "grep -vE '^\\+[[:space:]]*#'" in wf
         assert "grep -vF '``'" in wf
@@ -412,7 +445,7 @@ class TestCrossPlatform:
     def test_no_encoding_rule(self):
         # A line regex cannot decide this: nested calls truncate the lookahead
         # and multi-line calls split `encoding=` onto another line. Both give
-        # FALSE failures on correct code (verified against commit 1d78b24e3),
+        # FALSE failures on correct code,
         # so the rule is deliberately absent and its absence is documented.
         wf = _read("cross-platform.yml")
         assert "deliberately NO" in wf, "the absence must stay documented"
@@ -459,9 +492,9 @@ class TestPrScopeMeasureLogic:
     """Execute the real scope-measurement step with ``git`` stubbed.
 
     The step is advisory by contract (it never exits nonzero), which is
-    exactly why a swallowed read failure was invisible: a failed ``git diff``
-    used to collapse onto the same empty string as "no files changed", and
-    the step reported a verdict -- "No reviewable files changed." -- about a
+    exactly why a swallowed read failure is invisible: a failed ``git diff``
+    collapses onto the same empty string as "no files changed", and
+    the step reports a verdict -- "No reviewable files changed." -- about a
     diff it never obtained. These cases pin which of the two empty results
     produced the answer, without loosening the advisory contract.
     """
@@ -545,10 +578,10 @@ class TestPrScopeMeasureLogic:
         assert "No reviewable files changed." in result.stdout, result.stdout
 
     def test_uncomputable_diff_refuses_the_verdict_but_stays_advisory(self, tmp_path):
-        # The failure this pins: a failed `git diff` used to be swallowed into
-        # the same empty string as "no files changed", so the step claimed
+        # The failure this pins: a failed `git diff` swallowed into the same
+        # empty string as "no files changed" makes the step claim
         # "No reviewable files changed." having measured nothing. The step must
-        # now refuse to report any scope claim -- while still exiting 0,
+        # refuse to report any scope claim -- while still exiting 0,
         # because this gate's advisory contract (test_never_exits_nonzero)
         # is deliberate.
         result, summary = self._run_measure(tmp_path, git_status=128)
@@ -583,9 +616,9 @@ class TestDesignReviewBlocks:
     """
 
     def test_readiness_blocks_every_opinion_lane(self):
-        # The whole point of the promotion: the advisory bucket that used to
-        # force-pass UX and First Principles (and once Design too) is gone, so
-        # a red opinion lane now produces a red PR Readiness.
+        # The whole point of the promotion: no advisory bucket force-passes UX
+        # and First Principles (or Design), so a red opinion lane produces a
+        # red PR Readiness.
         wf = _read("pr-readiness.yml")
         assert (
             'passed+=("$label (advisory)")' not in wf
@@ -605,8 +638,8 @@ class TestDesignReviewBlocks:
 
     @pytest.mark.parametrize("name", ["design-review.yml", "fork-design-review.yml"])
     def test_prompt_no_longer_claims_block_is_advisory(self, name):
-        # The prompt used to tell the model "BLOCK does NOT block the merge",
-        # which taught it to under-use the verdict that now actually gates.
+        # The prompt must not tell the model "BLOCK does NOT block the merge",
+        # which would teach it to under-use the verdict that actually gates.
         wf = _read(name)
         assert "does NOT block the merge" not in wf
         assert "BLOCK (advisory)" not in wf
@@ -711,7 +744,7 @@ class TestDecidableFindingsExitTheTieBreaker:
     def test_ux_tie_breaker_carries_a_closed_exception_list(self, name):
         wf = _flat(_read(name))
         assert "Tie-breaker: when torn between BLOCK and CONCERNS" in wf
-        # Four decidable exits: the two notice rules, plus (PR #6783) a primary
+        # Four decidable exits: the two notice rules, plus a primary
         # control the blind reader could not use and a hard element swap. Each
         # is read off the blind-read report or the diff, not judged.
         assert "The tie-breaker does NOT apply to the four below" in wf

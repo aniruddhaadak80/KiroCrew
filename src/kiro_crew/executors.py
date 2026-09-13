@@ -72,7 +72,7 @@ import atexit
 import functools
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 
 _T = TypeVar("_T")
 
@@ -95,6 +95,8 @@ __all__ = [
     "run_in_cron_gate_pool",
     "cron_gate_budget",
     "run_in_embed_pool",
+    "run_with_recall_deadline",
+    "recall_executor",
     "shutdown_maintenance_executor",
 ]
 
@@ -144,18 +146,10 @@ _CRON_QUEUE_WAIT_SECS = 900
 # the maintenance pool's orphan-sweep workers.
 _MAX_DISCOVERY_WORKERS = 4
 
-# Ollama embed/probe offloads (consolidation lesson writes, memory import,
-# context-preview, and every build_message call — its episodic recall embeds
-# the query) block on network I/O for up to embedding_timeout_secs per call —
-# and against a HUNG endpoint every call eats the full timeout, since failures
-# are deliberately not cached.  Give them their own bounded pool so a wedged
-# Ollama parks mc-embed threads and queues further embed work behind ITSELF,
-# instead of exhausting asyncio's default executor (which the loop shares for
-# DNS resolution and every other asyncio.to_thread user).  Sized above the
-# other pools because build_message runs on every new session across all
-# surfaces (dashboard + Slack + cron + heartbeat + subagent can land
-# concurrently after a restart); with a healthy endpoint each call is fast,
-# so the cap only bites — deliberately — when Ollama is wedged.
+# Memory filesystem work and explicit embedding requests stay off the default
+# executor used by DNS. Prompt construction shares this pool but never embeds.
+# run_in_embed_pool admits work before submission, so a burst waits as cancellable
+# coroutines instead of growing ThreadPoolExecutor's unbounded work-item queue.
 _MAX_EMBED_WORKERS = 8
 
 # Governance checks for EXTERNALLY-triggered surfaces: the per-inbound-message
@@ -260,8 +254,12 @@ _MAX_STT_WORKERS = 2
 # the wait does NOT free the worker, so this is its OWN tiny pool: a wedged
 # resolution can only ever starve other path resolution, never the sweeps or
 # the default executor's DNS.  Two workers is deliberate -- healthy resolution is
-# microseconds, so the cap only bites when the filesystem is wedged, which is
-# exactly when queueing behind a wedged sibling is the correct outcome.
+# microseconds, so sustained queueing means the filesystem is wedged, and
+# queueing behind a wedged sibling can only time out.  The cap also bites under
+# plain concurrency (simultaneous cron fires submitting at once); a queued
+# resolution that never starts is cancelled on timeout and refused for that
+# call alone, charging no prefix cooldown (see
+# ``security.paths._run_resolution_bounded``).
 _MAX_PATH_RESOLVE_WORKERS = 2
 
 _lock = threading.Lock()
@@ -270,6 +268,7 @@ _subprocess_pool: ThreadPoolExecutor | None = None
 _cron_pool: ThreadPoolExecutor | None = None
 _discovery_pool: ThreadPoolExecutor | None = None
 _embed_pool: ThreadPoolExecutor | None = None
+_recall_pool: ThreadPoolExecutor | None = None
 _image_pool: ThreadPoolExecutor | None = None
 _stt_pool: ThreadPoolExecutor | None = None
 _governance_pool: ThreadPoolExecutor | None = None
@@ -454,13 +453,12 @@ def path_resolve_executor() -> ThreadPoolExecutor:
 
 
 def embed_executor() -> ThreadPoolExecutor:
-    """Return the process-wide Ollama embed/probe pool, creating it on first use.
+    """Return the process-wide memory/embedding pool, creating it on first use.
 
-    Threads are named ``mc-embed``.  Separate from asyncio's default executor
-    so a hung embedding endpoint (every call eats the full
-    ``embedding_timeout_secs``; failures are deliberately not cached) parks
-    only these workers — embed work queues behind ITSELF instead of starving
-    the loop's DNS resolution and every other ``asyncio.to_thread`` user.
+    Threads are named ``mc-embed``. Separate from asyncio's default executor so
+    memory I/O and explicit retrieval cannot occupy the workers used for DNS
+    resolution. ``run_in_embed_pool`` admits work before creating executor jobs;
+    native inference has its own bounded queue in ``embeddings``.
     """
     global _embed_pool
     if _embed_pool is None:
@@ -709,10 +707,9 @@ def cron_gate_budget(wake_budget: float) -> float:
 async def run_in_cron_gate_pool(func: Callable[..., _T], /, *args: Any, timeout: float) -> _T:
     """Run a cron fire-time gate on :func:`cron_gate_executor`, bounded both ways.
 
-    Two changes from awaiting ``run_in_executor`` directly, which is what the
-    gate sites used to do:
+    Two differences from awaiting ``run_in_executor`` directly:
 
-    * the gate no longer shares a pool with externally-paced inbound traffic, so
+    * the gate does not share a pool with externally-paced inbound traffic, so
       an inbound burst cannot put a FIFO backlog ahead of it; and
     * the wait is BOUNDED, raising :class:`CronQueueTimeout` when the gate never
       got a worker, which is the signal the callers translate into a
@@ -797,15 +794,73 @@ async def run_in_cron_gate_pool(func: Callable[..., _T], /, *args: Any, timeout:
         raise CronGateTimeout(asyncio.get_running_loop().time() - queued_at) from exc
 
 
-async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
-    """Run a blocking Ollama embed/probe callable on :func:`embed_executor`.
+RECALL_TIMEOUT_SECS = 9.0  # Finish before the MCP HTTP client's ten-second timeout.
 
-    Drop-in replacement for ``asyncio.to_thread`` at embed call sites: same
-    signature, but the work lands on the bounded ``mc-embed`` bulkhead pool
-    instead of asyncio's shared default executor.
+
+def recall_executor() -> ThreadPoolExecutor:
+    """Retrieval cannot occupy the workers needed for prompt preparation."""
+    global _recall_pool
+    with _lock:
+        if _recall_pool is None:
+            _recall_pool = ThreadPoolExecutor(
+                max_workers=_MAX_EMBED_WORKERS, thread_name_prefix="mc-recall"
+            )
+            atexit.register(shutdown_maintenance_executor)
+        return _recall_pool
+
+
+async def run_with_recall_deadline(awaitable: Awaitable[_T]) -> _T:
+    """Bound an entire recall, including cold store opening and pool admission."""
+    import time
+
+    from kiro_crew.embeddings import EmbeddingWork, embedding_work
+
+    inherited = embedding_work.get()
+    work = inherited or EmbeddingWork(time.monotonic() + RECALL_TIMEOUT_SECS)
+    token = embedding_work.set(work)
+    try:
+        return await asyncio.wait_for(awaitable, timeout=max(0.0, work.deadline - time.monotonic()))
+    finally:
+        if inherited is None:
+            work.cancelled.set()
+        embedding_work.reset(token)
+
+
+async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    """Offload bounded memory work, waiting without rejecting ordinary prompts.
+
+    Submission is bounded to the worker count for this gateway event loop. A
+    cancelled caller releases a slot only when its underlying thread actually
+    finishes (or the queued future is successfully cancelled).
     """
+    from contextvars import copy_context
+
+    from kiro_crew.embeddings import embedding_work
+
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(embed_executor(), functools.partial(func, *args, **kwargs))
+    recall = embedding_work.get() is not None
+    admission_key = "_kirocrew_recall_admission" if recall else "_kirocrew_memory_admission"
+    admission = getattr(loop, admission_key, None)
+    if admission is None:
+        admission = asyncio.Semaphore(_MAX_EMBED_WORKERS)
+        setattr(loop, admission_key, admission)
+    await admission.acquire()
+    try:
+        executor = recall_executor() if recall else embed_executor()
+        future = executor.submit(copy_context().run, functools.partial(func, *args, **kwargs))
+    except BaseException:
+        admission.release()
+        raise
+
+    def finished(_future: object) -> None:
+        try:
+            loop.call_soon_threadsafe(admission.release)
+        except RuntimeError:
+            # The owning loop has closed; no new task can await its admission.
+            pass
+
+    future.add_done_callback(finished)
+    return await asyncio.wrap_future(future, loop=loop)
 
 
 def shutdown_maintenance_executor() -> None:
@@ -814,7 +869,7 @@ def shutdown_maintenance_executor() -> None:
     The default executor pool is NOT included here -- it is owned by each event
     loop and shut down by asyncio when the loop closes.
     """
-    global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool
+    global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
     global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
     with _lock:
         pool, _pool = _pool, None
@@ -822,6 +877,7 @@ def shutdown_maintenance_executor() -> None:
         cron_pool, _cron_pool = _cron_pool, None
         discovery_pool, _discovery_pool = _discovery_pool, None
         embed_pool, _embed_pool = _embed_pool, None
+        recall_pool, _recall_pool = _recall_pool, None
         governance_pool, _governance_pool = _governance_pool, None
         image_pool, _image_pool = _image_pool, None
         cron_gate_pool, _cron_gate_pool = _cron_gate_pool, None
@@ -837,6 +893,8 @@ def shutdown_maintenance_executor() -> None:
         discovery_pool.shutdown(wait=False, cancel_futures=True)
     if embed_pool is not None:
         embed_pool.shutdown(wait=False, cancel_futures=True)
+    if recall_pool is not None:
+        recall_pool.shutdown(wait=False, cancel_futures=True)
     if governance_pool is not None:
         governance_pool.shutdown(wait=False, cancel_futures=True)
     if image_pool is not None:

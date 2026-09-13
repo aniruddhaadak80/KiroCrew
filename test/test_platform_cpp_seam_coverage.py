@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import pytest
+from source_corpus import source_texts
 
 import kiro_crew
 from kiro_crew.config.loader import KiroCrewConfig
@@ -76,6 +77,11 @@ from kiro_crew.platform.interfaces import InboundToken, SessionPrincipal
 
 # ── Static-analysis configuration ──
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_platform_cpp_seam_coverage")
 _SRC_ROOT = Path(kiro_crew.__file__).resolve().parent
 
 # Directories under the package that are NOT core consumption sites.
@@ -162,13 +168,22 @@ def _parsed_core_source_files() -> List[Tuple[Path, ast.AST]]:
     resulting tree. Factored out so the (immutable, run-invariant) parse pass is
     paid once per test session — via ``parsed_core_files`` below — instead of once
     per scanner. A file that fails to parse is skipped here, matching the
-    defensive behavior both callers previously implemented individually.
+    defensive behavior both callers implement individually.
+
+    Reads from ``test/source_corpus.py``'s shared, already-cached text of the
+    whole tree instead of a private ``rglob`` + ``read_text``: this scanner's
+    exclusion set (``platform``/``_vendor``) is a subset of files the corpus
+    already read for the other AST ratchets in this worker, so filtering the
+    shared list avoids a second full-tree read the corpus already paid for.
     """
+    core = set(_core_source_files())
     parsed: List[Tuple[Path, ast.AST]] = []
-    for path in _core_source_files():
+    for path, text in source_texts():
+        if path not in core:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - defensive
+            tree = ast.parse(text)
+        except SyntaxError:  # pragma: no cover - defensive
             continue
         parsed.append((path, tree))
     return parsed
@@ -455,7 +470,7 @@ class TestSeamCoverage:
         )
 
     def test_reserved_slots_are_real_fields(self, context_field_names) -> None:
-        """A reservation for a field that no longer exists is dead weight."""
+        """A reservation for a field that does not exist is dead weight."""
         unknown = sorted(set(RESERVED_SLOTS) - context_field_names)
         assert not unknown, f"RESERVED_SLOTS names non-existent field(s): {unknown}"
 

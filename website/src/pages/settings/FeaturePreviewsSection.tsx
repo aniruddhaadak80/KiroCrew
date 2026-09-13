@@ -2,6 +2,7 @@ import { useNavigate } from 'react-router-dom'
 import { ArrowRight } from 'lucide-react'
 
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
+import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
 import { i18nT } from '../../i18n/t'
@@ -54,7 +55,54 @@ import { i18nT } from '../../i18n/t'
  * are per-device localStorage keys by design (`previewFlags.ts` explains why
  * they are NOT backend config). Search deep-links still reach each toggle
  * through its registry id + `data-setting-label`, which need no configKey.
+ *
+ * Each card may also carry a "See what it looks like" button (`FeaturePreviewIntroButton`)
+ * opening a dialog with a REAL capture of the surface the flag reveals, a
+ * sentence on what it does, where it appears once on, and the same switch again.
+ * The intro is defined right here next to its card — the card IS the preview's
+ * definition — as a render-time builder rather than a table of catalog keys,
+ * for the same `check-i18n-keys.mjs` reason the cards are not a loop: the gate
+ * resolves a literal `i18nT('…')`, not a key read out of a nested object. A
+ * preview whose surface has not been captured yet (below: "Chat on a crew",
+ * whose menu entry only exists with a live tunnel to a second machine, which an
+ * isolated capture instance cannot honestly stage) simply has no builder and so
+ * no button — never a dialog with an empty frame.
  */
+
+/** Public paths of the captures; the files ride `public/`, never a JS chunk. */
+const MEDIA_BASE = '/app-assets/feature-previews'
+
+/** Webhooks: the `/webhooks` page itself, the flag's only door. */
+function webhooksIntro(): FeaturePreviewIntro {
+  return {
+    summary: i18nT('pages.developer.featurePreviewsTab.intro.webhooks_summary'),
+    whereToFind: i18nT('pages.developer.featurePreviewsTab.intro.webhooks_where'),
+    media: [
+      {
+        kind: 'image',
+        light: `${MEDIA_BASE}/webhooks-page-light.png`,
+        dark: `${MEDIA_BASE}/webhooks-page-dark.png`,
+        caption: i18nT('pages.developer.featurePreviewsTab.intro.webhooks_media_page'),
+      },
+    ],
+  }
+}
+
+/** Crew Members: the `/members` page, the flag's only door. */
+function crewIntro(): FeaturePreviewIntro {
+  return {
+    summary: i18nT('pages.developer.featurePreviewsTab.intro.crew_summary'),
+    whereToFind: i18nT('pages.developer.featurePreviewsTab.intro.crew_where'),
+    media: [
+      {
+        kind: 'image',
+        light: `${MEDIA_BASE}/crew-members-light.png`,
+        dark: `${MEDIA_BASE}/crew-members-dark.png`,
+        caption: i18nT('pages.developer.featurePreviewsTab.intro.crew_media_members'),
+      },
+    ],
+  }
+}
 
 /**
  * `data-setting-key` anchor on the section wrapper, for
@@ -97,8 +145,18 @@ export function FeaturePreviewsSection() {
           checked={webhooks}
           onChange={v => setPreviewFlag(PREVIEW_WEBHOOKS, v)}
         />
-        {webhooks && (
-          <div className="pt-1">
+        {/* One action row under the toggle: "See what it looks like" always, the ingress
+            link only once the flag is on. Same row so the card keeps one
+            footer whichever state it is in, rather than a link appearing on a
+            new line and pushing the next card down. */}
+        <div className="flex flex-wrap items-center gap-x-4 pt-1">
+          <FeaturePreviewIntroButton
+            title={i18nT('pages.developer.featurePreviewsTab.webhooks')}
+            intro={webhooksIntro()}
+            checked={webhooks}
+            onChange={v => setPreviewFlag(PREVIEW_WEBHOOKS, v)}
+          />
+          {webhooks && (
             <button
               type="button"
               onClick={() => navigate('/webhooks')}
@@ -111,37 +169,56 @@ export function FeaturePreviewsSection() {
                   promise a new window that never opens. */}
               <ArrowRight size={13} className="lucide-inline" />
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </SettingsCard>
-      {/* One card, one flag, BOTH crew doors: the Crew Members rail item and the
-          sidebar's "New Crew Mode chat" entry. The toggle copy names both, because
-          a reader who only sees "Crew" cannot predict which of the two moves — and
-          the two appear in places far enough apart that discovering the second one
-          by flipping the switch is not reliable.
+      {/* One card, one flag, one door: the Crew Members page (`/members`) and its
+          rail item. Crew Mode — the second door this card used to name — retired
+          in favour of that page; the sidebar create menu keeps a "Crew Members"
+          entry that opens the page, or lands HERE with this card ringed while the
+          flag is still off (`ChatSidebar.openCrewMembers`).
 
           NO ingress button here, deliberately, unlike the webhooks card above. That
           one needs its link because `/webhooks` is `hiddenFromNav` and the card is
-          its ONLY door. Crew is not: flipping this switch puts the Crew Members row
-          back on the rail in the same tick (`usePreviewFlagRevision`), so a link
-          here would be a second spelling of a door the user can already see — and
-          one that costs a catalog key in twelve languages permanently. */}
+          its ONLY door. Crew Members is not: flipping this switch puts the row back
+          on the rail in the same tick (`usePreviewFlagRevision`), so a link here
+          would be a second spelling of a door the user can already see — and one
+          that costs a catalog key in twelve languages permanently. */}
       <SettingsCard>
         <SettingsToggle
-          label={i18nT('pages.developer.featurePreviewsTab.crew')}
-          description={i18nT('pages.developer.featurePreviewsTab.the_crew_members_page_and_crew_mode_chats_both_a')}
+          label={i18nT('pages.developer.featurePreviewsTab.crew_members')}
+          description={i18nT('pages.developer.featurePreviewsTab.crew_members_desc')}
           checked={crew}
           onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
         />
+        {/* "See what it looks like" is not an ingress: it shows the page instead of
+            opening it, which is what a reader deciding whether to flip the switch
+            needs BEFORE flipping it. */}
+        <div className="pt-1">
+          <FeaturePreviewIntroButton
+            title={i18nT('pages.developer.featurePreviewsTab.crew_members')}
+            intro={crewIntro()}
+            checked={crew}
+            onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
+          />
+        </div>
       </SettingsCard>
-      {/* A SEPARATE card from Crew above, because the word names two unrelated
-          things: that flag holds Crew Mode and the Crew Members page, this one
-          holds a chat dispatched to another MACHINE over the instances tunnel.
-          One card each keeps a reader from flipping the wrong switch.
+      {/* A SEPARATE card from Crew Members above, because the word names two
+          unrelated things: that flag holds the Crew Members page, this one holds
+          a chat dispatched to another MACHINE over the instances tunnel. One card
+          each keeps a reader from flipping the wrong switch.
 
           NO ingress button, for the same reason as the crew card: turning it on
           puts the create-menu entry back in the same tick, and that menu is
-          already in front of the user. */}
+          already in front of the user.
+
+          NO "See what it looks like" yet either, and that is the missing-capture rule, not
+          an omission: the entry it adds only renders while a tunnel to a second
+          machine is live (`warmCrews.length > 0` in ChatSidebar), and the
+          isolated instance the captures come from has no honest way to stage
+          one. A dialog with a staged or drawn frame would break the promise the
+          other two dialogs make — that what you see is what will appear. Add a
+          builder here the day a real two-machine capture exists. */}
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew')}

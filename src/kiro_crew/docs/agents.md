@@ -41,11 +41,11 @@ Cron jobs can specify an agent at creation time.
 
 Kiro Crew owns specs named `kirocrew`, `kirocrew-lite`, `kirocrew-conductor`, `kirocrew-pipeline-conductor`, `kirocrew-ledger-conductor`, `kirocrew-worker`, `kirocrew-knowledge`, `kirocrew-research`, and `kirocrew-heartbeat`. The primary and lite specs are required; the others support goal conducting, pipeline fleet supervision, knowledge extraction, research, and heartbeat features.
 
-`kirocrew-ledger-conductor` is the goal conductor's work-ledger variant, and it is separate rather than a setting on `kirocrew-conductor` on purpose: the ledger flow inverts the dispatch order and replaces the patrol cycle, so putting it on the shipped conductor would move every existing conductor user onto a different procedure without asking. `kirocrew-worker` is the agent a conductor names for a leaf item — the default toolset plus the two reporting tools.
+`kirocrew-conductor` tracks its goal in the work ledger: it mounts `kirocrew-work`, binds each item to a session before seeding it, and settles every completion claim with the acceptance evaluator instead of by reading a transcript. `kirocrew-ledger-conductor` is a deprecated alias of it — the same spec under the flow's old name, kept for one release so a session or cron that names the old string keeps resolving, and removed next release. `kirocrew-worker` is the agent a conductor names for a leaf item — the default toolset plus the two reporting tools.
 
 ## Custom Agents
 
-Custom agents are JSON files in `~/.kiro/agents/`. They define their own system prompt, tools, MCP servers, and permissions.
+Custom agents are JSON files in `~/.kiro/agents/`. They define their own system prompt, tools, MCP servers, and permissions. To delete a template, remove its JSON file from `~/.kiro/agents/`. There is no in-app delete. A crew still bound to the deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
 
 ```json
 {
@@ -60,11 +60,11 @@ Custom agents are JSON files in `~/.kiro/agents/`. They define their own system 
 
 ## Managing Agents
 
-**Agent Capabilities → Agent Templates** shows installed agents with their source, tools, and MCP servers. Drop a new JSON file into `~/.kiro/agents/` and it appears automatically; the tab also provides edit and delete controls. `/agents` redirects to Agent Capabilities.
+**Agent Capabilities → Agents** shows your agents; select one and open its **Template** pane to see its definition — model, system prompt, skills, tools, and MCP servers. Drop a new JSON file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Agent Capabilities.
 
 ## Mapping Skills to an Agent
 
-Each agent template can be given its own set of [skills](skills.md). Open **Agent Capabilities → Agent Templates**, select an agent, and use the **Skills** section to add or remove them. Every edit saves immediately.
+Each agent template can be given its own set of [skills](skills.md). Open **Agent Capabilities → Agents**, select an agent, open its **Template** pane, and use the **Skills** section to add or remove them. Every edit saves immediately.
 
 Under the hood a mapped skill is a `skill://` entry in the agent's `resources`, so kiro-cli loads it natively when the agent starts:
 

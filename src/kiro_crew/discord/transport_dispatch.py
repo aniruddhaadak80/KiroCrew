@@ -29,7 +29,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.sections import _clamp_pct
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.discord.attachments import (
     append_attachment_context,
     process_discord_attachments,
@@ -54,10 +57,11 @@ from kiro_crew.discord.session_resume import (
     ResumeReleaseError,
     RoutingDecision,
 )
-from kiro_crew.discord.transport import DISCORD_CAPABILITIES
+from kiro_crew.discord.transport import DISCORD_CAPABILITIES, _coerce_snowflakes
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import (
@@ -65,6 +69,7 @@ from kiro_crew.messaging.commands import (
     compact_unsupported_reply,
     stop_running_turn,
 )
+from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
     build_auto_approve,
     build_directive_consumer,
@@ -88,7 +93,12 @@ from kiro_crew.messaging.upload_gate import session_is_restricted, uploads_restr
 from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.monitoring.models import MonitorDispatchResult
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact,
+    redact_credentials,
+    redact_exfiltration_urls,
+    redact_local_paths,
+)
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionBusyError
 from kiro_crew.session_allocation import SessionClosingError
@@ -100,6 +110,7 @@ if TYPE_CHECKING:
 
     from kiro_crew.context import ContextBuilder
     from kiro_crew.discord.client import DiscordClient, DiscordInteraction
+    from kiro_crew.discord.transport import DiscordTransport
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
 
@@ -229,11 +240,25 @@ class DiscordDispatcher:
         self.cfg = cfg
         self._allowed = set(allowed_user_ids or ())
         self._allowed_threads = set(allowed_thread_ids or ())
+        # The subset of ``_allowed_threads`` that came from config.json, so a
+        # reload can tell a thread an operator removed from a thread this process
+        # promoted at runtime (see ``register_allowed_thread``).
+        self._configured_threads: frozenset[str] = frozenset(self._allowed_threads)
         self.agent = agent
         self.conv_log = conv_log
         self.approval_mode = approval_mode
         self.client: "DiscordClient | None" = None
+        # Set by maybe_start_discord after construction (same construction-cycle
+        # reason as ``client``); the config applier pushes reloaded authorization
+        # fields at it.
+        self.transport: "DiscordTransport | None" = None
         self._conv = ConversationState(seed_fn=self._seed_gen)
+        # Held on self: the watcher holds the owner WEAKLY, so a subscription
+        # dropped here would be collected and the applier would silently stop
+        # firing.
+        self._config_sub = live.watch_section(
+            self, "discord", "messaging", name="DiscordDispatcher"
+        )
         # The mid-turn queue receipt + the lock serializing it against the
         # end-of-turn drain, shared with Telegram via messaging/queue_receipt.py.
         self._queue = ReceiptQueue()
@@ -260,6 +285,47 @@ class DiscordDispatcher:
     def register_allowed_thread(self, thread_id: str) -> None:
         """Authorize interactions in a thread created by the inbound transport."""
         self._allowed_threads.add(thread_id)
+
+    def reconfigure(self, section: Any) -> None:
+        """Push reloaded ``discord`` authorization fields at both holders.
+
+        This dispatcher keeps its OWN user roster and thread set: interactions
+        bypass ``transport.receive``, so ``_authorized`` and the guild-thread gate
+        re-check against them. Both are mutated IN PLACE so any holder of the same
+        object follows. Threads are UNIONED with the runtime-promoted ids rather
+        than replaced -- a thread this process created is not in ``config.json``
+        and dropping it would strand every follow-up press in it -- while a thread
+        an operator REMOVES from the config is dropped, so the reload narrows as
+        intended. A transport that is not up yet is skipped: it reads the section
+        fresh when it connects.
+        """
+        users = _coerce_snowflakes(getattr(section, "allowed_user_ids", None))
+        if users is None:
+            logger.warning(
+                "discord: allowed_user_ids is not a list in the reloaded config; the dispatcher "
+                "keeps its previous allow-list (%d id(s))",
+                len(self._allowed),
+            )
+        else:
+            self._allowed.clear()
+            self._allowed.update(users)
+            # The ``!sessions`` owner is the third copy of the roster and must
+            # move with it: an added second identity revokes the surface now.
+            self._session_resume.reconfigure(self._allowed)
+        threads = _coerce_snowflakes(getattr(section, "allowed_thread_ids", None))
+        if threads is None:
+            logger.warning(
+                "discord: allowed_thread_ids is not a list in the reloaded config; the dispatcher "
+                "keeps its previous %d entry(ies)",
+                len(self._allowed_threads),
+            )
+        else:
+            promoted = self._allowed_threads - self._configured_threads
+            self._allowed_threads.clear()
+            self._allowed_threads.update(set(threads) | promoted)
+            self._configured_threads = frozenset(threads)
+        if self.transport is not None:
+            self.transport.reconfigure(section)
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
@@ -369,9 +435,17 @@ class DiscordDispatcher:
                 await self.client.send_message(channel_id, _RELEASE_FAILURE)
                 return monitor_result
             self._conv.bump_gen(scope_id)
+            new_session_key = self._session_key(user_id, thread_id)
+            saved = await reserve_new_generation(
+                self.sessions,
+                new_session_key,
+                channel_type="Discord",
+            )
             message = "✅ New conversation started."
             if left_resumed is not None:
                 message = "✅ New conversation started — left the resumed session."
+            if not saved:
+                message += "\n⚠️ The new conversation could not be saved for restart."
             await self.client.send_message(channel_id, message)
             return monitor_result
         if cmd == "compact":
@@ -381,7 +455,7 @@ class DiscordDispatcher:
         if cmd == "sessions":
             # DM-ONLY. The owner gate answers WHO may resume, not WHERE the
             # result may be shown: in an allow-listed guild thread the picker
-            # would post dashboard session TITLES and the bind would replay five
+            # would post private session TITLES and the bind would replay five
             # transcript messages, making private history readable by every
             # member of that thread. Resume is inherently a private-surface
             # operation, so refuse outside a DM rather than redacting harder.
@@ -389,7 +463,7 @@ class DiscordDispatcher:
                 await self.client.send_message(
                     channel_id,
                     "🔒 `!sessions` works only in a direct message — it lists and "
-                    "replays private dashboard conversations, so it will not post "
+                    "replays private conversations, so it will not post "
                     "them into a shared thread. DM me instead.",
                 )
                 return monitor_result
@@ -398,6 +472,7 @@ class DiscordDispatcher:
                 user_id,
                 channel_id,
                 query=parse_command_argument(text),
+                native_key=self._session_key(user_id, thread_id),
             )
             return monitor_result
         if cmd == "link":
@@ -509,8 +584,8 @@ class DiscordDispatcher:
             self._conv.maybe_rotate(
                 scope_id,
                 time.time(),
-                idle_minutes=self.cfg.messaging.idle_reset_minutes,
-                daily_reset_hour=self.cfg.messaging.daily_reset_hour,
+                idle_minutes=int(self._live_cfg().messaging.idle_reset_minutes),
+                daily_reset_hour=int(self._live_cfg().messaging.daily_reset_hour),
             )
         if monitor_session_key is not None:
             # The gateway authorized one exact conversation generation. Recheck
@@ -541,6 +616,7 @@ class DiscordDispatcher:
             if resumed_key is not None:
                 return MonitorDispatchResult.UNAVAILABLE
             try:
+                _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
                 provider, is_new, resumed = await self.sessions.get_or_create(
                     session_key,
                     agent=agent,
@@ -659,6 +735,7 @@ class DiscordDispatcher:
             # leaving the session idle in that window lets a later message run
             # first and persist the conversation in reverse order.
             if not _acquired:
+                _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
                 # ``model`` applies only when this call COLD-STARTS the session: the
                 # fast path returns a reused session before it consults the argument.
                 # That is exactly what ``!model``'s reply promises ("applies to your
@@ -730,6 +807,14 @@ class DiscordDispatcher:
             # Publish this turn's session identity so managed MCP tools resolve
             # X-Session-Key; one shared writer lives in messaging.identity.
             await publish_turn_identity(self.sessions, session_key)
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``agent``: that value is a kiro agent name, a namespace
+            # disjoint from ``cfg.agents``, so a store derived from it resolves to
+            # ``default`` for exactly the crew that configured otherwise. A resumed
+            # dashboard session carries its crew's key here, which is what keeps a
+            # `!sessions` resume of a crew-bound conversation out of the operator's
+            # own memory. Its private tier was prepared before provider
+            # acquisition; an unavailable member store refuses the turn.
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message,
@@ -738,6 +823,7 @@ class DiscordDispatcher:
                 session_key,
                 channel_id=chan_id,
                 agent=agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 runtime_source="discord",
             )
@@ -750,8 +836,12 @@ class DiscordDispatcher:
                     agent=agent,
                     tool_kind=getattr(event, "tool_kind", "") or "",
                     raw_params=getattr(event, "raw_tool_params", None),
+                    diff_path=getattr(event, "diff_path", "") or "",
                     command=getattr(event, "shell_command", None),
                     is_shell=bool(getattr(event, "is_shell", False)),
+                    mcp_server_name=getattr(event, "mcp_server_name", "") or "",
+                    mcp_tool_name=getattr(event, "tool_name", "") or "",
+                    mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
                 )
                 if result.action == TOOL_DENY:
                     return "deny"
@@ -903,7 +993,7 @@ class DiscordDispatcher:
             )
             if monitor_completion is not None:
                 return MonitorDispatchResult.BUSY
-            # Durable inbound spool (issue #2217), for a USER message only — the
+            # Durable inbound spool, for a USER message only — the
             # monitor branch above returns first. A monitor turn is generated
             # work whose own loop re-fires after the restart, so spooling it
             # would replay a check the loop is about to run again anyway.
@@ -931,6 +1021,12 @@ class DiscordDispatcher:
                         attachments_dropped=len(getattr(msg, "attachments", None) or ()),
                     ),
                 )
+        except UnknownMemoryStore as exc:
+            logger.warning("Discord member memory unavailable: %s", exc)
+            if monitor_completion is not None:
+                return MonitorDispatchResult.UNAVAILABLE
+            await out_renderer.on_text_chunk(redact_local_paths(redact(str(exc)))[0][:1000])
+            await out_renderer.on_done()
         except Exception:
             logger.exception("Discord transport_dispatch: error handling message")
             if monitor_completion is not None:
@@ -975,7 +1071,7 @@ class DiscordDispatcher:
         """A message arrived mid-turn: steer the running turn or queue it."""
         assert self.client is not None
         channel_id = msg.conversation_id
-        mode = override_mode or self.cfg.messaging.queue_mode
+        mode = override_mode or str(self._live_cfg().messaging.queue_mode)
         if mode != "queue" and not msg.attachments:
             provider = self.sessions.get_provider(session_key)
             steer = getattr(provider, "steer", None)
@@ -1041,7 +1137,7 @@ class DiscordDispatcher:
                         texts.append(item[1])
                         attachments.extend(item_attachments)
                     else:
-                        # Once one message no longer fits, defer it and everything
+                        # Once one message does not fit, defer it and everything
                         # behind it so queue order remains exact.
                         defer_rest = True
                         remainder.append(item)
@@ -1273,7 +1369,12 @@ class DiscordDispatcher:
         if data.startswith("s:"):
             if itx.guild_id:
                 return
-            await self._session_resume.choose(self.client, itx, data)
+            await self._session_resume.choose(
+                self.client,
+                itx,
+                data,
+                native_key=self._session_key(itx.user_id, thread_id),
+            )
             return
 
         # Tool-approval decision: "a:<request_id>:<nonce>:<1|0>". The nonce is
@@ -1423,23 +1524,47 @@ class DiscordDispatcher:
     def _render_config(self) -> tuple[bool, bool]:
         """``(reactions_enabled, show_thinking)`` for the turn about to start.
 
-        Blocking (a config.json read plus schema validation), so callers run it
-        off the event loop.
+        May block (the fallback ``load()`` stats config.json and validates it),
+        so callers run it off the event loop.
 
-        Loaded fresh rather than taken from ``self.cfg``, which is the boot-time
+        Read live rather than taken from ``self.cfg``, which is the boot-time
         snapshot: an operator who turns the phase reactions off in the dashboard
-        expects the next message to be quiet, not the next restart. A failed load
+        expects the next message to be quiet, not the next restart. A failed read
         keeps the shipped defaults rather than failing the turn, because neither
         toggle is a security control: the loud default is the safe one to fall
         back to for reactions, and the quiet default is the safe one for
         reasoning.
         """
         try:
-            discord_cfg = KiroCrewConfig.load().discord
+            discord_cfg = self._live_cfg().discord
             return bool(discord_cfg.reactions_enabled), bool(discord_cfg.show_thinking)
         except Exception:
             logger.warning("discord: could not read the render toggles", exc_info=True)
             return True, False
+
+    # ── Live config ────────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when it is armed, else a fingerprint-cached
+        ``load()`` (two stats on a hit), else the boot copy. Falling back to
+        ``self.cfg`` rather than raising keeps a turn running when the config
+        file is momentarily unreadable: a threshold or a render toggle is not an
+        authorization decision, and the boot value is the one the operator last
+        had in force.
+        """
+        return live.current(self.cfg, log_prefix="discord")
+
+    def _soft_threshold(self) -> int:
+        """The context-nudge threshold from the live config.
+
+        Re-runs the loader's own clamp, because a reloaded value read straight
+        off the section can sit outside the valid range and either nudge on every
+        turn or never nudge at all. Discord has no hard threshold, so there is no
+        pair to order.
+        """
+        return _clamp_pct(int(getattr(self._live_cfg().discord, "soft_threshold_pct", 80)))
 
     def _resolve_agent(self) -> str:
         return self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
@@ -1456,7 +1581,7 @@ class DiscordDispatcher:
             self._resolve_agent(),
             thread_id or user_id,
             gen=gen,
-            dm_scope=("per-channel-peer" if thread_id else self.cfg.messaging.dm_scope),
+            dm_scope=("per-channel-peer" if thread_id else str(self.cfg.messaging.dm_scope)),
             chat_type=("group" if thread_id else "direct"),
         )
 
@@ -1486,7 +1611,7 @@ class DiscordDispatcher:
             channel="discord",
             agent=self._resolve_agent(),
             user_id=user_id,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
         )
 
     def _origin_mirror_link(self, channel_id: str) -> ChannelLink:
@@ -1729,9 +1854,9 @@ class DiscordDispatcher:
         (``session.autocompact_pct``).
         """
         pct = self.sessions.check_context_usage(session_key, provider)
-        soft_pct = self.cfg.discord.soft_threshold_pct
+        soft_pct = self._soft_threshold()
         if pct >= soft_pct and compact_unsupported_backend(provider):
-            # Capability gate (#8156): the nudge advises !compact, which this
+            # Capability gate: the nudge advises !compact, which this
             # backend refuses — it compacts on its own as context fills, so
             # there is nothing for the user to act on.
             return
@@ -1769,7 +1894,7 @@ class DiscordDispatcher:
                 await self.client.send_message(channel_id, "No active session to compact.")
                 return
 
-            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # Capability gate (mirroring the dashboard's gate): a
             # backend that cannot serve a manual /compact treats the prompt as
             # ordinary text and never answers, so dispatching would strand the
             # 120s wait below. Informational, never an error.

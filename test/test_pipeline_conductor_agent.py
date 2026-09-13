@@ -156,7 +156,7 @@ class TestPipelineConductorInstaller:
         ``kirocrew-work`` is NOT among them. It was mounted here briefly and the
         mount is retracted, because the work-ledger flow is a different dispatch
         and patrol procedure and this agent ships its own — see
-        ``kirocrew-ledger-conductor``. Negative rather than deleted so the mount
+        ``kirocrew-conductor``. Negative rather than deleted so the mount
         cannot return unnoticed.
         """
         data = self._install(tmp_path, monkeypatch)
@@ -290,10 +290,9 @@ class TestFleetProbe:
 
     def test_a_protocol_word_in_prose_is_not_a_report(self, tmp_path, capsys, monkeypatch):
         """The protocol is ``<WORD>:``. A line that merely OPENS with a protocol
-        word -- ``PR #6580 is green ...`` -- is prose, and tagging it invents a
-        report nobody filed. Measured over the 60 most recent transcripts on the
-        development host, 20 of the 94 assistant rows that matched the old
-        ``^<WORD>\\b`` form were prose, 13 of them a bare ``PR #<n>``."""
+        word -- ``PR #<n> is green ...`` -- is prose, and tagging it invents a
+        report nobody filed. Among assistant rows matching a bare ``^<WORD>\\b``
+        form, many are prose, and a bare ``PR #<n>`` is the common shape."""
         mod = self._mod()
         cfg = self._config(tmp_path, monkeypatch, ["s-prose"])
         self._session(
@@ -425,7 +424,7 @@ class TestFleetProbe:
 
         A real host resolves ``/proc/<pid>/exe`` to the binary the process is
         actually running, which for every honest process is what ``argv[0]`` names.
-        The wrapper exemption requires that kernel answer and no longer accepts
+        The wrapper exemption requires that kernel answer and rejects
         ``argv[0]`` alone, so a fake /proc that omits ``exe`` now models a process
         hiding its identity rather than an ordinary one -- which would make the
         option-parsing tests assert the spoof path instead of the case they are
@@ -1579,9 +1578,9 @@ class TestFleetProbe:
     def test_a_non_protocol_disposition_does_not_erase_the_terminal_tag(
         self, tmp_path, capsys, monkeypatch
     ):
-        """The defect 2b closes: the handled set keeps ONE entry per key, so a
-        later IDLE or GONE disposition used to overwrite the terminal report and
-        the finished worker read as wedged again on the next cycle."""
+        """The handled set keeps ONE entry per key, so a later IDLE or GONE
+        disposition must not overwrite the terminal report; otherwise the
+        finished worker reads as wedged again on the next cycle."""
         mod = self._mod()
         cfg = self._config(tmp_path, monkeypatch, ["s-done"], idle_alert_secs=100)
         sessions = tmp_path / "sessions"
@@ -1701,10 +1700,22 @@ class TestFleetProbe:
 
     def _proc(self, tmp_path: Path, pid: str, argv: bytes, cwd: Path | None) -> Path:
         """One fake ``/proc/<pid>``. ``cwd`` is written as a SYMLINK because that
-        is what the kernel exposes and what the probe reads."""
+        is what the kernel exposes and what the probe reads.
+
+        A ``stat`` file is always written: every live process on a real system
+        has one, and the probe reads its ``starttime`` (field 22) as the process
+        incarnation token that brackets the per-pid reads. A stable ``stat`` here
+        means one incarnation across the scan, so cwd classification is exercised
+        as it is in production; omitting it would model a process that exited
+        mid-scan, which is a different case with its own tests.
+        """
         proc = tmp_path / "proc"
         (proc / pid).mkdir(parents=True, exist_ok=True)
         (proc / pid / "cmdline").write_bytes(argv)
+        # field 1 pid, field 2 comm, field 3 state, then starttime is field 22 --
+        # index 19 in the split after ') ', where index 0 is the state field.
+        stat_tail = ["0"] * 18 + ["1000"] + ["0"] * 30
+        (proc / pid / "stat").write_text(f"{pid} (proc) R " + " ".join(stat_tail) + "\n", "ascii")
         if cwd is not None:
             cwd.mkdir(parents=True, exist_ok=True)
             os.symlink(str(cwd), str(proc / pid / "cwd"))
@@ -1789,7 +1800,7 @@ class TestFleetProbe:
         self._run(
             mod, cfg, capsys, "--mark-handled", "s-gone", "GREEN", self._digest_of(out, "s-gone")
         )
-        # The report is no longer in the window; only the state file knows.
+        # The report is not in the window; only the state file knows.
         self._session(sessions, "s-gone", "trailing chatter with no prefix", age_secs=500)
         out = self._run(mod, cfg, capsys)
         assert "TERMINAL" in out
@@ -2480,10 +2491,10 @@ class TestFleetProbe:
         """An answered report must not re-present because a later tag was marked.
 
         The handled set holds ONE entry per key, so marking a condition tag
-        (``IDLE``/``NOPROGRESS``) over an answered payload tag used to overwrite
-        the record that the payload was dealt with -- and the answered ruling then
-        fired again, sending the conductor to re-adjudicate something it had
-        already decided. The payload disposition is now preserved beside the new
+        (``IDLE``/``NOPROGRESS``) over an answered payload tag must not overwrite
+        the record that the payload was dealt with -- otherwise the answered ruling
+        fires again, sending the conductor to re-adjudicate something it has
+        already decided. The payload disposition is preserved beside the new
         entry, which is the shape ``proto`` already uses for the terminal reading.
         """
         mod = self._mod()

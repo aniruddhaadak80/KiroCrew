@@ -298,7 +298,6 @@ class TestPodRecordFreshness:
     @pytest.fixture
     def cfg(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PodConfig:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         return PodConfig.load()
 
     def test_an_unattributable_loopback_listener_still_proves_our_pod(
@@ -448,7 +447,7 @@ class TestPodRecordFreshness:
     def test_a_two_line_record_from_an_intermediate_build_is_unproven(
         self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A pid file carrying its own token is no longer where the reader looks.
+        """A pid file carrying its own token is not where the reader looks.
 
         Such a file exists only in a home written by an intermediate build. It
         must fail CLOSED -- and read as "record present, no start identity" so the
@@ -474,7 +473,6 @@ class TestPodUnprovenRemediation:
     @pytest.fixture
     def cfg(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PodConfig:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         return PodConfig.load()
 
     def test_no_record_at_all_is_told_to_restart(self, cfg: PodConfig) -> None:
@@ -533,7 +531,6 @@ class TestPodPidAttestation:
         deny the credential to every healthy pod on a minimal Linux box forever.
         """
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         live = os.getpid()
         monkeypatch.setattr(rt, "main_pid", lambda cfg, name: live)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
@@ -551,7 +548,6 @@ class TestPodPidAttestation:
     ) -> None:
         """The historical one-line format cannot prove it is not a crash leftover."""
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         live = os.getpid()
         monkeypatch.setattr(rt, "main_pid", lambda cfg, name: live)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
@@ -563,7 +559,6 @@ class TestPodPidAttestation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         _pin_start_token(monkeypatch, 4242, _START_TOKEN_FOR_4242)
         monkeypatch.setattr(rt, "main_pid", lambda cfg, name: 4242)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
@@ -580,7 +575,6 @@ class TestPodPidAttestation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         monkeypatch.setattr(rt, "main_pid", lambda cfg, name: 4242)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
         monkeypatch.setattr(
@@ -594,7 +588,6 @@ class TestPodPidAttestation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         _pin_start_token(monkeypatch, 4242, _START_TOKEN_FOR_4242)
         monkeypatch.setattr(rt, "main_pid", lambda cfg, name: 4242)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
@@ -612,7 +605,6 @@ class TestPodPidAttestation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded: str
     ) -> None:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(rt, "IS_POSIX", True)
         _pin_start_token(monkeypatch, 4242, _START_TOKEN_FOR_4242)
         monkeypatch.setattr(rt, "main_pid", lambda cfg, name: 4242)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
@@ -621,12 +613,24 @@ class TestPodPidAttestation:
             _write_record(cfg, "demo", 7999, f"{recorded}\n", _START_TOKEN_FOR_4242)
         assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
 
-    def test_non_posix_stays_unproven_without_touching_host_tools(
+    def test_windows_is_asked_the_same_question_as_every_other_host(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(rt, "IS_POSIX", False)
-        monkeypatch.setattr(rt, "main_pid", lambda cfg, name: pytest.fail("must not run"))
-        assert rt.port_owner(PodConfig.load(), "demo", 7999) == rt.OWNER_UNPROVEN
+        """``port_owner`` must not refuse win32 outright before consulting anything.
+
+        That was unsatisfiable rather than strict: ``pod up`` mints a token and
+        ``mint_token`` requires positive proof, so a healthy Windows pod could
+        never earn its own credential. Both facts the proof needs answer there
+        now, so the platform gate is gone and the freshness rule alone decides.
+        A record that cannot prove itself is still UNPROVEN, on every host.
+        """
+        monkeypatch.setattr(rt, "IS_WINDOWS", True)
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
+        cfg = PodConfig.load()
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda c, n, p: 4242)
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_POD
 
 
 class TestPodApiSecurityPosture:
@@ -839,6 +843,36 @@ class TestPodApiUnixTransport:
         # Actionable: names the socket it wanted and what to do about it.
         assert "dashboard-" in rendered and ".sock" in rendered
         assert "kirocrew pod status wt" in rendered
+
+    def test_windows_names_the_real_cause_instead_of_prescribing_a_futile_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The generic refusal is wrong ON WINDOWS, not merely unhelpful.
+
+        There the socket is not MISSING, it is never created: CPython on win32
+        exposes no ``AF_UNIX`` (measured on 3.12), so the pod's gateway binds no
+        dashboard socket and no amount of restarting produces one. Sending the
+        operator down "is it healthy / read the logs / down && up" therefore costs
+        them the pod's state on every lap and never reaches an explanation. There is
+        a way through -- mint a token, drive the loopback port yourself -- and the
+        message is the only place they will find it, because the docs that say so
+        are not what a failing command shows them.
+
+        Asserted by CONTENT rather than by absence of the old text, so a future
+        rewording cannot pass by dropping the guidance.
+        """
+        monkeypatch.setattr(rt, "IS_WINDOWS", True)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, name: True)
+
+        with pytest.raises(rt.PodError) as excinfo:
+            rt.pod_api(PodConfig.load(), "wt", "GET", "sessions")
+
+        rendered = str(excinfo.value)
+        assert "AF_UNIX" in rendered, "must name the actual missing capability"
+        assert "restart will not fix it" in rendered, "must stop the futile loop explicitly"
+        assert "kirocrew pod token wt" in rendered, "must name the way through"
+        assert "127.0.0.1:" in rendered, "must name where to send the request"
+        assert "pod down" not in rendered, "must not prescribe the restart that cannot help"
 
     def test_a_stale_socket_file_does_not_reopen_the_tcp_path(
         self, port_squatter: _RecordingServer
@@ -1154,8 +1188,10 @@ class TestPodApiAuditAndCli:
         Both halves of the round trip recurse once per nesting level, and which
         one gives way depends on how much stack is left — measured here, depth
         20,000 fails to decode while depth 2,000 decodes and then fails to
-        ENCODE. So this asserts the invariant that holds either way rather than
-        pinning a threshold that shifts with the interpreter and the call depth.
+        ENCODE on one interpreter and round-trips whole on another. So this
+        asserts the invariant that holds in every case rather than pinning a
+        threshold that shifts with the interpreter, the platform's thread stack
+        and the call depth.
         """
         raw = "[" * depth + "]" * depth
         monkeypatch.setattr(rt, "pod_api", lambda *args, **kwargs: (200, raw))
@@ -1170,7 +1206,19 @@ class TestPodApiAuditAndCli:
         # The request itself succeeded, so its status survives whichever leg gave way.
         assert document["status"] == 200
         assert document["ok"] is True
-        assert document["body"] in (raw, "<body omitted: not serializable>")
+        body = document["body"]
+        if isinstance(body, list):
+            # Neither leg gave way -- an interpreter with a deeper effective stack
+            # (Python 3.13 on Windows decodes AND re-encodes depth 2,000) round-trips
+            # the body intact. The invariant is then that it is the SAME body,
+            # checked iteratively so the assertion itself cannot hit the budget.
+            nesting, node = 0, body
+            while isinstance(node, list) and node:
+                node, nesting = node[0], nesting + 1
+            assert isinstance(node, list) and not node, "innermost element must be the empty list"
+            assert nesting + 1 == depth
+        else:
+            assert body in (raw, "<body omitted: not serializable>")
 
     def test_a_decode_failure_no_one_enumerated_degrades_to_text(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

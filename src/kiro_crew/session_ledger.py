@@ -14,7 +14,7 @@ Layout (see docs/system-specs/modules/session-work-ledger.md):
         state.json      # the whole record, replaced atomically on every write
         .lock           # cross-process mutex inode (never replaced by writes)
 
-Design notes, each earned by a review finding:
+Design notes:
 
 - **One document, one atomic write.** State and its event land in the same
   ``atomic_write`` (temp file + rename), so a crash between "phase moved" and
@@ -98,12 +98,10 @@ _STATE_FILE = "state.json"
 _KEY_FILE = "slot_key"
 _LOCK_FILE = ".lock"
 
-#: Identical fold to ``crew_chat._store_name`` — kept in lockstep so a slot
-#: key and its stores share one spelling family. Reimplemented rather than
-#: imported: ``crew_chat`` drags the whole crew orchestrator import graph into
-#: what must stay a leaf module usable from the gateway boot path. The fold
-#: shapes only the READABLE half of a directory name; identity is the digest
-#: over the exact key.
+#: Fold for the READABLE half of a store directory name (it originated as the
+#: Crew Mode store's fold and outlived that mode; ``work_ledger`` imports this
+#: copy). Kept in a leaf module usable from the gateway boot path. Identity is
+#: the digest over the exact key, never this fold.
 _STORE_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 _STORE_NAME_READABLE_MAX = 80
 
@@ -149,6 +147,46 @@ def _ledger_root() -> Path:
     return data_home() / "ledger"
 
 
+_EXTENDED_LENGTH_PREFIX = "\\\\?\\"
+
+
+def _plain(path: Path) -> Path:
+    """*path* without Windows' extended-length prefix; unchanged elsewhere."""
+    text = str(path)
+    if text.startswith(_EXTENDED_LENGTH_PREFIX + "UNC\\"):
+        return Path("\\\\" + text[len(_EXTENDED_LENGTH_PREFIX) + 4 :])
+    if text.startswith(_EXTENDED_LENGTH_PREFIX):
+        return Path(text[len(_EXTENDED_LENGTH_PREFIX) :])
+    return path
+
+
+def resolved_within(base: Path, name: str) -> Path | None:
+    """``base / name`` resolved, or ``None`` when it does not stay inside *base*.
+
+    The symlink-safe containment check every ledger path goes through. Two
+    properties keep it honest under concurrency:
+
+    * The base is resolved ONCE and the child is built from the resolved base, so
+      both sides are spelled from the same ancestors.
+    * Both sides are stripped of Windows' extended-length prefix before the
+      comparison. ``Path.resolve()`` on a FILE that another thread is replacing at
+      that moment comes back as ``\\\\?\\C:\\...``: ``ntpath.realpath`` drops the
+      prefix only after re-checking the stripped spelling, and that re-check fails
+      when the file has just been swapped out. The directory, resolved separately,
+      comes back as ``C:\\...``, and ``is_relative_to`` then reads the prefix alone
+      as an escape. Four threads binding one worker at once reproduce it in about
+      four runs of ten on a short-name temp root; the CI Windows shard is one.
+
+    The root itself is not a member: a name that folds to nothing must not be
+    granted the whole store.
+    """
+    parent = _plain(base.resolve())
+    resolved = _plain((parent / name).resolve())
+    if resolved == parent or not resolved.is_relative_to(parent):
+        return None
+    return resolved
+
+
 def ledger_dir(slot_key: str) -> Path:
     """Validated per-session ledger directory for *slot_key*.
 
@@ -159,10 +197,8 @@ def ledger_dir(slot_key: str) -> Path:
     """
     if not slot_key or "\0" in slot_key or "/" in slot_key or "\\" in slot_key:
         raise ValueError(f"Invalid slot key for ledger: {slot_key!r}")
-    base = _ledger_root()
-    resolved = (base / _store_name(slot_key)).resolve()
-    parent = base.resolve()
-    if resolved == parent or not resolved.is_relative_to(parent):
+    resolved = resolved_within(_ledger_root(), _store_name(slot_key))
+    if resolved is None:
         raise ValueError(f"Path traversal blocked for slot key: {slot_key!r}")
     return resolved
 
@@ -415,7 +451,7 @@ def record(
         # ``_serialize_bounded`` evicted from THIS dict, so the caller's
         # post-write view is the document that just landed on disk. Do not
         # serialize a copy here: that would return the pre-eviction lists
-        # while disk held the evicted ones (#6290).
+        # while disk held the evicted ones.
         return state
 
 
@@ -508,14 +544,12 @@ def _serialize_bounded(state: dict[str, Any], source: str = "") -> str:
 
 
 def purge(slot_key: str) -> None:
-    """Delete *slot_key*'s ledger directory. Best-effort, never raises.
+    """Delete *slot_key*'s ledger directory. Best-effort maintenance API.
 
-    Ledger content is disposable intermediate state — nothing reconstructs
-    from it — so this runs unconditionally on permanent session deletion.
-    A write racing the delete can at worst recreate an orphan directory that
-    the next delete sweeps; it can never touch another session's ledger, so
-    the funnel narrows the window (purge after the slot's turn is torn down)
-    instead of buying a tombstone protocol for disposable state.
+    History deletion deliberately does not call this function: a transcript can
+    be reclaimed while another process claims the same logical session. Callers
+    must establish their own ownership boundary before using this irreversible
+    primitive.
     """
     try:
         dir_path = ledger_dir(slot_key)
@@ -525,25 +559,11 @@ def purge(slot_key: str) -> None:
 
 
 def purge_matching(exact_keys: set[str], folded_keys: set[str], fold: Any) -> int:
-    """Purge every ledger whose breadcrumb key matches a delete candidate.
+    """Purge ledgers matching exact keys or a caller-supplied fold.
 
-    The delete funnel names a session by whatever spellings it has on hand
-    (history key, slot key, folded transcript spelling), but a channel
-    session's ledger is keyed by its EXACT session key — a spelling the
-    funnel may not hold once the slot is gone. This sweep closes that gap:
-    it walks the ledger root, reads each directory's ``slot_key`` breadcrumb,
-    and removes the ledger when the breadcrumb matches a candidate exactly or
-    under the caller-supplied *fold* (the transcript-filename fold, so the
-    folded history spelling the funnel does hold reaches the exact-key
-    ledger it names). The fold is used only to MATCH deletion targets, never
-    as storage identity; in the rare case two exact keys share a folded
-    spelling, both ledgers are removed — acceptable for disposable state,
-    where the alternative is one of them silently surviving its session.
-
-    Best-effort, never raises. Returns the number of ledgers removed. The
-    root holds one directory per session that ever recorded, so the walk is
-    small; a breadcrumbless directory (breadcrumb write is best-effort) is
-    still covered by the direct :func:`purge` calls the funnel makes first.
+    This is an explicit best-effort maintenance API. The fold selects targets;
+    it is never a storage identity. Callers must establish that every matching
+    exact key is safe to remove before invoking it.
     """
     removed = 0
     try:

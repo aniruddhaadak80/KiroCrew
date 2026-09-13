@@ -2,7 +2,7 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare } from 'lucide-react'
+import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { canonicalChatHref, sessionKeyFrom, sessionKeyFromChatHref } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
@@ -47,6 +47,7 @@ import { LinkChip, LinkCard } from './LinkPreview'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
+import { wholeMatchAutolinkHref, rearmConfigScanBudget } from '../utils/autolinkRules'
 import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
@@ -213,9 +214,36 @@ const REL_PREFIX_RE = /^\.{1,2}[/\\]/
  * rules would otherwise readmit it: the extension rule matches
  * `\\host\share\x.txt`, and the leading-`/` rule matches `//host/share/x`.
  * See `UNC_PREFIX_RE` for why that shape must never reach the probe.
+ *
+ * A directory written with a trailing separator (`/home/user/notes/`,
+ * `C:\Users\me\`) is classified by retrying on the slash-stripped form when the
+ * literal string fails: `PATH_SHAPE_RE` requires the string to END in a name
+ * character, so a trailing `/` otherwise fails the shape and the directory chip
+ * renders dead -- the directory-chip half of issue #9409. This widens NOTHING.
+ * The retry runs the SAME rules on the string minus one trailing separator, so a
+ * trailing slash rescues only a string whose slash-less form is already a
+ * candidate: `owner/repo/`, `text/plain/` and `2026/08/02/` stay rejected because
+ * `owner/repo` etc. are. The literal form is tried first so a bare drive root
+ * (`C:\`, whose slash-stripped `C:` is not a valid shape) keeps classifying, and
+ * the UNC refusal runs on the ORIGINAL string so `//host/share/` cannot slip
+ * through the strip.
  */
 export function isPathCandidate(s: string): boolean {
   if (UNC_PREFIX_RE.test(s)) return false
+  if (classifyPathShape(s)) return true
+  // Retry once on the slash-stripped form so a trailing separator does not
+  // disqualify an otherwise-valid directory. Guarded to len > 1 so `/` and `\`
+  // are not reduced to the empty string.
+  if (s.length > 1 && (s.endsWith('/') || s.endsWith('\\'))) {
+    return classifyPathShape(s.slice(0, -1))
+  }
+  return false
+}
+
+/** Shape + positive-signal test for a UNC-screened candidate. See
+ *  `isPathCandidate`, which owns the UNC refusal and the trailing-separator
+ *  retry. */
+function classifyPathShape(s: string): boolean {
   if (!PATH_SHAPE_RE.test(s) && !WIN_DRIVE_PATH_SHAPE_RE.test(s)) return false
   if (s.startsWith('/') || s.startsWith('~') || REL_PREFIX_RE.test(s)) return true
   // Rootedness is the positive signal, exactly as a leading `/` is on POSIX, so
@@ -584,41 +612,135 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
-    if (!ref.current || renderedRef.current === code) return
+    const host = ref.current
+    if (!host || renderedRef.current === code) return
     renderedRef.current = code
     setFailed(false)
-    loadMermaid().then(mermaid => {
-      // Re-initialized per render so a theme switch between two diagrams is
-      // picked up; initialize() is cheap and idempotent.
-      initMermaid(mermaid)
-      return mermaid.render(`mermaid-${id}`, code)
-    }).then(({ svg }) => {
-      if (!ref.current) return
-      const range = document.createRange()
-      range.selectNodeContents(ref.current)
-      range.deleteContents()
-      ref.current.appendChild(range.createContextualFragment(svg))
-      setSvg(svg)
-    }).catch(() => {
-      if (!ref.current) return
-      // The host is EMPTIED rather than filled with a hand-built <pre>. The
-      // source is rendered declaratively below for both states that show it
-      // (`failed || showSource`), so there is exactly one element -- and one set
-      // of styles -- meaning "this diagram's source as text". Building a second
-      // one here left two spellings of the same thing, kept in sync by hand,
-      // which diverges the first time either is retouched.
-      ref.current.textContent = ''
-      setSvg('')
-      setEnlarged(false)
-      // Reset so the failed state has ONE shape. Not to prevent stranding: the
-      // source below now lives OUTSIDE the hidden host, so neither value of
-      // `showSource` can strand the reader. It is that a later successful render
-      // should show the diagram it just produced rather than silently staying on
-      // text, and while no diagram exists neither does the toggle that would
-      // bring the reader back.
-      setShowSource(false)
-      setFailed(true)
+    // Draw only once this element HAS A BOX. mermaid sizes every label by
+    // getBoundingClientRect() on a scratch <div> it appends to document.body,
+    // so what it needs is a laid-out DOCUMENT, and the one place the two go
+    // dark together is the case that bit: a remote-instance pane is a
+    // display:none <iframe> while another instance tab is active
+    // (InstancesViewport hides, never unmounts), and inside it every rect is
+    // 0. A diagram that finishes streaming there comes back as a 16px viewBox
+    // with NaN node transforms -- an empty box where the flowchart should be,
+    // and nothing redraws it until the block happens to remount.
+    //
+    // `getClientRects()` is the probe because it is EMPTY when the element has
+    // no box at all (display:none anywhere above it, the hidden iframe
+    // included) and non-empty, at zero size, whenever layout did run. The
+    // obvious signals cannot tell: inside a hidden iframe
+    // document.visibilityState stays 'visible' and clientWidth reports the
+    // last laid-out value. A ResizeObserver stays silent while the box is
+    // absent and fires on the frame it reappears, after layout, which is
+    // exactly when mermaid's measurements are trustworthy again. The probe runs
+    // before the lazy mermaid load and before mermaid.render(), and the box is
+    // watched for the whole of render(), so every async gap around the
+    // measurement is covered.
+    let live = true
+    let settled = false
+    let observer: ResizeObserver | undefined
+    let watch: ResizeObserver | undefined
+    const whenBoxed = () => new Promise<void>(resolve => {
+      if (host.getClientRects().length > 0 || typeof ResizeObserver !== 'function') {
+        resolve()
+        return
+      }
+      observer = new ResizeObserver(() => {
+        if (host.getClientRects().length === 0) return
+        observer?.disconnect()
+        observer = undefined
+        resolve()
+      })
+      observer.observe(host)
     })
+    // One attempt: wait for a box, then render WHILE WATCHING THE BOX. render()
+    // is itself async -- it lazy-loads the diagram's own chunk, and image shapes
+    // load apart -- so the pane can go hidden after the probe and even come back
+    // before render() resolves, with some or all labels measured at 0 in
+    // between. A point check at the end would pass on those. The observer
+    // reports the box going to 0x0 on the first frame it is gone, so any hide
+    // that lasts a frame is caught even when the box is back by the end. A hide
+    // that starts AND ends inside one frame (under ~16ms) is not reported; no
+    // tab switch is that fast, and waiting a frame to find out would tax every
+    // diagram for it. Lost box, or no box at the end: discard that SVG and go
+    // round again. Without ResizeObserver there is nothing to wait on, so the
+    // result stands as it did before this change rather than rendering in a
+    // loop.
+    const attempt = (mermaid: MermaidApi): Promise<{ svg: string } | null> =>
+      whenBoxed()
+        .then(() => {
+          if (!live) return null
+          let lostBox = false
+          if (typeof ResizeObserver === 'function') {
+            watch = new ResizeObserver(() => {
+              if (host.getClientRects().length === 0) lostBox = true
+            })
+            watch.observe(host)
+          }
+          // Re-initialized per render so a theme switch between two diagrams is
+          // picked up; initialize() is cheap and idempotent.
+          initMermaid(mermaid)
+          return mermaid.render(`mermaid-${id}`, code)
+            .then(result => ({ result, lostBox }))
+            .finally(() => {
+              watch?.disconnect()
+              watch = undefined
+            })
+        })
+        .then(step => {
+          if (!step || !live) return null
+          const boxless = step.lostBox || host.getClientRects().length === 0
+          if (boxless && typeof ResizeObserver === 'function') return attempt(mermaid)
+          return step.result
+        })
+    whenBoxed()
+      .then(loadMermaid)
+      .then(attempt)
+      .then(result => {
+        if (!result || !ref.current) return
+        settled = true
+        const range = document.createRange()
+        range.selectNodeContents(ref.current)
+        range.deleteContents()
+        ref.current.appendChild(range.createContextualFragment(result.svg))
+        setSvg(result.svg)
+      })
+      .catch(() => {
+        if (!live || !ref.current) return
+        settled = true
+        // The host is EMPTIED rather than filled with a hand-built <pre>. The
+        // source is rendered declaratively below for both states that show it
+        // (`failed || showSource`), so there is exactly one element -- and one set
+        // of styles -- meaning "this diagram's source as text". Building a second
+        // one here left two spellings of the same thing, kept in sync by hand,
+        // which diverges the first time either is retouched.
+        ref.current.textContent = ''
+        setSvg('')
+        setEnlarged(false)
+        // Reset so the failed state has ONE shape. Not to prevent stranding: the
+        // source below now lives OUTSIDE the hidden host, so neither value of
+        // `showSource` can strand the reader. It is that a later successful render
+        // should show the diagram it just produced rather than silently staying on
+        // text, and while no diagram exists neither does the toggle that would
+        // bring the reader back.
+        setShowSource(false)
+        setFailed(true)
+      })
+    return () => {
+      // Torn down before anything was drawn: abandon this chain and forget the
+      // code too, or the guard above would make the next run (a new code
+      // string, or StrictMode's dev-only replay of this effect) skip a diagram
+      // that never rendered. Once the SVG or the failure notice is on screen
+      // there is nothing to abandon, and the guard keeps doing its job.
+      if (settled) return
+      live = false
+      observer?.disconnect()
+      observer = undefined
+      watch?.disconnect()
+      watch = undefined
+      renderedRef.current = ''
+    }
   }, [code, id])
 
   return (
@@ -837,9 +959,22 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       sessionCandidate = decodeURIComponent(href)
     } catch { /* keep it a normal link */ }
   }
+  // Whether this href NAMES a same-origin chat session at all, independent of
+  // whether that session is currently reachable (open). A closed/unknown key is
+  // still a chat-session href — it just does not resolve in the open-tabs roster.
+  const sessionHrefKey = sessionCandidate ? sessionKeyFromChatHref(sessionCandidate) : null
+  // Whether this renderer is wired to route sessions at all — the SAME predicate
+  // `resolveSessionChip` guards on (`onSessionOpen` AND `sessions`), so the link
+  // affordance and the click handler can never disagree. Both must be present:
+  // `ChatPage` keeps `onSessionOpen` wired but WITHHOLDS `sessions` while offline
+  // (`sessions={connected ? sessionTitles : undefined}`), and a no-controller
+  // render (e.g. an SDK `user` message row) has neither. In either case there is
+  // nothing that could switch sessions, so a `?sid=` link must stay an ordinary
+  // navigating link rather than be swallowed.
+  const sessionRouting = !!(sessionActions.onSessionOpen && sessionActions.sessions)
   // Same gate as the inline chip, so a link and a bare key naming one session
   // cannot disagree about whether it is reachable.
-  const sessionLink = sessionCandidate ? resolveSessionChip(sessionKeyFromChatHref(sessionCandidate) ?? '', sessionActions) : null
+  const sessionLink = sessionHrefKey ? resolveSessionChip(sessionHrefKey, sessionActions) : null
   // The attribute carries the canonical key: a modified click goes to the browser,
   // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
   const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
@@ -847,9 +982,28 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     // Only the PLAIN click is reinterpreted; the href stays real so Cmd+click
     // still opens the session in its own tab.
     const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
-    if (!sessionLink || !plainPrimaryClick) return
-    e.preventDefault()
-    sessionActions.onSessionOpen!(sessionLink.key)
+    if (!plainPrimaryClick) return
+    // A resolvable session opens in place. A chat-session href that does NOT
+    // resolve is swallowed rather than left to the browser. `resolveSessionChip`
+    // returns null in two cases, both correctly declined here:
+    //   - a closed / unknown key — its raw `?sid=` would navigate to a session
+    //     the controller cannot load, landing on a dead/blank view (#9914);
+    //   - the ACTIVE session's own key (`resolveSessionChip` rejects
+    //     `key === activeSession`) — a plain click is a no-op on the session you
+    //     are already in, matching the backtick chip, which renders the active
+    //     key as inert. Cmd/Ctrl/middle-click still opens the real href for
+    //     anyone who actually wants a duplicate tab.
+    //
+    // Both branches require `sessionRouting` — the renderer must actually be
+    // able to route sessions. When it cannot (offline: `sessions` withheld; or a
+    // no-controller render: neither wired), a `?sid=` link is an ordinary
+    // external link and keeps navigating as before, never a dead no-op.
+    if (sessionLink) {
+      e.preventDefault()
+      sessionActions.onSessionOpen!(sessionLink.key)
+    } else if (sessionHrefKey && sessionRouting) {
+      e.preventDefault()
+    }
   }
   const pathResolution = usePathResolution(
     localHref ?? '',
@@ -945,7 +1099,11 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       {...sp(node)}
       href={sessionHref ?? href}
       // A `/chat?sid=` href is never a path, so the session branch wins outright.
-      onClick={sessionLink ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
+      // `sessionHrefKey` (not `sessionLink`) gates the handler so a session link
+      // that does not resolve — a closed/unknown key, or the active session's own
+      // key — is still intercepted and declined rather than left to navigate the
+      // browser to a dead `?sid=` view (#9914) or a duplicate tab.
+      onClick={sessionHrefKey ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
       title={sessionLink
         ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
         : undefined}
@@ -1360,6 +1518,31 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
           safeProps={safeProps}
           onOpen={sessionActions.onSessionOpen!}
         >{children}</SessionChip>
+      )
+    }
+    // A span whose WHOLE text matches an operator-configured autolink rule is
+    // that work item (`PROJ-123`), so it links out
+    // instead of only copying. `inlineCode` is opaque to `remarkAutolinkRules`
+    // by design; whole-match keeps the chip atomic — `npm PROJ-123 run` stays a
+    // plain copyable span — and the session chip wins first: in-app navigation
+    // over an external link for a text both recognize. The native title
+    // discloses the real target, same disclosure discipline as the path chip
+    // below.
+    const patternHref = wholeMatchAutolinkHref(raw)
+    if (patternHref) {
+      return (
+        <a
+          href={patternHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={patternHref}
+          className="no-underline focus-ring"
+        >
+          {/* The glyph is what tells this chip apart from a copy chip at
+              rest: without it the two are pixel-identical and the click
+              outcome (open a tab vs copy) is a surprise. */}
+          <code className={`${CHIP_BASE} cursor-pointer hover:underline`} {...safeProps}>{reserve}{children}<ExternalLink className="lucide-inline ml-1" aria-hidden /></code>
+        </a>
       )
     }
     return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{reserve}{children}</CopyableCode>
@@ -3902,6 +4085,15 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
 export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
+  // One message = one config-rule scan pool. The blocks below each mount their
+  // OWN remark tree, so the rearm cannot live at the plugin's tree entry — a
+  // fence-heavy message would restore the pool once per block and multiply the
+  // 50ms ceiling by the block count. Render-phase on purpose (same discipline
+  // as ChatPage's registry write): the pool must be full before the first
+  // block's synchronous remark pass, and parent-then-children render order
+  // guarantees exactly that. Double-invoke under StrictMode is harmless — the
+  // pool is refilled before any drain either way.
+  rearmConfigScanBudget()
 
   /** Chip activation lives on the chip itself (see InlineCode); this handler is
    *  only the artifact-link delegation it has always been. */

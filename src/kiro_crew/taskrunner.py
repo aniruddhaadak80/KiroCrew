@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
 from kiro_crew import git_coord, shutdown_event
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.llm_helpers import stream_and_collect_json
@@ -97,6 +98,10 @@ _HEARTBEAT_INTERVAL = 30  # watchdog checks process liveness every 30s
 _DEAD_THRESHOLD = 2  # consecutive dead checks before fail-fast reset
 _RESULT_MEM_CAP = 4000  # truncate task.result in memory after step completes
 _WORKFLOW_RESULT_SUMMARY_CAP = 120
+# Sources with no operator watching the run: an invalid workflow spec must fail
+# with the SEL denial rather than degrade to the LLM decomposer. Attended sources
+# (chat, dashboard, CLI/unsourced) keep the fallback.
+_UNATTENDED_SOURCES = frozenset({"cron", "mcp"})
 
 
 class WorkflowRunPublisher(Protocol):
@@ -219,25 +224,42 @@ def _read_spec_prefix(path: str, max_chars: int) -> str:
         return spec_file.read(max_chars).strip()
 
 
-def _decompose_yaml_with_audit(yaml_content: str, task_id: str) -> list[Task]:
-    """Decompose YAML with SEL audit logging."""
+def _decompose_yaml_with_audit(
+    yaml_content: str,
+    task_id: str,
+    source: str = "",
+    spec_name: str = "",
+) -> list[Task]:
+    """Decompose YAML with SEL audit logging.
+
+    ``source``/``spec_name`` carry the run's provenance. Without them a
+    cron/MCP-sourced denial is recorded against ``dashboard`` — the one surface
+    that did not start the run — which makes the audit trail unusable for
+    exactly the unattended callers it exists to record.
+    """
+    metadata: dict[str, Any] = {"task_id": task_id}
+    if source:
+        metadata["source"] = source
+    if spec_name:
+        metadata["spec_name"] = spec_name
+    caller = source or "dashboard"
     try:
         tasks = decompose_yaml(yaml_content)
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="ok",
-            metadata={"task_id": task_id, "task_count": len(tasks)},
+            metadata={**metadata, "task_count": len(tasks)},
         )
         return tasks
     except Exception as exc:
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="error",
-            metadata={"task_id": task_id, "error": str(exc)},
+            metadata={**metadata, "error": str(exc)},
         )
         raise
 
@@ -281,6 +303,10 @@ class TaskRunner:
             self._work_dir = Path(self._workspace_dir)
         else:
             self._work_dir = work_dir or Path.cwd()
+        # What the constructor was handed, so a config write that later reverts
+        # ``taskrunner.workspace_dir`` restores exactly this (see _refresh_from_config).
+        self._ctor_workspace_dir = self._workspace_dir
+        self._ctor_work_dir = self._work_dir
         self._test_cmd: list[str] | None = None
         self._conversation_log = conversation_log
         self._consolidator = consolidator
@@ -297,14 +323,22 @@ class TaskRunner:
         # ``0`` (or unset) means "use the computed ceiling". An explicit value can
         # never raise concurrency above the host-safe maximum.
         try:
-            auto_cap = compute_max_subagents(KiroCrewConfig.load())
+            cfg: KiroCrewConfig | None = KiroCrewConfig.load()
         except Exception:
-            auto_cap = _MAX_PARALLEL_TASKS
-        auto_cap = max(1, auto_cap)
-        if max_parallel_steps and max_parallel_steps >= 1:
-            self._max_parallel_steps = min(max_parallel_steps, auto_cap)
-        else:
-            self._max_parallel_steps = auto_cap
+            cfg = None
+        self._max_parallel_steps = self._clamp_parallel_steps(max_parallel_steps, cfg)
+        # The ``taskrunner.*`` values the gateway constructed this runner from.
+        # Each run entry re-reads config and adopts a field whose config value has
+        # MOVED since this baseline (a hot write from any writer), while a field
+        # the config never changed keeps the constructor's argument -- so a test
+        # or embedder passing explicit values is not overridden by a config.json
+        # that never mentioned them. See ``_refresh_from_config``.
+        self._config_baseline: tuple[int, str] | None = (
+            (int(cfg.taskrunner.max_parallel_steps), str(cfg.taskrunner.workspace_dir))
+            if cfg is not None
+            else None
+        )
+        self._ctor_max_parallel_steps = max_parallel_steps
         self._runs: dict[str, Project] = {}
         # Serialize registry writes and enforce monotonic ordering. Snapshots
         # are always built on the event-loop thread (see _serialize_runs), so
@@ -333,6 +367,69 @@ class TaskRunner:
         self._workflow_service = workflow_service
         self._agent: str = ""
         self._load_runs()
+
+    @staticmethod
+    def _clamp_parallel_steps(requested: int | None, cfg: KiroCrewConfig | None) -> int:
+        """Bound *requested* by the host-safe ceiling; ``0``/``None`` means the ceiling."""
+        try:
+            auto_cap = compute_max_subagents(cfg) if cfg is not None else _MAX_PARALLEL_TASKS
+        except Exception:
+            auto_cap = _MAX_PARALLEL_TASKS
+        auto_cap = max(1, auto_cap)
+        if requested and requested >= 1:
+            return min(int(requested), auto_cap)
+        return auto_cap
+
+    def _refresh_from_config(self) -> None:
+        """Adopt ``taskrunner.max_parallel_steps`` / ``workspace_dir`` for the NEXT run.
+
+        Called at each run entry so a write to ``config.json`` from any writer
+        takes effect on the next run without a gateway restart, while a run that
+        is already executing keeps the values it started with (its parallel cap
+        and work dir are bound per run, not read from ``self`` mid-flight).
+
+        Reads the watcher's last applied snapshot (a plain attribute read) and
+        falls back to the fingerprint-cached loader before the watcher is armed.
+        A field is adopted only when its config value MOVED since the baseline
+        this runner was constructed against; an unchanged field keeps the
+        constructor's argument. ``workspace_dir`` goes through the same
+        sensitive-path validation the constructor applies.
+        """
+        if self._config_baseline is None:
+            return
+        # The snapshot is a plain attribute read. Before the watcher has primed
+        # there is nothing to refresh from without a ``load()`` -- which parses
+        # and validates the file on the event loop these entry points run on --
+        # so the constructor's values stand until the first primed run.
+        cfg = live.snapshot()
+        if cfg is None:
+            return
+        base_steps, base_ws = self._config_baseline
+        try:
+            new_steps = int(cfg.taskrunner.max_parallel_steps)
+            new_ws = str(cfg.taskrunner.workspace_dir)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if new_steps != base_steps:
+            requested: int | None = new_steps
+        else:
+            requested = self._ctor_max_parallel_steps
+        self._max_parallel_steps = self._clamp_parallel_steps(requested, cfg)
+        if new_ws != base_ws:
+            try:
+                resolved = _resolve_workspace_dir(new_ws)
+            except ValueError:
+                # A rejected (sensitive) path keeps the current target; the
+                # rejection is already SEL-audited by the validator.
+                logger.warning(
+                    "taskrunner.workspace_dir rejected on reload; keeping current target"
+                )
+                return
+        else:
+            resolved = self._ctor_workspace_dir
+        if resolved != self._workspace_dir:
+            self._workspace_dir = resolved
+            self._work_dir = Path(resolved) if resolved else self._ctor_work_dir
 
     @property
     def current_run(self) -> Project | None:
@@ -548,6 +645,7 @@ class TaskRunner:
             decompose_input = original_input = input_text
             spec_content = ""
 
+        self._refresh_from_config()
         _override = _resolve_workspace_dir(workspace_dir)
         async with self._start_lock:
             id_suffix = time.time_ns()
@@ -589,8 +687,18 @@ class TaskRunner:
             workflow_revision=workflow_revision,
         )
         try:
+            from kiro_crew.context import inherit_session_memory
+
+            await inherit_session_memory(
+                self._ctx, session_key, f"{_SESSION_PREFIX}:{task_id}:runtime"
+            )
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(decompose_input, task_id)
+                run.tasks = _decompose_yaml_with_audit(
+                    decompose_input,
+                    task_id,
+                    source=source,
+                    spec_name=Path(spec_path).name if spec_path else "",
+                )
             else:
                 try:
                     run.tasks = await asyncio.wait_for(
@@ -788,12 +896,23 @@ class TaskRunner:
         restartable = {"planned", "paused", "cancelled", "failed"}
         if run.status not in restartable:
             raise ValueError(f"Run {task_id} is not in a startable state (status={run.status})")
+        # The status flips terminal BEFORE the prior run's finally-block
+        # finishes -- git finalize (which removes the worktree) runs after
+        # the terminal status is persisted. A restart accepted in that window
+        # validates a workspace the prior finalizer is about to delete, and
+        # then executes against a missing directory. The background task
+        # handle is the honest signal: refuse while it is still running.
+        # (Same guard as retry_from_task.)
+        prior = self._tasks.get(task_id)
+        if prior is not None and not prior.done():
+            raise ValueError("Cannot restart while the previous run is still finishing")
 
         # Optional per-run workspace override: only applied to a run that has NOT
         # begun yet (status "planned"). A resumed run (paused/cancelled/failed) keeps
         # its original work_dir, so re-targeting the folder can't orphan work already
         # produced there (files/commits, git worktree state). The path is still
         # resolved+validated below regardless of status (audit/sensitive-path guard).
+        self._refresh_from_config()
         _override = _resolve_workspace_dir(workspace_dir)
         if _override and run.status == "planned":
             run.work_dir = _override
@@ -822,19 +941,43 @@ class TaskRunner:
         await self._apersist_runs()
 
         self._agent = agent
-        history_key = f"taskrunner:run:{task_id}"
+        history_key = await self._bound_history_key(run, f"taskrunner:run:{task_id}")
 
         async def _execute() -> None:
             watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
+            # Pessimistic from entry for a run that already owns a worktree:
+            # the finally-block finalize() force-removes run.worktree_path,
+            # and until _ensure_resumable_workspace positively identifies
+            # that path as this run's own worktree, deleting it could destroy
+            # an unrelated directory. The flag is assigned before the first
+            # await, so no cancellation anywhere in this coroutine can reach
+            # the finally with an unvalidated workspace still marked safe.
+            # A planned first run starts False: its worktree is created by
+            # this invocation's init_workspace, so its identity is not in
+            # question.
+            workspace_lost = bool(run.branch_name)
             try:
                 run.status = "running"
                 run.started_at = run.last_task_time = time.time()
                 await self._workflow_rebind(run)
                 await self._apersist_runs()  # persist immediately so crash recovery works
-                try:
-                    await git_coord.init_workspace(run)
-                except Exception:
-                    logger.debug("Git init failed for plan execution", exc_info=True)
+                if run.branch_name:
+                    # A restart of a run that once had a worktree (paused /
+                    # cancelled / failed) resumes against it exactly like a
+                    # retry does, so it shares the retry path's guard: a lost
+                    # worktree is recovered or the run fails closed.
+                    #
+                    if not await self._ensure_resumable_workspace(run, "restart"):
+                        return
+                    workspace_lost = False
+                else:
+                    # First initialisation of a planned run: git is
+                    # best-effort and its failure is non-fatal (the run
+                    # continues without git coordination).
+                    try:
+                        await git_coord.init_workspace(run)
+                    except Exception:
+                        logger.debug("Git init failed for plan execution", exc_info=True)
                 save_progress(run)
                 task_list = "\n".join(f"  {t.index}. {t.title}" for t in run.tasks)
                 await self._notify(
@@ -871,7 +1014,7 @@ class TaskRunner:
                 run.finished_at = time.time()
                 save_progress(run)
                 await self._apersist_runs()
-                if run.branch_name:
+                if run.branch_name and not workspace_lost:
                     try:
                         await git_coord.finalize(run)
                     except Exception:
@@ -911,6 +1054,7 @@ class TaskRunner:
             raise ValueError("Spec file is empty")
         if not task_id:
             task_id = f"{spec_path.stem}_{int(time.time())}"
+        self._refresh_from_config()
         _override = _resolve_workspace_dir(workspace_dir)
         _effective_ws = _override or self._workspace_dir
         task_dir = Path(_effective_ws) if _effective_ws else self._work_dir / spec_path.stem
@@ -936,18 +1080,32 @@ class TaskRunner:
         await self._grant_run_trust(run, bool(auto_approve))
         self._runs[task_id] = run
         watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
-        history_key = f"taskrunner:run:{spec_path.stem}"
+        history_key = await self._bound_history_key(run, f"taskrunner:run:{spec_path.stem}")
         try:
             await self._workflow_begin(run)
             await self._workflow_rebind(run)
             await self._apersist_runs()  # persist immediately so crash recovery works
             await self._notify("\U0001f680 Task started", f"Spec: `{spec_path.name}`", run=run)
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
-            elif not source and spec_path.suffix in (".yaml", ".yml"):
+                run.tasks = _decompose_yaml_with_audit(
+                    spec_content, task_id, source=source, spec_name=spec_path.name
+                )
+            elif spec_path.suffix in (".yaml", ".yml"):
+                # The suffix decides the decomposer, not the caller: a cron- or
+                # MCP-sourced workflow spec must decompose deterministically too.
                 try:
-                    run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
+                    run.tasks = _decompose_yaml_with_audit(
+                        spec_content, task_id, source=source, spec_name=spec_path.name
+                    )
                 except (ValueError, KeyError):
+                    # Deny by default for UNATTENDED callers (cron/MCP): nobody is
+                    # watching, so an invalid spec fails with the audit trail above
+                    # rather than degrading to the unaudited LLM decomposer.
+                    # Attended callers (chat, dashboard, CLI) keep the fallback —
+                    # an operator is present to see the plan, and `/task run
+                    # <file>.yaml` on a non-workflow YAML worked before the gate.
+                    if source in _UNATTENDED_SOURCES:
+                        raise
                     logger.warning(
                         "YAML spec %s is not in workflow format; falling back to LLM decomposition",
                         spec_path.name,
@@ -1028,6 +1186,9 @@ class TaskRunner:
         return run
 
     async def _execute_tasks(self, run: Project, history_key: str) -> None:
+        # Bound once per execution: a config reload adopted at a LATER run's
+        # entry (``_refresh_from_config``) must not resize this run's groups.
+        max_parallel_steps = self._max_parallel_steps
         pending = [t for t in run.tasks if t.status == TaskStatus.PENDING]
         already_done = {
             t.index for t in run.tasks if t.status in (TaskStatus.PASSED, TaskStatus.SKIPPED)
@@ -1082,13 +1243,13 @@ class TaskRunner:
                     "\u26a1 Parallel group", f"Running {len(resolved)} tasks: {titles}", run=run
                 )
                 # Bound concurrency with a semaphore sized by the configurable
-                # `taskrunner.max_parallel_steps` knob (self._max_parallel_steps),
+                # `taskrunner.max_parallel_steps` knob (bound per run above),
                 # not a hardcoded batch size. All ready tasks are dispatched at once
                 # and the semaphore caps how many run simultaneously, so a slow task
                 # no longer stalls a whole fixed-size batch. The knob is the single
                 # place to lift concurrency (capped by compute_max_subagents ceiling).
                 results: list[bool | BaseException] = []
-                sem = asyncio.Semaphore(self._max_parallel_steps)
+                sem = asyncio.Semaphore(max_parallel_steps)
 
                 async def _run_bounded(t: Task) -> bool:
                     async with sem:
@@ -1140,7 +1301,9 @@ class TaskRunner:
 
     async def self_review(self, run: Project, task: Task, session_key: str = "") -> bool:
         """Delegate to standalone self_review for backward compat."""
-        return await self_review_fn(run, task, self._sessions, self._agent, session_key=session_key)
+        return await self_review_fn(
+            run, task, self._sessions, self._agent, session_key=session_key, ctx=self._ctx
+        )
 
     async def _execute_single_task(
         self,
@@ -1244,7 +1407,9 @@ class TaskRunner:
         await self._notify(
             "\U0001f4cb Revised plan", f"{len(new_tasks)} new task(s):\n{task_list}", run=run
         )
-        history_key = f"taskrunner:run:{Path(run.spec_path).stem}"
+        history_key = await self._bound_history_key(
+            run, f"taskrunner:run:{Path(run.spec_path).stem}"
+        )
         for task in new_tasks:
             if run.status != "running" or shutdown_event.is_set():
                 break
@@ -1346,6 +1511,11 @@ class TaskRunner:
                 id_suffix += 1
                 task_id = f"{Path(spec_path).stem}_{id_suffix}"
 
+            from kiro_crew.context import inherit_session_memory
+
+            await inherit_session_memory(
+                self._ctx, session_key, f"{_SESSION_PREFIX}:{task_id}:runtime"
+            )
             self._runs[task_id] = Project(
                 spec_path=str(spec_path),
                 spec_content=early_content,
@@ -1515,11 +1685,11 @@ class TaskRunner:
             logger.debug("SEL audit failed for delete_run %s", task_id)
         return True
 
-    def cancel(self, task_id: str | None = None) -> None:
+    def cancel(self, task_id: str | None = None, *, exact: bool = False) -> None:
         """Cancel running tasks. Sets status to 'cancelling'; the finally block
         in run()/retry_from_task() handles actual cleanup and final status."""
         if task_id:
-            matches = [r for r in self._runs.values() if r.name == task_id]
+            matches = [] if exact else [r for r in self._runs.values() if r.name == task_id]
             keys = [r.task_id for r in matches] if matches else [task_id]
             for key in keys:
                 run = self._runs.get(key)
@@ -1549,6 +1719,36 @@ class TaskRunner:
         t = self._tasks.get(run.task_id)
         if t and not t.done():
             t.cancel()
+
+    async def _ensure_resumable_workspace(self, run: Project, verb: str) -> bool:
+        """Validate (and if possible recover) the worktree of a resumed run.
+
+        Directory-exists alone is not enough: ``git worktree remove``
+        deregisters and deletes in separate steps, so an interrupted
+        ``finalize()`` (or the worktree being removed out from under the run
+        some other way) can leave the directory present but not registered as
+        a git worktree -- resuming against it would silently dispatch every
+        remaining step against a non-git directory while still reporting them
+        completed. Returns True when the run may proceed. On unrecoverable
+        loss the run is failed closed (persisted and notified) and False is
+        returned; the caller must return without dispatching any steps.
+        """
+        if not run.branch_name or await git_coord.workspace_is_valid(run):
+            return True
+        if await git_coord.reinit_workspace_for_retry(run):
+            return True
+        run.status = "failed"
+        run.error = (
+            "Task Runner workspace worktree was lost and " f"could not be restored before {verb}"
+        )
+        run.finished_at = time.time()
+        await self._apersist_runs()
+        await self._notify(
+            f"\u274c {verb.capitalize()} failed",
+            "Workspace could not be restored",
+            run=run,
+        )
+        return False
 
     async def retry_from_task(self, task_id: str, from_task: int, agent: str = "") -> str:
         run = self._resolve_task(task_id)
@@ -1585,35 +1785,16 @@ class TaskRunner:
         run.started_at = run.last_task_time = time.time()
         await self._apersist_runs()  # persist immediately so crash recovery works
         self._agent = agent
-        history_key = f"taskrunner:run:{Path(run.spec_path).stem}"
+        history_key = await self._bound_history_key(
+            run, f"taskrunner:run:{Path(run.spec_path).stem}"
+        )
 
         async def _retry() -> None:
             watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
             try:
                 await self._workflow_rebind(run)
-                if run.branch_name and not await git_coord.workspace_is_valid(run):
-                    # Directory-exists alone is not enough: `git worktree
-                    # remove` deregisters and deletes in separate steps, so
-                    # an interrupted finalize() (or the worktree being
-                    # removed out from under the run some other way) can
-                    # leave the directory present but no longer a registered
-                    # git worktree -- resuming against it would silently
-                    # dispatch every remaining step against a non-git
-                    # directory while still reporting them completed.
-                    if not await git_coord.reinit_workspace_for_retry(run):
-                        run.status = "failed"
-                        run.error = (
-                            "Task Runner workspace worktree was lost and "
-                            "could not be restored before retry"
-                        )
-                        run.finished_at = time.time()
-                        await self._apersist_runs()
-                        await self._notify(
-                            "❌ Retry failed",
-                            "Workspace could not be restored",
-                            run=run,
-                        )
-                        return
+                if not await self._ensure_resumable_workspace(run, "retry"):
+                    return
                 await self._notify("\U0001f504 Retrying", f"From task {from_task}", run=run)
                 watchdog_task = asyncio.create_task(self._watchdog_loop(run))
                 await self._execute_tasks(run, history_key)
@@ -1678,6 +1859,17 @@ class TaskRunner:
 
     # ── History Integration ──
 
+    async def _bound_history_key(self, run: Project, legacy_key: str) -> str:
+        from kiro_crew.context import inherit_session_memory
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        runtime_key = f"{_SESSION_PREFIX}:{run.task_id}:runtime"
+        if await asyncio.to_thread(read_private_session_store, runtime_key) is None:
+            return legacy_key
+        history_key = f"taskrunner:run:{run.task_id}"
+        await inherit_session_memory(self._ctx, runtime_key, history_key)
+        return history_key
+
     def _log_task(self, history_key: str, run: Project, task: Task) -> None:
         if not self._conversation_log:
             return
@@ -1721,9 +1913,28 @@ class TaskRunner:
     # ── Learn from Failures ──
 
     async def _extract_lesson(self, task: Task, run: Project | None = None) -> None:
-        if not self._lesson_store:
-            return
         try:
+            from kiro_crew.member_memory_auth import read_private_session_store
+            from kiro_crew.memory_stores import UnknownMemoryStore
+
+            runtime_key = f"{_SESSION_PREFIX}:{run.task_id}:runtime" if run else ""
+            private_store = (
+                await asyncio.to_thread(read_private_session_store, runtime_key)
+                if runtime_key
+                else None
+            )
+            lesson_store = self._lesson_store
+            if not private_store and not lesson_store:
+                return
+            private_vectors = None
+            if private_store:
+                from kiro_crew.context import inherit_session_memory
+
+                context = self._ctx
+                if context is None:
+                    raise UnknownMemoryStore("The task's private lesson context is unavailable")
+                await inherit_session_memory(context, runtime_key, runtime_key)
+                private_vectors = await context.ensure_store(private_store)
             prompt = (
                 "A task failed after multiple attempts.\n\n"
                 f'Task: "{task.title}"\n'
@@ -1734,13 +1945,23 @@ class TaskRunner:
                 '"category": "tool"}\n\n'
                 "Respond with ONLY valid JSON."
             )
-            result = await self._call_llm_for_lesson(prompt)
+            result = (
+                await self._call_llm_for_lesson(prompt, runtime_key=runtime_key)
+                if private_store
+                else await self._call_llm_for_lesson(prompt)
+            )
             if not result or "rule" not in result:
                 return
             rule = result["rule"]
             category = result.get("category", "tool")
             negative = result.get("negative")
-            if self._consolidator and self._consolidator._vector_store:
+            if private_store:
+                if private_vectors is None:
+                    raise UnknownMemoryStore("The task's private lesson store is unavailable")
+                await run_in_embed_pool(
+                    private_vectors.write_lesson, rule, category, negative, "task_runner"
+                )
+            elif self._consolidator and self._consolidator._vector_store:
                 # write_lesson embeds via blocking urllib (Ollama); offload to
                 # keep the gateway event loop responsive (same pattern as
                 # dashboard/handlers/cron.py api_lessons_create).
@@ -1752,6 +1973,8 @@ class TaskRunner:
                     "task_runner",
                 )
             else:
+                if lesson_store is None:
+                    return
                 # Offloaded for the same reason as write_lesson above, and now
                 # necessarily so: LessonStore locks per PATH, so instances in
                 # different components share one lock. A dashboard writer holding
@@ -1759,7 +1982,7 @@ class TaskRunner:
                 # ran here. The lock is what makes the write atomic, so the fix is
                 # to move the caller off the loop rather than to weaken it.
                 await asyncio.to_thread(
-                    self._lesson_store.save,
+                    lesson_store.save,
                     Lesson(
                         ts=datetime.now(tz=timezone.utc).isoformat(),
                         rule=rule,
@@ -1774,20 +1997,32 @@ class TaskRunner:
         except Exception:
             logger.debug("Lesson extraction failed", exc_info=True)
 
-    async def _call_llm_for_lesson(self, prompt: str) -> dict | None:
-        session_key = BACKGROUND_KEY
+    async def _call_llm_for_lesson(self, prompt: str, *, runtime_key: str = "") -> dict | None:
+        session_key = f"{runtime_key}:lesson" if runtime_key else BACKGROUND_KEY
+        if runtime_key:
+            from kiro_crew.context import inherit_session_memory
+
+            await inherit_session_memory(self._ctx, runtime_key, session_key)
         try:
-            client, _is_new, _resumed = await self._sessions.get_or_create(
-                session_key,
-                agent=self._agent or None,
-            )
+            if runtime_key:
+                client, _is_new, _resumed = await self._sessions.open_task_session(
+                    runtime_key, session_key, agent=self._agent or None
+                )
+            else:
+                client, _is_new, _resumed = await self._sessions.get_or_create(
+                    session_key,
+                    agent=self._agent or None,
+                )
             return await stream_and_collect_json(client, prompt)
         except Exception:
             logger.debug("LLM lesson extraction call failed", exc_info=True)
             return None
         finally:
             self._sessions.release(session_key)
-            await self._sessions.recycle_background()
+            if runtime_key:
+                await self._sessions.reset(session_key)
+            else:
+                await self._sessions.recycle_background()
 
     # ── Task Watchdog ──
 
@@ -2091,7 +2326,7 @@ class TaskRunner:
                     # when the worktree location is actually known; otherwise
                     # fall back to the documented "task continues without git
                     # coordination" behaviour instead of committing into a path
-                    # no longer identified.
+                    # that is not identified.
                     git_enabled=bool(item.get("git_enabled", bool(_worktree_path))),
                     commit_hashes=list(item.get("commit_hashes", [])),
                     lessons_learned=list(item.get("lessons_learned", [])),

@@ -136,27 +136,43 @@ def posix_test_shell() -> str:
     return shell
 
 
-# ── Windows CI ──────────────────────────────────────────────────────────
+# ── Windows and macOS CI ────────────────────────────────────────────────
 # The backend runs natively on Windows (kiro_crew.platform_compat), but a
 # handful of suites exercise POSIX-only-by-design features (OS-level
 # sandbox, process groups / PGID semantics, PTY, AF_UNIX sockets -- see
 # docs/guides/windows-install.md's per-feature table). Skip collecting them on
 # Windows rather than marking test-by-test: several fail at import or
 # fixture time on win32.
+#
+# macOS reuses the same file-driven mechanism (macos-collect-ignore.txt). macOS is
+# POSIX, so the reasons that fill the Windows list do not apply there; that list is
+# expected to stay short or empty, and a file exists so a whole-file exclusion has
+# one documented home instead of an inline literal.
 from kiro_crew import platform_compat  # noqa: E402
+
+
+def _collect_ignore_from(listname: str) -> list:
+    """Bare test filenames listed in ``test/<listname>``, comments stripped."""
+    path = os.path.join(os.path.dirname(__file__), listname)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [
+                name
+                for name in (ln.split("#", 1)[0].strip() for ln in fh)
+                if name
+            ]
+    except OSError:  # pragma: no cover - list file absent in a partial checkout
+        return []
+
 
 if platform_compat.IS_WINDOWS:
     # Read from windows-collect-ignore.txt rather than an inline list: the CI
     # reduced-scope selector (scripts/ci-surface-tests.py) has to apply the same
     # exclusion, because naming a file explicitly on the pytest command line
     # bypasses collect_ignore. One file, two readers, no drift.
-    _ignore_listfile = os.path.join(os.path.dirname(__file__), "windows-collect-ignore.txt")
-    with open(_ignore_listfile, encoding="utf-8") as _fh:
-        collect_ignore = [
-            name
-            for name in (ln.split("#", 1)[0].strip() for ln in _fh)
-            if name
-        ]
+    collect_ignore = _collect_ignore_from("windows-collect-ignore.txt")
+elif platform_compat.IS_MACOS:
+    collect_ignore = _collect_ignore_from("macos-collect-ignore.txt")
 
 
 def make_escaping_link(inside: pathlib.Path, outside: pathlib.Path) -> str:
@@ -201,6 +217,77 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
     link.symlink_to(target, target_is_directory=True)
 
 
+def host_abs(*parts: str) -> str:
+    """A fixture path that is absolute on THIS host: ``/opt/shims`` or ``C:\\opt\\shims``.
+
+    Production filters and validates paths with ``os.path.isabs`` -- spec PATH
+    entries, trusted binaries, upload references, socket paths -- and from
+    Python 3.13 ``ntpath.isabs`` rejects a bare leading slash (a path
+    without a drive is relative to the current drive). A POSIX literal such as
+    ``"/usr/bin"`` therefore changes meaning per interpreter on Windows: absolute
+    on 3.12, relative on 3.13, so a test written with one silently exercises the
+    rejection branch there. Spell fixtures through this helper instead; it touches
+    no filesystem, and its result is what ``os.path.isabs`` accepts everywhere.
+    """
+    return os.path.abspath(os.path.join(os.sep, *parts))
+
+
+def forget_env_at_teardown(monkeypatch, *names: str) -> None:
+    """Make ``monkeypatch`` remove *names* from ``os.environ`` at teardown.
+
+    For a variable the code under test is about to WRITE (a saved channel token
+    exported for the running gateway, a ``PORT`` a booted server publishes, a
+    ``--env`` a CLI applies), neither obvious spelling restores the environment:
+
+    * ``monkeypatch.delenv(name, raising=False)`` BEFORE the write records nothing
+      when the variable is absent -- pytest only records an undo for a key that
+      existed -- so the value written later survives the test;
+    * ``monkeypatch.delenv(name)`` AFTER the write records the written value as
+      the thing to restore, so teardown puts the token BACK.
+
+    Both shapes were found leaking across tests in a full run. This records the
+    current state (absent or present) as the undo, so teardown returns the
+    variable to exactly what it was before the test, whatever the test wrote.
+    """
+    for name in names:
+        if name in os.environ:
+            monkeypatch.delenv(name)
+        else:
+            monkeypatch.setenv(name, "")  # records "was absent" as the undo
+            monkeypatch.delenv(name)
+
+
+def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
+    """Make ``kiro_crew.artifact_source`` see NO project root above ``ceiling``.
+
+    ``classify_source`` walks up from a file looking for ``PROJECT_ROOT_MARKERS``
+    (``.git``, ``Makefile``, ``package.json``, ``.kiro``, ...), so a test that
+    asserts COPY for "a plain directory" under ``tmp_path`` is also asserting
+    that nothing ABOVE ``tmp_path`` carries a marker. That is not the test's to
+    decide: pytest's temp root sits wherever ``TMPDIR`` points, and a checkout or
+    a ``.kiro`` workspace a few levels up turns the whole temp tree into a
+    project. Observed with ``TMPDIR`` under ``~/.kiro/crew/workspace``: every
+    such assertion answered LINK to that workspace instead of COPY.
+
+    Directories outside ``ceiling`` report no marker; inside it the real probe
+    runs, so the markers a test plants (``proj/.git``) still count. Pair it with
+    the ``_tempdir`` narrowing these tests already do -- the two seams together
+    make the rest of ``tmp_path`` ordinary, UNMARKED filesystem.
+    """
+    from kiro_crew import artifact_source
+
+    real_marker = artifact_source.project_root_marker
+    top = os.path.normcase(os.path.realpath(str(ceiling)))
+
+    def _capped(directory: str) -> str | None:
+        here = os.path.normcase(os.path.realpath(directory))
+        if here != top and not here.startswith(top + os.sep):
+            return None
+        return real_marker(directory)
+
+    monkeypatch.setattr(artifact_source, "project_root_marker", _capped)
+
+
 #: ``pytest_collection_modifyitems`` -- which applies the
 #: ``windows-expected-failures.txt`` skips -- lives in the ROOTDIR ``conftest.py``.
 #: That list already names node ids under
@@ -215,7 +302,7 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _windows_restrict_to_owner_stub(request, monkeypatch):
+def _windows_restrict_to_owner_stub(request, _floor_monkeypatch):
     """On Windows, no-op the secret lockdown for hermetic tests.
 
     Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity, or
@@ -233,7 +320,7 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     through, so stubbing only the file helper would leave every test that
     creates an owner-only directory writing a real DACL.
 
-    Note the lockdown no longer spawns anything -- it applies the DACL through
+    Note the lockdown does not spawn anything -- it applies the DACL through
     ``advapi32`` in-process -- so the subprocess-stub collision this fixture was
     built for is mostly gone. The stub is kept because a hermetic test that
     patches the SID resolver or the writer seam can still trip the fail-loud
@@ -252,8 +339,8 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     ):
         yield
         return
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: None)
-    monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", lambda p: None)
+    _floor_monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: None)
+    _floor_monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", lambda p: None)
     yield
 
 
@@ -278,7 +365,32 @@ def _release_source_corpus_after_module():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_aim_skills_dir(monkeypatch):
+def _drop_live_config_snapshot():
+    """Give every test an unstarted process watcher, and leave none behind.
+
+    ``kiro_crew.config.live`` keeps ONE process-global watcher, and every
+    point-of-use reader (``SkillsLoader._max_triggered_now``, the channel
+    dispatchers' ``_live_cfg``) prefers its snapshot over the config it was
+    constructed with. A test that primes it and does not reset therefore sets the
+    live config for every later test on the same xdist worker -- measured as a
+    ``max_triggered`` of 0 leaking into ``test_explain_for_skill`` from an
+    unrelated module. The reset is a lock and a ``None`` store, so it costs the
+    ~57k tests that never prime nothing measurable.
+
+    Reset on BOTH sides, so a test asserting on the subscription registry starts
+    from an empty one whatever ran before it on this worker -- the registry is
+    process-global too, and an entry another test left in it is indistinguishable
+    from one the test under way registered.
+    """
+    from kiro_crew.config import live
+
+    live.reset_for_tests()
+    yield
+    live.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_aim_skills_dir(_floor_monkeypatch):
     """Prevent SkillsLoader from discovering edition-contributed skill roots.
 
     SkillsLoader now sources extra skill roots from the CPP seam
@@ -294,7 +406,7 @@ def _isolate_aim_skills_dir(monkeypatch):
     """
     from kiro_crew.platform.defaults import DefaultMcpToolingProvider
 
-    monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [])
+    _floor_monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [])
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -329,7 +441,7 @@ def pytest_configure(config: pytest.Config) -> None:
     # never-probe-on-the-loop guard and read it as "this host has no sandbox".
 
 
-# ── xdist INTERNALERROR terminal report (issue #2803) ───────────────────
+# ── xdist INTERNALERROR terminal report ───────────────────
 # When TWO pytest-timeout worker kills land in the same ``--dist loadgroup``
 # shard, xdist's loadscope scheduler can die with ``KeyError:
 # <WorkerController gwN>`` (a replaced node present in ``assigned_work`` but
@@ -601,18 +713,18 @@ def _reset_reasoning_effort_globals():
 
 
 @pytest.fixture(autouse=True)
-def _disable_dev_fleet_background_tasks(monkeypatch):
+def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
     """Stop dev-fleet's app-startup hook from starting its background loops.
 
     A test that boots the real app via ``dev_fleet.server.create_app()`` (to
     exercise middleware, for instance) otherwise starts ``_status_refresher``,
     a genuine network ``git fetch``, as a fire-and-forget task. That task can
     still be running when the test's client tears down, and cancelling it then
-    is what leaked into unrelated tests and flaked ``Gateway Tests (macOS)``
-    (issue #1832). A test that wants the real refresher overrides this itself
+    is what leaked into unrelated tests and flaked the macOS backend job. A
+    test that wants the real refresher overrides this itself
     via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
-    monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
+    _floor_monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
 
 
 @pytest.fixture(autouse=True)
@@ -850,7 +962,7 @@ def _restore_default_child_watcher():
 
 
 @pytest.fixture(autouse=True)
-def _git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+def _git_identity(_floor_monkeypatch) -> None:
     """Make git tests hermetic: pin identity AND neutralize host global/system config.
 
     Two independent host-environment bleeds must be closed for git-backed tests
@@ -866,22 +978,22 @@ def _git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
        ``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM`` at ``/dev/null`` so no
        host-level config (excludes, aliases, hooks, signing) leaks into tests.
     """
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+    _floor_monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    _floor_monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+    _floor_monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    _floor_monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
     # Isolate from the host's global/system git config (Git >= 2.32). An empty
     # file (/dev/null) means git reads no global or system settings.
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    _floor_monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    _floor_monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
 
 
 @pytest.fixture(autouse=True)
-def _enterprise_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+def _enterprise_bypass(_floor_monkeypatch) -> None:
     """Set a default validated team_id so _route_message doesn't reject messages."""
-    monkeypatch.setattr("kiro_crew.slack.enterprise._validated_team_id", "TTEST")
-    monkeypatch.setattr("kiro_crew.slack.enterprise._validated_enterprise_id", "ETEST")
-    monkeypatch.setattr("kiro_crew.slack.enterprise._allowed_team_ids", {"TTEST"})
+    _floor_monkeypatch.setattr("kiro_crew.slack.enterprise._validated_team_id", "TTEST")
+    _floor_monkeypatch.setattr("kiro_crew.slack.enterprise._validated_enterprise_id", "ETEST")
+    _floor_monkeypatch.setattr("kiro_crew.slack.enterprise._allowed_team_ids", {"TTEST"})
 
 
 @pytest.fixture(autouse=True)
@@ -1110,31 +1222,11 @@ def _fake_computer_use_backend():
     reset_shared_backend()
 
 
-@pytest.fixture(autouse=True)
-def _reset_platform_context(monkeypatch):
-    """Clear the process-global PlatformContext between tests.
-
-    A test that composes a non-default context (e.g. an Amazon-overlay probe)
-    must not leak it into the next test.  ``current_context()`` lazily rebuilds
-    the standalone default on next access.
-
-    Also pins ``KIROCREW_PROFILE=standalone`` by default so a dev box that has a
-    real SSO-marker directory does not make ``boot_platform`` resolve the
-    ``amazon`` profile and fail closed (no companion installed) for the many
-    pre-existing tests that drive ``run_gateway`` / boot.  A test that wants the
-    amazon profile overrides this env via its own ``monkeypatch.setenv`` (it
-    runs after this autouse fixture), or composes the context directly via
-    ``set_context`` without booting.
-    """
-    from kiro_crew.platform.bootstrap import _reset_boot_state
-    from kiro_crew.platform.context import reset_context
-
-    monkeypatch.setenv("KIROCREW_PROFILE", "standalone")
-    reset_context()
-    _reset_boot_state()
-    yield
-    reset_context()
-    _reset_boot_state()
+# ``_reset_platform_context`` (the per-test PlatformContext reset and the
+# ``KIROCREW_PROFILE=standalone`` pin) lives in the ROOTDIR conftest, not here:
+# the ~108 test modules under ``src/kiro_crew/apps/builtins/*/tests/`` never see
+# this file, and an inherited enterprise ``KIROCREW_PROFILE`` failed 150+ of them
+# closed on an operator's box while ``test/`` stayed green.
 
 
 @pytest.fixture
@@ -1166,7 +1258,7 @@ def short_sock_dir(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _no_release_feed_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_release_feed_network(_floor_monkeypatch) -> None:
     """Make the update check's network seam unreachable for the whole suite.
 
     ``handlers.updates._do_update_check`` now has a second branch: any install
@@ -1195,20 +1287,20 @@ def _no_release_feed_network(monkeypatch: pytest.MonkeyPatch) -> None:
             "kiro_crew.dashboard.handlers.updates._fetch_feed_bytes instead"
         )
 
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr(
         "kiro_crew.dashboard.handlers.updates._fetch_feed_bytes", _refuse, raising=True
     )
 
 
 @pytest.fixture(autouse=True)
-def _no_live_catalog_network(monkeypatch: pytest.MonkeyPatch):
+def _no_live_catalog_network(_floor_monkeypatch):
     """Make the official app catalog's network seam unreachable for the suite.
 
     ``official_catalog._open_catalog`` is THE seam every catalog fetch goes
     through (its own docstring says tests must intercept there). Two paths
     reach it without a test asking to: the install path's
     ``inventory_for_install`` performs a fresh, deliberately UNCACHED HTTPS
-    fetch of ``official-registry.json`` on every call (#4236), and store
+    fetch of ``official-registry.json`` on every call, and store
     listings can trigger ``load_official_catalog``. Without this fixture,
     any test that walks either path makes a real HTTPS request to the live
     CDN — slow, offline-hostile, and nondeterministic: the test's verdict
@@ -1243,7 +1335,7 @@ def _no_live_catalog_network(monkeypatch: pytest.MonkeyPatch):
             "seam such as inventory_for_install) instead"
         )
 
-    monkeypatch.setattr(official_catalog, "_open_catalog", _refuse, raising=True)
+    _floor_monkeypatch.setattr(official_catalog, "_open_catalog", _refuse, raising=True)
     yield original
 
 
@@ -1258,7 +1350,7 @@ def named_cron_caller(monkeypatch):
 
     Tests about cron's FIELD handling -- schedules, channels, models, validation
     -- have always assumed a caller the gateway vouches for; they simply never
-    said so, because the unidentified state used to be allowed to write. This
+    said so. This
     states the precondition. A test that is actually ABOUT the unidentified
     caller must not use this fixture.
 
@@ -1328,6 +1420,40 @@ def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subagent, "cached_admission_check", _admit)
 
 
+@pytest.fixture
+def ample_host_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``resource_status.probe`` to AMPLE so no turn gains a ``[RESOURCES]`` line.
+
+    ``ContextBuilder.build_message`` prepends a ``[RESOURCES]`` advisory whenever
+    the host's own memory reading is tight or critical. Every test that asserts on
+    the SHAPE of a built turn -- that it opens with the user's text, with a hook
+    prefix, or with nothing at all -- therefore has the runner's free memory as a
+    hidden input, and fails with the advisory glued to the front of the string it
+    compared.
+
+    Not a platform gap: a macos-15 runner under a 3-way xdist split is simply the
+    first host observed under the threshold, and a loaded Linux runner reaches the
+    same state. The probe is imported INSIDE ``build_message``, so patching it on
+    its own module is what that call resolves.
+
+    A test that is actually ABOUT the advisory patches the probe in its own body,
+    which lands on top of this and reverts to it.
+    """
+    import kiro_crew.resource_status as resource_status
+
+    def _ample(cfg: object | None = None) -> "resource_status.ResourceStatus":
+        return resource_status.ResourceStatus(
+            available_gb=_HEALTHY_AVAILABLE_GB,
+            cpu_count=4,
+            load_per_cpu=0.1,
+            posture=resource_status.POSTURE_AMPLE,
+            pressure_gb=4.0,
+            critical_gb=2.0,
+        )
+
+    monkeypatch.setattr(resource_status, "probe", _ample)
+
+
 @pytest.fixture(autouse=True)
 def _reset_create_rate_limit_buckets():
     """Clear the session/folder creation rate limiter between tests.
@@ -1339,9 +1465,7 @@ def _reset_create_rate_limit_buckets():
     composition performs more than the per-window budget of creates within one
     wall-clock window then refuses a legitimate test create with
     ``create_rate_limited`` — a pass/fail outcome decided by shard composition
-    and runner speed, not the code under test (#7836; observed twice on the
-    Windows shard in one day, on PRs touching neither the limiter nor
-    session_control). The limiter's own direct tests build their scenarios on
+    and runner speed, not the code under test. The limiter's own direct tests build their scenarios on
     top of a clean slate, so clearing between tests changes nothing for them.
     """
     from kiro_crew.dashboard import create_rate_limit
@@ -1391,7 +1515,7 @@ class _InertGatewayPosts(list):
 
 
 @pytest.fixture(autouse=True)
-def gateway_posts(request, monkeypatch):
+def gateway_posts(request, _floor_monkeypatch):
     """Record ``mcp_core._post`` calls instead of letting them reach a gateway.
 
     ``mcp_tools.control._emit_directive`` publishes every directive out of band
@@ -1432,7 +1556,7 @@ def gateway_posts(request, monkeypatch):
                 " loopback_urlopen/_api_urlopen (or _post) in the test itself"
             )
 
-        monkeypatch.setattr(mcp_core, "loopback_urlopen", _refuse_network)
+        _floor_monkeypatch.setattr(mcp_core, "loopback_urlopen", _refuse_network)
         yield _InertGatewayPosts()
         return
 
@@ -1442,7 +1566,7 @@ def gateway_posts(request, monkeypatch):
         posted.append((path, json.loads(json.dumps(body)) if body is not None else None))
         return {}
 
-    monkeypatch.setattr(mcp_core, "_post", _capture)
+    _floor_monkeypatch.setattr(mcp_core, "_post", _capture)
     yield posted
 
 

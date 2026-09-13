@@ -43,6 +43,19 @@ design point so drift turns a build red. A checked-in recipe is not a
 precondition: scenarios exist precisely so agents can seed known states natively
 at debug time instead of designing fixtures on the spot.
 
+Some states are not reachable by authoring a few more rows, and those are the
+ones worth a scenario. History paging is the worked example: the slot-detail
+fast path answers `has_more=false` unless a session has size-rotated `archive/`
+segments, and rotation only happens once a transcript outgrows a 10 MiB budget,
+so every scenario built from a handful of messages leaves "load earlier"
+structurally unreachable. Seed `sessions-long-history` for anything on that
+seam - it ships one pinned session whose oldest 60 rows sit below a real
+rotation boundary, so the initial slot load answers `has_more=true` with a
+cursor that pages into the archive. Its archive segment is real
+`ConversationLog` rotation output rather than authored bytes; regenerate it by
+driving the writer as its `fixture.yaml` describes, and do not hand-edit the
+JSONL.
+
 ## Find the verification surface without searching the repository
 
 Start at [`../feature-map/README.md`](../feature-map/README.md). Its row for a
@@ -123,7 +136,7 @@ printf '%s\n' "$HANDLE" | jq -e '
   .status == "up" and (.base_url | startswith("http://127.0.0.1:"))
 ' >/dev/null
 
-bash "$HARNESS" "$WT" --fe-only --no-suppress-first-run
+bash "$HARNESS" "$WT" --no-suppress-first-run
 
 jq -se '
   any(.[]; .phase == "smoke" and .status == "pass") and
@@ -252,3 +265,48 @@ kirocrew pod prune
 Use `kirocrew pod prune --all` only when every reported orphan should be
 removed regardless of age. Reclamation is destructive to the isolated pod home,
 so keep a fresh crash home until its logs and sessions are no longer needed.
+
+## Recipe 5: the scenario phase
+
+The recipes above prove one worktree by hand. The scenario phase is the same
+proof, automated: `test/e2e/scenarios/` boots ONE pod through the verbs used
+above and drives five user-visible flows against it.
+
+| Scenario | What it proves |
+|---|---|
+| `test_settings_save.py` | A setting written through the API survives a gateway restart. |
+| `test_cron_fire.py` | A cron created through the API fires and records a run. |
+| `test_subagent_spawn.py` | One agent turn completes, with its tool call, against the packaged fake ACP backend. |
+| `test_service_install_dry_run.py` | The rendered host service definition captures `KIROCREW_PORT` and never the pod's throwaway home. |
+| `test_wheel_install.py` | The built wheel installs into a clean venv and `kirocrew --version` plus `kirocrew doctor` answer. |
+
+Run the phase from the worktree you are proving:
+
+```bash
+KIROCREW_E2E_SCENARIOS=1 \
+  .venv/bin/python -m pytest -v -p no:cacheprovider -o addopts= \
+  -n0 --timeout=600 test/e2e/scenarios/
+```
+
+Add `KIROCREW_E2E_SCENARIOS_REQUIRE=1` when you need a verdict rather than a
+best-effort run: it turns every precondition skip into a failure, so a missing
+venv, an unbuilt SPA bundle or a host with no pod backend cannot read as a pass.
+That is the setting the nightly job uses. Each file also runs alone, so
+`pytest ... test/e2e/scenarios/test_cron_fire.py` is a valid single check.
+
+Three preconditions, all of them the same ones the recipes above need. The
+worktree must have `.venv/bin/kirocrew`, because a pod boots the CHECKOUT's own
+binary and the suite refuses to fall back to the host's installed build. It must
+have a built `src/kiro_crew/static/dist`. And the host must be able to run pods
+at all, which the suite asks through the pod's own `runtime.require_backend()`
+rather than testing the platform itself.
+
+The suite runs on a hermetic pod plane (its own roots, unit prefix and port
+band), so it can never touch or reclaim your real pods. Its plane root is chosen
+SHORT deliberately: a pod's private dashboard socket lives at
+`<pod home>/dashboard-<port>.sock`, and a path over the AF_UNIX limit makes the
+gateway fall back to TCP-only, after which every `kirocrew pod api` call refuses
+correctly and permanently while the pod still answers health.
+
+CI runs this phase nightly on Linux and macOS. See
+[../ci/e2e-gate.md](../ci/e2e-gate.md) for that job.

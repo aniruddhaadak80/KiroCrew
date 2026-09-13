@@ -2,7 +2,10 @@
 
 This is a **leaf module**: it depends only on the standard library
 (``os``, ``sys``, ``pathlib``, ``logging``) and imports nothing from
-``kiro_crew``. Modules that only need to locate ``~/.kirocrew/`` should import
+``kiro_crew`` at import time. The one exception is a lazy, in-function import
+of :mod:`kiro_crew.atomic_write` inside ``_write_recovery_breadcrumb`` (that
+helper itself imports this module lazily, so there is no cycle). Modules that
+only need to locate ``~/.kirocrew/`` should import
 from here directly::
 
     from kiro_crew.config.paths import config_dir
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Callable, Mapping
@@ -146,14 +150,38 @@ def _write_recovery_breadcrumb(data_home: Path) -> None:
             "any surviving data or know where it had been. It is NOT a backup.\n"
         )
         # Idempotent: only (re)write when absent or the recorded path changed, so
-        # we don't churn the file on every process start.
-        if crumb.is_file():
+        # we don't churn the file on every process start. Read through a
+        # no-follow descriptor and confirm it is a regular file, so a planted
+        # symlink or FIFO can neither redirect the read nor hang or bloat
+        # startup (``read_text`` would follow it). Where O_NOFOLLOW does not
+        # exist (Windows), skip the read entirely - an open there would follow
+        # a symlink (e.g. to an unreachable UNC path, stalling startup) - and
+        # fall through to the atomic rewrite.
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if no_follow:
             try:
-                if str(data_home) in crumb.read_text(encoding="utf-8"):
-                    return
+                read_flags = os.O_RDONLY | no_follow | getattr(os, "O_NONBLOCK", 0)
+                crumb_fd = os.open(crumb, read_flags)
+                try:
+                    if stat.S_ISREG(os.fstat(crumb_fd).st_mode):
+                        existing = os.read(crumb_fd, 65536).decode("utf-8", errors="replace")
+                        if str(data_home) in existing:
+                            return
+                finally:
+                    os.close(crumb_fd)
             except OSError:
                 pass
-        crumb.write_text(content, encoding="utf-8")
+
+        # Write via the repo's mandated atomic-write helper: unique temp file,
+        # fchmod on the descriptor (never a path-based chmod), rename with the
+        # Windows sharing-violation retry, cleanup on failure. The rename
+        # replaces whatever directory entry sits at the breadcrumb path without
+        # following it, so a planted symlink is consumed - never written
+        # through - and its target is untouched. Imported lazily: this module
+        # stays an import-time leaf (see module docstring).
+        from kiro_crew.atomic_write import atomic_write
+
+        atomic_write(crumb, content, mode=0o600)
     except OSError:  # pragma: no cover - defensive: a breadcrumb is best-effort
         logger.debug("could not write recovery breadcrumb", exc_info=True)
 
@@ -359,6 +387,43 @@ def peek_data_home() -> Path:
     return _resolve_default_home()
 
 
+def private_runtime_log_dir() -> Path | None:
+    """Diagnostics routing only; this NEVER grants session or memory authority.
+
+    The namespace publishes a readonly marker and an execution-scoped log mount
+    before Python starts, so early configuration diagnostics do not race the
+    gateway's later PID publication. Seatbelt receives a path hint but confines
+    writes to that exact directory independently of the hint.
+    """
+    home = config_dir()
+    if sys.platform == "linux":
+        from kiro_crew.platform_compat import is_readonly_filesystem
+
+        if not is_readonly_filesystem(home):
+            return None
+        marker = home / ".private-member-runtime"
+        try:
+            if not marker.is_symlink() and marker.stat().st_mode & 0o222 == 0:
+                with marker.open("rb") as handle:
+                    if handle.read(2) == b"1":
+                        return home / "agent-logs"
+        except OSError:
+            pass
+    elif sys.platform == "darwin":
+        hint = os.environ.get("_KIROCREW_PRIVATE_LOG_DIRECTORY", "")
+        if hint:
+            path = Path(hint)
+            # circular import: this module is a leaf (see the module docstring) and must
+            # not import from ``kiro_crew`` at import time.
+            from kiro_crew.memory_stores import EXECUTION_LOGS_DIR_NAME, MEMORY_STORES_DIR_NAME
+
+            if path.parent == home / MEMORY_STORES_DIR_NAME / EXECUTION_LOGS_DIR_NAME and (
+                path.name.startswith("member-")
+            ):
+                return path
+    return None
+
+
 def ensure_data_home() -> Path:
     """Eagerly resolve and create the data home — call BEFORE the loop.
 
@@ -369,8 +434,39 @@ def ensure_data_home() -> Path:
     is a cheap cached lookup. Idempotent (the process-lifetime cache makes a
     second call a no-op) and safe to call unconditionally. Returns the resolved
     data home.
+
+    Also the one place the data home itself is tightened to owner-only, which
+    makes the guarantee a property of establishing the home rather than of one
+    subsystem happening to write there. The alternative — leaning on
+    ``VectorMemoryStore.init``'s ``make_owner_only_dir(db_path.parent)`` — only
+    reaches the data home while the DEFAULT store's ``memory.db`` sits directly
+    in it, so a home whose crews all use NAMED memory stores would never be
+    tightened at all. The per-store call still tightens its own directory, which
+    is what covers the files SQLite creates inside it.
+
+    Best-effort: ``restrict_dir_to_owner`` is fail-loud by contract, and a home
+    that could not be tightened must still be usable — a permission warning is
+    the right outcome, an unbootable gateway is not.
     """
-    return config_dir()
+    home = config_dir()
+    if (
+        sys.platform == "linux"
+        and private_runtime_log_dir() is not None
+        and home.stat().st_mode & 0o777 == 0o700
+    ):
+        # The private launcher already established the home. Its namespace view
+        # is readonly; attempting chmod there produces a false security warning.
+        return home
+    try:
+        from kiro_crew.platform_compat import restrict_dir_to_owner
+
+        restrict_dir_to_owner(home)
+    except OSError:
+        logger.warning(
+            "Cannot restrict the data home to owner-only; it may be readable by other users",
+            exc_info=True,
+        )
+    return home
 
 
 def config_package_dir() -> Path:
@@ -430,7 +526,7 @@ def _under_system_tmp(path: Path) -> bool:
     and the automation that clones a per-task scratch tree deletes it when the
     task ends. A machine-wide agent spec stamped from such a checkout outlives
     it and leaves every managed MCP server pointing at a launcher (and possibly
-    a pinned data home) that no longer exists (#4781).
+    a pinned data home) that is gone.
 
     Deliberately NOT folded into :func:`_in_ephemeral_tree`. That predicate
     serves the launcher installer, which rejected a blanket temp-dir rule on
@@ -452,8 +548,8 @@ def _under_system_tmp(path: Path) -> bool:
     root as configured AT CALL TIME (it honours ``$TMPDIR``), matching how the
     rest of this module treats redirected environments — but on macOS launchd
     sets ``$TMPDIR`` to a per-user ``/var/folders/.../T``, so ``gettempdir()``
-    alone does NOT contain ``/tmp``, and ``/tmp/<scratch clone>`` — the literal
-    shape #4781 reports — would read as durable there. POSIX ``/tmp`` is
+    alone does NOT contain ``/tmp``, and ``/tmp/<scratch clone>`` would read as
+    durable there. POSIX ``/tmp`` is
     therefore checked as well: it is reaped on reboot by contract, so nothing
     durable lives under it. ``/var/tmp`` deliberately is not: POSIX has it
     PRESERVED across reboots, which is the opposite claim.
@@ -474,12 +570,12 @@ def _under_system_tmp(path: Path) -> bool:
             roots.append(Path(candidate).resolve())
         except (OSError, ValueError):  # pragma: no cover - defensive: unusable root
             continue
-    # The PATH is resolved too, not just the roots. Resolving one side only made the
-    # comparison cross namespaces on exactly the platform this rule was added for:
+    # The PATH is resolved too, not just the roots. Resolving one side only makes the
+    # comparison cross namespaces on exactly the platform this rule exists for:
     # macOS resolves `/tmp` to `/private/tmp`, so a checkout at `/tmp/<scratch clone>`
-    # -- the literal shape #4781 reports -- kept `/tmp` among its parents, matched
-    # nothing, and read as DURABLE. The guard then stamped a machine-wide agent spec
-    # from a tree the OS reaps at reboot, which is the outcome it exists to prevent.
+    # keeps `/tmp` among its parents, matches nothing, and reads as DURABLE. The guard
+    # then stamps a machine-wide agent spec from a tree the OS reaps at reboot, which
+    # is the outcome it exists to prevent.
     #
     # Resolving is also the safe direction for a symlink pointing OUT of the temp tree:
     # the checkout really lives at the target, so a durable target correctly stops
@@ -708,7 +804,7 @@ def kiro_agents_dir() -> Path:
     ``kiro_home() / "agents"``. Two hand-written copies of the default would let a
     later change to the layout land in only one, and the write guard compares this
     resolver's answer against that one -- a stale comparison there reads a shared
-    target as private and fails OPEN on the machine-wide home, which is the #4912
+    target as private and fails OPEN on the machine-wide home, which is the
     failure class this whole seam exists to prevent.
     """
     if _agents_dir_override is not None:

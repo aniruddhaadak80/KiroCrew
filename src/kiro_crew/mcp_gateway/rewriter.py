@@ -29,8 +29,10 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Mapping
@@ -40,12 +42,44 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import mcp_search_path, spec_path_key
 from kiro_crew.mcp_gateway import STUB_MODULE
-from kiro_crew.mcp_gateway.hashing import hash_command, is_secret_env_key
+from kiro_crew.mcp_gateway.hashing import (
+    decode_target_args,
+    encode_target_args,
+    hash_command,
+    is_secret_env_key,
+)
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.sandbox import scrub_agent_denied_env
 
 logger = logging.getLogger(__name__)
+
+# cmd.exe's ceiling is smaller than CreateProcessW's; warn without rejecting
+# launchers that do not pass through cmd.exe.
+_WINDOWS_CMD_LINE_LIMIT = 8191
+
+# Normalized ``KIROCREW_MCP_TARGET_<SERVER>`` keys already warned about as a
+# base-name collision, so the notice fires once per distinct colliding key per
+# process instead of once per rewrite pass. ``_collect_target_env`` runs on
+# every pass (one call per agent spec, plus one per kept overlay), so a
+# genuinely single ambiguous config would otherwise print the same WARNING line
+# on every boot pass -- a wall of identical text an operator cannot count
+# distinct problems from. Guarded by ``_collision_warn_lock`` so two threads
+# rewriting at once cannot both report the same key. Repeats drop to DEBUG.
+_collision_warn_lock = threading.Lock()
+_collision_warned_keys: set[str] = set()
+
+
+def _reset_collision_warnings() -> None:
+    """Clear the per-process env-key collision warning latch.
+
+    A test hook: the module-level ``_collision_warned_keys`` set persists for
+    the life of the process, so a test that asserts on the WARNING record must
+    reset it between cases to see the first-occurrence notice again.
+    """
+    with _collision_warn_lock:
+        _collision_warned_keys.clear()
+
 
 # Fingerprint of the last completed rewrite, stored inside the overlay dir so
 # an unchanged boot can skip re-parsing every agent spec, re-resolving every
@@ -61,14 +95,14 @@ _FINGERPRINT_NAME = ".rewrite-fingerprint"
 # of serving overlays produced by older logic. The package version is also in
 # the fingerprint, so a release bump invalidates regardless; this constant is
 # the explicit knob for in-development changes.
-# Deliberately NOT bumped for the #8111 settings-overlay removal: the per-agent
-# overlay bytes are unchanged, the leftover overlay file is retained and
-# ignored (never consumed), and a stored ``settings_overlay`` output signature
-# is not rejected — it keeps vouching for the leftover's ACL relock — so a
-# pre-change fingerprint still validates correctly, and bumping would
-# gratuitously defeat the #5344 transient-keep gate (which compares stored vs
-# current inputs) on the first upgraded boot.
-_FINGERPRINT_SCHEMA = 3
+# Deliberately NOT bumped for the retained legacy settings overlay: the
+# per-agent overlay bytes do not depend on it, the leftover overlay file is
+# retained and ignored (never consumed), and a stored ``settings_overlay``
+# output signature is not rejected — it keeps vouching for the leftover's ACL
+# relock — so an older fingerprint still validates correctly, and bumping would
+# gratuitously defeat the transient-keep gate (which compares stored vs current
+# inputs) on the first upgraded boot.
+_FINGERPRINT_SCHEMA = 4
 
 
 @dataclass
@@ -130,11 +164,10 @@ _WRAPPER_MARKER = "_kirocrew_mcp_gateway_wrapped"
 _WRAPPER_MARKER_LEGACY = "_mc_mcp_gateway_wrapped"
 
 
-# Argument separator for the stub's ``--target-args`` flag. `|` is
-# printable, preserved through argv, and not legal in a kiro MCP command
-# path. If a real MCP arg contains `|`, override via stub's
-# ``--target-args-sep`` flag (not used here; not a problem in practice).
+# Read compatibility for overlays carrying delimiter-separated arguments.
 _TARGET_ARGS_SEP = "|"
+_TARGET_ARGS_FLAG = "--target-args-b64"
+_TARGET_ARGS_FLAG_LEGACY = "--target-args"
 
 #: The stub is launched as a module by the interpreter running KiroCrew.
 #: ``sys.executable`` is baked into the overlay rather than resolved at
@@ -233,7 +266,7 @@ def _withheld_env_count(
 
     The pooling bargain is "the backend starts with your declared env"; any
     withheld key can be the one the server dies without, so a non-zero count
-    disqualifies the entry from pooling (issue #3495 cause B). With forwarding
+    disqualifies the entry from pooling. With forwarding
     off every key is withheld. With forwarding on, gatewayd's forwarder still
     drops rotating-secret keys (excluded from the PoolKey, so co-tenants can
     disagree on their values) and the daemon's own credential-scrub set —
@@ -376,8 +409,7 @@ def _build_stub_entry(
     the stub entirely when the command is unresolvable or (for a poolable
     entry) any declared key would be withheld from the shared backend. This
     function therefore never emits a stub whose pooled spawn is a guaranteed
-    ENOENT (issue #3495 cause A) or whose declared env is silently dropped
-    (cause B).
+    ENOENT or whose declared env is silently dropped.
 
     Preserves ``autoApprove`` on the wrapped entry so kiro-cli still honours
     it at the UI layer. ``env`` is cleared on the wrapper — the stub passes
@@ -391,9 +423,8 @@ def _build_stub_entry(
         "--server", server_name,
         "--agent", agent_name,
         "--target-command", target_command,
-        # Use ``=`` so argparse treats the `|`-joined value as the flag's
-        # value even when it contains `--` (e.g. `--skill-paths|...`).
-        f"--target-args={_TARGET_ARGS_SEP.join(target_args)}",
+        # Keep both argument boundaries and shell metacharacters inside the payload.
+        f"{_TARGET_ARGS_FLAG}={encode_target_args(target_args)}",
         "--sandbox-mode", sandbox_mode,
         "--work-dir", str(work_dir),
         "--approval-mode", approval_mode,
@@ -411,7 +442,8 @@ def _build_stub_entry(
     # rewrite fingerprint's skip path effective.
     entry_identity_keys = sorted(k for k in frozenset(identity_keys) if k in env_pairs)
     if entry_identity_keys:
-        stub_args.extend(["--pool-identity-env", _TARGET_ARGS_SEP.join(entry_identity_keys)])
+        # A names-only list still needs encoding: its delimiter can be a pipe.
+        stub_args.extend(["--pool-identity-env-b64", encode_target_args(entry_identity_keys)])
     if env_pairs:
         # JSON-encode env so values containing ',' or '=' round-trip
         # intact. A prior CSV serialisation ``K=V,K2=V2`` silently
@@ -538,6 +570,15 @@ def _build_stub_entry(
         # not via kiro-cli's subprocess environment.
         "env": {},
     })
+    if platform_compat.IS_WINDOWS:
+        command_line = subprocess.list2cmdline([wrapped["command"], *wrapped["args"]])
+        command_units = len(command_line.encode("utf-16-le")) // 2
+        if command_units >= _WINDOWS_CMD_LINE_LIMIT:
+            logger.warning(
+                "rewriter: server %r generated command is %d UTF-16 units; "
+                "cmd.exe limit is %d. Shorten server arguments if initialization fails.",
+                server_name, command_units, _WINDOWS_CMD_LINE_LIMIT,
+            )
     return wrapped
 
 
@@ -657,10 +698,10 @@ def _rewrite_single_spec(
             str(entry.get("command", "")), entry_env, notes
         )
         if not resolved_cmd:
-            # Fix for issue #3495 cause A: an unresolvable bare command means
-            # gatewayd's spawn is a guaranteed ENOENT (it runs under the
-            # systemd --user PATH). Emitting a stub anyway degraded EVERY
-            # session through a spawn-fail → fallback-exec cycle. Leave the
+            # An unresolvable bare command means gatewayd's spawn is a
+            # guaranteed ENOENT (it runs under the systemd --user PATH), and
+            # emitting a stub anyway degrades EVERY session through a
+            # spawn-fail → fallback-exec cycle. Leave the
             # entry unwrapped instead: kiro-cli's own spawn environment may
             # still resolve the name, and if it cannot, the failure surfaces
             # in the session where the operator can see it.
@@ -679,7 +720,7 @@ def _rewrite_single_spec(
             else 0
         )
         if withheld:
-            # Fix for issue #3495 cause B: a pooled backend is spawned WITHOUT
+            # A pooled backend is spawned WITHOUT
             # part (or, with forwarding off, all) of the env this spec
             # declares. A server that needs a withheld key dies at prime on
             # every session — breaker trips, stub falls back, and the crash
@@ -892,10 +933,10 @@ def _injectable_settings_servers(
             continue
         entry_env = _normalized_env(entry, context=f"settings server {name!r}")
         if not _resolve_target_command(str(entry.get("command", "")), entry_env, notes):
-            # Issue #3495 cause A, settings edition: an unresolvable bare
-            # command must not be pooled into a stub whose spawn is a
-            # guaranteed ENOENT. Leaving it out of the injection set
-            # preserves the pre-pooling behaviour (kiro-cli merges the real
+            # Settings edition of the unresolvable-command guard: an
+            # unresolvable bare command must not be pooled into a stub whose
+            # spawn is a guaranteed ENOENT. Leaving it out of the injection
+            # set keeps the unpooled behaviour (kiro-cli merges the real
             # settings file and launches it with its own environment).
             logger.warning(
                 "rewriter: cannot resolve MCP command %r for opted-in "
@@ -911,8 +952,9 @@ def _injectable_settings_servers(
             else 0
         )
         if withheld:
-            # Issue #3495 cause B, settings edition: pooling would withhold
-            # part or all of this server's declared env and crash-loop it.
+            # Settings edition of the withheld-env guard: pooling would
+            # withhold part or all of this server's declared env and
+            # crash-loop it.
             # Leave it raw.
             # Same CodeQL constraint as the per-agent site: log only the
             # total declared count, never the secret-predicate-derived one.
@@ -1155,7 +1197,7 @@ def _rewrite_inputs_fingerprint(
       per-probe results, which the cache-hit path re-runs and compares (see
       :class:`_RewritePassNotes`).
     * ``forward_declared_env`` — decides whether an env-declaring server is
-      pooled at all (issue #3495 cause B pre-classification), so flipping the
+      pooled at all (the withheld-env pre-classification), so flipping the
       config flag must regenerate the overlays.
     * ``pool_identity_env`` — decides which secret-prefixed keys are hashed into
       the PoolKey and passed on stub argv, so editing the list must regenerate
@@ -1436,23 +1478,21 @@ def _store_fingerprint(
 def _relock_legacy_settings_overlay(
     overlay_dir: Path, stored: dict[str, Any] | None
 ) -> None:
-    """Re-assert owner-only protection on the leftover pre-#8111 settings
-    overlay — the ONE guard the removal keeps for that file.
+    """Re-assert owner-only protection on the leftover legacy settings
+    overlay — the ONE guard this pass keeps for that file.
 
-    The pass no longer writes, reads, or deletes the leftover, but the old
-    code re-tightened its ACL on every boot (a chmod / DACL edit changes no
-    content signature), and the file carries the passed-through env (tokens /
-    API keys) of non-poolable global servers. Dropping that repair would let
-    a once-loosened ACL stay loosened forever.
+    The pass never writes, reads, or deletes the leftover, but its ACL is
+    re-tightened on every boot (a chmod / DACL edit changes no content
+    signature) because the file carries the passed-through env (tokens / API
+    keys) of non-poolable global servers. Dropping that repair would let a
+    once-loosened ACL stay loosened forever.
 
-    Provenance-gated exactly like the old lockdown: only a file whose live
-    ``_stat_sig`` matches the fingerprint's recorded ``settings_overlay``
-    signature is touched — tightening, never deleting, and never a file the
-    recorded signature cannot vouch for.
+    Provenance-gated: only a file whose live ``_stat_sig`` matches the
+    fingerprint's recorded ``settings_overlay`` signature is touched —
+    tightening, never deleting, and never a file the recorded signature cannot
+    vouch for.
 
-    Best-effort rather than fail-loud: the old cache path fell through to the
-    full rewrite on failure because the full rewrite RE-CREATED the file
-    through protect-before-content writers. There is no writer any more, so
+    Best-effort rather than fail-loud: nothing re-creates this file, so
     refusing the cache would force full rewrites forever without repairing
     anything; log and retry next pass instead.
     """
@@ -1536,11 +1576,11 @@ def rewrite_agents(
     """
     stub_set = stub_servers or frozenset()
 
-    # A pre-#8111 release wrote a settings overlay to
-    # ``<overlay_dir>/../settings/mcp.json``; this pass no longer writes,
-    # reads, or DELETES it. Deliberately not swept: the leftover was always
+    # An install upgraded from an older release can still carry a settings
+    # overlay at ``<overlay_dir>/../settings/mcp.json``; this pass never
+    # writes, reads, or DELETES it. Deliberately not swept: that leftover was
     # written owner-only via ``atomic_write(..., restrict_to_owner=True)``
-    # into a 0o700 directory (issue #5285), its content is a subset copy of
+    # into a 0o700 directory, its content is a subset copy of
     # the user's real ``~/.kiro/settings/mcp.json`` (same secrets, same disk,
     # same protection), and nothing reads it — so it is inert, not exposed.
     # An automated deleter, by contrast, is an attack surface: it must prove
@@ -1603,7 +1643,7 @@ def rewrite_agents(
     )
     stored = _load_fingerprint(fingerprint_path)
     # One call covers both paths below (cache hit returns early; the full
-    # rewrite continues): re-tighten the leftover pre-#8111 settings overlay's
+    # rewrite continues): re-tighten the leftover legacy settings overlay's
     # ACL when the stored fingerprint vouches for it.
     _relock_legacy_settings_overlay(overlay_dir, stored)
     if stored is not None and stored.get("inputs") == current_inputs:
@@ -1652,7 +1692,7 @@ def rewrite_agents(
         except OSError as exc:
             # Transient read failure: same reasoning as the per-agent site —
             # do not cache a pass that treated an existing settings file as
-            # absent, and keep the previous per-agent overlays (#5328/#5344).
+            # absent, and keep the previous per-agent overlays.
             notes.source_read_failed = True
             settings_read_transient = True
             logger.warning("failed to read global mcp.json: %s", exc)
@@ -1669,8 +1709,8 @@ def rewrite_agents(
         # reachable without the file being gone -- a directory component
         # momentarily replaced, an atomic directory swap, a symlink being
         # re-pointed -- and reading those as absent rewrote every overlay with an
-        # empty injection set, which is #5344 through the stat path rather than
-        # the read path.
+        # empty injection set — the same degradation through the stat path
+        # rather than the read path.
         #
         # So classify explicitly: only ``FileNotFoundError`` may mean absent
         # (deterministic, cacheable, nothing to inject); every other OSError
@@ -1691,8 +1731,8 @@ def rewrite_agents(
     # Names of agents whose overlay could not be refreshed THIS PASS for a
     # TRANSIENT reason (source read failure, overlay write failure). The prune
     # keep-set is ``written | transient_keep``: a transient victim keeps its
-    # previous, healthy overlay (stale-but-working beats no overlay at all,
-    # #5328), while a deterministic skip (bad JSON, non-dict spec) prunes
+    # previous, healthy overlay (stale-but-working beats no overlay at all),
+    # while a deterministic skip (bad JSON, non-dict spec) prunes
     # exactly as a deleted source does — those passes are cacheable, and the
     # cached path's prune would sweep a kept-stale overlay one boot later
     # anyway, so keeping it here would make two boots over identical inputs
@@ -1708,7 +1748,7 @@ def rewrite_agents(
     # per-session and unpooled, with none of the identity the stub carries. The
     # pass is already uncacheable (``notes.source_read_failed`` was set at the
     # read site), so a restart self-heals; the degraded window is a whole
-    # gateway lifetime (#5344).
+    # gateway lifetime.
     #
     # Refuse to rewrite instead, exactly as the per-agent transient read
     # failure below does -- but only where refusing PRESERVES something. An
@@ -1783,7 +1823,7 @@ def rewrite_agents(
             # not be read. Readability can return without size/mtime changing,
             # so caching this incomplete pass would serve overlays missing
             # this agent forever. Mark the pass uncacheable, and keep the
-            # agent's previous overlay (#5328).
+            # agent's previous overlay.
             notes.source_read_failed = True
             transient_keep.add(path.name)
             logger.warning(
@@ -1838,10 +1878,10 @@ def rewrite_agents(
             # servers vanish mid-run). ``restrict_to_owner=True`` locks the temp
             # file down BEFORE the passed-through non-poolable / HTTP-SSE env
             # blocks (tokens / API keys) reach it — POSIX mode bits are a no-op
-            # against NTFS ACLs, and the previous Windows-only post-rename
-            # lockdown left them readable under the inherited DACL for the write
-            # window (issue #5285). It implies 0o600 on POSIX. A lockdown
-            # failure now happens before the rename, so the OSError handler
+            # against NTFS ACLs, and a Windows-only post-rename lockdown would
+            # leave them readable under the inherited DACL for the write
+            # window. It implies 0o600 on POSIX. A lockdown
+            # failure happens before the rename, so the OSError handler
             # below skips the overlay without ever publishing an unprotected
             # copy. Matches the env sidecar.
             atomic_write(target, json.dumps(new_spec, indent=2) + "\n", restrict_to_owner=True)
@@ -1862,8 +1902,8 @@ def rewrite_agents(
     # Prune stale overlay entries (user deleted or renamed an agent). The
     # keep-set answers "does this overlay's source still exist and did we
     # either refresh it or fail TRANSIENTLY?" — never bare write success,
-    # which conflated a transient failure with a deleted source and unlinked
-    # the previous, healthy overlay (#5328). Deterministic skips (bad JSON,
+    # which would conflate a transient failure with a deleted source and unlink
+    # the previous, healthy overlay. Deterministic skips (bad JSON,
     # non-dict) stay OUT of the keep-set: their pass is cacheable, and the
     # cached-path prune keys on the stored outputs, so keeping them here
     # would let two boots over identical inputs disagree.
@@ -1949,13 +1989,13 @@ def rewrite_agents(
         # (a rotated credential silently kept flowing the old value). Re-resolve
         # on every boot instead; specs with no placeholder still cache normally.
         uncacheable = "declared env contains ${VAR} placeholder(s)"
-    # While the leftover pre-#8111 settings overlay survives, the provenance
+    # While the leftover legacy settings overlay survives, the provenance
     # that licenses its per-boot ACL relock lives ONLY in the stored
     # fingerprint's ``settings_overlay`` signature. Both fingerprint-
     # replacement paths below carry that signature forward while the file
     # exists — dropping it would silently end the relock guard for the rest of
     # the install's life. Never re-derived from the live file: a file edited
-    # since the pre-change release recorded it loses its vouching exactly as
+    # since that signature was recorded loses its vouching exactly as
     # it should.
     legacy_sig = None
     _stored_outputs = (stored or {}).get("outputs")
@@ -2046,30 +2086,41 @@ def _collect_target_env(
         env_key = "KIROCREW_MCP_TARGET_" + server_name.replace("-", "_").upper()
         args = entry.get("args", []) or []
         target_cmd: str | None = None
-        target_args_str = ""
+        target_args_b64: str | None = None
+        target_args_legacy = ""
+        target_args_sep = _TARGET_ARGS_SEP
         i = 0
         while i < len(args):
-            a = args[i]
-            if a == "--target-command" and i + 1 < len(args):
-                target_cmd = str(args[i + 1])
-                i += 2
-                continue
-            if isinstance(a, str) and a.startswith("--target-args="):
-                target_args_str = a.split("=", 1)[1]
+            token = str(args[i])
+            flag, equals, value = token.partition("=")
+            if flag in {
+                "--target-command", _TARGET_ARGS_FLAG,
+                _TARGET_ARGS_FLAG_LEGACY, "--target-args-sep",
+            }:
+                if not equals:
+                    if i + 1 >= len(args):
+                        break
+                    i += 1
+                    value = str(args[i])
+                if flag == "--target-command":
+                    target_cmd = value
+                elif flag == _TARGET_ARGS_FLAG:
+                    target_args_b64 = value
+                elif flag == _TARGET_ARGS_FLAG_LEGACY:
+                    target_args_legacy = value
+                else:
+                    target_args_sep = value
             i += 1
         if target_cmd:
-            # Target args arrive separated by ``_TARGET_ARGS_SEP`` (the same
-            # constant _build_stub_entry joins them with). Split on it rather
-            # than a hardcoded literal so this reconstruction — which feeds
-            # hash_command — stays in lock-step with the stub's PoolKey hash if
-            # the separator ever changes. Quote each one (incl. the command)
-            # before space-joining so env_target_resolver's shlex.split
-            # round-trips args containing embedded spaces. The old
-            # ``replace("|"," ")`` split such an arg into multiple tokens,
-            # corrupting the backend command line.
-            raw_target_args = (
-                target_args_str.split(_TARGET_ARGS_SEP) if target_args_str else []
-            )
+            # Same precedence and decode as the stub: both sides must hash
+            # identical argv for daemon target lookup to find the backend.
+            if target_args_b64 is not None:
+                raw_target_args = decode_target_args(target_args_b64)
+            else:
+                raw_target_args = (
+                    target_args_legacy.split(target_args_sep) if target_args_legacy else []
+                )
+            # This is a matched quote/split codec, never a shell command.
             spec = " ".join(shlex.quote(p) for p in [target_cmd, *raw_target_args])
             # Bare server-name key: first-wins fallback. Two DISTINCT server
             # names can normalize to the same key ("my-server" vs "my_server",
@@ -2078,15 +2129,27 @@ def _collect_target_env(
             # ambiguous config is visible rather than silently first-wins.
             existing = target_env.get(env_key)
             if existing is not None and existing != spec:
-                logger.warning(
-                    "mcp-gateway rewriter: KIROCREW_MCP_TARGET env-key collision on "
-                    "%s (distinct server names normalize identically); the "
-                    "args-hashed key is used at resolve time, base stays "
-                    "first-wins", env_key,
-                )
+                with _collision_warn_lock:
+                    first = env_key not in _collision_warned_keys
+                    if first:
+                        _collision_warned_keys.add(env_key)
+                if first:
+                    logger.warning(
+                        "mcp-gateway rewriter: KIROCREW_MCP_TARGET env-key collision on "
+                        "%s (distinct server names normalize identically); the "
+                        "args-hashed key is used at resolve time, base stays "
+                        "first-wins",
+                        env_key,
+                    )
+                else:
+                    logger.debug(
+                        "mcp-gateway rewriter: KIROCREW_MCP_TARGET env-key collision on "
+                        "%s again (already reported this pass or a prior one)",
+                        env_key,
+                    )
             target_env.setdefault(env_key, spec)
             # Args-disambiguated key: idempotent per (server, command+args), so
-            # divergent same-named servers no longer collide on first-wins.
+            # divergent same-named servers do not collide on first-wins.
             hashed_key = env_key + "__" + hash_command(target_cmd, raw_target_args)
             target_env[hashed_key] = spec
 

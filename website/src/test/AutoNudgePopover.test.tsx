@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { useState } from 'react'
-import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import AutoNudgePopover, { type AutoNudgeLoop } from '../components/AutoNudgePopover'
 import { __resetForTests, loadGoalDraft, saveGoalDraft } from '../utils/goalDrafts'
@@ -272,13 +272,35 @@ describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
   beforeEach(() => { localStorage.clear(); __resetForTests() })
   afterEach(() => { vi.unstubAllGlobals() })
 
+  /**
+   * Render, then wait for the crons read to have been ANSWERED, not just issued.
+   *
+   * The section is populated by `fetch` -> `json()` -> `setState`, three promise
+   * hops that `act` does not wait for, so a bare `await act(render)` samples the
+   * popover before the answer lands. That made the positive test below flake
+   * (1 in 5 full runs on a loaded host) and every "not listed" assertion in this
+   * block vacuous: the section is absent BEFORE the fetch resolves whether or not
+   * the filter works. Waiting on the mocked fetch having been called, then
+   * draining the chain, makes both kinds of assertion about the rendered answer.
+   */
+  async function renderPopoverSettled() {
+    await act(async () => { renderPopover(null) })
+    const fetchMock = vi.mocked(fetch)
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(c => String(c[0]).startsWith('/api/crons'))).toBe(true),
+    )
+    for (let i = 0; i < 4; i++) {
+      await act(async () => { await Promise.resolve() })
+    }
+  }
+
   it('lists a script cron this slot owns, so an armed watch is visible in chat', async () => {
     // The reported gap: a watch is deliberately NOT an autonudge loop, so the
     // popover showed "Set a goal" and nothing else while a watch was polling --
     // the one surface a user opens to confirm something is running.
     stubCrons([cron()])
-    await act(async () => { renderPopover(null) })
-    expect(screen.getByText(/Zero-token watches/i)).toBeTruthy()
+    await renderPopoverSettled()
+    expect(await screen.findByText(/Zero-token watches/i)).toBeTruthy()
     expect(screen.getByText('pr watch #6234')).toBeTruthy()
   })
 
@@ -288,7 +310,7 @@ describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
     // must still match, and that is the property worth pinning: another
     // conversation's watch appearing here is worse than showing none.
     stubCrons([cron({ session_key: 'dashboard:chat-9-999', name: 'someone elses watch' })])
-    await act(async () => { renderPopover(null) })
+    await renderPopoverSettled()
     expect(screen.queryByText('someone elses watch')).toBeNull()
     expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
   })
@@ -297,14 +319,14 @@ describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
     // A cron with no script wakes the agent every fire. Listing it here would
     // make the heading lie about what it costs.
     stubCrons([cron({ script: '', name: 'daily reminder' })])
-    await act(async () => { renderPopover(null) })
+    await renderPopoverSettled()
     expect(screen.queryByText('daily reminder')).toBeNull()
     expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
   })
 
   it('never lists a disabled watch as if it were armed', async () => {
     stubCrons([cron({ enabled: false, name: 'paused watch' })])
-    await act(async () => { renderPopover(null) })
+    await renderPopoverSettled()
     expect(screen.queryByText('paused watch')).toBeNull()
   })
 
@@ -323,7 +345,7 @@ describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
         }),
       ) as unknown as typeof fetch,
     )
-    await act(async () => { renderPopover(null) })
+    await renderPopoverSettled()
     // A bare array is NOT the contract, so nothing should be read out of it.
     expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
   })
@@ -337,7 +359,7 @@ describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
           : Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) }),
       ) as unknown as typeof fetch,
     )
-    await act(async () => { renderPopover(null) })
+    await renderPopoverSettled()
     expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
     // The popover's actual job is still fully usable.
     expect(screen.getByPlaceholderText(/Describe what you want the agent to accomplish/i)).toBeTruthy()
@@ -604,10 +626,10 @@ describe('AutoNudgePopover Trigger nudge (#8212)', () => {
     expect(screen.queryByRole('button', { name: 'Start loop' })).toBeNull()
   })
 
-  it('says the loop is paused where the button would be, so the absence has a reason', () => {
+  it('says the loop is stopped where the button would be, so the absence has a reason', () => {
     // Absence alone is ambiguous: an inactive loop looked identical to an active
     // one whose button failed to render, and a usability reader could not tell
-    // the paused screenshot was even the same loop. The state is the reason for
+    // the stopped screenshot was even the same loop. The state is the reason for
     // the absence, so it occupies the space the absence leaves.
     renderWith(makeLoop({ active: false }))
     expect(screen.getByTestId('auto-nudge-loop-paused')).toBeTruthy()
@@ -688,6 +710,137 @@ describe('AutoNudgePopover Trigger nudge (#8212)', () => {
     // A refusal must not report success by tearing the popover down.
     expect(onChange).not.toHaveBeenCalled()
     expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it('names the object it clears once the loop is already stopped, and says the erase is final', async () => {
+    // One button, two actions. On a live loop the press stops the loop and keeps
+    // the record. On a stopped one there is nothing left to stop: the press
+    // removes it, which is the only way the slot can watch something else -- a
+    // stopped structured monitor blocks a re-arm until its row is gone.
+    // "Clear record" failed a blind read (the popover shows nothing called a
+    // "record"), so the label names the GOAL, the status reads Stopped rather
+    // than the resumable-sounding Paused, and a help line names both exits
+    // because the erase has no undo. Both directions asserted so this cannot
+    // just move the confusion.
+    renderWith(makeLoop({ active: false }))
+    const clear = screen.getByRole('button', { name: 'Clear stopped goal' })
+    expect(clear).toBeTruthy()
+    // Danger-coloured unconditionally, not on :hover -- a touch viewport never
+    // produces hover, so a hover-only colour renders an irreversible erase
+    // identically to the buttons beside it.
+    expect(clear.className).toContain('text-danger')
+    expect(screen.queryByRole('button', { name: 'Stop loop' })).toBeNull()
+    expect(screen.getByTestId('auto-nudge-loop-paused').textContent).toBe('Stopped')
+    expect(screen.getByTestId('auto-nudge-stopped-help').textContent)
+      .toBe('Start loop resumes this goal. Clear stopped goal removes it for good.')
+    cleanup()
+    renderWith(makeLoop({ active: true }))
+    expect(screen.getByRole('button', { name: 'Stop loop' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Clear stopped goal' })).toBeNull()
+    expect(screen.queryByTestId('auto-nudge-stopped-help')).toBeNull()
+  })
+
+  it('asks before erasing a stopped goal, and each label restates the action', async () => {
+    // Same two-step the monitor surface uses for its identical erase. The
+    // confirm row renders no question, so a bare "Yes" would name nothing:
+    // both labels have to restate what happens.
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') calls.push(String(url))
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) })
+    }) as unknown as typeof fetch)
+
+    renderWith(makeLoop({ active: false }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Clear stopped goal' })) })
+    expect(calls).toEqual([])
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy()
+    // Two controls, not three: the confirmation replaces the primary CTA rather
+    // than sitting beside it (website/AUTOSDE.yaml:230 caps a row at two). Its
+    // back-out reads "Cancel", the same word the monitor surface's confirm uses
+    // for the same act.
+    const row = screen.getByRole('button', { name: 'Cancel' }).parentElement!
+    expect(Array.from(row.querySelectorAll('button')).map(b => b.textContent))
+      .toEqual(['Cancel', 'Clear goal for good'])
+    // And the help line becomes the question, instead of naming two buttons that
+    // just left the row.
+    expect(screen.getByTestId('auto-nudge-stopped-help').textContent)
+      .toBe('Remove this goal for good?')
+    // Cancelling erases nothing and restores the original control.
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancel' })) })
+    expect(calls).toEqual([])
+    expect(screen.getByRole('button', { name: 'Clear stopped goal' })).toBeTruthy()
+    // Second press through the confirm performs it.
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Clear stopped goal' })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Clear goal for good' })) })
+    expect(calls).toEqual(['/api/autonudge/l1?intent=clear'])
+  })
+
+  it('drops a primed confirmation when the record changes under the popover', async () => {
+    // The popover re-renders from websocket state without closing, so another
+    // tab can swap the record while a confirmation is primed: edit and restart
+    // the same loop id, then a cycle cap stops it again. The press would then
+    // erase a goal the confirmation never described, and the server sees no
+    // mismatch because the record is inactive both times. Each of the three
+    // changes that can arrive this way is asserted.
+    // A harness that can swap the loop WITHOUT closing the popover, which is
+    // what a websocket-driven re-render does.
+    const Swappable = ({ next }: { next: Partial<AutoNudgeLoop> }) => {
+      const [loop, setLoop] = useState<AutoNudgeLoop>(makeLoop({ active: false }))
+      return (
+        <>
+          <button onClick={() => setLoop(current => ({ ...current, ...next }))}>swap</button>
+          <AutoNudgePopover
+            slotKey={SLOT}
+            loop={loop}
+            open={true}
+            onOpenChange={() => {}}
+            onChange={() => {}}
+          />
+        </>
+      )
+    }
+
+    for (const next of [
+      { id: 'l2' },
+      { active: true },
+      { message: 'a different goal entirely' },
+    ]) {
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+      render(
+        <QueryClientProvider client={qc}>
+          <Swappable next={next} />
+        </QueryClientProvider>,
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Clear stopped goal' }))
+      expect(screen.getByRole('button', { name: 'Clear goal for good' })).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: 'swap' }))
+      expect(screen.queryByRole('button', { name: 'Clear goal for good' })).toBeNull()
+      cleanup()
+    }
+  })
+
+  it('sends the pressed INTENT so a stale label cannot erase a record it did not mean to', async () => {
+    // The server otherwise reads the operation off the record's state at arrival
+    // time, so a "Stop loop" press against a record that went terminal in the
+    // meantime would clear it. The intent travels with the request; the server
+    // 409s on a mismatch.
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') calls.push(String(url))
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) })
+    }) as unknown as typeof fetch)
+
+    renderWith(makeLoop({ active: true }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Stop loop' })) })
+    cleanup()
+    renderWith(makeLoop({ active: false }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Clear stopped goal' })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Clear goal for good' })) })
+
+    expect(calls).toEqual([
+      '/api/autonudge/l1?intent=stop',
+      '/api/autonudge/l1?intent=clear',
+    ])
   })
 
   it('sits on the schedule line, not in the Stop/Save action row (max-two-buttons-per-row)', async () => {

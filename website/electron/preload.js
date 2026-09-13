@@ -28,6 +28,13 @@ contextBridge.exposeInMainWorld("kirocrew", {
 });
 
 contextBridge.exposeInMainWorld("electronAPI", {
+  // Evict the HTTP cache of one remote-crew pane origin (a loopback tunnel
+  // port) before reloading it. Used when the pane's module graph reports a
+  // load error: a hashed chunk the gateway once answered 404+immutable is
+  // replayed from cache forever, and only eviction gets the pane past Loading.
+  // Resolves to whether a purge ran; the caller reloads regardless.
+  clearPaneHttpCache: (origin) =>
+    ipcRenderer.invoke("pane:clear-http-cache", String(origin || "")),
   onStatus: (cb) => {
     const handler = (_e, msg) => cb(msg);
     ipcRenderer.on("status", handler);
@@ -227,6 +234,11 @@ contextBridge.exposeInMainWorld("browserAPI", {
     ipcRenderer.invoke("browser:set-control-owner", panelId, owner),
   getControl: (panelId) => ipcRenderer.invoke("browser:get-control", panelId),
   control: (panelId, op, args) => ipcRenderer.invoke("browser:control", panelId, op, args),
+  // Human-initiated element annotation on the page in the native view:
+  // start/stop pick mode, poll the notes the user typed in the in-page
+  // overlay, remove/edit/clear, capture a screenshot with the markers. Read
+  // through executeJavaScript + capturePage, not the agent control plane.
+  annotate: (panelId, op, args) => ipcRenderer.invoke("browser:annotate", panelId, op, args),
   // Declares that a chat session may host a browser panel, so the agent command
   // channel polls for it even before the Browser tab is ever opened. Grants no
   // authorization — authorization to drive the built-in browser is Browser Mode

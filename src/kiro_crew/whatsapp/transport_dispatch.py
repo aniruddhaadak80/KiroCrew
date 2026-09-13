@@ -14,6 +14,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.config import live
+from kiro_crew.config.sections import _normalize_threshold_pair
 from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.approval import (
     TextReplyApprovalDecider,
@@ -22,7 +24,10 @@ from kiro_crew.messaging.approval import (
     pending_for,
 )
 from kiro_crew.messaging.commands import compact_unsupported_backend
-from kiro_crew.messaging.conversation import ConversationState
+from kiro_crew.messaging.conversation import (
+    ConversationState,
+    reserve_new_generation,
+)
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     delivery_is_muted,
@@ -55,6 +60,7 @@ from kiro_crew.whatsapp.transport import WHATSAPP_CAPABILITIES, WhatsAppTranspor
 from kiro_crew.whatsapp.turn_renderer import WhatsAppRenderer
 
 if TYPE_CHECKING:
+    from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.whatsapp.client import WhatsAppClient
 
 logger = logging.getLogger(__name__)
@@ -102,6 +108,39 @@ class WhatsAppDispatcher:
         # ``:gen1`` still on disk, resuming the conversation the operator
         # explicitly discarded.
         self._conv: ConversationState[str] = ConversationState(seed_fn=self._seed_gen)
+        # Held on self: the watcher holds the owner WEAKLY, so a subscription
+        # dropped here would be collected and the applier would silently stop
+        # firing.
+        self._config_sub = live.watch_section(
+            self, "whatsapp", "messaging", target="transport", name="WhatsAppDispatcher"
+        )
+
+    # ── Live config ────────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when it is armed, else a fingerprint-cached
+        ``load()`` (two stats on a hit), else the boot copy. Falling back to
+        ``self.cfg`` rather than raising keeps a turn running when the config
+        file is momentarily unreadable -- a threshold or a rotation window is
+        not an authorization decision, and the boot value is the one the
+        operator last had in force.
+        """
+        return live.current(self.cfg, log_prefix="whatsapp")
+
+    def _thresholds(self) -> tuple[int, int]:
+        """``(soft, hard)`` context thresholds from the live config.
+
+        Re-runs the loader's own pair normalization, because reading the two
+        fields live without it can leave ``soft > hard`` and make the soft nudge
+        unreachable -- ``_maybe_notice`` tests ``pct >= hard`` first.
+        """
+        section = self._live_cfg().whatsapp
+        return _normalize_threshold_pair(
+            int(getattr(section, "soft_threshold_pct", 80)),
+            int(getattr(section, "hard_threshold_pct", 95)),
+        )
 
     async def handle_message(self, inbound: InboundMessage) -> None:
         """Transport dispatch callback: one normalized inbound message."""
@@ -177,7 +216,15 @@ class WhatsAppDispatcher:
         scope = inbound.conversation_id
         if command == "new":
             self._conv.bump_gen(scope)
-            await self._say(scope, NEW_SESSION_TEXT)
+            saved = await reserve_new_generation(
+                self.sessions,
+                self._session_key(scope),
+                channel_type="WhatsApp",
+            )
+            message = NEW_SESSION_TEXT
+            if not saved:
+                message += "\n⚠️ The new conversation could not be saved for restart."
+            await self._say(scope, message)
         elif command == "compact":
             # Clear the nudge flag first, so the soft-threshold nudge can fire
             # again once the context refills after this compaction.
@@ -247,7 +294,7 @@ class WhatsAppDispatcher:
             if provider is None:
                 await self._say(scope, COMPACT_NOTHING_TEXT)
                 return
-            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # Capability gate (mirroring the dashboard's gate): a
             # backend that cannot serve a manual /compact treats the prompt as
             # ordinary text and never answers, so dispatching would strand the
             # unbounded wait below. Informational, never an error.
@@ -301,7 +348,7 @@ class WhatsAppDispatcher:
         if self.sessions.is_busy(session_key):
             await self._handle_busy(inbound, session_key)
             return
-        m = self.cfg.messaging
+        m = self._live_cfg().messaging
         self._conv.maybe_rotate(
             scope,
             time.time(),
@@ -358,14 +405,14 @@ class WhatsAppDispatcher:
                 channel_type="whatsapp",
                 session_key=session_key,
                 conversation_id=f"whatsapp:{scope}",
-                # Durable inbound spool (issue #2217): DMs ONLY. The replay is a
+                # Durable inbound spool: DMs ONLY. The replay is a
                 # restart notice gated on ``may_send_to``, and this transport's
                 # ``may_send_to`` answers from ``dm_policy`` alone -- it knows
                 # nothing of the group roster, so a group removed or set to ``off``
                 # while the gateway was down would still receive the notice.
                 # Rather than teach the egress gate a roster it was never asked to
                 # hold, group routes are not declared and a refused group message
-                # degrades exactly as before this seam (tracked in #9144).
+                # degrades as any un-spooled refusal does: lost, with no restart notice.
                 #
                 # The text is the PRE-INGESTION original the transport captured,
                 # not ``inbound.text`` (by now rewritten with attachment context
@@ -521,9 +568,9 @@ class WhatsAppDispatcher:
         """
         pct = self.sessions.check_context_usage(session_key, provider)
         may_speak = not unprompted and not delivery_is_muted(self.sessions, session_key, "whatsapp")
-        wa = self.cfg.whatsapp
-        if pct >= wa.soft_threshold_pct:
-            # Capability gate (#8156): no forced compaction to run and the
+        soft, hard = self._thresholds()
+        if pct >= soft:
+            # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
             # on its own as context fills.
             unsupported = compact_unsupported_backend(provider)
@@ -533,7 +580,7 @@ class WhatsAppDispatcher:
                     unsupported,
                 )
                 return
-        if pct >= wa.hard_threshold_pct:
+        if pct >= hard:
             self._conv.clear_awaiting(scope)
             try:
                 await provider.compact()
@@ -543,7 +590,7 @@ class WhatsAppDispatcher:
                 return
             if may_speak:
                 await self._say(scope, COMPACT_AUTO_TEXT)
-        elif pct >= wa.soft_threshold_pct and not self._conv.is_awaiting(scope):
+        elif pct >= soft and not self._conv.is_awaiting(scope):
             # The flag records that the nudge WAS SENT, so it is set only when
             # one goes out: setting it while suppressed would spend the single
             # nudge this conversation gets on a message nobody read.
@@ -591,12 +638,13 @@ class WhatsAppDispatcher:
         )
 
         chat_type = CHAT_TYPE_FORUM if is_group_jid(scope) else CHAT_TYPE_DIRECT
-        dm_scope = self.cfg.messaging.dm_scope if is_operator else DM_SCOPE_PER_CHANNEL_PEER
+        gen = self._conv.current_gen(scope)
+        dm_scope = str(self.cfg.messaging.dm_scope) if is_operator else DM_SCOPE_PER_CHANNEL_PEER
         return build_dm_session_key(
             "whatsapp",
             self._resolve_agent(),
             scope,
-            gen=self._conv.current_gen(scope),
+            gen=gen,
             dm_scope=dm_scope,
             chat_type=chat_type,
         )
@@ -629,6 +677,6 @@ class WhatsAppDispatcher:
             channel="whatsapp",
             agent=self._resolve_agent(),
             user_id=scope,
-            dm_scope=self.cfg.messaging.dm_scope,
+            dm_scope=str(self.cfg.messaging.dm_scope),
             chat_type=CHAT_TYPE_FORUM if is_group_jid(scope) else CHAT_TYPE_DIRECT,
         )

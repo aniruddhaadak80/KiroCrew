@@ -66,7 +66,7 @@ Metadata only, by design: transcript-derived text never appears in the output,
 so no private session content crosses into the caller's context whatever keys
 the config watches. Content, when a ruling needs it, is read through the
 workspace-authorized session tools.
-    BANNED pid=<pid> rule=<regex> cwd=fleet|unknown
+    BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s
     OK <n> watched, <m> fired | load/cpu <x> (<posture>) | mem <G>G
        | banned <k> | foreign <k> | deliver init-timeout <a>, watchdog <b>
 
@@ -241,7 +241,7 @@ def _count_own_rows(raw: bytes) -> int:
     return total
 
 
-#: Error shapes observed in real worker tails during the 2026-08-30 fleet run.
+#: Error shapes observed in real worker tails, not shapes invented here.
 DEFAULT_ERR_RES = (
     r"Bedrock is throttling",
     r"dispatch failure",
@@ -252,22 +252,21 @@ DEFAULT_ERR_RES = (
 #: and a bare full-suite vitest with no file arguments.
 #:
 #: "Nobody chose" is the honest statement of what this rule catches, and it is
-#: not the same as "too many". This comment used to say a bare pytest forks one
-#: worker per core because of the repo's ``-n auto`` addopts. That premise is
-#: wrong: ``setup.cfg`` documents that ``auto`` is bounded by the rootdir
-#: conftest's ``pytest_xdist_auto_num_workers`` hook, which sizes the pool by
-#: available memory and by what concurrent runs on the host already hold, and
-#: that "an explicit ``-n <N>`` bypasses the budget". So on THIS repo the
-#: explicit spelling is the one that can outgrow the host, and ``auto`` is the
-#: one that cannot.
+#: not the same as "too many". On THIS repo the explicit spelling is the one
+#: that can outgrow the host: ``setup.cfg`` documents that ``auto`` is bounded
+#: by the rootdir conftest's ``pytest_xdist_auto_num_workers`` hook, which sizes
+#: the pool by available memory and by what concurrent runs on the host already
+#: hold, and that "an explicit ``-n <N>`` bypasses the budget". So ``auto`` is the
+#: spelling that cannot outgrow it.
 #:
 #: The rule's sense is deliberately left as it stands, because changing which
 #: shapes it flags changes what the conductor stops mid-turn across a whole
 #: fleet, and that is not a comment's decision to make. What it costs is stated
 #: plainly instead: ``-n 4``, ``-n=4``, ``-n4``, ``-n0`` and
-#: ``--numprocesses=4`` all read as bounded, ``-n auto`` and a bare pytest do
-#: not. ``-n0`` is the repo's own documented override and is genuinely
-#: in-process, so the safest form a worker can run is also a passing one.
+#: ``--numprocesses=4`` all read as bounded, while ``-n auto`` and any pytest
+#: carrying no numeric ``-n`` -- including a targeted single-file run -- do not.
+#: ``-n0`` is the repo's own documented override and is genuinely in-process, so
+#: the safest form a worker can run is also a passing one.
 DEFAULT_BANNED_RES = (
     r"\bpytest\b(?!.*(?:-n|--numprocesses)\s*=?\s*\d)",
     r"\bvitest\b\s+run\s*$",
@@ -298,14 +297,14 @@ NOPROGRESS_TAG = "NOPROGRESS"
 #: Reports that END an assignment. A worker that files one and then writes an
 #: unprefixed line is finished, not wedged, and must not age into IDLE.
 #:
-#: ``GREEN`` is the one that matters most and was missing from the first version
-#: of this set, which is worth recording because it made the fix cover only its
-#: rare cases: ``GREEN`` is the literal exit condition in every worker's contract
-#: ("report GREEN and stop"), so the most common terminal state in the fleet aged
-#: into IDLE and the conductor nudged workers that had already delivered -- the
-#: exact harm this set exists to remove. ``PR`` is deliberately NOT here: opening
-#: a pull request is a milestone the work continues past, and a worker that has
-#: only reported ``PR`` still owes the conductor a green.
+#: ``GREEN`` is the member that matters most, and a set without it covers only
+#: the rare cases: ``GREEN`` is the literal exit condition in every worker's
+#: contract ("report GREEN and stop"), so omitting it ages the fleet's most
+#: common terminal state into IDLE and has the conductor nudge workers that
+#: already delivered -- the exact harm this set exists to remove. ``PR`` is
+#: deliberately NOT here: opening a pull request is a milestone the work
+#: continues past, and a worker that has only reported ``PR`` still owes the
+#: conductor a green.
 TERMINAL_TAGS = frozenset({"GREEN", "STANDDOWN", "PROPOSAL"})
 
 #: Reports that keep their meaning until the conductor ACTS on them.
@@ -1082,6 +1081,108 @@ def _owner_class(proc_entry: Path, fleet: list[str], cmd: str = "") -> str:
     return "foreign"
 
 
+def _proc_starttime_ticks(proc_root: Path, pid: str) -> int | None:
+    """The ``starttime`` of the process at *pid* in clock ticks since boot, or None.
+
+    This is the process INCARNATION token: a pid is reused, but boot-relative
+    starttime distinguishes one incarnation of that pid from the next. The banned
+    scan reads ``cmdline`` at one instant and the age at another, so it captures
+    this token beside the cmdline and checks it again before emitting; a mismatch
+    means the pid was recycled between the reads and the two facts describe two
+    processes, so the age is not printed. The signed pid supervisor reads the same
+    field to bind a mapping to a process incarnation; here it is read only to
+    compare, never to grant anything.
+
+    ``/proc/<pid>/stat`` field 22 is ``starttime``. The ``comm`` field (field 2)
+    can hold spaces and parentheses, so the parse resumes after the LAST ``)``; a
+    comm like ``(sh )nasty)`` keeps its own parentheses out of the field split.
+    None on any unreadable or malformed input -- the caller treats an unreadable
+    token exactly like a mismatch and emits ``age=?s``.
+    """
+    try:
+        stat = (proc_root / pid / "stat").read_text(encoding="ascii", errors="replace")
+        rparen = stat.rindex(")")
+        return int(stat[rparen + 2 :].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _proc_age_secs(proc_root: Path, pid: str, expected_start: int | None) -> int | None:
+    """How many seconds the process at *pid* has been alive, or None.
+
+    The reader problem the age solves: a bare ``BANNED pid=`` line is the same
+    every cycle whether the process the conductor stopped is still running or a
+    new offender holds its recycled number -- pids are recycled, so the number
+    alone cannot tell those apart, and a re-emitted line reads as either
+    "handled, ignore" or "still burning the host" with no way to choose. The
+    process's own age settles it: an age that grows across cycles marks one
+    process still alive; a small age under a recycled number marks a fresh
+    violation. The age is a fact about the running process, so it costs no state
+    file and no second writer -- the probe stays read-only outside
+    ``--mark-handled``.
+
+    ``expected_start`` is the incarnation token captured before the per-pid reads
+    and is REQUIRED. The banned scan reads ``cmdline``/``cwd`` and the age at
+    DIFFERENT instants, so a pid recycled between them would splice one process's
+    identity onto another process's age -- the fidelity fix's own fidelity defect.
+    This re-reads ``starttime`` and returns None (rendered ``age=?s``) unless it
+    still matches, so the age is emitted only when it provably describes the same
+    process the reads did. A None token refuses as well: an age with no
+    incarnation to anchor it cannot be trusted.
+
+    Both reads are world-readable like ``/proc/<pid>/cmdline`` (the field this
+    scan trusts), so a process owned by another user answers here even though its
+    ``cwd``/``exe`` links do not. ``proc_root`` is threaded through rather than
+    ``/proc`` hardcoded, so the test harness's ``KIROCREW_PROBE_PROC_ROOT``
+    supplies both files, under the same containment rule as every other path here.
+
+    ``/proc/<pid>/stat`` field 22 is ``starttime`` in clock ticks since boot.
+    Any unreadable or malformed input returns None, which the caller renders as
+    ``age=?s`` -- the same handling as an unreadable cwd, and never crashes the
+    scan.
+
+    The source is ``/proc`` plus ``os.sysconf`` for the clock tick rate, both
+    POSIX-only. On a platform without them the age is genuinely uncomputable, so
+    this returns None and the caller emits ``age=?s`` there too. The field is
+    never omitted: a missing field would read as "no age" and let a reader assume
+    the process is new, while ``age=?s`` says the age is unavailable. There is no
+    stdlib-only process create-time source on Windows, so ``age=?s`` is the honest
+    answer rather than a number from a guessed tick rate.
+    """
+    starttime_ticks = _proc_starttime_ticks(proc_root, pid)
+    if starttime_ticks is None:
+        return None
+    # Bind the age to the incarnation the caller saw: the token is REQUIRED, so a
+    # None token (starttime unreadable when the caller captured it) refuses too --
+    # an age with no incarnation to anchor it cannot be trusted. If the pid was
+    # recycled between the caller's capture and now, ``starttime`` differs from
+    # the token and the age would belong to a different process. Refuse it -- the
+    # caller renders ``age=?s``, the same unknown the Windows path already emits,
+    # so this needs no new output shape.
+    if expected_start is None or starttime_ticks != expected_start:
+        return None
+    try:
+        uptime = float((proc_root / "uptime").read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    # The tick rate converts starttime into seconds and comes from ``os.sysconf``,
+    # which is POSIX-only. Where it is absent there is no reliable rate, so the
+    # age is genuinely uncomputable: return None (rendered ``age=?s``) rather than
+    # guess a rate and print a wrong number. A wrong age reads as a real age, so a
+    # reader trusts it; ``age=?s`` tells them the answer is unavailable.
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, ValueError, OSError):
+        return None
+    if hz <= 0:
+        return None
+    age = uptime - starttime_ticks / hz
+    # A negative age means the two reads disagreed (clock skew, or a pid that
+    # exited and its number was reused between the two opens); clamp to 0 rather
+    # than print a value that reads as nonsense.
+    return int(age) if age >= 0 else 0
+
+
 def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
     """Banned-process lines plus the host summary fragment."""
     banned_res = [
@@ -1099,6 +1200,13 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
             if not entry.name.isdigit():
                 continue
             try:
+                # The process incarnation, captured BEFORE any other per-pid read.
+                # cmdline, cwd and exe are separate /proc reads at different
+                # instants; if the pid is recycled partway through, they describe
+                # two processes. Capturing starttime first and re-reading it before
+                # emit brackets the whole record: a change means the reads cannot
+                # be trusted as one process, so the derived fields are withheld.
+                start_tok = _proc_starttime_ticks(proc_root, entry.name)
                 # argv is kept as a LIST, not just the space-joined string. The
                 # banned-operation rules are arg-shaped and must still see the
                 # joined form, but deciding whether this pid is a shell wrapper is
@@ -1158,12 +1266,57 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
                     foreign += 1
                     continue
                 banned += 1
+                # Re-read the incarnation token now that every per-pid read is
+                # done. If it is unreadable or differs from the one captured
+                # before the reads, the pid was recycled partway through and the
+                # cmdline, cwd and age describe more than one process -- so the
+                # WHOLE record is stale, not just the age. Withhold both derived
+                # fields: cwd drops to ``unknown`` (the non-stopping class, so a
+                # spliced record can never trigger a stop against an innocent
+                # worker) and age to ``?s``. pid and rule still print, so the
+                # violation is not silently dropped and the next cycle re-observes.
+                #
+                # EVERY per-pid read in the emission path is bracketed by this one
+                # token, so there is no third unguarded read:
+                #   * ``/proc/<pid>/stat``  -> start_tok (captured first, above)
+                #   * ``/proc/<pid>/cmdline`` (rule + argv)   -- inside the bracket
+                #   * ``/proc/<pid>/exe``  (_trusted_program_base) -- inside
+                #   * ``/proc/<pid>/cwd``  (_owner_class)          -- inside
+                #   * ``/proc/<pid>/stat`` -> end_tok (this line): start==end proves
+                #     the four reads above saw ONE incarnation, else cwd->unknown.
+                #   * ``/proc/<pid>/stat``+``/proc/uptime`` (age) -- independently
+                #     re-bound to start_tok inside ``_proc_age_secs`` (mismatch or
+                #     None -> ``age=?s``).
+                # starttime is monotonic per boot, so a recycle anywhere in the
+                # window necessarily changes it and is caught; a recycle back to
+                # the same starttime is impossible.
+                end_tok = _proc_starttime_ticks(proc_root, entry.name)
+                incarnation_stable = start_tok is not None and end_tok == start_tok
+                if not incarnation_stable:
+                    cwd_class = "unknown"
                 # pid + WHICH RULE fired + the cwd class is everything the
                 # conductor needs (stop the owner, re-seed with the directive).
                 # The argv is deliberately not echoed: a command line can carry
                 # credentials or presigned URLs, and this line lands in the
                 # conductor's model context.
-                lines.append(f"BANNED pid={entry.name} rule={matched} cwd={cwd_class}")
+                #
+                # ``age=`` is what makes a re-emitted line readable across
+                # cycles: a bare pid cannot say whether the process the conductor
+                # stopped is still running or a new offender holds its recycled
+                # number, so the same line reads as either handled-ignore or
+                # still-burning with no way to choose. A process age that grows
+                # across cycles marks one process still alive; a small age marks a
+                # fresh violation. The age comes from the running process, so it
+                # costs no state and keeps the probe read-only outside
+                # ``--mark-handled``. An unreadable or stale age prints ``age=?s``,
+                # like an unknown cwd, and never blocks the line.
+                age = (
+                    _proc_age_secs(proc_root, entry.name, start_tok) if incarnation_stable else None
+                )
+                age_field = "?" if age is None else str(age)
+                lines.append(
+                    f"BANNED pid={entry.name} rule={matched} cwd={cwd_class} age={age_field}s"
+                )
     per_cpu = None
     if hasattr(os, "getloadavg"):
         try:
@@ -1409,14 +1562,13 @@ def mark_handled(cfg: dict[str, Any], state_path: Path, key: str, tag: str, dige
     # ONE field records the last payload disposition, and it is written on EVERY
     # mark: set when this mark IS a payload, carried forward when it is not.
     #
-    # An earlier version wrote two fields for this -- `proto` for the terminal
-    # reading and `settled` for the suppression -- and gated the second on the
-    # condition tags alone. That left the same data loss reachable one door down:
-    # an `ERR` disposition on a session whose `BLOCKED` was answered overwrote the
-    # answer, and once a heartbeat stopped the error row being last, the answered
-    # ruling presented again. The rule is not "condition marks preserve payloads"
-    # but "a mark that is not itself a payload cannot erase one", so the carry is
-    # unconditional and the two fields collapse into this one.
+    # The carry is unconditional, and one field carries both readings, because
+    # the rule is not "condition marks preserve payloads" but "a mark that is not
+    # itself a payload cannot erase one". Gating the carry on the condition tags
+    # alone leaves the same data loss reachable one door down: an `ERR`
+    # disposition on a session whose `BLOCKED` was answered overwrites the
+    # answer, and once a heartbeat stops the error row being last, the answered
+    # ruling presents again.
     previous = handled.get(key)
     previous = previous if isinstance(previous, dict) else {}
     prior_tag, prior_digest = previous.get("tag"), previous.get("digest")

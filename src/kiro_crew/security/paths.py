@@ -34,8 +34,10 @@ prefix until the mount answers again.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import platform
 import re
 import threading
 import time
@@ -44,12 +46,14 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+from kiro_crew.agent_sdk import host_auth
 from kiro_crew.executors import _MAX_PATH_RESOLVE_WORKERS, path_resolve_executor
 from kiro_crew.identity_stores import (
     AUTH_SQLITE_DB,
     AUTH_SQLITE_SIDECAR_SUFFIXES,
     fenced_home_dirs,
 )
+from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME
 
 from .diagnostics import annotate_refusal, refusal_diagnostic
 
@@ -74,11 +78,6 @@ def _leaf_segments(spec: str) -> list[str]:
     return spec.split(_LEAF_SEPARATOR)
 
 
-def _leaf_basename(spec: str) -> str:
-    """Final segment of a ``/``-authored leaf spec."""
-    return _leaf_segments(spec)[-1]
-
-
 _SENSITIVE_HOME_DIRS: list[str] = [
     # Gateway-owned Kiro auth staging. Owner-only filesystem mode does not
     # isolate another process running as the same UID, so every agent sandbox
@@ -96,22 +95,30 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     ".pypirc",
     ".netrc",
     ".git-credentials",
-    # ACP adapter OAuth token stores. Each adapter owns its own sign-in flow and
+    # ACP adapter credential stores. Each adapter owns its own sign-in flow and
     # persists its own tokens; Kiro Crew never reads them, and only ever checks
     # that the file EXISTS so it can name the right sign-in command. An agent
     # that could ``fs_read`` one could impersonate the operator against that
-    # vendor, so both are on the floor "precisely so nothing else does".
+    # vendor, so they are on the floor "precisely so nothing else does".
     #
-    # Only the token leaf is classified. The sibling config files — codex's
-    # ``config.toml``, claude's ``settings*.json`` — deliberately stay readable:
+    # DECLARED by each harness rather than spelled here
+    # (``agent_sdk.host_auth.AGENT_AUTH_DECLARATIONS``), for the same reason the
+    # identity-store splice below reads one canonical table: this fence, the
+    # sandbox mask that compensates for it, and the sign-in advice the operator
+    # is shown all have to name the same file, and the harness that shipped
+    # selectable first shipped with its live token off this list because the
+    # list was hand-maintained somewhere else. A harness declares what it
+    # STORES; this module stays the one that decides what is fenced.
+    #
+    # Only the token leaf is declared. The sibling config files -- codex's
+    # ``config.toml``, claude's ``settings*.json`` -- deliberately stay readable:
     # routing diagnosis needs them and they carry no credential.
     #
-    # These are ``$HOME``-rooted defaults. Both adapters honour a home override
-    # (``CODEX_HOME``; ``CLAUDE_CONFIG_DIR`` / ``CLAUDE_HOME``), re-anchored in
-    # ``_home_dir_targets_uncached`` so an override cannot move the token out
+    # These are ``$HOME``-rooted defaults. A harness that honours a home override
+    # declares the variable too, and every declared leaf is re-anchored under it
+    # in ``_home_dir_targets_uncached`` so an override cannot move the token out
     # from under the gate.
-    ".codex/auth.json",
-    ".claude/.credentials.json",
+    *host_auth.credential_leaves(),
     # (The Notes builtin's GitHub PAT lives under the crew data-home at
     # ``<prefix>/workspace/md-notebook/pat``; it is added below via
     # ``_CREW_SECRET_LEAVES`` so BOTH ``.kiro/crew`` and the legacy ``.kirocrew``
@@ -136,11 +143,10 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     # (sandbox.py) is SEPARATE, so kiro-cli's own auth is unaffected.
     # The identity-store directories come from the single canonical table
     # (``identity_stores.IDENTITY_STORE_ROOTS``) so this fence and the five other
-    # readers cannot drift apart (#6352). The splice emits all eight in table
+    # readers cannot drift apart. The splice emits all eight in table
     # order (``.local/share`` -> ``Library/Application Support`` ->
-    # ``AppData/Local`` -> ``AppData/Roaming``, kiro-cli before amazon-q), which
-    # is the exact order this list carried before the refactor -- a golden test
-    # freezes that the final list is unchanged.
+    # ``AppData/Local`` -> ``AppData/Roaming``, kiro-cli before amazon-q), and a
+    # golden test freezes the final list against exactly that.
     #
     # Windows layouts: current kiro-cli writes the local, non-roaming app-data
     # directory (%LOCALAPPDATA% defaults to ~/AppData/Local); the Roaming entries
@@ -245,6 +251,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     # HMAC-gated ``PUT /api/settings``; the app's own backend opens the file
     # directly rather than through this gate, so it keeps working.
     "workspace/md-notebook/settings.json",
+    # The Notes builtin's write-staging directory. Every state writer above stages
+    # its temp file in here before renaming onto its target, so during a write —
+    # and after a crash between write and rename — a file in this directory holds
+    # the same bytes as the leaves above, PAT included. Classified as the whole
+    # DIRECTORY (like ``whatsapp``) so every temp name, present and future, is
+    # covered. A TOP-LEVEL leaf, not one under ``workspace/md-notebook``, so an
+    # agent-writable ancestor cannot be renamed out from under it. The app's own
+    # backend opens it directly rather than through this gate, so writes keep
+    # working.
+    "md-notebook-staging",
     # The AWS Control builtin's app data directory. ``backup.json`` in here holds
     # ``nightly``, the bit that AUTHORIZES the app's startup loop to upload the
     # gateway's memory and workspace to S3 unattended, so a prompt-injected agent
@@ -270,6 +286,12 @@ _CREW_SECRET_LEAVES: list[str] = [
     # one CLI spawn that must write into it is granted its per-call subdirectory
     # explicitly.
     "aws-control-staging",
+    # Quarantine markers for auto-improvement clones whose rollback and retirement both
+    # failed. A marker is the only durable record that a clone carrying a refused, unscanned
+    # commit must not be reused, and an agent that could write or delete one could certify
+    # its own poisoned clone. Masked at OS level too (`sandbox._CREW_HIDDEN_LEAVES`), since a
+    # spawned shell's `open()` never routes through this gate.
+    "quarantined-clones",
     "browser-cookies.txt",
     "playwright-storage-state.json",
     # The refused-inbound spool (messaging/inbound_spool.py). Not a secret: it is
@@ -315,13 +337,18 @@ _CREW_SECRET_LEAVES: list[str] = [
     # operator's logged-in browser without them seeing a prompt. The gateway hands
     # it to the CLI through the environment, so nothing legitimate opens the file.
     "playwright-extension-token",
+    # Gateway-executed browser launcher and its vendored package tree. Agent
+    # subprocesses receive a READONLY sandbox view so their browser commands can
+    # run it; file tools must not inspect or replace the executable the
+    # unsandboxed gateway later uses for startup cleanup and owner launches.
+    "playwright-cli",
     # Legacy SEL HMAC key location (pre-``trust/`` installs, and any stale file
     # a backup restore resurrects). Kept alongside the ``trust``
     # directory entry below so the key is gated at BOTH locations.
     "sel_hmac.key",
     # SEL trust-root directory: sel.py stores/migrates the audit chain's HMAC
     # signing key at ``trust/sel_hmac.key`` — OUTSIDE the log's directory, so
-    # write access to the log dir no longer implies re-signing power. The whole
+    # write access to the log dir does not imply re-signing power. The whole
     # dir is gated (like ``profiles``/``run``) so future trust-root material is
     # covered without a new entry. sel.py opens the key directly, not through
     # this gate.
@@ -334,6 +361,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
     # path directly (as keystone writers must), so it would have followed the link.
     "trust",
+    "member-memory-bindings",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
     # it into this directory, so a segment holds exactly the same audit records
@@ -399,6 +427,15 @@ _CREW_SECRET_LEAVES: list[str] = [
     # files. The dashboard and workflow service open it directly and remain able
     # to create, list, update, and execute definitions.
     "workflow_library",
+    # The crew appearance library: packs the user imported and a crew wears.
+    # Only the gateway's owner-gated ``/api/appearances`` routes open it, and
+    # they open it directly, so fencing it costs nothing in-process. Left off
+    # this list, an agent's file tools could rewrite a manifest or erase the art
+    # on any host: the sandbox bind-mask covers the Linux shell plane only, and
+    # this list is what stops ``fs_write``/``fs_read`` on Windows and macOS.
+    # Recovery is a re-import, but a prompt-injected agent corrupting user data
+    # is the mainline threat these leaves exist for.
+    "appearance-library",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -487,7 +524,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # agent could therefore mint the dashboard token, PUT ``mode=act`` with a rule
     # matching a signal, and unlock provider actions the operator never granted, which
     # defeats the app's central safety property (``effective = min(app_mode, rule_mode)``
-    # is only a ceiling if the agent cannot raise it). Found in review. Here for the same
+    # is only a ceiling if the agent cannot raise it). Here for the same
     # reasons as the secrets leaf directly above — served unauthenticated over
     # ``/config`` and writable by any auto-approved shell in ``config.json`` — so it moves
     # to the read+write keystone floor. Dashboard PUT is the sole writer and opens the
@@ -594,8 +631,8 @@ _CREW_SECRET_LEAVES: list[str] = [
     "run",
     # Encrypted secret vault directory — denylists the entire subdirectory so
     # the key file, ciphertext store, lock, and atomic-write temp files are all
-    # unreadable to the agent through any Kiro Crew-mediated channel (PR 1 of
-    # #2351). The verb-independent sensitive-path backstop covers a scripted
+    # unreadable to the agent through any Kiro Crew-mediated channel.
+    # The verb-independent sensitive-path backstop covers a scripted
     # ``python -c "open('~/.kiro/crew/.vault/...')"`` too.
     ".vault",
     # KAS-mode auth token store. In the KAS-embedded runtime Kiro Crew performs the
@@ -638,6 +675,33 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``identity_stores`` and opens it directly, not through this gate.
     AUTH_SQLITE_DB,
     *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+    # Named memory stores. Each subdirectory is ONE crew's private memory silo --
+    # its markdown tree, its FTS index and its vector-store SQLite file -- and the
+    # whole point of a named store is that a crew reaches only its own. Agent file
+    # tools run as the same UID as every store on disk, so owner-only modes decide
+    # nothing here: without this entry any crew's agent could read another crew's
+    # preferences and lessons straight off disk, or rewrite them, which is the
+    # boundary the split exists to draw. Read AND write, because reading another
+    # crew's memory is the primary harm and writing it is steering that crew's
+    # future turns.
+    #
+    # A DIRECTORY entry, for the reason ``routing`` and ``webhooks`` above are:
+    # markdown files are published through ``atomic_write``'s ``mkstemp`` sibling,
+    # so fencing final names only would leave a writable path to the same bytes
+    # under a random temp name.
+    #
+    # DELIBERATE ASYMMETRY, do not "tidy" it: the DEFAULT store's own ``memory.db``
+    # and ``workspace/memory/`` stay readable, because that is the agent's own
+    # memory and reading it is the product working. Fencing them would be a
+    # default-path behaviour change, which the coexistence constraint forbids. So
+    # ``is_sensitive_path(<home>/memory.db)`` is False and
+    # ``is_sensitive_path(<home>/memory_stores/work/memory.db)`` is True, on
+    # purpose. Full reasoning: docs/system-specs/modules/security.md.
+    #
+    # Every legitimate reader opens a store path DIRECTLY rather than through this
+    # gate -- the established keystone-reader pattern -- so the memory subsystem is
+    # unaffected.
+    MEMORY_STORES_DIR_NAME,
 ]
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
@@ -741,7 +805,7 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # could rewrite it to name its own login would make
     # ``rotation.authorize_action`` -> ``_definitely_off_shift`` accept its own
     # forged shift and execute an off-shift production write against a teammate's
-    # tooling. Found in review.
+    # tooling.
     #
     # This is the last of five instances of one class on this app's off-shift
     # refusal (the others: the GitHub login, the strict-gating flag, the
@@ -768,7 +832,7 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # signal that does not exist. That is the same defect already fixed on ``/incident/claim``
     # by resolving the signal server-side; this is the same forgery reached through the store
     # instead of the request body, which server-side resolution cannot help with because the
-    # store IS the server's copy. Found in review (GPT 5.6).
+    # store IS the server's copy.
     #
     # The gateway's own writers (``store.claim``/``update_fields``, the reconcile SOP) open
     # this path directly and do not route through this gate, so the app keeps working; only
@@ -820,6 +884,30 @@ _WRITE_PROTECTED_HOME_PATHS += [
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
+    # The per-agent bookkeeping sidecar (agent_state.py, ``agent_model_state.json``
+    # directly under the crew home). It is the same input-to-an-authorization-decision
+    # class as rotation.yaml and the OMC index: besides model bookkeeping it records
+    # FORK LINEAGE — ``forked_from`` / ``private_to`` mark a template as ONE crew's
+    # private copy of a shared one (blueprint / copy-on-first-edit semantics). The
+    # fork endpoint reads this lineage to decide whether a template is already the
+    # crew's own copy; a prompt-injected agent that could write it would forge a
+    # ``private_to`` entry naming a SHARED template, so the fork returns
+    # ``already_private`` and the owner's next PATCH lands on the shared file instead
+    # of forking a copy — silently mutating a template other crews depend on. Nothing
+    # downstream neutralizes the forgery: the fork/PATCH path trusts the sidecar as
+    # its own record..
+    #
+    # WRITE-protected, NOT read+write sensitive: it holds no secret and is READ
+    # constantly (``list_agents`` enriches every row with fork info, model resolution
+    # reads ``model_managed`` / ``cc_model``), so classifying it sensitive would break
+    # those reads. Only the agent's own file-edit tool is refused; every internal
+    # writer (agent_state._write via ``atomic_write``) opens the path directly and does
+    # not route through this gate, so the dashboard fork/PATCH and the CLI model-state
+    # updates keep working.
+    f"{prefix}/agent_model_state.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
     # The Connections tool-alias OWNERSHIP RECORD, third instance of the same class as the
     # two above and with the same read/write asymmetry. It holds no secret and the rebuild
     # reads it on every run, so classifying it sensitive would break the feature — but it is
@@ -834,7 +922,7 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # alias — laundering the edit through Kiro Crew's own trusted writer, which is what makes
     # it worse than editing the spec directly: the deletion is performed and persisted by the
     # legitimate owner of that file. The generation fingerprint cannot defend this, because a
-    # forger reads the same spec it does. Found in review (GPT 5.6).
+    # forger reads the same spec it does.
     #
     # ``alias_record._write`` opens the path directly via ``atomic_write`` and does not route
     # through this gate, so both record writes still work; only the agent's own file-edit
@@ -1008,11 +1096,75 @@ def _oversize_refusal(length: int, limit: int) -> str:
 # The thread is NOT freed by the timeout (a started future cannot be cancelled);
 # that is why this has its own pool -- see ``executors.path_resolve_executor``.
 _PATH_RESOLVE_TIMEOUT_SECS = 2.0
+# The ANCHOR REBUILD's own budget. One pool job there performs ~130 `realpath`
+# calls to build ~200 targets, where a candidate resolution performs one or two,
+# so a single budget sized for the candidate leaves the rebuild running ~130x
+# closer to its ceiling -- measured: a cold rebuild is 130 `_realpath_or_none`
+# calls, a warm one 4. Sizing this to the work actually done is what stops an
+# ordinarily-slow rebuild from being mistaken for a wedged mount on a loaded host
+# (4 xdist workers plus real-time antivirus on a 4-vCPU Windows runner is where it
+# was first observed); raising `_PATH_RESOLVE_TIMEOUT_SECS` globally instead would
+# relax the latency guarantee on the candidate path, which does not need it.
+_PATH_RESOLVE_REBUILD_TIMEOUT_SECS = 8.0
+# Fail-closed tightening: successful waits and stalls under DISTINCT prefixes all
+# block the calling thread. Allow 12s total (one rebuild plus its maximum grace),
+# leaving 13s of the 25s watchdog for heartbeat age and other tool-call work.
+# Retain that spend until 25s after the LAST wait, not a fixed window boundary:
+# otherwise two adjacent windows can spend twice the cap inside one watchdog gap.
+# Background callers have their own allowance, never the event-loop thread's.
+_PATH_RESOLVE_WAIT_CAP_SECS = 12.0
+_PATH_RESOLVE_WAIT_WINDOW_SECS = 25.0
+# A wait below this floor is resolver-pool round-trip overhead, not filesystem
+# latency, so it is excluded from the cumulative spend above -- otherwise ordinary
+# bulk work (a project-tree listing, a knowledge-indexing pass, a directory-wide
+# path_contains_sensitive scan) accumulates thousands of sub-millisecond on-time
+# waits and exhausts the allowance with zero mount evidence, trading the rare
+# crash this bound removes for a reachable silent host-wide refusal instead.
+# Measured on a 32-core host: 3000 calls against a healthy path cost 1.151s of
+# accounted wait, 0.384ms/call -- 100ms is ~260x that overhead, so realistic pool
+# jitter stays free, and 20x under the 2.0s default candidate budget, so it stays
+# far below both a single missed-budget timeout and the slow-but-completing case
+# this bound must still catch: a run of waits that each finish just under budget
+# (13 at ~2s apiece is ~25s of loop block) all clear the floor and still count.
+_PATH_RESOLVE_WAIT_FLOOR_SECS = 0.1
+# How much longer a resolution that missed its budget is given to finish before the
+# prefix is charged with a stall. A miss is not itself proof of a wedged mount -- a
+# merely slow one completes -- and on any platform where the syscall probe below
+# cannot discriminate, this is what separates the two, empirically rather than by
+# syscall table. Paid at most once per prefix per cooldown, because the charge that
+# follows a grace miss refuses later paths under the prefix without probing.
+#
+# Expressed as a FRACTION of the caller's budget, not a constant: the grace is "half
+# again as long as this caller already agreed to wait", so a caller that deliberately
+# chooses a tight budget keeps a tight worst case (the whole point of taking a budget
+# per call) instead of inheriting a fixed multi-second tail. Capped so the generous
+# rebuild budget cannot compound into the loop-stall watchdog this bound protects:
+# 8s + 4s stays well inside 25s.
+_PATH_RESOLVE_GRACE_FACTOR = 1.5
+_PATH_RESOLVE_GRACE_MAX_SECS = 4.0
 _PATH_RESOLVE_COOLDOWN_SECS = 30.0
 _PATH_RESOLVE_COOLDOWN_MAX_SECS = 1800.0
+# The load arm declines to charge the prefix, so it carries the event-loop bound the cooldown
+# would otherwise supply: this many uncharged probes per prefix per window.
+_PATH_RESOLVE_LOAD_WINDOW_SECS = 10.0
+_PATH_RESOLVE_LOAD_MAX_PROBES = 3
+# ``/proc/<tid>/syscall`` reports the syscall NUMBER, which is per-architecture. An unmapped
+# architecture yields an empty set, which fails toward charging the prefix.
+_FS_BLOCKING_SYSCALLS_BY_ARCH: dict[str, frozenset[int]] = {
+    "x86_64": frozenset(
+        {4, 5, 6, 89, 262, 267, 332}
+    ),  # stat fstat lstat readlink newfstatat readlinkat statx
+    "aarch64": frozenset({78, 79, 80, 291}),  # readlinkat newfstatat fstat statx
+}
+_FS_BLOCKING_SYSCALLS: frozenset[int] = _FS_BLOCKING_SYSCALLS_BY_ARCH.get(
+    platform.machine(), frozenset()
+)
 # stall prefix -> (monotonic deadline until which paths under it are refused,
 # consecutive stalls recorded under it -- drives the exponential backoff)
 _path_resolve_degraded: dict[str, tuple[float, int]] = {}
+_path_resolve_load_probes: dict[str, tuple[float, int]] = {}
+# calling thread id -> (quiet-window end, accumulated seconds in result waits)
+_path_resolve_thread_waits: dict[int, tuple[float, float]] = {}
 # futures that timed out and still hold an mc-pathres worker; pruned as they finish
 # (candidate spellings, root anchors and target rebuilds all land here)
 _path_resolve_wedged: list[Future[Any]] = []
@@ -1064,15 +1216,32 @@ def _stall_prefix(expanded: str) -> str:
 
     A wedged mount stalls everything beneath its mount point, and mount points
     sit at depth one or two (``/home/<user>`` autofs, ``/Volumes/<share>``,
-    ``/net/<host>``, ``C:\\Users``), so two components is the narrowest key
+    ``/net/<host>``, ``C:\\Users\\<user>``), so two components is the narrowest key
     that still covers the whole stalled subtree.  Scoping the cooldown here is
     what keeps a stall on the REMOTE half of an ``ssh`` command from switching
     resolution off for the local workspace where a bypass symlink would live.
+
+    **The DRIVE is split off first, and on Windows that is what makes the key two
+    components rather than one.**  A POSIX absolute path starts with an empty
+    component (``"/a/b"`` -> ``["", "a", "b"]``), which is why three are kept; a
+    Windows path does not (``"C:\\Users\\bob"`` -> ``["C:", "Users", "bob"]``), so
+    counting components without splitting the drive kept ``C:`` as one of the two
+    and collapsed every user path to ``C:\\Users``.  That single key contains
+    ``$HOME``, ``%TEMP%``, the workspace and the checkout, so one stall anywhere in
+    the profile refused path resolution for essentially the whole host -- the exact
+    opposite of the per-mount isolation this function exists to provide.
+
+    A UNC share root is returned whole: ``\\\\server\\share`` IS the mount point,
+    and ``splitdrive`` already reports it as the drive, so no component of the
+    remainder belongs in the key.
     """
     normalized = os.path.normpath(expanded)
-    parts = normalized.split(os.sep)
+    drive, rest = os.path.splitdrive(normalized)
+    if drive[:1] in ("\\", "/") and drive[1:2] in ("\\", "/"):
+        return drive
+    parts = rest.split(os.sep)
     keep = 3 if parts and parts[0] == "" else 2  # leading "" for an absolute path
-    return os.sep.join(parts[:keep]) or normalized
+    return (drive + os.sep.join(parts[:keep])) or normalized
 
 
 def _wedged_workers() -> int:
@@ -1089,16 +1258,112 @@ def _wedged_workers() -> int:
         return len(_path_resolve_wedged)
 
 
+def _worker_blocked_in_filesystem(tid: int | None) -> bool:
+    """True when thread ``tid`` is blocked inside a syscall a path resolution can block in.
+
+    Separates the two causes of a started-but-unfinished resolution, which the budget alone
+    cannot distinguish: a worker stuck on a wedged mount versus one that started and was then
+    starved of the CPU. Both consume almost no CPU, so a CPU-time comparison cannot tell them
+    apart, and neither can the ``/proc`` state field: measured on a 48-core host, a thread doing
+    ordinary ``lstat`` work and a thread doing nothing but burn CPU BOTH alternate between ``R``
+    and ``S`` from one sample to the next, because a Python thread spends most of its wall time
+    waiting on the GIL rather than inside a syscall.
+
+    What does separate them is WHICH syscall the thread is in. A thread genuinely blocked in a
+    kernel wait reports that syscall on every sample; one merely contending reports ``futex`` or
+    ``running``. And these syscalls complete in microseconds on a healthy filesystem, so
+    sampling one at all is itself evidence that it is not completing.
+
+    UNVERIFIED, and deliberately not claimed: that a thread stuck in one of these syscalls on a
+    real wedged NFS, FUSE or CIFS mount reports it stably. No wedged mount could be produced
+    where this was measured: an unprivileged ``fusermount3`` mount returns EPERM and
+    ``unshare(CLONE_NEWUSER)`` returns EPERM, so neither FUSE nor a user-namespace NFS mount is
+    available there.
+
+    What IS confirmed is the sampling this rests on, including for the state class a wedged FUSE
+    or CIFS mount actually waits in. An ``openat`` on a FIFO with no writer blocks
+    INTERRUPTIBLY while operating on a real filesystem path, and measured on a 48-core x86_64
+    host it reported state ``S`` with syscall 257 on 15 of 15 samples and no other value -- so
+    an in-``S`` filesystem wait samples exactly as stably as the uninterruptible waits (a pipe
+    ``read`` and a ``clock_nanosleep``, each 12 of 12). See
+    ``test_an_in_s_filesystem_wait_is_sampled_stably_and_reads_as_blocked``.
+
+    The table covers ``readlink`` as well as the stat family because CPython's
+    ``posixpath.realpath`` calls ``os.lstat`` AND ``os.readlink`` per component: a mount that
+    answers the lstat from cache and hangs the readlink would otherwise read as not blocked,
+    take the load arm, and pay an uncharged full-budget probe per token rather than opening one
+    cooldown.
+
+    Fails toward the EXISTING behaviour -- an unreadable ``/proc``, a thread that has already
+    exited, an architecture whose syscall numbers are not mapped -- by returning True, so the
+    caller still charges the prefix rather than silently withholding an escalation the gate
+    would otherwise make.
+    """
+    if tid is None or not _FS_BLOCKING_SYSCALLS:
+        return True
+    try:
+        with open(f"/proc/self/task/{tid}/syscall", "rb") as fh:
+            head = fh.read().split()
+    except OSError:
+        return True
+    if not head:
+        return True
+    sampled = head[0]
+    if sampled == b"running":
+        blocked = False
+    else:
+        try:
+            blocked = int(sampled) in _FS_BLOCKING_SYSCALLS
+        except ValueError:
+            blocked = True
+    logger.debug(
+        "resolver worker tid=%s syscall=%s blocked_in_filesystem=%s",
+        tid,
+        sampled.decode("ascii", "replace"),
+        blocked,
+    )
+    return blocked
+
+
+def _load_arm_budget_spent(prefix: str) -> bool:
+    """Record a load-arm probe under *prefix*; True once the window's allowance is gone.
+
+    The per-prefix cooldown has a second job besides remembering a dead mount: it BOUNDS how
+    much event-loop time one call can spend probing. A single tool call can carry many path
+    tokens, and ten tokens each paying the full budget puts the event loop back past the
+    watchdog this whole bound exists to protect. Declining to charge the prefix removes that
+    bound, so the load arm has to carry it: the first ``_PATH_RESOLVE_LOAD_MAX_PROBES`` probes
+    in a window are free, and the next one charges the prefix normally.
+
+    The count is cleared ONLY by the window expiring, never by a successful resolution. It
+    measures event-loop time already spent, which a later success cannot refund: clearing it on
+    success let an alternating success / CPU-starved-timeout run under one prefix pay the full
+    budget on every timeout while never crossing the allowance.
+    """
+    now = _path_resolve_clock()
+    with _path_resolve_lock:
+        if len(_path_resolve_load_probes) > 64:
+            _path_resolve_load_probes.clear()
+        window_end, probes = _path_resolve_load_probes.get(prefix, (0.0, 0))
+        if now >= window_end:
+            window_end, probes = now + _PATH_RESOLVE_LOAD_WINDOW_SECS, 0
+        probes += 1
+        _path_resolve_load_probes[prefix] = (window_end, probes)
+        return probes > _PATH_RESOLVE_LOAD_MAX_PROBES
+
+
 def _mark_stalled(prefix: str, budget: float) -> None:
     """Record an OBSERVED stall under *prefix*: back off exponentially on repeats.
 
-    Only a resolution that actually timed out is recorded.  A refusal issued
-    because every worker was already pinned costs nothing (nothing is
-    submitted) and must not charge the refused prefix -- often the local
-    workspace -- a backoff it never earned, or a transient dual-mount outage
-    would keep refusing healthy paths for the accrued window after the mounts
-    recover.  The log line deliberately omits the path: the token is
-    agent-supplied and is what the gates exist to keep out of clear-text logs.
+    Only a resolution that actually RAN and timed out is recorded.  A refusal
+    issued because every worker was already pinned (nothing is submitted), or
+    because a submitted resolution never left the queue (its future cancelled
+    on timeout), says nothing about the filesystem and must not charge the
+    refused prefix -- often the local workspace -- a backoff it never earned,
+    or a transient dual-mount outage would keep refusing healthy paths for the
+    accrued window after the mounts recover.  The log line deliberately omits
+    the path: the token is agent-supplied and is what the gates exist to keep
+    out of clear-text logs.
     """
     now = _path_resolve_clock()
     with _path_resolve_lock:
@@ -1145,7 +1410,7 @@ _ResolvedT = TypeVar("_ResolvedT")
 
 
 def _run_resolution_bounded(
-    expanded: str, worker: Callable[[str], _ResolvedT]
+    expanded: str, worker: Callable[[str], _ResolvedT], *, budget: float | None = None
 ) -> _ResolvedT | None:
     """Run *worker(expanded)* on the ``mc-pathres`` pool within the resolve budget.
 
@@ -1169,7 +1434,25 @@ def _run_resolution_bounded(
     prefix with a stall history is only re-probed while that leaves at least one
     worker free for everything else -- so a permanently dead mount is probed
     rarely and can never pin the whole pool.  Never blocks the caller for longer
-    than ``_PATH_RESOLVE_TIMEOUT_SECS``.
+    than *budget* plus its grace -- the bounded second wait a missed budget earns
+    before the prefix is charged, itself a capped fraction of *budget*. Both waits
+    also consume the calling thread's cumulative allowance -- excluding a wait
+    below the floor, resolver-pool round-trip overhead rather than filesystem
+    latency; exhaustion refuses without submitting work or charging a prefix until
+    the quiet window expires.
+    Charging the prefix on a timeout ALSO requires that both the budget and the
+    grace were granted in full, uncapped by the allowance: a wait clamped short by
+    the allowance says nothing about the mount, so it refuses this call alone,
+    the same conclusion the saturated-pool, never-ran and load arms reach.
+
+    A stall is charged only to a resolution that RAN.  A future that times out
+    still QUEUED (the pool saturated by concurrent callers, e.g. simultaneous
+    cron fires) is cancelled and refuses this call alone: queue wait is
+    evidence about load, not about the mount, so it opens no cooldown and pins
+    no worker in :func:`_wedged_workers`.  A future claimed by a freeing worker
+    in the very instant the deadline fires is abandoned by handshake -- the
+    worker returns without entering the resolution -- so the never-ran
+    classification is binding, not a race.
 
     The UNC shortcut is NOT here: skipping a ``\\\\server\\share`` token is a
     stance about agent-supplied CANDIDATES (:func:`_resolved_forms_bounded`),
@@ -1177,8 +1460,16 @@ def _run_resolution_bounded(
     fence itself, and a UNC home with a junction inside ``KIROCREW_HOME`` must
     still be canonicalised or a canonical-spelling request would miss the
     governance file (found in review); the bound makes that probe safe.
+
+    *budget* sizes the wait to the work the caller submits: the anchor REBUILD is
+    one job performing ~130 ``realpath`` calls and passes
+    ``_PATH_RESOLVE_REBUILD_TIMEOUT_SECS``, while a candidate resolution keeps the
+    default. One budget for both put the rebuild ~130x closer to its ceiling than
+    the path whose latency the default exists to guarantee.
     """
-    budget = _PATH_RESOLVE_TIMEOUT_SECS
+    if budget is None:
+        budget = _PATH_RESOLVE_TIMEOUT_SECS
+    requested_budget = budget
     now = _path_resolve_clock()
     prefix = _stall_prefix(expanded)
     with _path_resolve_lock:
@@ -1200,17 +1491,172 @@ def _run_resolution_bounded(
             _MAX_PATH_RESOLVE_WORKERS,
         )
         raise PathResolutionStalled(expanded, prefix)
+    caller_tid = threading.get_ident()
+    with _path_resolve_lock:
+        if len(_path_resolve_thread_waits) > 64:
+            # Clearing live entries would let thread churn refund the loop's spend.
+            expired = [tid for tid, (end, _) in _path_resolve_thread_waits.items() if now >= end]
+            for expired_tid in expired:
+                del _path_resolve_thread_waits[expired_tid]
+        window_end, seconds_spent = _path_resolve_thread_waits.get(caller_tid, (0.0, 0.0))
+        if now >= window_end:
+            seconds_spent = 0.0
+    remaining = _PATH_RESOLVE_WAIT_CAP_SECS - seconds_spent
+    if remaining <= 0:
+        # No work ran, so this refusal says nothing about the prefix's mount.
+        logger.debug(
+            "sensitive-path symlink resolution refused without probing: calling thread's "
+            "cumulative wait allowance exhausted; prefix not charged"
+        )
+        raise PathResolutionStalled(expanded, prefix)
+    granted_budget = min(budget, remaining)
     try:
-        future = path_resolve_executor().submit(worker, expanded)
+        started = threading.Event()
+        abandoned = threading.Event()
+        handoff = threading.Lock()
+        worker_tid: list[int] = []
+
+        @functools.wraps(worker)
+        def _tracked(arg: str) -> _ResolvedT | None:
+            worker_tid.append(threading.get_native_id())
+            with handoff:
+                if abandoned.is_set():
+                    # The caller classified this future as never-run at its
+                    # deadline: return without touching the filesystem, so a
+                    # late claim can neither probe a wedged mount nor pin a
+                    # worker _wedged_workers() is not tracking.
+                    return None
+                started.set()
+            return worker(arg)
+
+        future = path_resolve_executor().submit(_tracked, expanded)
     except RuntimeError:
         # Pool already shut down (interpreter exit).  Lexical forms only.
         return None
+
+    def _wait_for_result(timeout: float) -> _ResolvedT | None:
+        nonlocal seconds_spent
+        wait_start = _path_resolve_clock()
+        try:
+            return future.result(timeout=timeout)
+        finally:
+            wait_end = _path_resolve_clock()
+            elapsed = max(0.0, wait_end - wait_start)
+            if elapsed >= _PATH_RESOLVE_WAIT_FLOOR_SECS:
+                seconds_spent += elapsed
+                with _path_resolve_lock:
+                    _path_resolve_thread_waits[caller_tid] = (
+                        wait_end + _PATH_RESOLVE_WAIT_WINDOW_SECS,
+                        seconds_spent,
+                    )
+
     try:
-        value = future.result(timeout=budget)
+        value = _wait_for_result(granted_budget)
     except FutureTimeoutError:
+        if future.cancel():
+            # Never claimed by a worker: the pool was saturated and the
+            # resolution never started -- evidence about load, not the mount.
+            logger.debug(
+                "sensitive-path symlink resolution refused: the resolver pool was "
+                "saturated and the resolution never started; prefix not charged"
+            )
+            raise PathResolutionStalled(expanded, prefix) from None
+        with handoff:
+            ran = started.is_set()
+            if not ran:
+                abandoned.set()
+        if not ran:
+            # Claimed by a freeing worker in the instant the deadline fired,
+            # before entering the resolution.  The handshake makes the
+            # classification binding: the worker sees ``abandoned`` and returns
+            # without probing, so it pins nothing and there is nothing to
+            # charge -- the same conclusion as the queued arm above.
+            logger.debug(
+                "sensitive-path symlink resolution refused: the resolver pool was "
+                "saturated and the resolution never started; prefix not charged"
+            )
+            raise PathResolutionStalled(expanded, prefix) from None
         with _path_resolve_lock:
             _path_resolve_wedged.append(future)
-        _mark_stalled(prefix, budget)
+        tid = worker_tid[0] if worker_tid else None
+        if not _worker_blocked_in_filesystem(tid) and not _load_arm_budget_spent(prefix):
+            logger.debug(
+                "sensitive-path resolution timed out under load; prefix not charged (tid=%s)",
+                tid,
+            )
+            # The worker RAN but never got the CPU: the same conclusion as the queued
+            # arm above, reached one step later.  The future stays tracked as wedged
+            # (it does hold a worker until it finishes), but the prefix is NOT charged,
+            # so ordinary contention refuses THIS resolution instead of opening a
+            # cooldown across every path under the prefix.
+            raise PathResolutionStalled(expanded, prefix) from None
+        # A missed budget is not yet proof of a wedged mount, and charging the prefix
+        # is the expensive conclusion: it refuses EVERY path under that prefix for the
+        # cooldown, so one transient miss becomes a cascade of refusals across
+        # unrelated paths. Give the resolution a bounded GRACE to finish first. This is
+        # the only discriminator available wherever the syscall probe above cannot
+        # answer -- an architecture absent from `_FS_BLOCKING_SYSCALLS_BY_ARCH`, which
+        # is every Windows host (`platform.machine()` is "AMD64") and Apple silicon --
+        # because there it returns True for a merely slow resolution as readily as for
+        # a dead mount, and the prefix was charged either way.
+        #
+        # Costs nothing on a genuinely wedged mount beyond delaying the cooldown by
+        # the grace, and is paid at most ONCE per prefix per cooldown: the charge
+        # below refuses later paths under the prefix without probing at all. The
+        # future stays tracked as wedged while this waits, so a second token cannot
+        # pin the last worker meanwhile, and it self-prunes from that list if it does
+        # complete (`_wedged_workers` drops finished futures).
+        entitled_grace = min(
+            requested_budget * _PATH_RESOLVE_GRACE_FACTOR, _PATH_RESOLVE_GRACE_MAX_SECS
+        )
+        granted_grace = min(entitled_grace, _PATH_RESOLVE_WAIT_CAP_SECS - seconds_spent)
+        # A one-element list, not an Optional: the sentinel has to distinguish "the
+        # future completed" from "it completed as None", and the worker's own return
+        # is Optional since the never-ran handshake above makes it return None.  That
+        # arm raises before reaching here, so a None here can only come from the
+        # worker itself and is passed through exactly like the on-time path does.
+        late: list[_ResolvedT | None] = []
+        try:
+            if granted_grace > 0:
+                late.append(_wait_for_result(granted_grace))
+        except FutureTimeoutError:
+            pass
+        except Exception:
+            logger.debug("sensitive-path symlink resolution failed", exc_info=True)
+            return None
+        if late:
+            logger.debug(
+                "sensitive-path resolution completed within %.1fs past its %.1fs "
+                "budget, so the prefix is NOT charged (tid=%s)",
+                granted_grace,
+                requested_budget,
+                tid,
+            )
+            if history is not None:
+                with _path_resolve_lock:
+                    _path_resolve_degraded.pop(prefix, None)
+            return late[0]
+        if granted_budget < requested_budget or granted_grace < entitled_grace:
+            # The wait ended early because the calling thread's cumulative allowance
+            # ran out, not because the resolution itself proved anything about the
+            # mount -- the same conclusion the saturated-pool, never-ran and load
+            # arms above reach by a different route. Charging here would let the
+            # allowance clamp reopen exactly the blast radius this bound removes:
+            # on a host where the syscall probe cannot discriminate (every Windows
+            # host, and Apple silicon), the grace is the ONLY signal, and a
+            # truncated grace answers nothing either way. Refuse this call alone.
+            logger.debug(
+                "sensitive-path resolution timed out with its budget or grace clamped "
+                "by the calling thread's cumulative wait allowance; prefix not "
+                "charged (tid=%s)",
+                tid,
+            )
+            raise PathResolutionStalled(expanded, prefix) from None
+        logger.debug(
+            "sensitive-path resolution timed out blocked in the filesystem (tid=%s)",
+            tid,
+        )
+        _mark_stalled(prefix, requested_budget)
         raise PathResolutionStalled(expanded, prefix) from None
     except Exception:
         # The worker's own exceptions are already swallowed inside the worker;
@@ -1277,7 +1723,7 @@ def _candidate_forms(path_str: str, base_dir: str | None = None) -> set[str]:
     # the lexical forms are the fail-safe fallback when resolution FAILS
     # (over-matching a sensitive-looking path is the safe direction).
     # Resolution is BOUNDED -- see _resolved_forms_bounded: an unbounded lstat on
-    # a stalled automount used to wedge the event loop from inside on_tool_call.
+    # a stalled automount would wedge the event loop from inside on_tool_call.
     # A resolution that does not COMPLETE raises PathResolutionStalled through
     # here, and every gate turns that into a refusal: no lexical-only matching
     # of a path whose canonical form is unknown.
@@ -1440,15 +1886,15 @@ def _home_dir_targets_uncached(
     # (the default form stays, so every location is always covered). Guarded on
     # membership in *home_dirs* for the same reason as the agents dir above: a
     # write-tier build must not gain a read-tier target.
-    for _leaf, _root_fields in _OVERRIDE_ANCHORED_LEAVES:
+    _adapter_roots = dict(resolved.adapter_roots)
+    for _leaf, _root_envs, _under_root in _OVERRIDE_ANCHORED_LEAVES:
         if _leaf not in home_dirs:
             continue
-        _basename = _leaf_basename(_leaf)
-        for _field in _root_fields:
-            _root = getattr(resolved, _field, None)
+        for _env in _root_envs:
+            _root = _adapter_roots.get(_env)
             if not _root:
                 continue
-            _full = os.path.join(_root, _basename)
+            _full = os.path.join(_root, *_leaf_segments(_under_root))
             sensitive_targets.add(_full.casefold())
             _full_real = _realpath_or_none(_full)
             if _full_real is not None:
@@ -1471,13 +1917,13 @@ def _home_dir_targets_uncached(
 # The key is built from the RESOLVED roots (``Path.home().resolve()`` and the
 # resolved ``KIROCREW_HOME``), NOT from the raw env vars, because those two
 # values are exactly what the builder anchors its targets on. Keying on the raw
-# ``$HOME`` string was wrong twice over:
+# ``$HOME`` string is wrong twice over:
 #   1. Repointing a symlink AT ``$HOME`` leaves ``$HOME`` unchanged while every
-#      target moves, so the gate returned False for a credential path the
-#      uncached code blocked (a real, reproduced bypass — see the regression
+#      target moves, so the gate returns False for a credential path the
+#      uncached code blocks (a real, reproduced bypass — see the regression
 #      test ``test_repointed_home_symlink_is_not_served_from_cache``).
 #   2. ``Path.home()`` reads ``USERPROFILE`` on Windows and never ``HOME``, so on
-#      that platform the key omitted the one variable that decides the anchor.
+#      that platform the key omits the one variable that decides the anchor.
 # Resolving the roots costs ~2 realpath calls (~0.06ms) against the ~1.14ms
 # rebuild it replaces, so the win survives. Those calls -- and the rebuild
 # itself -- run on the ``mc-pathres`` pool under the resolve budget, one thread
@@ -1515,17 +1961,25 @@ class _ResolvedRoots(NamedTuple):
     fields than the builder anchors on is the fail-OPEN shape the resolved-home
     key already exists to prevent.
 
-    A new adapter with its own credential home adds a field here and an entry in
-    ``_OVERRIDE_ANCHORED_LEAVES``; nothing else changes, because the tuple is
-    unpacked by FIELD rather than by position.
+    A new adapter with its own credential home adds NOTHING here: its override
+    variables arrive in ``adapter_roots``, projected from its own declaration in
+    ``agent_sdk.host_auth``. That is what keeps this tuple fixed-width as harnesses
+    are added, and what keeps the anchors and the key derived from one table rather
+    than from a per-adapter field each caller has to remember to pair up.
     """
 
     home: str
     crew_home: str | None
     kiro_home: str | None
-    codex_home: str | None
-    claude_config_dir: str | None
-    claude_home: str | None
+    #: Each declared ``$HOME``-override variable and the root it resolves to, in
+    #: declaration order, ``None`` when the variable is unset.
+    #:
+    #: A TUPLE of pairs rather than a dict because this NamedTuple is also the
+    #: cache key: it has to hash, and it has to change exactly when an override
+    #: that would move a target changes. A dict would make the key unhashable,
+    #: and the fallback -- keying on fewer fields than the builder anchors on --
+    #: is the fail-OPEN shape the resolved-home key exists to prevent.
+    adapter_roots: tuple[tuple[str, str | None], ...]
     logical_home: str
     # ``KIROCREW_OS_HOME`` is an ALTERNATE WHOLE ``$HOME``, not one adapter's
     # credential leaf: ``pod.runtime.build_pod_env`` sets it and
@@ -1536,23 +1990,27 @@ class _ResolvedRoots(NamedTuple):
     # under this root. No host SSO cache contents are copied in; that staging was
     # removed. It is therefore anchored by re-anchoring EVERY ``home_dirs`` entry
     # in ``_home_dir_targets_uncached``, rather than through
-    # ``_OVERRIDE_ANCHORED_LEAVES``, which maps one leaf to the roots its parent
-    # can move to. Without it the relocated tree sits at a path no matcher
+    # ``_OVERRIDE_ANCHORED_LEAVES``, which maps one leaf to the roots that move
+    # it. Without it the relocated tree sits at a path no matcher
     # covers, so an agent inside a pod could read the operator's identity token
     # at the pod-path spelling while the identical bytes at ``~/.aws`` are
     # refused.
     os_home: str | None
 
 
-#: Sensitive leaf → the override roots its parent directory can be moved to.
+#: Sensitive leaf -> the ``$HOME``-override VARIABLES that move it, and the
+#: spelling it takes under each of them.
 #:
-#: The leaf's own ``$HOME``-rooted form is anchored by the ordinary path in
-#: ``_home_dir_targets_uncached``; this table only covers the overrides. A leaf
-#: absent from the *home_dirs* list being built is skipped, so a write-tier
-#: build never leaks a read-tier target.
-_OVERRIDE_ANCHORED_LEAVES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (".codex/auth.json", ("codex_home",)),
-    (".claude/.credentials.json", ("claude_config_dir", "claude_home")),
+#: PROJECTED from the harness declarations, not enumerated: the pairing has to
+#: name the same leaf the list above fences and the same variable the resolver
+#: below reads, and it was a third hand-maintained copy of both. A leaf absent
+#: from the *home_dirs* list being built is skipped, so a write-tier build never
+#: leaks a read-tier target.
+#:
+#: Read once at import, like the leaf list itself: the declarations are static
+#: data, and re-projecting per gate call would put a table walk on the hot path.
+_OVERRIDE_ANCHORED_LEAVES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    host_auth.override_anchored_leaves()
 )
 
 
@@ -1605,13 +2063,16 @@ def _lexical_root(expanded: str) -> str:
     return os.path.normpath(expanded)
 
 
-#: The override roots :func:`_resolve_root_anchors` resolves, in field order.
+#: The HOST's own override roots :func:`_resolve_root_anchors` resolves, in field
+#: order. Each relocates a whole tree this core owns or honours itself.
+#:
+#: A harness's own credential home is NOT here: those arrive from
+#: :func:`host_auth.home_override_env_vars` into ``adapter_roots``, so adding a
+#: harness edits neither this tuple, nor ``_ResolvedRoots``, nor either of the two
+#: loops that anchor on them.
 _OVERRIDE_ROOT_ENVS: tuple[tuple[str, str], ...] = (
     ("crew_home", "KIROCREW_HOME"),
     ("kiro_home", "KIRO_HOME"),
-    ("codex_home", "CODEX_HOME"),
-    ("claude_config_dir", "CLAUDE_CONFIG_DIR"),
-    ("claude_home", "CLAUDE_HOME"),
     ("os_home", "KIROCREW_OS_HOME"),
 )
 
@@ -1628,7 +2089,14 @@ def _resolve_root_anchors(logical_home: str) -> _ResolvedRoots:
     """
     home = _realpath_or_none(logical_home) or logical_home
     overrides = {field: _resolved_env_root(env) for field, env in _OVERRIDE_ROOT_ENVS}
-    return _ResolvedRoots(home=home, logical_home=logical_home, **overrides)
+    # Resolved in the SAME worker call as the host's own roots, for the reason
+    # above: one thread hop for every anchor, rather than one more per harness.
+    adapter_roots = tuple(
+        (env, _resolved_env_root(env)) for env in host_auth.home_override_env_vars()
+    )
+    return _ResolvedRoots(
+        home=home, logical_home=logical_home, adapter_roots=adapter_roots, **overrides
+    )
 
 
 def _resolved_root_key() -> _ResolvedRoots:
@@ -1645,7 +2113,7 @@ def _resolved_root_key() -> _ResolvedRoots:
     to ``~/.kiro`` in ``kiro_home()``, already covered by the default form); it is
     resolved only so a symlinked override keys and anchors identically.
 
-    The three adapter roots do the same for the OAuth token leaves in
+    ``adapter_roots`` does the same for every declared harness credential home in
     ``_OVERRIDE_ANCHORED_LEAVES``.
 
     ``logical_home`` is ``Path.home()`` UNRESOLVED.  It is a separate anchor, not
@@ -1713,9 +2181,9 @@ def _home_dir_targets(home_dirs: list[str]) -> set[str]:
     poison the cache for every other caller; copy here if that ever happens.
     """
     # Resolve the roots ONCE and use the same tuple for both the key and the
-    # build. Resolving separately let a root symlink repointed between the two
+    # build. Resolving separately lets a root symlink repointed between the two
     # reads file one root's targets under the other root's key — a fail-OPEN
-    # TOCTOU. Local review caught this; see the regression test
+    # TOCTOU, pinned by the regression test
     # test_roots_are_resolved_once_for_key_and_build.
     roots = _resolved_root_key()
     key = (tuple(home_dirs),) + roots
@@ -1739,11 +2207,11 @@ def _rebuild_targets_bounded(home_dirs: list[str], roots: _ResolvedRoots) -> set
     The anchors -- ``$HOME``, the ``KIROCREW_HOME`` / ``KIRO_HOME`` / adapter
     override roots and the ~40 keystone leaves under them -- are the paths the
     sensitive-target set is built FROM, as opposed to the agent-supplied
-    candidate checked AGAINST it.  They used to be ``realpath``'d inline, on
-    the event loop, every time the 0.1s cache expired: on a Windows desktop
-    under heavy disk load (a full test run plus several subagents, all being
-    scanned by real-time antivirus) ``realpath($HOME)`` blocked past the 25s
-    loop-stall watchdog from inside ``on_tool_call``, and the gateway exited
+    candidate checked AGAINST it.  They are deliberately NOT ``realpath``'d
+    inline on the event loop every time the 0.1s cache expires: on a Windows
+    desktop under heavy disk load (a full test run plus several subagents, all
+    being scanned by real-time antivirus) ``realpath($HOME)`` blocks past the
+    25s loop-stall watchdog from inside ``on_tool_call``, and the gateway exits
     with every in-flight turn -- the same crash the bounded candidate
     resolution already prevents for the OTHER half of the check.
 
@@ -1752,6 +2220,11 @@ def _rebuild_targets_bounded(home_dirs: list[str], roots: _ResolvedRoots) -> set
     and 40 thread hops per rebuild is what turns a 9s gate into a 15s one.  The
     stall bookkeeping is charged to ``roots.home``'s prefix, the mount every
     anchor ordinarily lives under and the one the crash dumps named.
+
+    It carries its OWN budget (``_PATH_RESOLVE_REBUILD_TIMEOUT_SECS``) because that
+    single job does ~130 ``realpath`` calls where a candidate resolution does one or
+    two: sharing the candidate's budget sized the wait to the wrong work and let an
+    ordinarily-slow rebuild on a loaded host read as a stalled mount.
 
     A rebuild that does not complete canonically within the budget RAISES, and
     every gate turns that into a refusal -- the same invariant as
@@ -1765,7 +2238,9 @@ def _rebuild_targets_bounded(home_dirs: list[str], roots: _ResolvedRoots) -> set
     """
     try:
         targets = _run_resolution_bounded(
-            roots.home, lambda _home: _home_dir_targets_uncached(home_dirs, roots)
+            roots.home,
+            lambda _home: _home_dir_targets_uncached(home_dirs, roots),
+            budget=_PATH_RESOLVE_REBUILD_TIMEOUT_SECS,
         )
     except PathResolutionStalled:
         targets = None
@@ -2059,15 +2534,15 @@ def sandbox_credential_targets(exclude_leaves: tuple[str, ...] = ()) -> tuple[st
                         else resolved.crew_home
                     )
                     break
-    # An adapter's OAuth token follows that adapter's own home override.
-    for leaf, root_fields in _OVERRIDE_ANCHORED_LEAVES:
+    # An adapter's credential store follows that adapter's own home override.
+    adapter_roots = dict(resolved.adapter_roots)
+    for leaf, root_envs, under_root in _OVERRIDE_ANCHORED_LEAVES:
         if leaf in excluded or leaf not in _SENSITIVE_HOME_DIRS:
             continue
-        basename = _leaf_basename(leaf)
-        for field in root_fields:
-            root = getattr(resolved, field, None)
+        for env in root_envs:
+            root = adapter_roots.get(env)
             if root:
-                targets.add(os.path.join(root, basename))
+                targets.add(os.path.join(root, *_leaf_segments(under_root)))
     return tuple(sorted(targets))
 
 
@@ -2094,9 +2569,9 @@ def is_sensitive_bash_command(
     The subject is a SHELL COMMAND LINE. The two detectors read it with shell grammar
     -- separator runs are redundant, newlines and ``|`` split pipeline stages, an
     ``env | grep`` pipeline is one command -- and none of that holds for a Python
-    source file. A caller with a source body in hand must not route it here: it was
-    tried (#7912, #8563, #8643, #8812) and every shell pass produced a class of false
-    denial on ordinary scripts. The cron script gate (``mcp_cron._vet_script_contents``)
+    source file. A caller with a source body in hand must not route it here: every
+    shell pass over a source body produces a class of false denial on ordinary
+    scripts. The cron script gate (``mcp_cron._vet_script_contents``)
     runs only full-text detectors that are meaningful on source, and the sandbox is the
     runtime control for what a script may open.
 
@@ -2107,7 +2582,7 @@ def is_sensitive_bash_command(
     ``admission_policy.json``, ``computer_use.json``) read-only in every mode, and
     :func:`is_sensitive_path` refuses every resolved path the file tools open. A text
     matcher over ``cat ~/.aws/credentials`` adds no protection on top of that and
-    denied ordinary read-only commands whenever a fenced spelling appeared as data
+    denies ordinary read-only commands whenever a fenced spelling appears as data
     (a grep pattern, a commit message, a note), so no such matcher runs here; a
     keystone READ through the shell is permitted by design.
 

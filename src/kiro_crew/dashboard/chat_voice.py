@@ -26,6 +26,7 @@ from kiro_crew.config.loader import config_path
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.piper_runtime import PiperRuntime
+from kiro_crew.sandbox import SandboxUnavailableError
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
@@ -142,6 +143,62 @@ def _read_audio(path: str) -> bytes:
     """Read a synthesized clip whole. Blocking — call it through ``to_thread``."""
     with open(path, "rb") as f:
         return f.read()
+
+
+#: How long one sandbox-refusal kind stays reported before it is worth saying
+#: again. Auto-speak synthesises per sentence and the remedy never changes, so the
+#: first notice is the informative one; a later recurrence still deserves a notice
+#: rather than silence, in case an operator fixed the host and it regressed.
+_SANDBOX_NOTICE_COOLDOWN_S = 1800.0
+
+
+def _sandbox_refusal_response(
+    state: DashboardState, identity: dict[str, str], exc: SandboxUnavailableError
+) -> web.Response:
+    """Report a fail-closed sandbox refusal on every surface that can carry it.
+
+    Shared by both synthesis branches so the streaming and non-streaming paths
+    cannot drift into reporting the same refusal differently.
+
+    The sandbox layer's OWN prose is relayed rather than composed here: it picks
+    the remedy per ``exc.kind``, and only "no_backend" may name the
+    allow_unsandboxed_exec opt-in — "transient" is momentary resource pressure
+    where advising that opt-in would be actively wrong, and "foreign_sandbox"
+    points at a kiro-cli setting instead.
+
+    The ``code`` is what the repo requires of any new ``status >= 400`` JSON body
+    (``test_no_new_error_response_without_a_code``), because the dashboard renders
+    ``error`` verbatim into a localized UI and an un-coded sentence is
+    untranslatable by construction. It is derived from the kind mechanically,
+    since the kinds are a closed lower_snake set.
+
+    The notification is the only surface that carries the REMEDY. The dashboard
+    does consume ``voice_error``, but its handler keys a generic failure off
+    ``code`` and never renders ``error``, and both auto-speak call sites discard
+    the rejected request — so the prose reaches a person only through the note.
+    That handler also drops any event without a ``request_id``, which is why the
+    broadcast carries the whole identity rather than the slot alone. It is
+    throttled per KIND rather than per request: the remedy is a host-level
+    property, identical for every slot, so the kind is the whole of what
+    distinguishes one notice from another.
+    """
+    msg = f"Voice synthesis was refused by the sandbox. {exc}"
+    code = f"sandbox_{exc.kind}"
+    state.broadcast_ws("voice_error", {**identity, "error": msg, "code": code})
+    now = time.monotonic()
+    last = state._voice_sandbox_notified.get(exc.kind)
+    if last is None or now - last >= _SANDBOX_NOTICE_COOLDOWN_S:
+        state._voice_sandbox_notified[exc.kind] = now
+        state.notify(
+            "agent",
+            "Voice reply skipped",
+            msg,
+            meta={"slot": identity.get("slot", ""), "kind": exc.kind},
+        )
+    return web.json_response(
+        {"ok": False, "error": msg, "code": code, "request_id": identity.get("request_id", "")},
+        status=502,
+    )
 
 
 async def api_voice_config(request: web.Request) -> web.Response:
@@ -408,6 +465,14 @@ async def _synthesize_request(
                 "voice_unavailable", "The selected voice provider returned no audio."
             )
         return web.json_response({"ok": True, "chunks": len(chunk_paths), "request_id": request_id})
+    except SandboxUnavailableError as exc:
+        # Polly reaches the sandbox through this branch, so without its own clause
+        # the refusal would fall to the generic handler below -- a 500 with no
+        # notification, leaving the remedy invisible on a Polly host exactly as it
+        # was before. Same helper as the non-streaming branch, so both report
+        # identically.
+        logger.exception("Voice synthesis was refused by the sandbox")
+        return _sandbox_refusal_response(state, identity, exc)
     except Exception as exc:
         logger.exception("Voice synthesis failed")
         err_msg, _ = redact_exfiltration_urls(str(exc))
@@ -553,6 +618,12 @@ async def _synthesize_nonstreaming(
             {**identity, "audio": audio_b64, "chunks": 1, "audioMime": "audio/wav"},
         )
         return web.json_response({"ok": True, "chunks": 1, "request_id": identity["request_id"]})
+    except SandboxUnavailableError as exc:
+        # The default `system` engine reaches the sandbox through here; piper has its
+        # own streaming path. Reporting lives in the shared helper so this branch and
+        # the streaming one cannot diverge.
+        logger.exception("Voice synthesis was refused by the sandbox")
+        return _sandbox_refusal_response(state, identity, exc)
     except Exception as exc:
         logger.exception("Local voice synthesis failed")
         err_msg, _ = redact_exfiltration_urls(str(exc))
@@ -628,11 +699,11 @@ async def api_voice_voices(request: web.Request) -> web.Response:
         return web.json_response({"voices": _voices_cache})
 
     # The catalogue lives behind a paid provider, so two gates come before the
-    # subprocess. Both used to be absent here: the ONLY thing stopping this
-    # endpoint from calling AWS was the frontend declining to fetch it while
-    # Piper was selected, so any other client — or a direct request — reached
+    # subprocess. Neither may be dropped: without them the only thing stopping
+    # this endpoint from calling AWS is the frontend declining to fetch it while
+    # Piper is selected, so any other client — or a direct request — reaches
     # `aws polly describe-voices` against whatever the ambient credential chain
-    # resolved to.
+    # resolves to.
     #
     # 1. Not the active provider: a Piper user has no business shipping a
     #    request to Polly at all.
@@ -656,7 +727,7 @@ async def api_voice_voices(request: web.Request) -> web.Response:
         # default Piper provider works without it). Resolution goes through
         # the deploy engine's shared well-known-dirs resolver, so a gateway
         # running under launchd with a minimal PATH still finds a Homebrew /
-        # official-pkg install (#4770). When the CLI genuinely is not
+        # official-pkg install. When the CLI genuinely is not
         # installed, degrade to an empty list instead of a 500 + traceback.
         # Not cached, so the list recovers as soon as `aws` becomes
         # resolvable. The probe runs in a thread so a wedged network mount
@@ -702,7 +773,7 @@ async def api_voice_voices(request: web.Request) -> web.Response:
         # Reap via communicate(), not wait(): wait_for cancelled the pipe
         # readers before the kill landed, so a child blocked writing to a
         # full stderr PIPE is never drained and wait() can hang the request
-        # handler indefinitely (#5975, same class as #5834).
+        # handler indefinitely.
         await proc.communicate()
         return web.json_response({"error": "timeout"}, status=504)
     except FileNotFoundError:

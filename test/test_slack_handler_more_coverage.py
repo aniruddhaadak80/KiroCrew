@@ -608,8 +608,7 @@ class TestAutoTitleToolRejection:
         assert not [a for a in slack.actions if a[0] == "set_thread_title"]
 
     def test_lock_is_rebound_when_the_event_loop_changes(self):
-        """Regression for #4789 (mechanism now shared via #4800's LoopBoundLock):
-        the module-global auto-title lock must keep working when the running
+        """The module-global auto-title lock must keep working when the running
         event loop changes.
 
         ``pytest-asyncio`` gives every async test a fresh loop, and on
@@ -649,8 +648,7 @@ class TestAutoTitleToolRejection:
         lock2, inner2, provider2, slack2 = _run_once("slack:loop2")
 
         # One shared chokepoint object, but each loop must get its OWN inner
-        # lock — this is the rebinding invariant that #4789's fix introduced
-        # and #4800's LoopBoundLock now carries.
+        # lock — the rebinding invariant that LoopBoundLock enforces.
         assert lock2 is lock1
         assert inner2 is not inner1
         # …and the real path must still work there: the rejection is recorded
@@ -1247,10 +1245,18 @@ class _Slot:
             "meta": {**(meta or {}), "mid": f"m-slot-{len(self.appended)}"},
         }
 
-    def queue_append(self, text, *, meta=None, directive_user_origin):
+    def queue_append(
+        self,
+        text,
+        *,
+        meta=None,
+        directive_user_origin,
+        directive_channel_origin,
+    ):
         assert directive_user_origin is True
+        assert directive_channel_origin is True
         # The linked-thread enqueue stamps the admission-time containment
-        # snapshot (#5911) so the drain can re-assert it at delivery.
+        # snapshot so the drain can re-assert it at delivery.
         assert isinstance(meta, dict)
         self.queued.append(text)
 
@@ -1279,8 +1285,16 @@ class TestLinkedThreadRouting:
 
         ran: list[str] = []
 
-        async def _fake_run_chat(state, slot, text, *, _directive_user_origin):
+        async def _fake_run_chat(
+            state,
+            slot,
+            text,
+            *,
+            _directive_user_origin,
+            _directive_channel_origin,
+        ):
             assert _directive_user_origin is True
+            assert _directive_channel_origin is True
             ran.append(text)
 
         monkeypatch.setattr(chat_mod, "_run_chat", _fake_run_chat)

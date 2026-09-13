@@ -105,6 +105,27 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Memory recovery responses",
+        "dashboard/handlers/memory_admin.py",
+        "Retired episode text and supersession references, plus backup and restore "
+        "failure details served to the memory recovery panel. These fields pass "
+        "through the shared credential + exfiltration-URL chain before egress.",
+    ),
+    (
+        "Memory record editor responses",
+        "dashboard/handlers/memory_edit.py",
+        "Record detail, correction previews, and bulk operation results served to "
+        "the memory editor. Nested fields pass through the shared credential + "
+        "exfiltration-URL chain before reaching the browser.",
+    ),
+    (
+        "Member memory recall and copy responses",
+        "dashboard/handlers/memory_member.py",
+        "Selected facts, experiences, corrections, and owner-selected copy results "
+        "returned to the dashboard or the memory_recall tool. Nested fields pass "
+        "through the shared credential + exfiltration-URL chain before serialization.",
+    ),
+    (
         "CLI wheel-update failures",
         "cli_server.py",
         "The failure text `kirocrew update` prints when a managed-venv shadow "
@@ -184,6 +205,19 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "`*_TOKEN=` echo -- shapes the shared credential family does NOT match, so "
         "this sink adds its own npm patterns on top of the shared two-pass and "
         "redacts at the source rather than at either boundary.",
+    ),
+    (
+        "Browser panel launch failures",
+        "browser_cli/launcher.py",
+        "The CLI's own words when the Browser panel's address bar could not open a "
+        "page (`playwright-cli -s=panel-… open|goto` failing), shown VERBATIM in the "
+        "panel's failure card; the gateway log gets only the session name and the "
+        "exit code, never the text. The daemon's stack quotes its "
+        "environment and the URL the human typed, so the text can carry a "
+        "query-string credential or a `*_TOKEN=` echo; `_error_text` distills the "
+        "message and runs the shared credential + exfiltration-URL chain on the "
+        "kept lines BEFORE the cap, so a truncated head cannot leak what the tail "
+        "would have matched.",
     ),
     (
         "Azure DevOps comment bodies",
@@ -421,8 +455,6 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         # `python helper.py` is allowed and can open a socket. The shell denylist cannot close
         # that — it gates the requested command, not what the command then does. Consequence:
         # point the PR watcher only at repositories whose PR comments you would be willing to
-        # execute. Raised by the GPT review (twice); the credential half was already verified
-        # under D-84, the egress half is new and correct.
         "Auto-Improvement PR-watcher egress boundary",
         "apps/builtins/auto_improvement/backend/pr_watchers.py",
         "The watcher reads UNTRUSTED text (pull-request comments, check logs) and runs with an "
@@ -651,14 +683,6 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "passes the exfiltration-URL and credential scanners before dispatch.",
     ),
     (
-        "Crew Mode delivery",
-        "crew_chat.py",
-        "Every crew-slot post (`_post`): forwarded subagent summaries/errors, "
-        "decision-agent questions, and topic-meta renders — all LLM-authored — "
-        "written to the transcript, broadcast over WS, and persisted to the "
-        "conversation log.",
-    ),
-    (
         "Onboarding import",
         "onboarding_import.py",
         "Imported foreign-agent history and config before it enters Kiro Crew.",
@@ -670,7 +694,7 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "channel inherits redaction from this one egress.",
     ),
     (
-        "Hook auto-replies (shared channel pipeline)",
+        "Hook replies and memory refusals (shared channel pipeline)",
         "messaging/dispatch.py",
         "A user-defined `on_message` hook can answer a turn instead of the model, "
         "which SHORT-CIRCUITS the turn and so never reaches the redactor in "
@@ -682,12 +706,20 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "the session-directive consumer's confirmation log line, which scrubs the "
         "same LLM-derived text before it reaches the gateway log; it is named here "
         "rather than allowlisted separately because a module gets one "
-        "classification and the egress one is the load-bearing half.",
+        "classification and the egress one is the load-bearing half. Member-memory "
+        "refusals also remove local paths before truncation and channel delivery.",
     ),
     (
         "Outbound raster payloads",
         "messaging/outbound_files.py",
         "Exact raster bytes pass both credential and exfiltration-URL scanners " "before upload.",
+    ),
+    (
+        "Slack member-memory refusal",
+        "slack/transport_dispatch.py",
+        "Member-memory errors bypass the streamed response. Credentials, "
+        "exfiltration URLs and local paths are removed before the bounded "
+        "refusal is sent to the channel.",
     ),
     (
         "Discord direct send",
@@ -1270,6 +1302,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Transfer-side log hygiene: both redact a URL down to scheme+host before it
+        # reaches a gateway log line ("Downloading %s from %s", a fetch failure, a
+        # manifest that overran its byte bound). The url is operator- or
+        # manifest-supplied and its path or query can carry a token, so the redaction
+        # keeps that out of the log ring and /api/logs. Neither module writes to a
+        # human-bound or third-party output, so neither is an egress boundary.
+        "asset_downloader.py",
+        "feature_videos_manifest.py",
         # Gate-side log hygiene: the update provider redacts an update command's
         # stderr before writing it to the gateway log. It is a boot-time
         # operational log line, not an output boundary bound for a human or a
@@ -1281,6 +1321,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # hygiene so a response echoing a credential or exfiltration URL cannot
         # leak into the log ring / /api/logs stream; not an egress boundary.
         "task_planner.py",
+        # Gate-side log hygiene, same shape as update_provider: redacts pip's
+        # stderr tail (an app requirements.txt can name an index URL carrying
+        # credentials) before the provisioning failure is written to the
+        # gateway log and to the app backend's own log file. Defensive
+        # scrubbing at the point of capture, not an output boundary.
+        "apps/backend.py",
         # Capture-side, not egress: the per-session MCP report scrubs a server
         # name and a failing server's startup error as it RECORDS them, so a
         # credential never enters the accumulator at all. Deliberately earlier
@@ -1318,6 +1364,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
         "apps/builtins/mochi/redact.py",
+        # Shared declared-temp warning-field formatter: applies a redactor the
+        # caller injects, then repr-escapes the result. It emits nothing; the
+        # probe and gateway logger modules that consume the returned string are
+        # the output boundaries.
+        "sandbox.py",
         # Shared model-fallback text builders (fallback_story_of /
         # annotate_model_fallback): scrub the chain-exhaustion story and the
         # fallback-served warning line ONCE, centrally, so every consumer gets
@@ -1326,6 +1377,17 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # paths in slack/gateway.py and the sub-agent completion path in
         # subagent.py), which are the registered sinks.
         "llm_helpers.py",
+        # The app-facing seam: it OWNS no output. It hands the redaction pass to
+        # an installed app so the app can scrub content at its own boundary, and
+        # the write that follows happens in app code this repo does not inventory.
+        # Registering it as a sink would count an egress path as covered on the
+        # strength of a call the app may never make, which is the overstatement
+        # the panel's count exists to avoid; the app's own boundary is the real
+        # one and is outside this list either way. Not a companion-blind site
+        # despite naming a baseline redactor: it takes the WARNINGS from the
+        # baseline pass and finishes the text through `redact_via_context`, so a
+        # loaded companion's patterns still apply to whatever the app publishes.
+        "apps/scrub_sdk.py",
         # Redacts artifact names/metadata at the point they are STAGED (the
         # pushable list and the S3 meta sidecar), before any response exists.
         # It owns no output of its own — every HTTP response carrying that data
@@ -1336,8 +1398,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # the dashboard only through routes.py, the registered sink.
         "apps/builtins/aws_control/backend/storage.py",
         # Same shape: scrubs profile names and STS-derived account metadata as
-        # the account snapshot is BUILT. It owns no output — the snapshot is
-        # served only through routes.py, the registered sink for this app.
+        # the account snapshot is BUILT, and the registry default that
+        # resolve_consent_target falls back to. It owns no output — the snapshot
+        # is served through routes.py, the registered sink for this app, and the
+        # resolved profile/region reach the paid-service consent card through
+        # dashboard/handlers/aws_consent.py; both read text this module already
+        # scrubbed.
         "apps/builtins/aws_control/backend/accounts.py",
         # Same shape, one layer earlier: scrubs runner-supplied job payload as the
         # run record is BUILT and persisted. `_redact` covers `step`, `error` and
@@ -1368,6 +1434,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # read, not an egress pass.
         "autonudge.py",
         "autonudge_authz.py",
+        # Inbound structured-monitor target validation. A canonical provider URL
+        # is rejected when its path contains credential-shaped text, before the
+        # target reaches persistence, inspection, or a wake envelope.
+        "monitoring/targets.py",
         # Gate-side log hygiene for a channel whose user identity IS a phone
         # number or an Apple Account email. ``redact_handle`` shortens a handle
         # before it reaches a gateway log line or a SEL ``caller`` field. None of
@@ -1375,10 +1445,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         #
         # ``imessage/renderer.py`` is deliberately NOT in this list even though
         # it also calls ``redact_handle`` for a delivery-failure log line: it is
-        # a real egress sink and is registered as one above. An earlier version
-        # of this note claimed the renderer's redaction "is the shared
-        # TurnDriver's and is already counted there" -- that was wrong, and it is
-        # the kind of wrong that suppresses a gate. The driver scans the provider
+        # a real egress sink and is registered as one above. Its redaction is NOT
+        # the shared TurnDriver's and is not already counted there -- treating it as
+        # such is the kind of wrong that suppresses a gate. The driver scans the
+        # provider stream as literal bytes; the renderer then flattens the markup, which
         # stream as literal bytes; the renderer then flattens the markup, which
         # can reassemble a credential that scan could not see.
         "imessage/client.py",
@@ -1431,7 +1501,7 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # Source-side pre-pass, same shape as the aws_control scrubbers: pip's
         # stderr tail is scrubbed with redact_and_truncate at the point the
         # install-failure payload is BUILT, so the 200-char bound can never cut
-        # a credential mid-match (a sliced fragment no longer matches the
+        # a credential mid-match (a sliced fragment does not match the
         # credential regex, and the route's own redaction pass cannot catch
         # it). It owns no output — the payload reaches the dashboard only
         # through ``_handle_deps_install`` in routes.py, the registered sink
@@ -1646,6 +1716,7 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # credentials before they enter canonical monitor state. The controller's
         # later agent-session injection is the registered output boundary.
         "monitoring/github_pull_request.py",
+        "monitoring/pull_request.py",
         # Computer use: the redaction pass runs on third-party desktop content
         # (window titles, accessibility values) on its way INTO the model's
         # context, exactly like the MCP tool-result paths above. `policy.py` owns
@@ -1696,8 +1767,8 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/code_review_sage/sage_lib/followup.py",
         "apps/builtins/code_review_sage/backend/routes.py",
         # Dev Fleet's redactor wrapper and the cohesive owners that apply it to
-        # the app's own API/state/worktree surfaces. These were previously all
-        # housed in server.py and retain the same non-core-egress classification.
+        # the app's own API/state/worktree surfaces, all carrying the same
+        # non-core-egress classification.
         "apps/builtins/dev_fleet/runtime.py",
         "apps/builtins/dev_fleet/http_api.py",
         "apps/builtins/dev_fleet/fleet_state.py",
@@ -2040,9 +2111,9 @@ def _token_auth_items() -> list[PostureItem]:
 
     # Tri-state, deliberately, and derived from the LIVE bindings so it recovers
     # on its own. A pin that has collapsed onto a same-host proxy's loopback
-    # address is NOT the control this row used to advertise, and "nothing is
+    # address is NOT the control this row advertises, and "nothing is
     # pinned right now" is not evidence that pins are effective — rendering
-    # either as the plain claim is the failure this row is being corrected for.
+    # either as the plain claim is the failure this row exists to avoid.
     _pinned = proxied_pin_observed()
     if _pinned is None:
         _pin_detail = (

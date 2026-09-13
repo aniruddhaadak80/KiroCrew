@@ -183,7 +183,7 @@ _REFERENCE_MARKER = "<!-- cron-ref -->"
 #: threshold sits well above break-even rather than at it: a 100-char message
 #: repeated across a full 200-row window costs ~20KB against a 10MB rotation
 #: budget, which is not worth trading the text for. The saving only becomes worth
-#: the indirection at the kilobyte-prompt scale this change exists for.
+#: the indirection at the kilobyte-prompt scale.
 _MIN_PROMPT_CHARS_TO_REFERENCE = 500
 
 #: How far back a reference may reach for its antecedent, in ROWS of the tab.
@@ -386,12 +386,18 @@ def _bind_cron_slot(
     """
     slot = state.get_or_create_slot(
         name=f"cron-{job.id}",
-        agent=job.agent_id or "",
+        agent=job.member_id or job.agent_id or "",
         # A cron result is the job's output, not something the person typed.
         # A USER label would expose it to any app holding `slots:user`.
         origin=SlotOrigin.CRON,
     )
     slot.title = f"Cron: {_safe_job_name(job)}"
+    # A provider-template alias on a legacy V1 job cannot authorize a private
+    # member. Private cron dispatch publishes its protected session binding;
+    # follow-up turns must use that binding instead of minting one from agent_id.
+    slot._memory_assignment_from_history = True
+    if job.memory_store:
+        slot.memory_store = job.memory_store
     if not slot.linked_session_key:
         slot.linked_session_key = f"cron:{job.id}"
         hydrate_slot_from_history(slot, history or [])
@@ -422,10 +428,9 @@ def inject_cron_result_to_dashboard(
     ``history`` is the ``cron:{id}`` transcript, hydrated into the slot the first
     time this binds one. It is REQUIRED and has no default on purpose: this
     function is synchronous and every caller is async, so a default would let a
-    caller silently hand the whole-transcript parse back to the event loop --
-    the defect issue #7408 fixed at five sites, four of which were exactly that
-    omission. Without a default, forgetting it is a ``TypeError`` at the call,
-    not a stall in production. Async callers get the value from
+    caller silently hand the whole-transcript parse back to the event loop.
+    Without a default, forgetting it is a ``TypeError`` at the call, not a stall
+    in production. Async callers get the value from
     :func:`prefetch_cron_history`; a sync caller must read it itself and own the
     blocking cost.
 
@@ -441,9 +446,9 @@ def inject_cron_result_to_dashboard(
     Writes the run as a PAIR: the job's own prompt as a ``user`` row, then the
     result as an ``assistant`` row, both headed by :func:`run_stamp`. The
     executor streams the prompt straight to the provider and never persists it,
-    so a follow-up turn used to replay a stack of results with nothing saying
-    what any of them had been asked -- it could not tell which run the person in
-    front of it was answering. The pair is written only when the run produced a
+    so without the user row a follow-up turn replays a stack of results with
+    nothing saying what any of them was asked -- it cannot tell which run the
+    person in front of it is answering. The pair is written only when the run produced a
     result, so neither row can appear without its counterpart.
 
     ``include_prompt`` is False for a caller that is RE-SURFACING an older
@@ -615,17 +620,16 @@ async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict
 async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     """Make an eligible job's tab exist — and carry its identity — at run START.
 
-    Until this helper existed, :func:`inject_cron_result_to_dashboard` was the
-    ONLY creator site for a ``cron-{job.id}`` slot, and it runs after the turn
-    finishes. So during a brand-new job's FIRST run the tab was not there:
-    session-control caller identity resolves through the live slot table
-    (``caller_slot_key`` matches the presented ``cron:{job_id}`` against each
-    slot's link), so every verb a first run called refused with
-    ``caller_unidentified`` — on exactly the run a person watches after
-    creating the job. The dashboard-surface registry had the same first-run
-    hole for sub-agent event routing, completion injection, and
-    widget/question/approval delivery. From the second run onward the previous
-    delivery's slot masked all of it (issue #8336).
+    :func:`inject_cron_result_to_dashboard` is the other creator site for a
+    ``cron-{job.id}`` slot, and it runs only after the turn finishes — too late
+    for a brand-new job's FIRST run: session-control caller identity resolves
+    through the live slot table (``caller_slot_key`` matches the presented
+    ``cron:{job_id}`` against each slot's link), so without this pre-create every
+    verb a first run calls refuses with ``caller_unidentified`` — on exactly the
+    run a person watches after creating the job. The dashboard-surface registry
+    has the same first-run dependency for sub-agent event routing, completion
+    injection, and widget/question/approval delivery. From the second run onward
+    the previous delivery's slot covers all of it.
 
     Eligibility lives HERE, not at call sites: only a job that will get this
     tab at delivery anyway (``job.persistent_session and not

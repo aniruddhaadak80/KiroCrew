@@ -50,6 +50,20 @@ and radii are injected as fixed defaults by `buildCustomThemeCss` (fonts are a
 pack-level L1 surface, not per-color-mode data), and the `--search-highlight*`
 trio is an internal find-in-page surface not exposed to theme packs.
 
+**`buildCustomThemeCss` also fills the allowlisted colors a pack OMITS.** Fonts
+and radii are not the only thing it emits. Because `variables.json` requires only
+`--bg`, `--text` and `--accent`, a valid pack can leave ~50 tokens unset, and an
+unset token inherits from the bare `:root` in `index.css` — which carries the DARK
+palette and has no light counterpart. A pack with a light `--bg` would therefore
+paint dark-mode surfaces under its own light palette. So the builder derives the
+gap from the pack's own palette: surfaces and borders as small steps from `--bg`
+toward `--text`, the muted ramp at 75/85% of that axis, a foreground on a
+saturated fill picked black-or-white by that fill's luminance, and the designed
+syntax/diff sets taken from the built-in theme of the matching polarity. Only
+omitted tokens are filled, so a declared value always wins, and only
+`[data-theme="custom-*"]` selectors are written, so no built-in palette moves.
+The author-facing detail lives in the `theme-pack-authoring` skill.
+
 **A card must carry its own edge.** `--card` is not guaranteed to differ from
 `--bg`: in `kiro-light` both are `#ffffff`, because the canvas is white and the
 shell (nav rail, sessions list) steps back onto `--panel` instead. So a `bg-card`
@@ -205,7 +219,7 @@ rule aimed at anything else never reaches the document.
 | Class | Where it is applied |
 |---|---|
 | `topbar` | the header shell (`App.tsx`) |
-| `sidebar` | the chat session list (`ChatSidebar.tsx`) |
+| `sidebar` | the conversation-list cards: the chat session list (`ChatSidebar.tsx`) and the Crew Members roster (`members/MembersPage.tsx`), both via `LIST_SHELL_CLS` in `components/listShell.ts` |
 | `chat-container` | the chat scroll region (`ChatPane.tsx`, `ChatPage.tsx`) |
 | `message-bubble` | a user or assistant turn (`chat/UserMessage.tsx`, `chat/AssistantMessage.tsx`) |
 | `input-area` | the composer (`ChatInput.tsx`) |
@@ -358,6 +372,28 @@ because swapping an icon changes the rendered component type and remounts its
 element, and animating the icon itself would restart that animation and desync it
 from the other layer. If your loader swaps artwork on a timer, animate a stable
 wrapper for the same reason.
+
+### Installed packs: custom loader art
+
+`registerThemeBranding()` is compiled-theme only. An **installed pack** (a
+`theme.json` dropped in via Settings) reaches the loader through **files**, not
+code:
+
+- **`loaderIcons`** — the allowlisted stock symbols (Level 1), as above.
+- **`loader/*.png` `.webp` `.gif` `.svg`** — ship your **own images** (Level 1).
+  Ship **one** and it renders on its own; ship **2–8** and the stock carousel
+  cycles them. Animated WebP/APNG/GIF and animated SVG **self-animate** inside
+  the `<img>`, so a single fully-authored loop is a first-class loader. Ordered
+  by filename; each is served with a strict Content-Type + `nosniff` under the
+  sandboxed asset CSP (`default-src 'none'; sandbox`), referenced only as an
+  `<img>`. SVG is safe here for the same reason `logo.svg` is: an `<img>`-loaded
+  SVG runs in the browser's **secure static/animated mode** — scripts disabled,
+  external references not fetched — so it cannot run code or beacon out, while
+  its SMIL/CSS animation still plays. A count outside 1–8 fails install.
+
+Precedence, highest first: compiled `loader` → pack `loader/*` images (one on its
+own, 2–8 cycled) → `loaderIcons` (pack manifest, then compiled) → the default
+mascot pool.
 
 Registration is read at module load (see `src/extensions.ts`); registering after
 the shell has rendered does not take effect until the next theme switch.

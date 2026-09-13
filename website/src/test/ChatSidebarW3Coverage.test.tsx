@@ -178,7 +178,7 @@ function renderSidebar(opts: { slots?: TestSlot[]; folders?: ChatFolder[] } = {}
     chat: {
       ...defaults.chat,
       activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {},
-      goalLoops: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
+      automations: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
     } as unknown as RootState['chat'],
   })
   // staleTime + refetchOnMount keep the seeded folder list authoritative. An
@@ -421,7 +421,7 @@ describe('ChatSidebar — list-view folder header', () => {
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
     // Folder membership rides the create payload (9th arg) so the slot is
     // published in its final location instead of jumping in from the root.
-    expect(mocks.createChatSlot.mock.calls[0][8]).toBe('f1')
+    expect(mocks.createChatSlot.mock.calls[0][7]).toBe('f1')
   })
 
   it('expands a collapsed folder before creating the chat inside it', async () => {

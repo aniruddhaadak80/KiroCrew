@@ -100,8 +100,9 @@ class TestBaselineGenerator:
             "defaultValue",
         }
         # ``nullable`` is only emitted when True (Optional[X] dict/list values);
-        # it's a valid extra key but never required.
-        optional_keys = {"nullable"}
+        # ``requiresRestart`` only for a field marked ``restart=True``. Both are
+        # valid extra keys but never required.
+        optional_keys = {"nullable", "requiresRestart"}
 
         for entry_dict in data["entries"]:
             keys = set(entry_dict.keys())
@@ -212,8 +213,8 @@ class TestCommittedBaselineParity:
     Without this the snapshot is unchecked: every other test in this module
     runs the generator into a temp directory and compares it against the
     in-memory ``SCHEMA_REGISTRY``, so ``config-baseline.json`` at the repo root
-    can fall arbitrarily far behind and nothing goes red. It did -- by 72
-    entries (#3664), and by a stale default before that (#2862).
+    can fall arbitrarily far behind and nothing goes red -- by whole blocks of
+    entries, or by a single stale default.
     """
 
     def test_committed_snapshot_matches_generator(self, tmp_path: str) -> None:

@@ -6,23 +6,26 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.config.loader import config_dir
+from kiro_crew.context import ContextBuilder
 from kiro_crew.cron import (
     CronPendingMismatch,
     CronStoreBusy,
     CronStoreUnreadable,
     is_valid_timezone,
+    parse_time_string,
 )
 from kiro_crew.cron_script import (
     _read_script_body,
@@ -53,10 +56,12 @@ from kiro_crew.validation import (
     _MODEL_NAME_RE,
     CHANNEL_ID_RE,
     CHANNEL_MAX_LEN,
+    CRON_ADD_SCHEMA,
     LEARN_ADD_SCHEMA,
     MAX_CRON_MESSAGE,
     MAX_SHORT_STRING,
     SLACK_THREAD_TS_RE,
+    FieldSpec,
     ValidationError,
     normalize_lesson_category,
     validate_string_field,
@@ -71,8 +76,13 @@ from ._shared import (
     _is_restricted_session,
     _probe_persisted_session,
     _redact_memory_field,
+    guard_owner_surface_routes,
     read_bounded_json,
+    resolve_lesson_memory_store,
 )
+
+if TYPE_CHECKING:
+    from kiro_crew.learn import LessonStore
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +188,8 @@ def _invalid_path_id_response(value: str, name: str) -> web.Response | None:
     than ``MAX_SHORT_STRING``, else ``None``. This is the single validator the
     cron routes apply to every path-param id — the job/run routes and both
     cron-folder routes — so a malformed id is rejected before any lock
-    acquisition, thread dispatch, or state lookup (the asymmetric-perimeter gap
-    #5789/#5808 closed). These ids are server-minted, so an over-long value only
-    arrives from a malformed/hostile client.
+    acquisition, thread dispatch, or state lookup. These ids are server-minted,
+    so an over-long value only arrives from a malformed/hostile client.
     """
     if not value or len(value) > MAX_SHORT_STRING:
         return web.json_response(
@@ -268,7 +277,7 @@ async def _resolve_contradictions(
 async def _resolve_and_supersede(
     state: DashboardState, sk: str, rule: str, candidates: list[dict], vs: Any
 ) -> None:
-    """Resolve contradictions and delete superseded lessons (runs in background).
+    """Resolve V1 contradictions and delete superseded lessons in background.
 
     Split out of ``api_lessons_create`` so the slow per-candidate LLM verdict
     does not block the HTTP response. Deletes are emitted with the same SEL
@@ -276,6 +285,10 @@ async def _resolve_and_supersede(
     a failed background sweep must never crash the event loop, and the lesson
     itself is already persisted.
     """
+    # V2 keeps distinct rules for explicit owner review. A model's guessed
+    # contradiction is not authority to remove an existing private memory.
+    if getattr(vs, "algorithm_version", "v1") == "v2":
+        return
     try:
         contradicted = await _resolve_contradictions(state, rule, candidates)
     except Exception:
@@ -314,6 +327,236 @@ async def _resolve_and_supersede(
 # ── Cron / Lessons ──
 
 
+def _schema_field(field_name: str) -> FieldSpec | None:
+    """Return *field_name*'s :class:`FieldSpec` from ``CRON_ADD_SCHEMA``, or ``None``.
+
+    Every limit this route applies to a one-shot field is read through here
+    rather than restated, because the route's contract is that it validates the
+    same bodies the ``cron_add`` tool does: a copied limit is a limit that drifts
+    the moment the schema's is retuned, and the drift reappears as the divergence
+    this route exists to close. That covers the numeric bounds AND ``at_time``'s
+    length — a longer string than the tool accepts is how an oversized duration
+    reaches the parser in the first place.
+    """
+    for spec in CRON_ADD_SCHEMA.fields:
+        if spec.name == field_name:
+            return spec
+    return None
+
+
+def _resolve_one_shot_at(body: dict[str, Any]) -> tuple[float | None, web.Response | None]:
+    """Resolve a one-shot fire time from ``at`` / ``delay`` / ``at_time``.
+
+    Returns ``(at_ts, None)`` on success — with ``at_ts`` ``None`` when the body
+    names no one-shot at all, which is the recurring case and not an error — or
+    ``(None, response)`` carrying a 400 the caller returns verbatim.
+
+    Mirrors ``cron_add``'s **parser and precedence**: ``at`` (absolute epoch
+    seconds) wins, then ``delay`` (seconds from now), then ``at_time`` (human
+    string, parsed in the CONFIGURED timezone by the shared
+    :func:`parse_time_string`), so a one-shot body means the same instant
+    whichever door received it. The acceptance sets are NOT identical: the
+    resolved-instant ceiling below is stricter than the tool, which bounds only
+    its raw fields.
+
+    Four things this refuses that the declared type alone would let through:
+
+    * a bool for ``at``/``delay`` — ``isinstance(True, int)`` is true in Python,
+      so a bare ``isinstance`` check would silently read ``True`` as ``1``;
+    * a value ``float()`` cannot even represent. JSON integers are unbounded, and
+      ``float(10**400)`` raises ``OverflowError`` — uncaught, that is a bare 500
+      on a request that never reaches the store;
+    * a non-finite float — ``json.loads`` accepts ``NaN`` and ``Infinity`` by
+      default, and ``NaN`` defeats every comparison below (each is false), which
+      would persist a job whose next run can never arrive;
+    * a value outside the schema's own bounds. An unbounded far-future ``at`` is
+      not merely a silly job: ``format_schedule`` renders it through
+      ``datetime.fromtimestamp``, which raises above year 9999, and it does so
+      inside the comprehension that serializes EVERY job — so one poisoned
+      record turns the whole cron listing into a 500 until it is deleted by id.
+      ``{"at": 1.75e12}`` (epoch MILLIseconds — the ordinary ``Date.now()``
+      mistake) is exactly that shape, which is why the bound is enforced here
+      rather than left to the store;
+    * a time already gone, which would otherwise fire the moment the scheduler
+      next ticks rather than when the caller asked.
+    """
+
+    def _number(field: str) -> tuple[float | None, web.Response | None]:
+        spec = _schema_field(field)
+
+        def refuse(why: str) -> tuple[None, web.Response]:
+            return None, web.json_response(
+                {"error": f"'{field}' {why}", "code": f"invalid_{field}"}, status=400
+            )
+
+        raw = body.get(field)
+        if raw is None:
+            return None, None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return refuse("must be a number")
+        try:
+            val = float(raw)
+        except OverflowError:
+            # A JSON integer has no width limit, so this arrives from the wire.
+            # Refused as out-of-range rather than propagating: it is by definition
+            # past any ceiling the schema declares.
+            return refuse("is too large")
+        if not math.isfinite(val):
+            return refuse("must be a finite number")
+        lo = spec.min_val if spec else None
+        hi = spec.max_val if spec else None
+        if (lo is not None and val < lo) or (hi is not None and val > hi):
+            return refuse(f"must be between {lo} and {hi}")
+        return val, None
+
+    at_ts, err = _number("at")
+    if err is not None:
+        return None, err
+    if at_ts is None:
+        delay, err = _number("delay")
+        if err is not None:
+            return None, err
+        if delay is not None:
+            at_ts = time.time() + delay
+    if at_ts is None:
+        # Length from the schema, not MAX_SHORT_STRING: a string longer than the
+        # tool accepts is how an oversized relative duration ("in <hundreds of
+        # digits> hours") reaches the parser, where the arithmetic overflows.
+        at_time_spec = _schema_field("at_time")
+        at_time_max = at_time_spec.max_len if at_time_spec and at_time_spec.max_len else 100
+        try:
+            at_time = validate_string_field(body, "at_time", max_len=at_time_max)
+        except ValidationError as exc:
+            return None, web.json_response(
+                {"error": str(exc), "code": "invalid_at_time"}, status=400
+            )
+        if at_time:
+            parsed = parse_time_string(at_time)
+            if isinstance(parsed, str):
+                # parse_time_string reports failure as an already-prefixed
+                # "Error: ..." string; strip the prefix so the JSON body is not
+                # doubly labelled once the client reads `error`.
+                return None, web.json_response(
+                    {
+                        "error": parsed.removeprefix("Error: "),
+                        "code": "invalid_at_time",
+                    },
+                    status=400,
+                )
+            at_ts = parsed
+    # The resolved instant carries the same ceiling as a raw ``at``, whatever
+    # produced it. ``delay`` cannot escape its own bound, but ``at_time``'s
+    # relative form has none — ``"in 999999999 hours"`` parses to a timestamp
+    # ``datetime.fromtimestamp`` cannot render, which is the poisoned record that
+    # 500s the listing. Bounding the raw fields alone would leave that door open.
+    if at_ts is not None:
+        at_spec = _schema_field("at")
+        lo = at_spec.min_val if at_spec else None
+        hi = at_spec.max_val if at_spec else None
+        if (lo is not None and at_ts < lo) or (hi is not None and at_ts > hi):
+            return None, web.json_response(
+                {
+                    "error": f"resolved time is outside the supported range ({lo} to {hi})",
+                    "code": "at_out_of_range",
+                },
+                status=400,
+            )
+    if at_ts is not None and at_ts < time.time():
+        return None, web.json_response(
+            {"error": "requested time is in the past", "code": "at_in_past"},
+            status=400,
+        )
+    return at_ts, None
+
+
+async def api_cron_tools(request: web.Request) -> web.Response:
+    """Run private-runtime cron tools on the host with verified caller scope."""
+    if request.get("internal_auth") is not True:
+        return web.json_response(
+            {
+                "error": "An authenticated internal connection is required.",
+                "code": "internal_auth_required",
+            },
+            status=403,
+        )
+    from kiro_crew.member_memory_auth import memory_request_identity
+    from kiro_crew.memory_stores import memory_store_version
+
+    actual, verified = await asyncio.to_thread(memory_request_identity, request)
+    if not verified or not actual or actual != request.headers.get("X-Session-Key", ""):
+        return web.json_response(
+            {
+                "error": "This caller's private member session could not be verified. "
+                "Reopen the member conversation and retry.",
+                "code": "member_session_unverified",
+            },
+            status=403,
+        )
+    state = request.app["state"]
+    # This resolves the immutable session binding and validates its declared
+    # member/store ownership, then compares it with the verified process store.
+    store, refusal = await resolve_lesson_memory_store(request, state, "cron.tools")
+    if refusal is not None:
+        return refusal
+    if not store or await asyncio.to_thread(memory_store_version, store) != 2:
+        return web.json_response(
+            {
+                "error": "A verified private member store is required.",
+                "code": "member_memory_required",
+            },
+            status=403,
+        )
+    body, error = await read_bounded_json(request, max_bytes=_MAX_CRON_BODY_BYTES)
+    if error is not None:
+        return error
+    assert body is not None
+    from kiro_crew import mcp_cron
+    from kiro_crew.mcp_caller import CallerContext, current_caller, set_current_caller
+
+    name, arguments = body.get("name"), body.get("arguments")
+    if (
+        set(body) != {"name", "arguments"}
+        or not isinstance(name, str)
+        or name not in {tool["name"] for tool in mcp_cron._list_tools()}
+        or not isinstance(arguments, dict)
+    ):
+        return web.json_response(
+            {
+                "error": "Provide a known cron tool and an arguments object.",
+                "code": "invalid_cron_tool",
+            },
+            status=400,
+        )
+
+    def dispatch() -> str:
+        # ContextVars are isolated by to_thread. Restore the prior value even
+        # on failure; no caller identity survives into a later request.
+        previous = current_caller()
+        set_current_caller(
+            CallerContext(
+                session_key=actual, session_type=actual.partition(":")[0], from_gateway=True
+            )
+        )
+        try:
+            return mcp_cron._call_tool_locally(name, arguments)
+        finally:
+            set_current_caller(previous)
+
+    try:
+        result = await asyncio.to_thread(dispatch)
+    except Exception:
+        logger.exception("Private cron tool dispatch failed")
+        return web.json_response(
+            {
+                "error": "The cron tool did not finish. Check cron_list before retrying a mutation.",
+                "code": "cron_tool_failed",
+            },
+            status=503,
+        )
+    state.push_refresh("crons")
+    return web.json_response({"result": result})
+
+
 async def api_crons_create(request: web.Request) -> web.Response:
     """POST /api/crons — create a cron job."""
     state: DashboardState = request.app["state"]
@@ -338,6 +581,11 @@ async def api_crons_create(request: web.Request) -> web.Response:
         approval_mode = validate_string_field(body, "approval_mode", max_len=10)
         timezone_val = validate_string_field(body, "timezone", max_len=50)
         agent_id = validate_string_field(body, "agent", max_len=MAX_SHORT_STRING)
+        source_preset = validate_string_field(body, "source_preset", max_len=MAX_SHORT_STRING)
+        source_template_prompt = validate_string_field(
+            body, "source_template_prompt", max_len=MAX_CRON_MESSAGE
+        )
+        member_id = validate_string_field(body, "member_id", max_len=MAX_SHORT_STRING)
     except ValidationError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     if not name or not message:
@@ -346,6 +594,13 @@ async def api_crons_create(request: web.Request) -> web.Response:
     if not every and not cron_expr and schedule:
         # Treat schedule string as cron expr if 5-field, else as interval
         cron_expr = schedule if len(schedule.split()) == 5 else None
+    # One-shot scheduling, mirroring cron_add's `at` / `delay` / `at_time`.
+    # Precedence matches the tool exactly (`at` wins, then `delay`, then
+    # `at_time`) so the same request body cannot mean two different instants
+    # depending on which entry point received it.
+    at_ts, at_err = _resolve_one_shot_at(body)
+    if at_err is not None:
+        return at_err
     if channel and not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     if approval_mode and approval_mode not in {"", "auto"}:
@@ -356,6 +611,12 @@ async def api_crons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": f"invalid timezone: {safe_tz!r}"}, status=400)
     strict_schedule = body.get("strict_schedule", False)
     hide_in_chat = body.get("hide_in_chat", False)
+    # A job created on a full context pays for memory, lessons, steering, skills
+    # and prior history on every wake, whether or not the wake had anything to
+    # do. The store has carried this flag since the tool path gained it; only
+    # this handler dropped it, so a job created from the dashboard could not opt
+    # out of that cost without a later edit from chat or the CLI.
+    minimal_context = body.get("minimal_context", False)
     # Same folder_id contract as PATCH /api/crons/{id}: string or null → "",
     # anything else is a 400 so the two entry points cannot diverge.
     folder_id = body.get("folder_id", "")
@@ -396,35 +657,65 @@ async def api_crons_create(request: web.Request) -> web.Response:
     add_kwargs: dict[str, Any] = {
         "channel": channel,
         "agent_id": (agent_id or ""),
+        "member_id": member_id or "",
         "model": model_val,
         "silent": bool(silent),
         "timezone": (timezone_val or ""),
         "strict_schedule": bool(strict_schedule),
         "hide_in_chat": bool(hide_in_chat),
+        "minimal_context": bool(minimal_context),
         "folder_id": folder_id,
+        # Dashboard-only template provenance (see CronJob.source_preset). The
+        # prompt SNAPSHOT is what makes the Schedule-page "template updated"
+        # hint attributable: comparing it against the template's current prompt
+        # detects a template that moved, distinct from a user who edited their
+        # own copy. Both "" for a blank create. Never gate execution.
+        "source_preset": (source_preset or ""),
+        "source_template_prompt": (source_template_prompt or ""),
     }
     if approval_mode:
         add_kwargs["approval_mode"] = approval_mode
+    # Which schedule this job carries. Resolved to kwargs FIRST, then handed to a
+    # single add_job_async call: one call site means the store-failure handling
+    # below is written once and cannot drift between the three schedule shapes.
+    schedule_kwargs: dict[str, Any]
     if every:
         try:
             every = int(every)
         except (ValueError, TypeError):
-            return web.json_response({"error": "'every' must be an integer"}, status=400)
-        try:
-            job = await state.crons.add_job_async(name, message, every_secs=every, **add_kwargs)
-        except CronStoreBusy:
-            return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
-        except CronStoreUnreadable as exc:
-            return _cron_unreadable_response(exc)
+            return web.json_response(
+                {"error": "'every' must be an integer", "code": "invalid_every"}, status=400
+            )
+        schedule_kwargs = {"every_secs": every}
     elif cron_expr:
-        try:
-            job = await state.crons.add_job_async(name, message, cron_expr=cron_expr, **add_kwargs)
-        except CronStoreBusy:
-            return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
-        except CronStoreUnreadable as exc:
-            return _cron_unreadable_response(exc)
+        schedule_kwargs = {"cron_expr": cron_expr}
+    elif at_ts is not None:
+        # One-shot: `delete_after_run` is derived here rather than accepted from
+        # the body, exactly as cron_add derives it (`delete_after_run=bool(at_ts)`).
+        # A caller-supplied flag would allow a job with a single fire time that
+        # never leaves the store, which the scheduler has no way to run again.
+        schedule_kwargs = {"at_ts": at_ts, "delete_after_run": True}
     else:
-        return web.json_response({"error": "schedule, every, or cron required"}, status=400)
+        return web.json_response(
+            {
+                "error": "schedule, every, cron, at, delay, or at_time required",
+                "code": "missing_schedule",
+            },
+            status=400,
+        )
+    try:
+        job = await state.crons.add_job_async(name, message, **schedule_kwargs, **add_kwargs)
+    except CronStoreBusy:
+        return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
+    except ValueError as exc:
+        # Member binding is validated inside the locked transaction, before
+        # append/save. Surface that refusal for every schedule form without
+        # publishing a success refresh or retrying against Global memory.
+        return web.json_response(
+            {"error": _redact_memory_field(str(exc)), "code": "invalid_cron"}, status=400
+        )
     state.push_refresh("crons")
     return web.json_response({"ok": True, "id": job.id})
 
@@ -542,13 +833,14 @@ async def api_cron_update(request: web.Request) -> web.Response:
         "silent",
         "strict_schedule",
         "hide_in_chat",
+        "minimal_context",
         "folder_id",
     ):
         if key in body:
             kwargs[key] = body[key]
     # name routes through the same validator as POST (type check +
     # sanitize_string + length cap) so the two REST surfaces cannot diverge:
-    # PATCH previously passed it through entirely unvalidated, letting a
+    # without it PATCH would pass the value through unvalidated, letting a
     # non-string or oversize name persist verbatim into crons.json.
     if "name" in kwargs:
         try:
@@ -557,7 +849,7 @@ async def api_cron_update(request: web.Request) -> web.Response:
             return web.json_response({"error": str(exc), "code": "invalid_name"}, status=400)
     # message routes through the same validator as POST (type check +
     # sanitize_string + length cap) so the two REST surfaces cannot diverge:
-    # PATCH previously passed it through entirely unvalidated. Sanitizing here
+    # without it PATCH would pass the value through unvalidated. Sanitizing here
     # also keeps length measured post-normalization, matching create.
     if "message" in kwargs:
         try:
@@ -576,6 +868,11 @@ async def api_cron_update(request: web.Request) -> web.Response:
                 status=400,
             )
     # UI sends "agent"; internal kwarg is "agent_id". Accept "agent_id" for scripted callers.
+    if "member_id" in body:
+        try:
+            kwargs["member_id"] = validate_string_field(body, "member_id", max_len=MAX_SHORT_STRING)
+        except ValidationError as exc:
+            return web.json_response({"error": str(exc), "code": "invalid_member_id"}, status=400)
     # Normalize whitespace and coerce null so update and create persist the same value.
     if "agent" in body:
         kwargs["agent_id"] = (body["agent"] or "").strip()
@@ -1023,8 +1320,8 @@ async def _promote_pending_grant(
         )
     # The commit landed and the promoting write already consumed the pending
     # request, so the grant is fully active with nothing left to clear.
-    # A bare enqueue: SEL is warmed at gateway startup (sel.warm_sel_singleton,
-    # #8608); guarded because a FAILED warm leaves construction to retry here.
+    # A bare enqueue: SEL is warmed at gateway startup (sel.warm_sel_singleton);
+    # guarded because a FAILED warm leaves construction to retry here.
     try:
         _sel().log_api_access(
             caller="dashboard",
@@ -1535,11 +1832,16 @@ _SCRIPT_SOURCE_MAX_BYTES = 256 * 1024
 # reaches the promotion path.
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
-# The read below traverses the O_NOFOLLOW + fd-real-path chokepoint in hooks
-# (safe_read_file_bytes_nolink), which has no Windows implementation
-# (pinned_fs.fd_real_path returns None there -> fail-closed on every read). Gate with an
-# honest 501 rather than an opaque refusal, mirroring the theme-pack routes.
-_SCRIPT_SOURCE_WIN_UNSUPPORTED = os.name == "nt"
+# The read below traverses the link-refusal + fd-real-path chokepoint in hooks
+# (safe_read_file_bytes_nolink). Every half answers on Windows as well as on POSIX:
+# the open goes through ``platform_compat.open_file_no_reparse``, which refuses a
+# reparse point at the FINAL component there in the same call that opens it;
+# ``pinned_fs.fd_real_path`` reads the opened handle's real path through
+# ``GetFinalPathNameByHandleW``, so the containment check against
+# ``<config_dir>/crons/`` and the sensitivity check are pinned to the inode actually
+# opened; and ``os.fstat`` reports ``st_nlink`` there, so the hardlink-alias refusal
+# holds too. This read needs no ``dir_fd``/``openat``, which is the primitive Windows
+# lacks.
 
 
 def _read_script_source_sync(
@@ -1672,14 +1974,6 @@ async def api_cron_script_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "job not found", "code": "job_not_found"}, status=404)
     if not job.script:
         return web.json_response({"error": "job has no script", "code": "no_script"}, status=404)
-    if _SCRIPT_SOURCE_WIN_UNSUPPORTED:
-        return web.json_response(
-            {
-                "error": "script source view is not yet supported on Windows",
-                "code": "unsupported_platform",
-            },
-            status=501,
-        )
     payload, err = await asyncio.get_running_loop().run_in_executor(
         discovery_executor(), _read_script_source_sync, job.script
     )
@@ -1803,7 +2097,7 @@ async def _recognize_session(
     # A channel-originated session (Slack, Telegram, Discord, Webex,
     # WeCom, …) is a legitimate established session: its key is namespaced
     # ``{channel}:{conversation_id}`` and the transport publishes
-    # ``session_pid`` so the gateway resolves this X-Session-Key (#232).
+    # ``session_pid`` so the gateway resolves this X-Session-Key.
     # Recognise the WHOLE channel-namespace family via the canonical
     # ``is_channel_session_key`` — not just Slack. Two reasons this is the
     # right gate, both already true for Slack:
@@ -1817,11 +2111,11 @@ async def _recognize_session(
     #     dropped) while the file is ``dashboard_<safe_key>.jsonl`` with
     #     colons folded to ``_``, so no probed name ever matches (and a
     #     colon is now rejected outright by ``_persisted_session_path``).
-    # Before this, only ``slack:`` was accepted, so learn_add failed with
-    # HTTP 400 "unknown session" from every OTHER channel (Telegram /
-    # Discord / Webex / WeCom) even though the session is fully identified
-    # (#1268). The bare Slack thread_ts shim stays for legacy native-Slack
-    # keys. Incognito/temporary sessions are still blocked by each route's
+    # Accepting only ``slack:`` would fail learn_add with HTTP 400
+    # "unknown session" from every OTHER channel (Telegram / Discord /
+    # Webex / WeCom) even though the session is fully identified. The bare
+    # Slack thread_ts shim covers native-Slack keys.
+    # Incognito/temporary sessions are still blocked by each route's
     # live-slot policy check (Slack is the only channel with that concept),
     # so widening the namespace does not widen memory writes to ephemeral
     # sessions.
@@ -1922,6 +2216,52 @@ async def _recognize_session(
     return None
 
 
+def _lesson_jsonl_store(
+    state: DashboardState,
+    silo: str,
+    scope: str = "global",
+    workspace: str | None = None,
+) -> LessonStore:
+    """The JSONL lessons file a caller bound to *silo* reads and writes.
+
+    THE DESTINATION FOLLOWS THE BINDING, NEVER THE POPULATION. A named store starts
+    empty and nothing is ever copied into it, so "this store holds no lessons" is the
+    ordinary state of a freshly bound crew — and the answer to it is that store's OWN
+    ``lessons.jsonl``, reached through the same ``get_lessons_for`` seam the context
+    builder and the consolidator use. Keying the choice on whether rows exist is what
+    let an empty silo read the operator's global lessons, substring-delete one of them,
+    and file the crew's own correction into the one file every other crew is injected
+    with. ``state.lessons`` and the per-workspace stores are reachable only from the
+    GLOBAL binding, which is where every install without a silo writes.
+
+    A silo takes no *workspace* arm even when *scope* asks for one: a store name and a
+    workspace name are separate namespaces and the store is the tighter scope, the same
+    precedence ``context._target_key`` applies. *scope* carries the
+    ``ALLOWED_LESSON_SCOPES`` wire value, and its default is the value
+    ``LEARN_ADD_SCHEMA`` supplies when a caller names none — which is also what the
+    read-only list route passes, since that route unions the workspace tier rather than
+    selecting between the two.
+    """
+    if silo:
+        return ContextBuilder.get_lessons_for(memory_store=silo)
+    if scope == "workspace":
+        return _get_lessons(state, workspace)
+    return state.lessons
+
+
+async def _prepare_private_lesson_store(store: str) -> web.Response | None:
+    """Prepare V2 before synchronous lesson readers can borrow a handle."""
+    from kiro_crew.context import ContextBuilder
+    from kiro_crew.memory_stores import UnknownMemoryStore, memory_store_version
+
+    try:
+        if store and memory_store_version(store) == 2:
+            await ContextBuilder.ensure_store(store)
+    except (UnknownMemoryStore, OSError) as exc:
+        return web.json_response({"error": str(exc), "code": "store_unavailable"}, status=503)
+    return None
+
+
 async def api_lessons_create(request: web.Request) -> web.Response:
     """POST /api/lessons — add a lesson (vector store or JSONL fallback)."""
     from kiro_crew.learn import Lesson  # noqa: F811
@@ -1986,7 +2326,24 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # the vector store rather than injecting a scoped lesson the other withholds.
     repo_scope = cleaned.get("repo_scope") or None
     # Write to vector store if available, else JSONL
-    vs = _get_memory(state).vector_store
+    # THE CALLER'S silo, not the global store. This is the agent's only durable
+    # memory-write surface, so writing globally let a crew bound to one silo steer
+    # every other crew's turns -- and, in the other direction, the crew's own
+    # context injects only its silo's lessons, so its correction never reached its
+    # own later turns. Falls back to the global store when the session names none,
+    # which is where every install wrote before silos existed.
+    _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.create")
+    if refusal is not None:
+        return refusal
+    memory_refusal = await _prepare_private_lesson_store(_lesson_silo)
+    if memory_refusal is not None:
+        return memory_refusal
+    _lesson_mem = (
+        await asyncio.to_thread(ContextBuilder.get_memory_for, memory_store=_lesson_silo)
+        if _lesson_silo
+        else _get_memory(state)
+    )
+    vs = _lesson_mem.vector_store
     if vs:
         # Embed the rule once off the event loop and reuse it for both the
         # contradiction scan and write_lesson's own dedup pass — the store
@@ -2017,12 +2374,11 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             repo_scope,
         )
         # Sweep ONLY when the lesson actually landed. The write declines for a value
-        # its preflight refuses (reachable now that ``negative`` is forwarded here at
-        # all -- this call site passed a literal None before) and for a dedup refusal.
-        # The result used to be discarded, so a refused write still ran the sweep
-        # below, and _resolve_and_supersede would delete_semantic an older
-        # contradicted lesson whose "replacement" was never stored -- destroying a
-        # lesson on a request that persisted nothing, under HTTP 200. Superseding on
+        # its preflight refuses (reachable because ``negative`` is forwarded here) and
+        # for a dedup refusal. Discarding the result would let a refused write still
+        # run the sweep below, where _resolve_and_supersede would delete_semantic an
+        # older contradicted lesson whose "replacement" was never stored -- destroying
+        # a lesson on a request that persisted nothing, under HTTP 200. Superseding on
         # the authority of a write that did not happen is wrong for every declining
         # outcome, so gate on ``wrote`` rather than on the cause.
         outcome = result.outcome.value
@@ -2037,7 +2393,9 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # Redacting HERE covers both readers: the dashboard and the ``learn_add`` tool
         # each see only what this route sends.
         superseded = _redact_memory_field(list(result.superseded))
-        if result.wrote:
+        # Avoid even scanning or scheduling the model-based sweep for V2;
+        # explicit corrections remain available through the owner review flow.
+        if result.wrote and getattr(vs, "algorithm_version", "v1") != "v2":
             candidates = await asyncio.to_thread(
                 vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb, repo_scope
             )
@@ -2058,11 +2416,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             repo_scope=repo_scope,
             ts=datetime.now(timezone.utc).isoformat(),
         )
-        store = (
-            _get_lessons(state, cleaned.get("workspace"))
-            if scope == "workspace"
-            else (state.lessons)
-        )
+        store = _lesson_jsonl_store(state, _lesson_silo, scope, cleaned.get("workspace"))
         # save_or_enrich, not save: a re-submit of a stored rule carrying a new
         # NOT-clause has to attach it rather than be skipped as a duplicate.
         # Off the loop because it reads the file and rewrites it whole -- the
@@ -2070,10 +2424,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         #
         # This store answers with the same three words the vector store's outcome uses
         # (inserted / enriched / unchanged) and validates no content, so it has no
-        # refusing outcome to report. Its value is echoed as-is: ``state.lessons`` is a
-        # real ``LessonStore`` at every construction site, and its ``save_or_enrich``
-        # is annotated ``-> str`` with three string-literal returns, so there is
-        # nothing here for a filter to catch. ``test_lesson_write_outcome`` pins
+        # refusing outcome to report. Its value is echoed as-is: every arm of
+        # ``_lesson_jsonl_store`` answers with a real ``LessonStore``, and its
+        # ``save_or_enrich`` is annotated ``-> str`` with three string-literal returns,
+        # so there is nothing here for a filter to catch. ``test_lesson_write_outcome`` pins
         # LessonWriteOutcome's wire values against those three words, so the two
         # stores cannot drift apart in silence.
         outcome = await asyncio.to_thread(store.save_or_enrich, lesson)
@@ -2102,9 +2456,9 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # ``ok`` answers the question the caller actually asked -- is the lesson I
     # submitted in the store -- so it stays true for a no-op re-submit (it is stored,
     # there was simply nothing to write) and turns false when a dedup rule or
-    # validation kept it out. It used to be an unconditional true, which told the
-    # caller its lesson was saved even when the store had refused the value; the
-    # ``learn_add`` tool and the CLI both reported "Saved" on that response.
+    # validation kept it out. An unconditional true would tell the caller its
+    # lesson was saved even when the store refused the value, and the ``learn_add``
+    # tool and the CLI would both report "Saved" on that response.
     # ``outcome`` and ``reason`` are additive, so a client that only reads ``ok``
     # keeps working. ``superseded`` is additive for the same reason, and it is the
     # only channel that can carry the rules this write DELETED: they are tombstoned,
@@ -2166,14 +2520,32 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
         return web.json_response({"error": "rule substring required"}, status=400)
     scope = body.get("scope", "global")
     # Delete from vector store if active, else JSONL
-    vs = _get_memory(state).vector_store
+    # THE CALLER'S silo, not the global store. This is the agent's only durable
+    # memory-write surface, so writing globally let a crew bound to one silo steer
+    # every other crew's turns -- and, in the other direction, the crew's own
+    # context injects only its silo's lessons, so its correction never reached its
+    # own later turns. Falls back to the global store when the session names none,
+    # which is where every install wrote before silos existed.
+    _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.delete")
+    if refusal is not None:
+        return refusal
+    memory_refusal = await _prepare_private_lesson_store(_lesson_silo)
+    if memory_refusal is not None:
+        return memory_refusal
+    _lesson_mem = (
+        await asyncio.to_thread(ContextBuilder.get_memory_for, memory_store=_lesson_silo)
+        if _lesson_silo
+        else _get_memory(state)
+    )
+    vs = _lesson_mem.vector_store
     vs_lessons = await asyncio.to_thread(vs.get_lessons) if vs else None
-    if vs_lessons:
+    # `vs and` rather than `vs_lessons` alone: the rows do not narrow the store,
+    # and the store is a real union now that it is resolved per caller instead of
+    # arriving untyped from the global getter.
+    if vs and vs_lessons:
         ok = await asyncio.to_thread(vs.delete_lesson, rule_sub)
     else:
-        store = (
-            _get_lessons(state, body.get("workspace")) if scope == "workspace" else (state.lessons)
-        )
+        store = _lesson_jsonl_store(state, _lesson_silo, scope, body.get("workspace"))
         # Off the loop. remove() now takes the store's shared lock, which a worker
         # thread can be holding across file I/O for a concurrent save_or_enrich --
         # so calling it inline would let one lessons write stall every task on the
@@ -2220,6 +2592,8 @@ async def api_crons(request: web.Request) -> web.Response:
             "created_ts": j.created_ts or None,
             "last_status": j.last_status,
             "agent": redact_credentials(redact_exfiltration_urls(j.agent_id or "")[0])[0] or None,
+            "member_id": j.member_id or None,
+            "memory_store": j.memory_store or None,
             # The crews a sequence job actually wakes. Serialized because
             # `agent_sequence` takes PRECEDENCE over `agent_id` at run time, so a
             # consumer reading only `agent` would attribute such a job to the
@@ -2245,8 +2619,34 @@ async def api_crons(request: web.Request) -> web.Response:
             "silent": j.silent,
             "strict_schedule": j.strict_schedule,
             "hide_in_chat": j.hide_in_chat,
+            # Returned so the edit form can show the job's real setting instead
+            # of defaulting the control to off and silently clearing the flag on
+            # the next save.
+            "minimal_context": j.minimal_context,
             "folder_id": j.folder_id,
+            # The Schedule-page template this job was seeded from, or None. A
+            # stable catalog id (e.g. "error-digest"), not user free-text, so
+            # it is returned as-is; the frontend matches it against the live
+            # SCHEDULE_PRESETS to decide whether the source template moved.
+            "source_preset": redact_credentials(redact_exfiltration_urls(j.source_preset or "")[0])[
+                0
+            ]
+            or None,
+            # The template's prompt AS IT WAS at save time. The frontend
+            # compares THIS against the live preset prompt (template moved?),
+            # not the job's current message (which the user may have edited),
+            # so the hint attributes the change to the template. Redacted with
+            # the same pipeline as every other free-text field on this dict:
+            # it is a client-settable POST field, so it cannot bypass the
+            # dashboard's credential/exfiltration redaction. None when the job
+            # carries no template lineage.
+            "source_template_prompt": redact_credentials(
+                redact_exfiltration_urls(j.source_template_prompt or "")[0]
+            )[0]
+            or None,
             "last_run_ts": j.last_run_ts,
+            "last_retry_count": j.last_retry_count,
+            "last_retry_run_ts": j.last_retry_run_ts,
             "has_result": bool(j.last_result),
             "has_slot": state.has_slot(f"cron-{j.id}"),
             "next_run_ts": compute_next_run_ts(j, now=now),
@@ -2296,7 +2696,7 @@ async def api_crons(request: web.Request) -> web.Response:
 # requests cannot race on the in-memory list + disk persist cycle. The lock is
 # created lazily and re-created if the running event loop changes (Python 3.10
 # binds a Lock to the loop it first waits on) — loop-bound via the shared
-# LoopBoundLock (#4800).
+# LoopBoundLock.
 _cron_folders_lock = LoopBoundLock()
 
 
@@ -2442,7 +2842,24 @@ async def api_lessons(request: web.Request) -> web.Response:
         return {"rule": safe_rule, "category": safe_category, "ts": ts}
 
     # Read from vector store if it has lessons, else JSONL
-    vs = _get_memory(state).vector_store
+    # THE CALLER'S silo, not the global store. This is the agent's only durable
+    # memory-write surface, so writing globally let a crew bound to one silo steer
+    # every other crew's turns -- and, in the other direction, the crew's own
+    # context injects only its silo's lessons, so its correction never reached its
+    # own later turns. Falls back to the global store when the session names none,
+    # which is where every install wrote before silos existed.
+    _lesson_silo, refusal = await resolve_lesson_memory_store(request, state, "lessons.list")
+    if refusal is not None:
+        return refusal
+    memory_refusal = await _prepare_private_lesson_store(_lesson_silo)
+    if memory_refusal is not None:
+        return memory_refusal
+    _lesson_mem = (
+        await asyncio.to_thread(ContextBuilder.get_memory_for, memory_store=_lesson_silo)
+        if _lesson_silo
+        else _get_memory(state)
+    )
+    vs = _lesson_mem.vector_store
     vs_lessons = await asyncio.to_thread(vs.get_lessons) if vs else None
     if vs_lessons:
         # Deferred import: ``vector_memory`` pulls snowballstemmer plus the
@@ -2467,14 +2884,30 @@ async def api_lessons(request: web.Request) -> web.Response:
             raw_category = decoded.get("category") if isinstance(decoded, dict) else None
             data.append(_safe_lesson(rule, raw_category, e.get("updated_at", "")))
     else:
-        # Merge global + workspace-scoped lessons
-        global_lessons = state.lessons.load_all()
-        ws = workspace or _get_active_workspace(state)
-        if ws != "default":
-            ws_lessons = _get_lessons(state, ws).load_all()
-            seen = {le.rule.lower().strip() for le in global_lessons}
-            for le in ws_lessons:
-                if le.rule.lower().strip() not in seen:
-                    global_lessons.append(le)
-        data = [_safe_lesson(le.rule, le.category, le.ts) for le in global_lessons[-50:]]
+        # The JSONL tier of the store this caller is BOUND to, which for a silo is its
+        # own file and never the operator's -- an empty silo answers "no lessons", not
+        # "here are the global ones". A silo also takes no workspace union: the two are
+        # separate namespaces, so another target's rows are not this store's to show.
+        rows = await asyncio.to_thread(lambda: _lesson_jsonl_store(state, _lesson_silo).load_all())
+        if not _lesson_silo:
+            # Merge global + workspace-scoped lessons
+            ws = workspace or _get_active_workspace(state)
+            if ws != "default":
+                ws_lessons = await asyncio.to_thread(lambda: _get_lessons(state, ws).load_all())
+                seen = {le.rule.lower().strip() for le in rows}
+                for le in ws_lessons:
+                    if le.rule.lower().strip() not in seen:
+                        rows.append(le)
+        data = [_safe_lesson(le.rule, le.category, le.ts) for le in rows[-50:]]
     return web.json_response({"lessons": data})
+
+
+# Every other api_* handler in this module is an owner surface, so a private
+# member's internal call is refused before it runs. These four verify and scope
+# their own caller instead.
+guard_owner_surface_routes(
+    globals(),
+    member_scoped=frozenset(
+        {"api_cron_tools", "api_lessons", "api_lessons_create", "api_lessons_delete"}
+    ),
+)

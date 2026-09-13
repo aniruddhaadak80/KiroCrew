@@ -930,6 +930,45 @@ class TestRunMarker:
         cmd = build_candidate_command("status", marker_port=7000)
         assert '[ -n "$__kb" ] && [ -x "$__kb" ]' in cmd
 
+    def test_run_dir_lockdown_is_the_directory_helper(self, tmp_path, monkeypatch):
+        """``run/`` holds the gateway's credential, pid and launcher marker.
+
+        A bare ``os.chmod(0o700)`` is a silent no-op on Windows, so the
+        directory and everything created inside it keep the inherited DACL.
+        The tightening must go through ``platform_compat.restrict_dir_to_owner``,
+        whose Windows grants carry ``(OI)(CI)`` and so also cover the ``.pid``
+        and ``.bin`` sidecars, which ``atomic_write(mode=0o600)`` cannot.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew import platform_compat
+        from kiro_crew.instances import run_marker
+
+        seen: list[str] = []
+        # Re-patch over the session-wide Windows stub in conftest so this
+        # assertion is not vacuous on the Windows matrix.
+        monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", lambda p: seen.append(str(p)))
+        d = run_marker._run_dir()
+        assert seen == [str(d)]
+
+    def test_run_dir_lockdown_failure_is_best_effort(self, tmp_path, monkeypatch):
+        """A refused lockdown must not break gateway startup.
+
+        ``restrict_dir_to_owner`` is fail-loud by design, but ``_run_dir`` is on
+        the path of ``secret_path()``, which the dashboard calls outside a
+        try/except. The existing contract — tighten if possible, otherwise carry
+        on — is what the caller depends on, so the raise is absorbed here.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew import platform_compat
+        from kiro_crew.instances import run_marker
+
+        def _refuse(_path):
+            raise OSError("lockdown refused")
+
+        monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", _refuse)
+        d = run_marker._run_dir()
+        assert d.is_dir()
+
 
 # ── run-marker port discovery (clients find a gateway on a non-default port) ──
 
@@ -1555,7 +1594,7 @@ Host {host}
         silently discards the user's own. ``IgnoreUnknown`` is the one that
         bites: it is how a cross-platform config carries an option this ssh does
         not recognise, and losing it turns a working config into ``Bad
-        configuration option`` -- every tunnel then fails where it used to
+        configuration option`` -- every tunnel then fails where it would
         connect. Multiplexing is safe to pin because a supervised tunnel must
         never share a connection; that reasoning does not generalise.
 
@@ -1653,13 +1692,138 @@ class TestSshTunnelManager:
         assert mgr.get_token("cd-1") == "SECRET_TOK"
         inst = reg.get("cd-1")
         # local_port is ALLOCATED from the tunnel base, not mirrored onto
-        # remote_port (#1972).
+        # remote_port.
         assert inst.was_connected is True
         assert inst.local_port >= mgr._allocator.base_port
         assert inst.local_port != inst.remote_port
         assert reg.get_last_active().id == "cd-1"
         # idempotent
         assert (await mgr.connect("cd-1")).state == TunnelState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_connect_rebuild_replaces_a_connected_tunnel(self, tmp_path):
+        """``rebuild=True`` is the pane's Retry after a watchdog verdict on a
+        document that DID navigate: every probe says the tunnel is fine, so the
+        idempotent connect would hand the same (stalled) forwarder back. The
+        rebuild must stop the old child, spawn a new one, keep the user's
+        connect intent, and answer CONNECTED with a live token."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        first = await mgr.connect("cd-1")
+        assert first.state == TunnelState.CONNECTED
+        old_tunnel = mgr._tunnels["cd-1"]
+
+        second = await mgr.connect("cd-1", rebuild=True)
+        assert second.state == TunnelState.CONNECTED
+        assert mgr._tunnels["cd-1"] is not old_tunnel, "a rebuild must spawn a new forwarder"
+        assert old_tunnel.stopped, "the stalled forwarder must be stopped, not orphaned"
+        assert mgr.get_token("cd-1") == "SECRET_TOK"
+        inst = reg.get("cd-1")
+        assert inst.was_connected is True, "rebuild keeps the connect intent (keep_intent)"
+        assert inst.local_port == second.local_port
+        assert inst.local_port >= mgr._allocator.base_port
+        # The freed port is excluded from the re-allocation: a cause bound to the
+        # old port (not just a stalled stream on the old forwarder) is escaped too.
+        assert second.local_port != first.local_port, "rebuild must not re-use the port it freed"
+        # A plain connect afterwards is idempotent on the NEW tunnel.
+        assert (await mgr.connect("cd-1")).state == TunnelState.CONNECTED
+        assert mgr._tunnels["cd-1"] is not old_tunnel
+
+    @pytest.mark.asyncio
+    async def test_connect_rebuild_teardown_failure_is_an_error_status(self, tmp_path):
+        """A stop that raises during rebuild must NOT propagate out of connect()
+        (the handler would turn it into an unexplained 500). It is reported like
+        every other connect failure: ERROR status with the reason, retained for
+        last_error, and the old tunnel is left tracked and intact — nothing is
+        removed unless the stop succeeded."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        first = await mgr.connect("cd-1")
+        assert first.state == TunnelState.CONNECTED
+        old_tunnel = mgr._tunnels["cd-1"]
+
+        async def boom():
+            raise RuntimeError("kill failed: EPERM")
+
+        old_tunnel.stop = boom
+
+        st = await mgr.connect("cd-1", rebuild=True)
+        assert st.state == TunnelState.ERROR
+        assert "EPERM" in (st.error or "")
+        assert "EPERM" in (mgr.last_error("cd-1") or "")
+        # The live tunnel is untouched: still tracked, credential still held.
+        assert mgr._tunnels["cd-1"] is old_tunnel
+        assert mgr.get_token("cd-1") == "SECRET_TOK"
+        assert reg.get("cd-1").was_connected is True
+
+    @pytest.mark.asyncio
+    async def test_connect_only_if_connected_declines_without_side_effects(self, tmp_path):
+        """The viewport's auto-warm must never bring a tunnel up or touch the
+        connect intent: for an absent tunnel it answers DISCONNECTED, spawns
+        nothing, mints nothing, and leaves was_connected exactly as the user
+        last set it (here: cleared by an explicit disconnect)."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        # Never connected.
+        st = await mgr.connect("cd-1", only_if_connected=True)
+        assert st.state == TunnelState.DISCONNECTED
+        assert "cd-1" not in mgr._tunnels
+        assert not mgr.get_token("cd-1")
+        assert reg.get("cd-1").was_connected is False
+
+        # Connected, then explicitly disconnected: the race auto-warm loses.
+        assert (await mgr.connect("cd-1")).state == TunnelState.CONNECTED
+        await mgr.disconnect("cd-1")
+        assert reg.get("cd-1").was_connected is False
+        st = await mgr.connect("cd-1", only_if_connected=True)
+        assert st.state == TunnelState.DISCONNECTED
+        assert (
+            "cd-1" not in mgr._tunnels
+        ), "a connected-only connect must not re-open a closed tunnel"
+        assert (
+            reg.get("cd-1").was_connected is False
+        ), "a connected-only connect must not re-persist intent"
+
+    @pytest.mark.asyncio
+    async def test_connect_only_if_connected_answers_a_live_tunnel_like_plain_connect(
+        self, tmp_path
+    ):
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        first = await mgr.connect("cd-1")
+        tunnel = mgr._tunnels["cd-1"]
+        st = await mgr.connect("cd-1", only_if_connected=True)
+        assert st.state == TunnelState.CONNECTED
+        assert st.local_port == first.local_port
+        assert mgr._tunnels["cd-1"] is tunnel, "idempotent on the live tunnel"
+        assert mgr.get_token("cd-1") == "SECRET_TOK"
+
+    @pytest.mark.asyncio
+    async def test_connect_rebuild_and_only_if_connected_are_exclusive(self, tmp_path):
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        with pytest.raises(ValueError):
+            await mgr.connect("cd-1", rebuild=True, only_if_connected=True)
+
+    @pytest.mark.asyncio
+    async def test_connect_rebuild_with_no_tunnel_is_a_plain_connect(self, tmp_path):
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        st = await mgr.connect("cd-1", rebuild=True)
+        assert st.state == TunnelState.CONNECTED
+        assert mgr.get_token("cd-1") == "SECRET_TOK"
 
     @pytest.mark.asyncio
     async def test_connect_resets_recover_attempts(self, tmp_path):
@@ -1752,7 +1916,7 @@ class TestSshTunnelManager:
         inst = reg.get("cd-1")
         assert inst.local_port == _UNALLOCATED_PORT  # port hint cleared
         assert inst.was_connected is False
-        # the cleared port is no longer counted as reserved
+        # the cleared port is not counted as reserved
         assert allocated not in mgr._reserved_ports()
 
     @pytest.mark.asyncio
@@ -2261,7 +2425,7 @@ class TestHandlers:
         """The served cap covers every REGISTERED crew, connected or not.
 
         This is the regression that produced "one random crew is broken". The cap
-        used to be the live connected count, so a crew whose tunnel came up just
+        must not be the live connected count: a crew whose tunnel came up just
         after this request was not counted, the cap arrived one short, and the
         viewport evicted a pane to honour it. Eviction unmounts the pane and
         cold-boots the remote SPA on the next click, which reads as a disconnect —
@@ -2377,6 +2541,154 @@ class TestHandlers:
         # list must NOT leak the token
         r = asyncio.run(handlers.api_instances_list(_FakeReq(state)))
         assert "SECRET_TOK" not in r.body.decode()
+
+    def test_connect_rebuild_query_reaches_the_manager(self, tmp_path, monkeypatch):
+        """``?rebuild=1`` is the pane's Retry after a watchdog verdict; it must be
+        forwarded as ``rebuild=True`` and nothing else about the response changes.
+        Without the flag the manager is called with its plain positional
+        contract, so every existing caller (and fake) keeps working."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, TunnelStatus
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        calls = []
+
+        class FakeMgr:
+            async def connect(self, iid, *, rebuild=False, only_if_connected=False):
+                calls.append((rebuild, only_if_connected))
+                if only_if_connected and not reg.get(iid).was_connected:
+                    return TunnelStatus(
+                        iid, TunnelState.DISCONNECTED, local_port=0, remote_port=7777
+                    )
+                reg.update(iid, was_connected=True, local_port=7778)
+                return TunnelStatus(iid, TunnelState.CONNECTED, local_port=7778, remote_port=7777)
+
+            def get_token(self, iid):
+                return "SECRET_TOK"
+
+            async def token_validates(self, local_port, token):
+                return True
+
+        state = _State(reg, FakeMgr())
+        r = asyncio.run(handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"})))
+        assert r.status == 200
+        r = asyncio.run(
+            handlers.api_instances_connect(
+                _FakeReq(state, match={"id": "cd-1"}, query={"rebuild": "1"})
+            )
+        )
+        assert r.status == 200 and _body(r)["token"] == "SECRET_TOK"
+        r = asyncio.run(
+            handlers.api_instances_connect(
+                _FakeReq(state, match={"id": "cd-1"}, query={"rebuild": "0"})
+            )
+        )
+        assert r.status == 200
+        assert calls == [(False, False), (True, False), (False, False)]
+
+    def test_connect_only_if_connected_query_declines_as_200_not_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """``?only_if_connected=1`` (auto-warm) reaches the manager as the keyword;
+        a declined (not-up) answer is a 200 with a non-connected state and
+        ``code=instance_not_connected`` — the shape the shared connect step reads
+        as `warm-declined` — never the 502 a real connect failure gets. A live
+        tunnel is answered exactly like a plain connect. Combining it with
+        ``rebuild`` is a 400."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, TunnelStatus
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        calls = []
+
+        class FakeMgr:
+            async def connect(self, iid, *, rebuild=False, only_if_connected=False):
+                calls.append((rebuild, only_if_connected))
+                if only_if_connected and not reg.get(iid).was_connected:
+                    return TunnelStatus(
+                        iid, TunnelState.DISCONNECTED, local_port=0, remote_port=7777
+                    )
+                reg.update(iid, was_connected=True, local_port=7778)
+                return TunnelStatus(iid, TunnelState.CONNECTED, local_port=7778, remote_port=7777)
+
+            def get_token(self, iid):
+                return "SECRET_TOK"
+
+            async def token_validates(self, local_port, token):
+                return True
+
+        state = _State(reg, FakeMgr())
+        q = {"only_if_connected": "1"}
+        r = asyncio.run(
+            handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"}, query=q))
+        )
+        assert r.status == 200
+        body = _body(r)
+        assert body["state"] == "disconnected" and body["code"] == "instance_not_connected"
+        assert "token" not in body
+        assert reg.get("cd-1").was_connected is False
+
+        # Bring it up the normal way, then the connected-only call is a plain answer.
+        r = asyncio.run(handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"})))
+        assert r.status == 200
+        r = asyncio.run(
+            handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"}, query=q))
+        )
+        assert r.status == 200 and _body(r)["token"] == "SECRET_TOK"
+        assert calls == [(False, True), (False, False), (False, True)]
+
+        r = asyncio.run(
+            handlers.api_instances_connect(
+                _FakeReq(
+                    state, match={"id": "cd-1"}, query={"rebuild": "1", "only_if_connected": "1"}
+                )
+            )
+        )
+        assert r.status == 400
+
+    def test_connect_exclusive_flags_rejection_is_audited(self, tmp_path, monkeypatch):
+        """The ``rebuild`` + ``only_if_connected`` 400 is a control-plane refusal
+        like every other early exit in connect (manager unavailable, not found),
+        so it must leave the same ``instances_connect`` / ``denied`` SEL line —
+        an owner hand-crafting the pair must not be the one connect outcome the
+        audit trail cannot see."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        events = []
+
+        class FakeSel:
+            def log_tool_invocation(self, **kw):
+                events.append(kw)
+
+        monkeypatch.setattr(handlers, "sel", lambda: FakeSel())
+
+        class FakeMgr:
+            async def connect(self, iid, *, rebuild=False, only_if_connected=False):
+                raise AssertionError("manager must not be reached on a 400")
+
+        r = asyncio.run(
+            handlers.api_instances_connect(
+                _FakeReq(
+                    _State(reg, FakeMgr()),
+                    match={"id": "cd-1"},
+                    query={"rebuild": "1", "only_if_connected": "1"},
+                )
+            )
+        )
+        assert r.status == 400
+        assert [(e["tool_name"], e["outcome"], e["request_id"]) for e in events] == [
+            ("instances_connect", "denied", "cd-1")
+        ]
+        assert "mutually exclusive" in events[0]["error"]
 
     def test_connect_remints_when_stored_token_stale(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
@@ -2588,7 +2900,7 @@ class TestHandlers:
         assert body["diagnosis"]["reason"] == "remote dashboard down"
 
     def test_add_defaults_remote_port_to_the_stock_gateway_port(self, tmp_path, monkeypatch):
-        """#1972: the ADD endpoint must not carry its own stale port default.
+        """The ADD endpoint must not carry its own stale port default.
 
         The registry default and the handler default were separate literals, so
         correcting the registry left the HTTP path (which is what the Add form
@@ -3311,7 +3623,7 @@ class TestHandlers:
     def test_update_locks_addressing_fields_for_correlated_cloud_instance(
         self, tmp_path, monkeypatch
     ):
-        # Regression test for #3387: PATCH must not let a non-dashboard caller
+        # PATCH must not let a non-dashboard caller
         # (CLI, script, agent) rewrite the fields Stop/Start/Delete use to
         # resolve an EC2 stack launched by Kiro Crew — doing so strands a running,
         # billing instance with no dashboard path to reach it.
@@ -3376,8 +3688,8 @@ class TestHandlers:
     def test_update_fails_closed_when_correlation_check_errors(self, tmp_path, monkeypatch):
         # If the launch job store can't be read, the correlation check must
         # NOT fall back to "not correlated" — that would let this addressing
-        # edit through and strand a launched, billing instance the same way
-        # #3387 did. The PATCH refuses the edit instead of persisting one it
+        # edit through and strand a launched, billing instance. The PATCH
+        # refuses the edit instead of persisting one it
         # could not verify was safe.
         from kiro_crew.dashboard import handlers_instances as handlers
 
@@ -3490,7 +3802,7 @@ class TestTokenMintGeneric:
         assert rc == 0 and err == ""
 
     def test_run_remote_kirocrew_honors_connect_timeout_secs(self, monkeypatch):
-        """#3579: the fail-fast 10s ConnectTimeout default must not silently
+        """The fail-fast 10s ConnectTimeout default must not silently
         override a caller-supplied budget -- a restart on a slow-proxy host
         needs the same connect budget the mint itself gets."""
         from kiro_crew.instances import token_mint as tm
@@ -3533,7 +3845,7 @@ class TestTokenMintGeneric:
         assert "[REDACTED: credential]" in err
 
     def test_run_remote_kirocrew_redacts_urls_before_credentials(self, monkeypatch):
-        """#9014: pin the ORDER of the redaction passes, not just the redaction.
+        """Pin the ORDER of the redaction passes, not just the redaction.
 
         The exfiltration-URL pass keys on the token-bearing URL shape, so
         running the credential pass first substitutes a placeholder into the
@@ -3565,7 +3877,7 @@ class TestTokenMintGeneric:
         assert "AKIAIOSFODNN7EXAMPLE" not in err
 
     def test_stdout_tail_url_pass_not_disarmed_by_token_prescrub(self, monkeypatch):
-        """#9014: the stdout-tail site has a second disarm path — its own
+        """The stdout-tail site has a second disarm path — its own
         ``_TOKEN_RE`` pre-scrub. Substituting ``token=<redacted>`` into a URL's
         query string before the exfiltration-URL pass destroys the token-bearing
         shape that pass keys on, so a suspicious destination would survive into
@@ -3597,7 +3909,7 @@ class TestTokenMintGeneric:
         """First ``communicate`` times out; the reap (a SECOND communicate)
         records itself and returns. ``wait`` must never be touched: on a
         killed child blocked writing into a full stderr pipe it hangs the
-        caller forever (#5989)."""
+        caller forever."""
 
         def __init__(self) -> None:
             self.pid = 4242
@@ -3761,7 +4073,7 @@ class TestDiagnostics:
         assert asyncio.run(diag._probe_remote_dashboard("cd-1", 7777)) is False
 
     def test_probes_honor_connect_timeout_secs(self, monkeypatch):
-        """#3579: the hardcoded ConnectTimeout=10 must not silently override a
+        """The hardcoded ConnectTimeout=10 must not silently override a
         caller-supplied budget -- a diagnosis on a slow-proxy host the user
         already tuned instances.connect_timeout_secs for must not be
         misreported as unreachable just because the probe never saw that
@@ -4218,7 +4530,7 @@ class TestSelfHealRefreshRestart:
         # remote_port defaults to 5476 → threaded so restart uses the marker resolver.
         # connect_timeout_secs comes from the configured mint budget (unset here,
         # so the ssh default from constants.DEFAULT_MINT_TIMEOUT_SECS), not the
-        # 10s ssh-exec fail-fast fallback -- this is the fix for #3579: a restart
+        # 10s ssh-exec fail-fast fallback -- a restart
         # on a slow-proxy host must reuse the same budget the mint itself gets.
         assert r["ok"] and calls["a"] == ("cd-1-alias", "restart", 5476, 30.0)
         # validation failure
@@ -4229,7 +4541,7 @@ class TestSelfHealRefreshRestart:
         assert not r["ok"]
 
     def test_diagnose_caps_connect_timeout_at_the_diagnostics_ceiling(self, tmp_path, monkeypatch):
-        """#3579: a user who raised instances.connect_timeout_secs for a
+        """A user who raised instances.connect_timeout_secs for a
         genuinely slow proxy still wants a diagnosis to resolve in well
         under a minute, not silently inherit the full tunable -- diagnose()
         must cap what it forwards, not pass the configured value straight
@@ -4346,7 +4658,7 @@ class TestSelfHealRefreshRestart:
 
 
 class TestInstancesStartupHooks:
-    """Regression for "Cannot modify frozen list".
+    """The startup hooks must register before aiohttp freezes its signal lists.
 
     The instances startup/cleanup hooks must be registered on the aiohttp app
     BEFORE ``runner.setup()`` freezes its signal lists. If registered after,
@@ -4465,7 +4777,7 @@ class TestPortMirror:
 
     @pytest.mark.asyncio
     async def test_two_instances_share_one_remote_port(self, tmp_path, monkeypatch):
-        """#1972: two stock installs both reporting the SAME remote port connect.
+        """Two stock installs both reporting the SAME remote port connect.
 
         This is the case mirroring made impossible — and the shipped defaults put
         every stock pair in it.
@@ -5190,14 +5502,14 @@ class TestSsmTunnelArgv:
 
     @pytest.fixture(autouse=True)
     def _bare_resolver(self, monkeypatch):
-        """Pin the shared aws-CLI resolver (#4770) to the bare name so the
+        """Pin the shared aws-CLI resolver to the bare name so the
         argv-shape assertions stay deterministic across hosts."""
         from kiro_crew.cloud import ssm
 
         monkeypatch.setattr(ssm, "resolve_aws_bin", lambda: "aws")
 
     def test_start_builds_argv_off_the_event_loop(self, monkeypatch):
-        """The SSM branch's argv build resolves the aws CLI (#4770), which
+        """The SSM branch's argv build resolves the aws CLI, which
         probes the filesystem — start() must run it in a worker thread, never
         on the gateway event loop (a stalled network mount on PATH would
         otherwise freeze every request)."""
@@ -5362,7 +5674,7 @@ class TestSsmTunnelProcessGroup:
         The argv head is resolved absolutely, but the aws CLI then looks the
         plugin up BY NAME on this child's own PATH — under a GUI-launched gateway
         the minimal launchd one — so the tunnel died inside a correctly resolved
-        ``aws`` (#5392). SSH keeps ``env=None`` (inherit): its binary lives in
+        ``aws``. SSH keeps ``env=None`` (inherit): its binary lives in
         the system bin dir and widening a tunnel child's PATH without a reason to
         is the opposite of what this fix argues for.
         """
@@ -5637,7 +5949,7 @@ class TestSsmTransportSelection:
 
     @pytest.mark.asyncio
     async def test_plugin_probe_runs_off_the_event_loop(self, tmp_path, monkeypatch):
-        """#5392: the prerequisite probe must not block the gateway event loop.
+        """The prerequisite probe must not block the gateway event loop.
 
         The probe resolves the plugin through the deploy engine's shared resolver
         — PATH scan, then the well-known install dirs, then executable-provenance
@@ -5815,7 +6127,7 @@ class TestSsmExitErrorClassification:
         assert "ssh auth failed" in t._exit_error(255)
 
 
-# ── #5235: hard-kill-orphaned forwarder reclaim (pid + exact-argv guard) ────
+# ── hard-kill-orphaned forwarder reclaim (pid + exact-argv guard) ────
 
 
 class TestForwarderPidHints:
@@ -5949,6 +6261,57 @@ class TestForwarderPidHints:
         assert inst.forwarder_pid == os.getpid()
         assert inst.forwarder_start == (pc.process_start_time(os.getpid()) or "")
         assert inst.was_connected is True
+        # The port is part of that identity: it is what forwarder_sig is
+        # signed over, so it tracks the live tunnel in the same write.
+        assert inst.local_port == mgr._tunnels["cd-1"].status.local_port
+
+    @pytest.mark.asyncio
+    async def test_mark_recovered_persists_the_rebuilt_port(self, tmp_path, monkeypatch):
+        """A rebuild landing on a different local port records THAT port.
+
+        ``_recover`` rebuilds on the LIVE tunnel's port, so the port a recovery
+        settles on can differ from the one ``connect`` assigned. Leaving the
+        registry's ``local_port`` behind points every consumer that reads it
+        (the pane URL, ``diagnose``'s fallback) at a port with no listener, and
+        desyncs ``forwarder_sig`` — a MAC over the port — so the orphan reclaim
+        refuses the very child this write exists to record.
+        """
+        import kiro_crew.instances.ssh_tunnel_manager as stm
+        from kiro_crew import platform_compat as pc
+
+        my_pid = os.getpid()
+        key = b"k" * 32
+        monkeypatch.setattr(stm, "_reclaim_identity_key", lambda: key)
+        # Pin the start time: on a host where reading it fails (a sandbox that
+        # denies the process query) it records as "" and the signing branch is
+        # skipped, which would let the signature assertion below pass without
+        # ever computing a signature.
+        monkeypatch.setattr(pc, "process_start_time", lambda pid: "424242")
+
+        def factory(*a, **k):
+            t = _FakeTunnel(*a, **k)
+            t.pid = my_pid
+            return t
+
+        reg, mgr = self._mgr(tmp_path, factory=factory)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        assigned = reg.get("cd-1").local_port
+        assert assigned > 0
+
+        # The replacement child bound a different loopback port.
+        rebuilt = assigned + 1
+        mgr._tunnels["cd-1"].status.local_port = rebuilt
+        await mgr._mark_recovered("cd-1")
+
+        inst = reg.get("cd-1")
+        assert inst.local_port == rebuilt
+        # The identity and the port it is signed with stay consistent, so a
+        # later reclaim can still authenticate this child.
+        assert inst.forwarder_sig == stm._forwarder_identity_sig(
+            key, "cd-1", my_pid, "424242", rebuilt
+        )
+        assert inst.forwarder_sig != ""
 
 
 class TestOrphanForwarderReclaim:
@@ -5960,7 +6323,7 @@ class TestOrphanForwarderReclaim:
 
     * the leaked-forwarder case proves the child is terminated and its port
       released (identity confirmed via the real /proc//ps argv read);
-    * the #1972 regression cases prove a process this manager did not spawn is
+    * the reclaim-guard cases prove a process this manager did not spawn is
       NEVER signalled — whether its pid is recorded (pid recycled), unrecorded,
       or its port is not even occupied.
 
@@ -6116,7 +6479,7 @@ class TestOrphanForwarderReclaim:
             st = await mgr.connect("cd-1")
 
             assert st.state == TunnelState.CONNECTED
-            # (a) the old forwarder process is no longer alive…
+            # (a) the old forwarder process is not alive…
             assert proc.wait(timeout=10) is not None
             # …and its port is released.
             deadline = time.monotonic() + 5.0
@@ -6314,7 +6677,7 @@ class TestOrphanForwarderReclaim:
 
     @pytest.mark.asyncio
     async def test_recorded_pid_with_foreign_argv_is_never_signalled(self, tmp_path, monkeypatch):
-        """#1972 regression: the recorded pid was recycled onto a process this
+        """The recorded pid is recycled onto a process this
         manager did not spawn (its argv is not the forward command line). It
         must be left alone even with a matching start time and an open orphan
         gate."""
@@ -6351,8 +6714,7 @@ class TestOrphanForwarderReclaim:
     @pytest.mark.asyncio
     async def test_unrecorded_port_holder_is_never_signalled(self, tmp_path):
         """No recorded identity -> no candidate: the reclaim never scans the
-        process table for whoever holds the port (that scan is what #1972
-        removed)."""
+        process table for whoever holds the port."""
         from kiro_crew.instances.ssh_tunnel_manager import TunnelState
 
         proc, port, _argv = self._spawn_port_holder()
@@ -6483,7 +6845,7 @@ class TestOrphanForwarderReclaim:
         assert delivered == [pc.SIGTERM], "SIGKILL must be withheld on identity change"
 
     def test_sigkill_withheld_when_pid_vanishes_but_port_lingers(self, monkeypatch):
-        """Open-box guard test: a pid that no longer exists while the port is
+        """Open-box guard test: a pid that does not exist while the port is
         still held (SSM wrapper gone, plugin lingering — or a recycle inside a
         poll gap) is NOT a safe SIGKILL fall-through: getpgid on a recycled
         pid would resolve the REPLACEMENT process. No verified identity, no
@@ -6678,8 +7040,8 @@ class TestProxyRequest:
     async def test_401_after_a_successful_remint_is_still_typed(self, tmp_path, monkeypatch):
         """The re-mint succeeding does not make the SECOND 401 a normal reply.
 
-        Previously the retry guard was `status in (401, 403) and not reminted`,
-        so once a fresh credential had been minted a second rejection fell
+        A guard of `status in (401, 403) and not reminted` fails here:
+        once a fresh credential is minted a second rejection falls
         through to the caller as a bare peer 401 — the UI would read "the chat
         endpoint said no" instead of a credential failure, with no coded error.
         """

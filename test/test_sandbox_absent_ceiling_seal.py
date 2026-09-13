@@ -58,7 +58,7 @@ def _seal_loop_source() -> str:
     """The launcher's ``READONLY_DIRS`` loop body, ready to run.
 
     Pulled out of the generated script rather than restated, so this test cannot pass
-    against a loop the launcher no longer contains.
+    against a loop the launcher does not contain.
     """
     script = sandbox._build_launcher_script("strict")
     loop = (
@@ -93,6 +93,28 @@ def _run_seal_loop(targets: list[str]) -> list[tuple[str, int]]:
         },
     )
     return calls
+
+
+@_POSIX_ONLY
+def test_member_run_identity_is_sealed_before_any_run_exists(crew_home):
+    target = crew_home / "member-memory-bindings"
+    assert not target.exists()
+    sandbox._materialize_sealable_ceilings()
+    assert target.is_dir()
+    calls = _run_seal_loop([str(target)])
+    assert (str(target), _MS_BIND) in calls
+    assert (str(target), _MS_REMOUNT | _MS_BIND | _MS_RDONLY) in calls
+
+
+@_POSIX_ONLY
+def test_private_memory_root_is_maskable_before_the_first_member_exists(crew_home):
+    target = crew_home / "memory_stores"
+    assert not target.exists()
+    sandbox.namespace_argv(["/bin/true"])
+    assert target.is_dir()
+    script = sandbox._build_launcher_script("standard")
+    match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
+    assert match and str(target) in json.loads(match.group(1))
 
 
 @_POSIX_ONLY
@@ -471,6 +493,39 @@ class TestADanglingSymlinkRefusesTheSpawn:
 
 
 @_POSIX_ONLY
+class TestGatewayLauncherDirectoryNeedsARealLeaf:
+    def test_a_resolving_symlink_refuses_the_spawn(self, crew_home, tmp_path):
+        real = tmp_path / "attacker-controlled"
+        real.mkdir()
+        target = crew_home / "playwright-cli"
+        target.symlink_to(real, target_is_directory=True)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink(), "the operator must remove the refused link"
+
+    def test_a_symlink_winning_the_create_race_refuses(self, crew_home, tmp_path, monkeypatch):
+        target = crew_home / "playwright-cli"
+        real = tmp_path / "race-winner"
+        real.mkdir()
+        real_mkdir = os.mkdir
+
+        def _mkdir(path, mode=0o777, *, dir_fd=None):
+            if os.fspath(path) == os.fspath(target):
+                target.symlink_to(real, target_is_directory=True)
+                raise FileExistsError("symlink won the race")
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", _mkdir)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink()
+
+
+@_POSIX_ONLY
 class TestAnAliasBackedCeilingIsReported:
     """``MS_RDONLY`` binds a MOUNT, not an inode, so a second name survives the seal.
 
@@ -611,13 +666,21 @@ class TestMaskableDirsAreMaterializedBeforeTheSpawn:
             assert (crew_home / leaf).is_dir()
 
     def test_an_existing_directory_is_left_alone_and_not_reported(self, crew_home):
-        target = crew_home / "aws-control-staging"
-        target.mkdir(parents=True)
-        marker = target / "drive-preview-live"
-        marker.mkdir()
+        """Every leaf, not one of them: with a leaf hardcoded here, adding a second one to
+        ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` makes materialisation report the new leaf and
+        this assertion fail for a reason that has nothing to do with what it checks."""
+        markers = []
+        for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+            target = crew_home / leaf
+            target.mkdir(parents=True)
+            marker = target / "pre-existing-content"
+            marker.mkdir()
+            markers.append(marker)
 
         assert sandbox._materialize_maskable_dirs() == []
-        assert marker.is_dir()
+        assert markers, "no maskable leaves are declared, so this proves nothing"
+        for marker in markers:
+            assert marker.is_dir()
 
     @_POSIX_ONLY
     @pytest.mark.parametrize("mode", ["standard", "cc", "strict"])

@@ -32,16 +32,24 @@ SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "security-condu
 SKILL_MD = SKILL_DIR / "SKILL.md"
 ROE_JSON = SKILL_DIR / "rules-of-engagement.json"
 
-#: The four scripts the procedure delegates its deterministic half to. Named here
+#: The five scripts the procedure delegates its deterministic half to. Named here
 #: rather than globbed from the directory on purpose: the point is that the PROSE
 #: cites each one, and a glob would pass on a skill body that mentions none of
-#: them -- which is exactly the state while sibling changes are still building
 #: them.
+#:
+#: One list, not two. A wider "may ship" set existed while the scripts were landing
+#: one sibling change at a time and a script could be on disk before the clause it
+#: is cited by: ``verify_fix.py`` was the only entry it ever held. Now that the
+#: skill body cites all five, the two lists would answer the same question, and the
+#: wider one is the weaker contract -- an undocumented script would pass it. A
+#: script that lands ahead of its clause again re-splits this deliberately, in the
+#: change that needs it.
 BUNDLED_SCRIPTS = (
     "scope_check.py",
     "finding_entry.py",
     "verify_finding.py",
     "ledger.py",
+    "verify_fix.py",
 )
 
 #: Every field ``scope_check.py`` and the human reviewer read. Pinned as a set so
@@ -135,10 +143,23 @@ class TestSkillIsInstallable:
 
 
 class TestTheProcedureDelegatesToItsScripts:
-    def test_every_script_is_cited_by_name(self, skill_text: str) -> None:
+    def test_every_bundled_script_is_cited_by_name(self, skill_text: str) -> None:
+        """Every script that ships beside the body is named IN the body.
+
+        A shipped script the procedure never cites is a capability nothing tells the
+        conductor to use, which is how ``verify_fix.py`` sat on disk with the fixer
+        lane still accepting a fix on green checks alone."""
         flat = _flat(skill_text)
         for script in BUNDLED_SCRIPTS:
             assert script in flat, script
+
+    def test_the_fixer_lane_accepts_on_both_halves(self, skill_text: str) -> None:
+        """Checks green is half the question; the other half is whether a legitimate
+        operation still runs, and no ordinary test asserts that."""
+        gates = _flat(_section(skill_text, "## The two human gates"))
+        assert "verify_fix.py" in gates
+        assert "pr checks are green and" in gates
+        assert "never on checks alone" in gates
 
     def test_an_absent_script_is_unknown_and_not_permission(self, skill_text: str) -> None:
         """The scripts land in sibling changes, so "not installed yet" is the
@@ -165,6 +186,22 @@ class TestPolicyRefusalIsTheBoundary:
 
     def test_a_refusal_is_recorded_as_an_event(self, skill_text: str) -> None:
         assert "record it as an event" in _flat(skill_text)
+
+    def test_both_worker_briefs_name_the_event_kind(self, skill_text: str) -> None:
+        """The conductor rules on the event, so the WORKER has to have recorded one
+        under the name the retrospective looks for -- and without a secret in it."""
+        for heading in ("## Auditor seed template", "## Verifier seed template"):
+            body = _flat(_section(skill_text, heading))
+            assert "policy_block" in body, heading
+            assert "command shape" in body, heading
+
+    def test_the_retrospective_rules_on_every_block(self, skill_text: str) -> None:
+        """A block nobody rules on is the question that never reaches the corpus."""
+        body = _flat(_section(skill_text, "## Retrospective seed template"))
+        assert "policy_block" in body
+        assert "false positive" in body
+        assert "ledger.py propose-golden-path" in body
+        assert "approve-golden-path" in body
 
     def test_the_auditor_brief_carries_the_rule_itself(self, skill_text: str) -> None:
         """The conductor knowing it is not enough -- the worker is the one holding
@@ -264,10 +301,55 @@ class TestRetrospectiveBrief:
     def test_lessons_are_proposed_through_the_ledger_cli(self, skill_text: str) -> None:
         assert "ledger.py propose-lesson" in _flat(_section(skill_text, self.HEADING))
 
+    def test_both_lesson_sources_are_named_and_neither_is_a_dead_end(self, skill_text: str) -> None:
+        """A `policy_block` is an event rather than a finding, so `--source-finding`
+        has no id to resolve for one. `propose-lesson` takes
+        `--source-policy-block` for exactly that case, so the brief must name it:
+        an instruction that only offered the finding flag would send a worker to run
+        a command that exits 2, and the guidance half of the ruling would be lost
+        again.
+        """
+        body = _flat(_section(skill_text, self.HEADING))
+        assert "golden-path row first" in body
+        assert "--source-finding" in body
+        assert "--source-policy-block" in body
+        # Every false positive gets both halves now; the old brief made the lesson
+        # conditional, and that condition is the gap this replaces.
+        assert "only when the block has a finding to cite" not in body
+        assert "propose it for every false positive" in body
+        assert "never invent a finding id" in body
+
     def test_an_unapproved_lesson_never_reaches_a_seed(self, skill_text: str) -> None:
         body = _flat(_section(skill_text, self.HEADING))
         assert "inactive until a human approves" in body
         assert "never inject an unapproved lesson" in body
+
+
+class TestCrossPlatform:
+    """A fix that only works on one platform locks the others out, and a
+    single-platform run cannot see it."""
+
+    HEADING = "## Cross-platform"
+
+    def test_all_three_platforms_are_named(self, skill_text: str) -> None:
+        body = _flat(_section(skill_text, self.HEADING))
+        for platform in ("linux", "macos", "windows"):
+            assert platform in body, platform
+
+    def test_a_branch_ships_with_its_counterpart(self, skill_text: str) -> None:
+        body = _flat(_section(skill_text, self.HEADING))
+        assert "in the same change" in body
+        assert "3-os matrix" in body
+
+    def test_an_unsupported_platform_is_never_confirmed(self, skill_text: str) -> None:
+        body = _flat(_section(skill_text, self.HEADING))
+        assert "needs-human" in body
+        assert "never" in body and "confirmed" in body
+
+    def test_the_label_covers_a_line_not_a_pr(self, skill_text: str) -> None:
+        body = _flat(_section(skill_text, self.HEADING))
+        assert "posix-only-approved" in body
+        assert "never a pr" in body
 
 
 class TestSeverityAdjudication:
@@ -322,6 +404,21 @@ class TestStopConditions:
         body = _flat(_section(skill_text, self.HEADING))
         assert "autonudge_stop" in body
 
+    def test_a_terminal_child_is_closed_in_the_cycle_and_at_the_stop(self, skill_text: str) -> None:
+        """Stopping a child's loop is not the same act as closing its session, so the
+        procedure has to name the second one twice: per item inside the cycle, and for
+        whatever is still open when the conductor itself stops. The VOID fixer is
+        called out because ``session_stop`` reads as the whole close-out for it."""
+        cycle = _flat(_section(skill_text, "## The patrol cycle"))
+        assert "session_close that child session in the same cycle" in cycle
+        assert "a void fixer is closed after its session_stop" in cycle
+        body = _flat(_section(skill_text, self.HEADING))
+        assert "session_close each remaining child whose item is terminal" in body
+        assert (
+            "a child still holding a pending human question, or a fixer driving an"
+            " unmerged pr, stays open" in body
+        )
+
 
 class TestRulesOfEngagementExport:
     """The M0 review surface. Shape is a contract; the values are the human's."""
@@ -370,6 +467,9 @@ class TestRulesOfEngagementExport:
             "policy-block",
             "network-egress",
             "scratch-worktree",
+            # The platform rule the posix-only-approved label is an exception to. A
+            # fix usable on one platform is an outage on the other two.
+            "platform",
         ):
             assert token in values, token
 
@@ -377,6 +477,15 @@ class TestRulesOfEngagementExport:
         values = " ".join(r["value"] for r in roe["rules"]["human_approval"])
         assert "active-testing" in values
         assert "fixer-dispatch" in values
+
+    def test_golden_path_approval_and_deactivation_are_one_gated_row(self, roe: dict) -> None:
+        """Asymmetry is the defeat: a fixer that can deactivate a row retires the
+        one its fix broke, and both gates then pass on a corpus missing it. So the
+        row names deactivation as well, and one row keeps the two inseparable."""
+        rows = [r for r in roe["rules"]["human_approval"] if "golden_paths" in r["value"]]
+        assert len(rows) == 1, [r["value"] for r in roe["rules"]["human_approval"]]
+        assert "deactivating" in rows[0]["value"]
+        assert "approving" in rows[0]["value"]
 
     def test_the_report_schema_matches_the_finding_record(self, roe: dict) -> None:
         fields = {r["value"] for r in roe["rules"]["report_schema"]}

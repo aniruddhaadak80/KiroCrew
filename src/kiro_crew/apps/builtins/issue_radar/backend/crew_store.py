@@ -252,7 +252,7 @@ def _finite_int(value: Any) -> int | None:
     Returning ``None`` for "not a number" is :func:`_validated_text_setting`'s
     convention — the caller decides whether that means the default, ``None`` on the
     record, or a refusal. A FRACTIONAL float reads as "not a number" too: ``int()``
-    truncates, so ``47.9`` used to store as ``47`` — a value the operator never
+    truncates, so ``47.9`` would store as ``47`` — a value the operator never
     asked for, silently, with the form reporting success. Truncation is the same
     silent substitution the frontend's ``Number.isInteger`` guard refuses one layer
     up; refusing here as well means neither layer can invent a value on its own.
@@ -498,8 +498,8 @@ def read_settings(owner: str, repo: str, root: Path | None = None) -> dict[str, 
     out = dict(DEFAULT_SETTINGS)
     if path.is_file():
         try:
-            stored = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return out
         if isinstance(stored, dict):
             ttl = _validated_ttl_hours(stored.get("claim_ttl_hours"))
@@ -557,8 +557,8 @@ def list_crews(
         if not is_crew_id(path.stem):
             continue
         try:
-            rec = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -576,8 +576,8 @@ def read_crew(
     if not path.is_file():
         return None
     try:
-        rec = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return _coerce_crew(rec) if isinstance(rec, dict) else None
 
@@ -791,8 +791,8 @@ def read_work_item(
     if not path.is_file():
         return None
     try:
-        rec = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return rec if isinstance(rec, dict) else None
 
@@ -806,8 +806,8 @@ def list_work_items(
         return out
     for path in sorted(d.glob("*.json")):
         try:
-            rec = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -823,7 +823,7 @@ def open_slot_count(
 ) -> int:
     """Work items occupying a slot: every unfinished one.
 
-    No exemption, because there is no longer a phase in which the crew is not the
+    No exemption, because there is no phase in which the crew is not the
     actor: an item it cannot progress without a human is recorded as a pass and its
     claim released, so anything still open is work this crew owes.
     """
@@ -1335,8 +1335,8 @@ def read_skips(owner: str, repo: str, root: Path | None = None) -> dict[str, dic
     if not path.is_file():
         return {}
     try:
-        stored = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     if not isinstance(stored, dict):
         return {}
@@ -1405,7 +1405,7 @@ def record_skip(
     ``_records_lock_path``. Every crew writes this one file whole, so a per-crew
     lock would let two of them drop each other's decisions.
 
-    THE FLAG IS TRUE AT THE MOMENT OF THE WRITE AND NO LONGER. It says this call
+    THE FLAG IS TRUE AT THE MOMENT OF THE WRITE AND NOT AFTER IT. It says this call
     inserted the entry; it cannot say the entry is still this caller's to remove,
     because this function's lock is released before it returns. A caller that will
     later COMPENSATE the write — un-index the entry if a subsequent write of its own
@@ -1598,7 +1598,7 @@ def commit_work_progress(
                         # rolled back like any other step. The item is already
                         # written by this point, so an exception here — the lock
                         # file is one more open descriptor, and fd exhaustion or a
-                        # permission fault raises — used to escape past the rollback
+                        # permission fault raises — would escape past the rollback
                         # and leave the item changed with neither its skip-index
                         # entry nor its ledger event: the one outcome this
                         # transaction exists to prevent.
@@ -1829,7 +1829,7 @@ def _fold_one_item(
     Three things a naive fold gets wrong, each pinned by a test:
 
     * **The live phase is the record's, authoritative — never the max timeline
-      index.** A review round-trip (``awaiting-ci -> addressing-review ->
+      index.** A round-trip through review (``awaiting-ci -> addressing-review ->
       awaiting-ci``) ends LEFT of where it has been, so keying the head off the
       furthest column reached puts the item in a phase it already left. This
       function reads ``phase`` straight off the record and returns it as its own
@@ -1865,10 +1865,10 @@ def _fold_one_item(
         if ph in seen_spine and exit_entry is not None:
             # Came back to a phase already visited, AND an exit was standing — this
             # is a genuine reopen (the store cleared the terminal fields to make it
-            # one), not a review round-trip within the spine.
+            # one), not a round-trip through review within the spine.
             reopens += 1
         if exit_entry is not None:
-            # Reopened: the exit no longer holds, whatever it was.
+            # Reopened: the exit does not hold, whatever it was.
             exit_entry = None
         seen_spine.add(ph)
         timeline.append({"phase": ph, "at": at})

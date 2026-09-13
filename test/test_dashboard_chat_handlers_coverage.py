@@ -24,6 +24,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard import chat_handlers as ch
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_values
 from kiro_crew.dashboard.state import _MAX_PENDING_CONTEXT, DashboardState, _ChatSlot
@@ -64,10 +66,18 @@ def _app(state: DashboardState, method: str, path: str, handler) -> web.Applicat
     return app
 
 
-def _acp(**attrs):
-    """An AcpProvider double that still satisfies ``isinstance``."""
+def _acp(*, backend=ACP_BACKEND_KIRO, **attrs):
+    """An AcpProvider double that still satisfies ``isinstance``.
+
+    ``backend`` names which harness the double is talking to, and the double
+    carries the REAL capability record for it. ``_wire_model_id`` asks
+    ``SessionCapabilities.model_id_namespace`` rather than which backend it is, and
+    ``capabilities_of`` requires a genuine record -- a ``MagicMock(spec=...)``'s
+    attributes are all truthy, so an attribute-shaped flag would let the double
+    claim every capability at once.
+    """
     provider = MagicMock(spec=AcpProvider)
-    provider.is_claude_backend = False
+    provider.capabilities = capabilities_for(backend)
     provider.has_active_turn = MagicMock(return_value=False)
     provider.available_models = MagicMock(return_value=[])
     provider.supports_effort = MagicMock(return_value=False)
@@ -240,12 +250,13 @@ class TestHasConversation:
 
 class TestWireModelId:
     def test_claude_backend_cannot_express_default(self):
-        assert ch._wire_model_id(_acp(is_claude_backend=True), "sonnet-4.5") == "sonnet-4.5"
-        assert ch._wire_model_id(_acp(is_claude_backend=True), "") == ""
-        assert ch._wire_model_id(_acp(is_claude_backend=True), "auto") == ""
+        claude = ACP_BACKEND_CLAUDE
+        assert ch._wire_model_id(_acp(backend=claude), "sonnet-4.5") == "sonnet-4.5"
+        assert ch._wire_model_id(_acp(backend=claude), "") == ""
+        assert ch._wire_model_id(_acp(backend=claude), "auto") == ""
 
     def test_claude_backend_translates_canonical_key(self):
-        wire = ch._wire_model_id(_acp(is_claude_backend=True), "opus-4.8-1m")
+        wire = ch._wire_model_id(_acp(backend=ACP_BACKEND_CLAUDE), "opus-4.8-1m")
         assert wire == "global.anthropic.claude-opus-4-8[1m]"
 
     def test_kiro_default_needs_auto_to_be_advertised(self):
@@ -1006,7 +1017,7 @@ class TestSlotWorkspace:
 
     @pytest.mark.asyncio
     async def test_switch_is_allowed_once_the_conversation_started(self):
-        # #1717: a started conversation used to answer 409. It now switches,
+        # A started conversation switches rather than answering 409,
         # because the transcript is workspace-independent -- only the live
         # agent process is restarted, exactly as the sibling switches do.
         slot = _ChatSlot("s1")
@@ -1025,7 +1036,7 @@ class TestSlotWorkspace:
     @pytest.mark.asyncio
     async def test_no_op_switch_does_not_reset(self):
         # Re-picking the workspace the slot already has changes nothing, so it
-        # must not tear the live session down (Opus review finding on #9084).
+        # must not tear the live session down.
         slot = _ChatSlot("s1")
         slot.workspace = "same-ws"
         slot.project = "/tmp/ws-same"
@@ -1043,7 +1054,7 @@ class TestSlotWorkspace:
     @pytest.mark.asyncio
     async def test_switch_on_started_conversation_marks_the_slot_dirty(self):
         # The periodic flush persists a slot's metadata only while _dirty is
-        # set (GPT review finding on #9084). Without this a crash before the
+        # set. Without this a crash before the
         # next message restores the OLD workspace over a switch the user saw
         # succeed. Only reachable now that a started conversation may switch.
         slot = _ChatSlot("s1")
@@ -1060,8 +1071,8 @@ class TestSlotWorkspace:
     @pytest.mark.asyncio
     async def test_switch_refused_while_subagents_attached(self):
         # The reset kills the runtime attached children run on, so the switch
-        # refuses like every sibling switch handler (GPT review finding on
-        # #9084). Before the commit: workspace/project untouched.
+        # refuses like every sibling switch handler. Before the commit:
+        # workspace/project untouched.
         slot = _ChatSlot("s1")
         slot.workspace = "default"
         slot.project = "/tmp/ws-default"

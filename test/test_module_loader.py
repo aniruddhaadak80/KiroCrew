@@ -340,6 +340,7 @@ class TestModuleUnload:
     def test_reload_after_unload_gets_fresh_code(self, tmp_path: Path) -> None:
         """After unload, re-loading gets fresh module code."""
         import importlib
+        import importlib.util
         import uuid
         work_dir = tmp_path / uuid.uuid4().hex
         work_dir.mkdir()
@@ -351,13 +352,13 @@ class TestModuleUnload:
 
         unload_app_modules("test-app-reload")
 
-        # Update the file — also invalidate any bytecode cache
+        # Update the file: also invalidate any bytecode cache. Located through
+        # cache_from_source, which honours sys.pycache_prefix (the suite redirects
+        # bytecode off the checkout), rather than assuming a sibling __pycache__/.
         mod_path.write_text("def func(ctx): return 'v2'")
-        # Remove __pycache__ if it exists
-        pycache = work_dir / "__pycache__"
-        if pycache.exists():
-            import shutil
-            shutil.rmtree(pycache)
+        cached = Path(importlib.util.cache_from_source(str(mod_path)))
+        if cached.exists():
+            cached.unlink()
         # Invalidate importlib caches
         importlib.invalidate_caches()
 
@@ -368,7 +369,7 @@ class TestModuleUnload:
 
 
 # ---------------------------------------------------------------------------
-# Issue #6078: a multi-module app backend must be able to import its own siblings
+# A multi-module app backend must be able to import its own siblings
 # ---------------------------------------------------------------------------
 
 
@@ -704,13 +705,13 @@ def test_deploy_skill_install_replaces_managed_dir(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# resolve_loaded_callable — gone-app shutdown (issue #7880 reconciler teardown)
+# resolve_loaded_callable — gone-app shutdown (reconciler teardown)
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_loaded_callable_survives_deleted_files(tmp_path, monkeypatch):
     """GPT [BLOCKING]: CLI uninstall deletes an app's files, so the disk loader
-    can no longer resolve its on_shutdown -- yet the module the gateway imported
+    cannot resolve its on_shutdown -- yet the module the gateway imported
     is still resident in sys.modules and a task its on_startup spawned is still
     live. resolve_loaded_callable resolves the callable from that cached module
     so trust revocation can still run on_shutdown, where load_app_module (disk)
@@ -776,10 +777,10 @@ def test_cached_shutdown_callable_survives_uninstall_of_uncached_module():
 
 
 def test_clear_all_shutdown_callables_drops_the_whole_cache():
-    """GPT round-9: the gateway teardown sweep does not go through per-app
+    """The gateway teardown sweep does not go through per-app
     unload_app_modules, so it must drop the whole shutdown cache -- otherwise a
-    callable captured this generation survives into an in-process restart and is
-    used to stop a NEWLY loaded worker."""
+    callable captured this generation survives into an in-process restart and
+    could stop a NEWLY loaded worker."""
     import kiro_crew.apps.module_loader as ml
 
     ml._shutdown_callables.clear()

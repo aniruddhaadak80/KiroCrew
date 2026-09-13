@@ -20,7 +20,30 @@ state.json # complete state record
 
 `session_ledger.ledger_key()` removes only dashboard namespace and prefix spellings before storage. `session_ledger._store_name()` combines a readable fold with a digest of that exact key; `test_distinct_channel_keys_never_share_a_ledger` guards against the lossy-fold collision that would otherwise let one channel session overwrite another. `session_ledger.ledger_dir()` rejects hostile raw keys and requires the resolved directory to remain below the ledger root, preventing traversal through a folded name.
 
-Closing a dashboard tab preserves the ledger. Permanent history deletion calls `_remove_slot_for_history_key()` in `dashboard.handlers.sessions`; it cancels matching turns and destroys their sessions before calling `session_ledger.purge()` and `purge_matching()`. That ordering prevents a dying in-process turn from writing after the normal purge. `session_ledger.purge()` accepts that a cross-process race can recreate disposable orphan state; the next deletion sweep removes it.
+Closing a dashboard tab preserves the ledger. Permanent history deletion also
+preserves it. A transcript can be created or restored by another process after
+any in-process owner check, and no request-local fence can make ledger deletion
+atomic with that claim. A stale ledger is reversible; deleting a successor's
+resumable state is not. Standalone `purge()` / `purge_matching()` remain explicit
+synchronous maintenance primitives, not part of the history-delete request path.
+
+The same history-delete funnel separately releases cron ownership. The single
+delete performs a strict cron-owner scan before unlink and another after it; bulk
+clear batches both scans. `_delete_history_session()` binds the exact owner keys
+from that scan and a readable `linked_session_key` into the immutable
+`_HistoryDeleteClaim` while holding the canonical-plus-legacy transcript lock
+set. `_remove_slot_for_history_key()` first revalidates the captured slot,
+transcript, task and session generation, then cancels the old turn and conditionally
+destroys only that manager generation. After those awaits it rechecks both live
+slots and SessionManager's live/reserved keys, and hands only the proven retired
+owner keys to `CronService.release_jobs_owned_by()`. Pins, ledgers and autocompact overrides are
+preserved; cron release is allowed because its exact ownership was established
+before unlink rather than inferred from a lossy filename fold. Known cron-store
+failures (`cron_store_unreadable`, `cron_store_busy`, and for an unreadable
+transcript `cron_ownership_unknown`) leave the row intact with a 409; bulk clear
+reports per-row unreadable claims in `undeletable`. Other post-unlink errors log
+the by-id recovery command (`kirocrew cron adopt <id> --release`). See
+[learn-cron-dashboard](learn-cron-dashboard.md).
 
 ## 3. State record and bounded writes
 
@@ -69,6 +92,9 @@ Every `_fire_*_nudge` adapter in `slack.gateway` calls `compose_nudge_body()`, i
 
 ## 6. Failure behavior and scope
 
-A read failure yields an empty ledger. A write lock failure is retryable. Permanent deletion removes matching ledger directories, while the documented cross-process race may leave only disposable orphan state for the next sweep. Snapshot failures are best-effort and never prevent the nudge from firing.
+A read failure yields an empty ledger. A write lock failure is retryable. Both
+closing a tab and permanently deleting its history preserve matching ledger
+directories; explicit maintenance may remove stale ledger state later. Snapshot
+failures are best-effort and never prevent the nudge from firing.
 
 The ledger does not journal individual tool operations, arbitrate execution ownership with leases, or add a dashboard UI. It records state between wakes; the MCP tools and nudge composer are its public surfaces.

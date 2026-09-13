@@ -284,6 +284,20 @@
 /* ── Design tokens ── */
 /* Shared across all themes */
 :root {
+  /* Top safe-area inset, consumed by the tailwind.config.js safe-area plugin
+     (p-safe / top-safe / top-safe-offset-* / top-safe-or-*). 0 by default: in
+     any in-browser context the UA's own chrome sits between the status bar /
+     display cutout and the page, so a non-zero top env() there is spurious —
+     Android WebView browsers (e.g. corporate wrappers) report the cutout
+     height even with their URL bar on screen, which painted a dead band above
+     the app header. Only when the app IS the window (installed PWA) does the
+     viewport really extend under the cutout, and display-mode is exactly that
+     signal — the @media block after this rule re-enables env() there.
+     Bottom/left/right stay bare env() in the plugin — those insets are real
+     in-browser. Declared INSIDE this first :root block deliberately:
+     src/i18n/scriptFonts.test.ts reads the file's first :root body for the
+     script-fallback tokens, so a separate leading block would shadow it. */
+  --safe-area-top: 0px;
   /* Single source of truth for the script fallbacks. Every declaration of
      --font-body / --mono — here, in the theme blocks below, and the ones built in
      hooks/useTheme.tsx and hooks/useZoom.ts — references these by name instead of
@@ -307,6 +321,12 @@
   --font-body:var(--theme-font-sans, var(--script-fallbacks),'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif);
   --mono:var(--theme-font-mono, var(--script-fallbacks-mono),'JetBrains Mono',ui-monospace,SFMono-Regular,monospace);
   --radius-sm:6px;--radius-md:8px;--radius-lg:12px;--radius-xl:16px;
+}
+/* The standalone/fullscreen half of the --safe-area-top gate declared above:
+   only when the app is the window does the top env() inset describe a region
+   this viewport actually occupies. */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  :root { --safe-area-top: env(safe-area-inset-top, 0px); }
 }
 html:lang(zh-CN) {
   /* Isolated Simplified aliases for Chinese UI. Not :lang(zh): that also
@@ -1543,9 +1563,10 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 [data-theme="kiro-light"] .nav-active,[data-theme="kiro-light"] .session-row.session-active,[data-theme="kiro-light"] .list-selected{background:#d8d2e0;color:#723acc;border-color:#c4bcd0}
 [data-theme="kiro-light"] .nav-active .text-accent{color:#723acc}
 /* Kiro light: the canvas is white and the app shell steps back. --bg is #ffffff so the chat
-   transcript and every page read as the primary surface; the nav rail and sessions list take
-   --panel (#fafafa) instead of the elevated white they use elsewhere, which is the only thing
-   separating them from the canvas — a white card on a white page has no edge but its border.
+   transcript and every page read as the primary surface; the nav rail and the list cards (the
+   sessions list and the Crew Members roster, both built from components/listShell) take --panel
+   (#fafafa) instead of the elevated white they use elsewhere, which is the only thing separating
+   them from the canvas — a white card on a white page has no edge but its border.
    The user bubble is a borderless bg-card fill, so on a white canvas it needs a tint or it
    disappears entirely; --bg-hover (#f0f0f0) keeps it in the same grey family as the shell. The
    edit-mode box that replaces a bubble in place carries the same hook, so editing does not flip
@@ -1955,6 +1976,14 @@ file-tree-container{
    and a display:none row measures as zero-width chips at offset zero -- read as
    "on screen", which would silently swallow their unread. */
 @container (max-width:152px){ .tb-left .tb-drop-crew-name{display:none} }
+/* The route-history arrows drop before either chip rung fires: they are the one
+   redundant control in the group (⌘/Ctrl+←/→, the mouse buttons and browser
+   chrome all reach the same history), while the crew chips are the identity of
+   the tab. Two 28px buttons = 56px on top of the 139px chip cluster the 152px
+   rung protects, so this rung fires 56px above it. Under a plain browser
+   dashboard with no remote instances the group holds only the arrows and never
+   comes near the rung. */
+@container (max-width:208px){ .tb-left .tb-drop-navhistory{display:none} }
 /* Terminal rung for the identity group, the counterpart of the capsule's
    dot-only one: below this the active-crew chip goes too and the group keeps just
    the nav button and the dropdown -- which still names the crew on screen, with a
@@ -2232,35 +2261,6 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    without fighting hover/active background states, which now use the standard
    neutral tokens (hover:bg-bg-hover, bg-accent-subtle when active). */
 .session-row{--_sc:var(--session-color,transparent);--session-muted:var(--muted);content-visibility:auto;contain-intrinsic-size:auto 60px}
-/* Browser-tab demo: the side panel's ACTIVE tab chip fuses with the panel body
-   below it — same background (--bg), no bottom radius, and Chrome's inverted
-   bottom corners painted in the body colour so the elevated strip appears to
-   curve into the tab. */
-.side-tab-active::before,.side-tab-active::after{
-  /* Offsets resolve against the chip's PADDING box, and the chip carries a 1px
-     border: bottom:-1px lands the pieces on the border-box bottom (the strip's
-     seam). Each piece is 9px wide so it also COVERS the chip's own side border
-     over the flare's height — otherwise the straight hairline runs down through
-     the curve as a visible stub. The radial gradient paints three bands: the
-     concave strip region (transparent), a 1px --border arc that CONTINUES the
-     side hairline around the curve, and the --bg wedge that fuses with the
-     panel body. The circle centre sits 1px in from the outer edge so the arc's
-     top lands exactly on the hairline's column — no jog at the junction. */
-  content:'';position:absolute;bottom:-1px;width:9px;height:8px;
-  pointer-events:none}
-.side-tab-active::before{
-  left:-9px;
-  background:radial-gradient(circle at 1px 0,transparent 7px,var(--border) 7px 8px,var(--bg) 8px)}
-.side-tab-active::after{
-  right:-9px;
-  background:radial-gradient(circle at calc(100% - 1px) 0,transparent 7px,var(--border) 7px 8px,var(--bg) 8px)}
-/* Inactive chips: the hover wash floats INSET from the body seam (Chrome-style)
-   so a hovered tab cannot read as fused/selected the way the active tab does.
-   The chip carries isolation:isolate, so z-index:-1 keeps the wash behind the
-   chip's icon/label but above the strip surface. */
-.side-tab-inactive:hover::before{
-  content:'';position:absolute;left:0;right:0;top:2px;bottom:4px;
-  border-radius:8px;background:var(--bg-hover);z-index:-1}
 /* Reveal-in-sidebar confirmation: an accent outline the reveal handler holds
    briefly and then fades (ChatSidebar reveal effect, issue #912). Outline, not
    background, because the revealed row is usually the active one and already
@@ -2791,3 +2791,84 @@ html[data-font-family="opendyslexic"] .nav-item {
   background-position: 24px 12px, 24px 46px, 24px 80px;
   contain: layout paint style;
 }
+
+/* The controls occupy the workspace's top-right corner, independent of which
+   panel owns that edge. Reserve space only in that panel's title controls. */
+[data-panel-toggle-owner="chat"] [data-panel-controls-host="chat"],
+[data-panel-toggle-owner="workspace"] [data-panel-controls-host="workspace"],
+[data-panel-toggle-owner="terminal"] [data-panel-controls-host="terminal"] { padding-right: calc(var(--workspace-panel-control-count, 2) * (var(--panel-toolbar-button-size) + var(--panel-toolbar-gap))); }
+[data-panel-toggle-owner="workspace"] .panel-toolbar-actions > [data-panel-controls-local-close="workspace"],
+[data-panel-toggle-owner="terminal"] .panel-toolbar-actions > [data-panel-controls-local-close="terminal"] { display: none; }
+
+[data-panel-toggle-owner="search"] .workspace-search-header { padding-right: calc(var(--workspace-panel-control-count, 2) * (var(--panel-toolbar-button-size) + var(--panel-toolbar-gap)) + 16px); }
+
+/* Shared geometry for chat, workspace and terminal title actions. */
+:root {
+  --panel-toolbar-height: 44px;
+  --panel-toolbar-button-size: 28px;
+  --panel-toolbar-icon-size: 16px;
+  --panel-toolbar-gap: 6px;
+}
+[data-session-grid-view],
+[data-panel-toggle-owner="chat"]:has([data-session-grid-view]) [data-workspace-panel-controls] {
+  --panel-toolbar-height: 32px;
+  --panel-toolbar-button-size: 24px;
+  --panel-toolbar-icon-size: 14px;
+  --panel-toolbar-gap: 4px;
+}
+.panel-toolbar {
+  height: var(--panel-toolbar-height);
+  min-height: var(--panel-toolbar-height);
+  box-sizing: border-box;
+}
+.panel-toolbar-action,
+.panel-toolbar-actions > :is(button, [role="button"]) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--panel-toolbar-button-size);
+  min-width: var(--panel-toolbar-button-size);
+  flex-shrink: 0;
+}
+.panel-toolbar-action > svg,
+.panel-toolbar-actions > :is(button, [role="button"]) > svg {
+  width: var(--panel-toolbar-icon-size);
+  height: var(--panel-toolbar-icon-size);
+}
+
+.panel-tab-icon {
+  width: var(--panel-toolbar-icon-size);
+  height: var(--panel-toolbar-icon-size);
+}
+.panel-tab-icon > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.panel-toolbar-actions { gap: var(--panel-toolbar-gap); }
+
+/* Fullscreen spans every content column but keeps the shell's first row. In
+   focus mode that row is the shared 8px edge inset; otherwise it is the 42px
+   title row. Keeping it makes the left, chat and side-panel toolbars align. */
+[data-workspace-fullscreen] #activity-bar-slot {
+  position: absolute;
+  inset: 0;
+  grid-area: 2 / 1 / -1 / -1 !important;
+  z-index: 65;
+  background: var(--bg);
+}
+[data-workspace-fullscreen] #activity-bar-slot [data-workspace-panel-host] {
+  width: 100% !important;
+  height: 100% !important;
+}
+[data-workspace-fullscreen] [data-workspace-panel-host].fixed {
+  height: auto !important;
+  z-index: 65;
+}
+[data-workspace-fullscreen] [data-workspace-panel-controls] { z-index: 66; padding-right: 0; }
+[data-workspace-fullscreen].mac-electron:not(.mac-fullscreen) .side-panel-strip { padding-left: 84px; }
+[data-workspace-fullscreen].win-electron .side-panel-strip { padding-right: 142px; }
+[data-workspace-fullscreen].linux-electron .side-panel-strip { padding-right: 112px; }
+[data-workspace-fullscreen].win-electron [data-workspace-panel-controls] { right: 142px; }
+[data-workspace-fullscreen].linux-electron [data-workspace-panel-controls] { right: 112px; }

@@ -18,6 +18,11 @@ from pathlib import Path
 
 import pytest
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_ci_surface_tests")
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "ci-surface-tests.py"
 
@@ -63,7 +68,7 @@ def test_script_exists_and_is_executable() -> None:
 
 # Known cross-surface parity guards. Each of these lives in one suite but
 # asserts against the OTHER surface's source, so each MUST stay in the must-run
-# set. Audited 2026-08-06; extend this list when a new guard is added.
+# set. Extend this list when a new guard is added.
 _BACKEND_GUARDS = (
     "test/test_redaction_mirror_parity.py",
     "test/test_theme_css_security.py",
@@ -314,8 +319,7 @@ _OBSERVED_WINDOWS_FAILURES = (
 
 def _ignore_names() -> set[str]:
     names = (
-        ln.split("#", 1)[0].strip()
-        for ln in _IGNORE_LIST.read_text(encoding="utf-8").splitlines()
+        ln.split("#", 1)[0].strip() for ln in _IGNORE_LIST.read_text(encoding="utf-8").splitlines()
     )
     return {n for n in names if n}
 
@@ -331,12 +335,22 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
     conftest's `collect_ignore` branch only executes on Windows, so a parsing
     typo here would silently re-enable a suite that fails at import on win32 and
     would not be caught on a POSIX dev machine. Pin the exact set.
+
+    ``test_harness.py`` left this set when the gateway harness became
+    cross-platform (reader thread instead of ``selectors`` on a pipe, tree kill
+    instead of ``terminate_pgid``); it now runs on the Windows shards.
+
+    ``test_pod_windows_boot.py`` is the one entry here for a reason other than a
+    POSIX assumption: it boots a real pod under Task Scheduler, needs a built
+    ``.venv`` inside the checkout that the shards never create, and costs minutes.
+    Its own dedicated ci.yml job names it on the command line, which bypasses this
+    list by design.
     """
     assert _ignore_names() == {
-        "test_harness.py",
         "test_sandbox_argv.py",
         "test_sandbox_cc_mode.py",
         "test_sandbox_hardlink_scan.py",
+        "test_sandbox_md_notebook_carveout.py",
         "test_sandbox_nested_tier.py",
         "test_pid_lifecycle.py",
         "test_pid_sweep_helpers.py",
@@ -358,6 +372,7 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_file_office_preview.py",
         "test_dashboard_file_io.py",
         "test_dev_fleet_app.py",
+        "test_pod_windows_boot.py",
     }
 
 
@@ -438,14 +453,28 @@ def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
     suite = tmp_path / "t"
     suite.mkdir()
     (suite / "conftest.py").write_text('collect_ignore = ["test_boom.py"]\n', encoding="utf-8")
-    (suite / "test_boom.py").write_text('raise RuntimeError("import-time failure")\n', encoding="utf-8")
+    (suite / "test_boom.py").write_text(
+        'raise RuntimeError("import-time failure")\n', encoding="utf-8"
+    )
     (suite / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
     def run(*target: str) -> int:
         return subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-             "-p", "no:randomly", "--no-cov", *target],
-            cwd=tmp_path, capture_output=True, text=True,
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:randomly",
+                "--no-cov",
+                *target,
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
         ).returncode
 
     assert run(str(suite)) == 0, "recursive collection should honour collect_ignore"

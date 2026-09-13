@@ -1,4 +1,4 @@
-"""Channel-agent per-command trust grants (issue #5231).
+"""Channel-agent per-command trust grants.
 
 ``trust_command`` / ``trust_base`` record agent-scoped patterns via the
 approve endpoint; ``_stream_task`` must auto-approve a subsequent tool call
@@ -133,7 +133,7 @@ def _stub_name_grant_verdict(monkeypatch, refusal):
 
 @pytest.mark.asyncio
 async def test_name_grant_refusal_falls_through_to_interactive_card(monkeypatch):
-    """A matched grant whose program name can no longer be vouched for (e.g.
+    """A matched grant whose program name cannot be vouched for (e.g.
     the file behind a trusted ./deploy.sh was replaced) must NOT auto-approve
     — and must not reject either: the request takes the interactive card."""
     sel_mock = MagicMock()
@@ -350,15 +350,16 @@ async def test_redacted_command_is_never_a_grant_target():
 
     assert stash == [""]
     posts = _approval_posts(ch)
-    assert "**Shell command (allow once):" in posts[0][1]
+    assert "**Shell command (exact text unverified):" in posts[0][1]
     assert "**Running:" not in posts[0][1]
 
 
 @pytest.mark.asyncio
 async def test_transport_redaction_provenance_is_never_a_grant_target():
     """A transport may redact bytes without leaving a marker the channel can
-    rediscover. Its provenance bit is authoritative and must keep the card
-    allow-once-only even when the remaining command looks harmless."""
+    rediscover. Its provenance bit is authoritative and must keep the card off
+    every command-scoped tier even when the remaining command looks harmless.
+    The blanket channel grant is unaffected: it names no command."""
     agent = _make_agent(set())
     stash: list[str] = []
     ch = _make_channel(agent, capture=stash)
@@ -374,7 +375,7 @@ async def test_transport_redaction_provenance_is_never_a_grant_target():
 
     assert stash == [""]
     posts = _approval_posts(ch)
-    assert "**Shell command (allow once):" in posts[0][1]
+    assert "**Shell command (exact text unverified):" in posts[0][1]
     assert "**Running:" not in posts[0][1]
 
 
