@@ -734,9 +734,9 @@ def test_writer_never_emits_a_locale_rendered_identity(_private_warm_home: Path)
     for key in ("gateway_started", "runtime_started"):
         recorded = owner[key]
         assert recorded, "a readable host must record both identities"
-        assert warm._CURRENT_START_ID_RE.match(recorded), (
-            f"{key} is not in the current representation: {recorded!r}"
-        )
+        assert warm._CURRENT_START_ID_RE.match(
+            recorded
+        ), f"{key} is not in the current representation: {recorded!r}"
 
 
 def test_start_ids_comparable_allows_only_the_current_representation():
