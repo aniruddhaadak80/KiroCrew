@@ -775,7 +775,7 @@ class TestLogsCmdOtherSources:
         self, monkeypatch, tmp_path, sel_rec, capsys
     ) -> None:
         """No ``tail(1)`` (Windows ships none): the resolved file is read
-        in-process instead of exec'ing a missing binary (#10291)."""
+        in-process instead of exec'ing a missing binary."""
         monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.UNSUPPORTED)
         monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
         monkeypatch.setattr(shutil, "which", lambda *a, **k: None)

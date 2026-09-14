@@ -2451,7 +2451,7 @@ def _tail_log_file(path: Path, lines: int, follow: bool) -> None:
     Fallback for hosts without ``tail(1)`` (Windows ships none): the caller
     already resolved the exact file, so exec'ing an external binary buys
     nothing over reading it here -- and exec'ing a missing binary fails with
-    a bare FileNotFoundError that reads as a KiroCrew crash (#10291).
+    a bare FileNotFoundError that reads as a Kiro Crew crash.
     """
     with open(path, encoding="utf-8", errors="replace") as fh:
         sys.stdout.write("".join(fh.readlines()[-lines:] if lines > 0 else []))
@@ -2574,7 +2574,7 @@ def _logs_cmd(args: argparse.Namespace) -> None:
             sys.exit(1)
     if shutil.which("tail") is None:
         # No tail(1) on this host (Windows ships none): read the resolved
-        # file in-process instead of exec'ing a missing binary (#10291).
+        # file in-process instead of exec'ing a missing binary.
         _tail_log_file(fallback, lines, follow)
         return
     cmd = ["tail", "-n", str(lines)]
