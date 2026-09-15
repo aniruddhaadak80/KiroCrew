@@ -1072,6 +1072,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.selectable-models",
+    "label": "Selectable Models",
+    "labelKey": "pages.settings.chatPanel.selectable_models",
+    "description": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "dashboard.model_picker_hidden_models",
+    "settingId": "chat.selectable-models"
+  },
+  {
     "id": "chat.send-shortcut",
     "label": "Send shortcut",
     "labelKey": "pages.settings.chatPanel.send_shortcut",
@@ -1282,6 +1293,52 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "connections.client-id",
+    "label": "Client ID",
+    "labelKey": "pages.settings.connectionsPanel.client_id",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "connections.client-secret",
+    "label": "Client secret",
+    "labelKey": "pages.settings.connectionsPanel.client_secret",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "connections.client-secret-2",
+    "label": "Client secret",
+    "labelKey": "pages.settings.connectionsPanel.client_secret",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 2
+  },
+  {
+    "id": "connections.oauth-client-github",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "GitHub",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-github",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-asana",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Asana",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-asana",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
     "id": "developer.chat-on-a-crew",
     "label": "Chat on a crew",
     "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
@@ -1304,6 +1361,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Developer Mode",
     "labelKey": "pages.settings.developerPanel.developer_mode",
     "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.remote-instance-sessions",
+    "label": "Remote instance sessions",
+    "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
+    "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1

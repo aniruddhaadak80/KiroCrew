@@ -105,6 +105,14 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Member capability editor responses",
+        "agent_capabilities.py",
+        "Owner-facing capability rows, Parent-change previews and impact summaries. "
+        "safe_view applies redact_via_context before serialization and masks credential "
+        "map values while preserving their structure. Retained secret values and "
+        "source-content digests remain server-side.",
+    ),
+    (
         "Memory recovery responses",
         "dashboard/handlers/memory_admin.py",
         "Retired episode text and supersession references, plus backup and restore "
@@ -377,6 +385,36 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "conversation_log.search_sessions directly, bypassing the "
         "/api/sessions/search handler where the local redaction normally runs, "
         "so the same title/snippet scrub is applied here.",
+    ),
+    (
+        "Peer live-session list",
+        "dashboard/handlers_instances.py",
+        "Rows returned by GET /api/instances/{id}/chat-slots, straight to the "
+        "browser's Sessions list. A second, distinct boundary in this module from "
+        "the federated search above: these are a connected peer's OPEN session "
+        "titles, and a title is MODEL-AUTHORED text produced on the other machine. "
+        "The local half of that same list has its title scrubbed by "
+        "dashboard/slot_projection.py before it renders, so a peer row forwarded "
+        "as-sent would be the one row in a merged list whose text never met a "
+        "redactor. Allowlist-reshaped to the fields the sidebar reads, then every "
+        "string run through the peer-text sink (scrub before clamp, so a "
+        "credential cannot survive by sitting past the length limit).",
+    ),
+    (
+        "Adopted peer transcript",
+        "dashboard/remote_adopt.py",
+        "A peer session's whole HISTORY, copied into a local slot when the user "
+        "opens that session here (POST /api/chat/slots with adopt_remote_slot). A "
+        "third boundary distinct from the two above, and the widest: those forward "
+        "one row's metadata, this one copies every message BODY the other machine "
+        "produced — model output, tool calls and their results — and PERSISTS it "
+        "into this hub's own transcript file, where later readers cannot tell it "
+        "came from a peer. Every role is scrubbed, user text included: the local "
+        "rule leaves user-authored text raw because its author is its only reader, "
+        "which stops being true once the text arrives over a wire. Row meta goes "
+        "through the deep scrub as well, because that is where tool payloads live. "
+        "The inherited agent, title and memory_mode take the same pass before they "
+        "land on the slot.",
     ),
     (
         "Profile artifact",
@@ -1849,6 +1887,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # (an internal model field). The egress boundary is the dashboard API
         # handler that serializes hooks via to_dict() — already a registered sink.
         "hooks.py",
+        # Helper, not a boundary: `redact_oauth_client_secrets` /
+        # `restore_redacted_oauth_client_secrets` are pure functions over an agent
+        # spec dict that mask (and, on the write-back, un-mask) a pre-registered
+        # Connections client's `oauth.clientSecret`. Nothing leaves the process
+        # here; the egress boundaries are the two dashboard reads that CALL the
+        # masker -- `GET /api/agent/config` and `GET /api/agents/detail/{name}`
+        # in `dashboard/handlers/agents.py`, an already-registered sink.
+        "mcp_utils.py",
     }
 )
 

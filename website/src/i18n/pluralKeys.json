@@ -1,4 +1,7 @@
 [
+  "pages.overview.vectorMemoryCard.repair_deferred",
+  "pages.overview.vectorMemoryCard.repair_invalidation",
+  "pages.overview.vectorMemoryCard.repair_vectors",
   "app.n_more",
   "app.notification_count",
   "app.show_more_apps",
@@ -114,6 +117,7 @@
   "components.skillBrowserModal.file",
   "components.webPreviewPanel.annotate_clear_confirm",
   "components.webPreviewPanel.annotations_count",
+  "crewCapabilities.memberChanged",
   "pages.aidlc.taskDetailPanel.task_2",
   "pages.appsPage.agent",
   "pages.appsPage.app",
@@ -146,6 +150,7 @@
   "pages.chatSidebar.day",
   "pages.chatSidebar.more_pull_request_in_this_session",
   "pages.chatSidebar.more_pull_request_or_issue_in_this_session",
+  "pages.chatSidebar.remote_sessions_not_shown_in_board_view",
   "pages.chatSidebar.running_session",
   "pages.chatSidebar.session",
   "pages.chatSidebar.session_failed_to_switch",

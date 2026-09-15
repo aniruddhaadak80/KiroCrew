@@ -240,17 +240,32 @@ DEFAULT_SEARCH_PROXY_TIMEOUT_SECS: float = 6.0
 SEARCH_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
 
 # Timeout (secs) for one peer capability read over an already-open tunnel (GET
-# the peer's /api/version, /api/agents, /api/models, /api/effort-levels or
-# /api/workspaces — no SSH spawn). Larger than the token probe (2s) because the
-# peer does real work for some of these (the model list can round-trip to its
-# own provider), and kept as short as that work allows because a capability read
-# blocks a chat header from rendering: a user watching an empty model picker is
-# better served by a fast "peer did not answer" than by a long wait. It is the
-# one peer budget ABOVE the federated-search timeout (6s), which fans out reads
-# that a partial result set can absorb; a missing capability read has no partial
-# form — the picker is simply empty — so it is the one worth waiting out.
-# The reads run concurrently, so this is the worst-case latency for the set.
+# the peer's /api/version, /api/agents, /api/effort-levels or /api/workspaces —
+# no SSH spawn; /api/models carries its own larger budget below). Larger than
+# the token probe (2s) because the peer does real work for some of these, and
+# kept as short as that work allows because a capability read blocks a chat
+# header from rendering: a user watching an empty picker is better served by a
+# fast "peer did not answer" than by a long wait. It sits above the
+# federated-search timeout (6s), which fans out reads that a partial result set
+# can absorb; a missing capability read has no partial form — the picker is
+# simply empty — so it is the one worth waiting out.
+# The reads run concurrently, so the slowest budget in the set is the
+# worst-case latency for the whole aggregated reply.
 DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
+
+# Timeout (secs) for the peer's /api/models capability read specifically. The
+# other four reads answer from state the peer already holds, but the model list
+# is the one read whose COLD path runs real subprocess work on the peer: up to
+# 5s of sandbox-backend detection plus up to 10s of `kiro-cli chat
+# --list-models` before the first reply is cached, ~15s worst case end to end.
+# Budgeting it at the shared 8s guarantees the cold read is killed by this side
+# while the peer's own bounded work is still running, and the aggregator then
+# reports `capability_unreachable` for a peer that is healthy — the model
+# picker of every fresh remote-bound chat opens empty. 20s clears the
+# peer's worst case with margin without turning a genuinely dead tunnel into a
+# minute-long hang; the reads run concurrently, so the four cheap reads still
+# settle at 8s and only the model list waits this long.
+DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS: float = 20.0
 
 # Byte ceiling for one peer capability reply, enforced BEFORE JSON decoding for
 # the same reason as the search cap above. Sized for the largest honest payload
@@ -258,6 +273,29 @@ DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
 # tens of KiB each even on a heavily-configured gateway, so 2 MiB only ever
 # bites on a hostile or broken peer.
 CAPABILITY_REPLY_MAX_BYTES: int = 2 * 1024 * 1024
+
+# Byte ceiling for one peer's live-slots reply, enforced BEFORE JSON decoding for
+# the same reason as the two caps above. The peer answers with a full slot
+# projection per OPEN session — a few KiB each — so even a gateway holding a
+# hundred open sessions lands well under 1 MiB; 4 MiB only ever bites on a
+# hostile or broken peer.
+#
+# Its OWN constant rather than borrowing CAPABILITY_REPLY_MAX_BYTES, and 4 MiB
+# rather than that cap's 2 MiB, because the two bound different payload SHAPES —
+# which is the same split that already separates the two caps above. A capability
+# reply is fixed-shape: one agent roster, one model list, sized by how the peer is
+# configured and not by how much it is being used. This reply and the federated
+# search one are UNBOUNDED-CARDINALITY lists — N open sessions, N search hits —
+# whose honest size scales with a peer's workload, so they carry the looser bound
+# and the search cap's 4 MiB is the precedent this follows.
+#
+# Sharing one constant across endpoints that differ that way is the actual hazard:
+# each of these comments records the specific honest payload its number was sized
+# against, and one symbol cannot hold three such rationales. A later change
+# raising the capability cap for a grown model list would silently loosen this
+# read too, and tightening this one after a memory incident would break the model
+# picker — neither of which the changing author would see.
+PEER_SLOTS_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
 
 
 # Accepted shape for a dashboard-token lifetime: a positive integer of at most

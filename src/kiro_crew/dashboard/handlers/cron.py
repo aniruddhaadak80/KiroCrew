@@ -50,6 +50,7 @@ from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.project_scope import scope_selector_is_inadmissible
 from kiro_crew.secrets import SecretVault
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import (
@@ -2042,6 +2043,38 @@ def _is_temporary_transcript(persisted_mode: str) -> bool:
     return persisted_mode == "temporary"
 
 
+async def _headless_mode_refusal(
+    state: DashboardState,
+    sk: str,
+    operation: str,
+    blocks_mode: Callable[[str], bool],
+) -> web.Response | None:
+    """Enforce the admitted mode without consulting a replacement parent."""
+    from kiro_crew.dashboard.handlers._shared import resolve_session_memory_mode
+    from kiro_crew.workflow_memory import WorkflowMemoryError
+
+    try:
+        mode = await resolve_session_memory_mode(state, sk)
+        if not blocks_mode(mode):
+            return None
+    except (OSError, ValueError, WorkflowMemoryError):
+        pass  # Unknown birth policy is not permission to access memory.
+    _sel().log_api_access(
+        caller=sk,
+        operation=operation,
+        outcome="denied",
+        source="dashboard",
+        resources="restricted_session_mode",
+    )
+    return web.json_response(
+        {
+            "error": "Memory access is not allowed in this session mode.",
+            "code": "restricted_session",
+        },
+        status=403,
+    )
+
+
 async def _recognize_session(
     state: DashboardState,
     sk: str,
@@ -2094,6 +2127,23 @@ async def _recognize_session(
     slot_name = sk.split(":", 1)[-1] if ":" in sk else sk
     in_slots = slot_name in state._slots
     in_restricted = sk in state._restricted_keys
+    # Headless callers have no slot. A namespace only selects this lookup:
+    # recognition still requires the FULL key's live owner. Dashboard/archive
+    # callers keep their persisted-mode check even if a provider remains alive.
+    # Dedicated children use SessionManager; shared children own runtime handles
+    # through SubagentManager. Neither a saved run nor its parent's PID suffices.
+    # Private proof/store authorization and restricted-mode gates stay separate.
+    sessions = getattr(state, "sessions", None)
+    subagents = getattr(state, "subagents", None)
+    in_live_session = (
+        sk.startswith(("subagent:", "wf:", "wf-pool:", "wf-unpooled:", "wf-worker:", "wf-author:"))
+        and sessions is not None
+        and sessions.has_session(sk) is True
+    ) or (subagents is not None and subagents.has_live_shared_session(sk) is True)
+    if in_live_session:
+        refusal = await _headless_mode_refusal(state, sk, operation, blocks_persisted_mode)
+        if refusal is not None:
+            return refusal
     # A channel-originated session (Slack, Telegram, Discord, Webex,
     # WeCom, …) is a legitimate established session: its key is namespaced
     # ``{channel}:{conversation_id}`` and the transport publishes
@@ -2129,7 +2179,7 @@ async def _recognize_session(
     # hop. One composed call answers BOTH questions (does the session
     # exist, and may it touch memory) from a single path resolution, so the
     # two decisions can never be made about different files.
-    if not (in_slots or in_restricted or is_channel_ns):
+    if not (in_slots or in_restricted or is_channel_ns or in_live_session):
         exists, persisted_mode = await asyncio.to_thread(_probe_persisted_session, slot_name)
         if not exists:
             # Slot may have been evicted from memory (idle sweep,
@@ -2204,6 +2254,14 @@ async def _recognize_session(
             outcome="allowed",
             source="dashboard",
             resources="restricted_key",
+        )
+    elif in_live_session:
+        _sel().log_api_access(
+            caller=sk,
+            operation=operation,
+            outcome="allowed",
+            source="dashboard",
+            resources="live_session",
         )
     else:  # is_channel_ns
         _sel().log_api_access(
@@ -2519,6 +2577,44 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     if not rule_sub:
         return web.json_response({"error": "rule substring required"}, status=400)
     scope = body.get("scope", "global")
+    # Optional repo_scope discriminator. A lesson's identity is the pair
+    # ``(rule, repo_scope)``: a scoped row and a same-rule global row are two
+    # distinct lessons, and this selector decides which of them the delete
+    # reaches. This is a DIFFERENT axis from the legacy ``scope`` selector
+    # above (global/workspace tier), so it is a distinct body field.
+    #
+    # Absent key -> not selective: scope stays out of the match and every
+    # substring hit is removed, so an existing client is unaffected and no
+    # stored row migrates. Present key -> selective, including an empty or
+    # whitespace-only string, which targets the unscoped (global) rows.
+    # ``sentinel`` distinguishes the two: ``body.get(..., sentinel)`` cannot
+    # collapse a present empty string into "absent" the way ``or None`` would.
+    #
+    # A present value is refused unless it is a string: coercing a JSON null
+    # to "" would silently turn "no selector" into "delete the global rows".
+    # A nonempty selector the write surface would refuse (a bare "/", an
+    # absolute path, a dot segment) is refused for the mirror reason -- no
+    # admissibly stored row carries it, so canonical folding would land the
+    # delete on rows the caller never named.
+    _no_scope_key = object()
+    _rs = body.get("repo_scope", _no_scope_key)
+    if _rs is _no_scope_key:
+        repo_scope = None
+    elif not isinstance(_rs, str):
+        return web.json_response(
+            {"error": "repo_scope must be a string", "code": "repo_scope_not_string"},
+            status=400,
+        )
+    elif scope_selector_is_inadmissible(_rs):
+        return web.json_response(
+            {
+                "error": "repo_scope does not name a usable scope",
+                "code": "repo_scope_inadmissible",
+            },
+            status=400,
+        )
+    else:
+        repo_scope = _rs
     # Delete from vector store if active, else JSONL
     # THE CALLER'S silo, not the global store. This is the agent's only durable
     # memory-write surface, so writing globally let a crew bound to one silo steer
@@ -2543,14 +2639,14 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     # and the store is a real union now that it is resolved per caller instead of
     # arriving untyped from the global getter.
     if vs and vs_lessons:
-        ok = await asyncio.to_thread(vs.delete_lesson, rule_sub)
+        ok = await asyncio.to_thread(vs.delete_lesson, rule_sub, repo_scope)
     else:
         store = _lesson_jsonl_store(state, _lesson_silo, scope, body.get("workspace"))
         # Off the loop. remove() now takes the store's shared lock, which a worker
         # thread can be holding across file I/O for a concurrent save_or_enrich --
         # so calling it inline would let one lessons write stall every task on the
         # event loop. Same reason api_lessons_create offloads its write.
-        ok = await asyncio.to_thread(store.remove, rule_sub)
+        ok = await asyncio.to_thread(store.remove, rule_sub, repo_scope)
     if ok:
         state.push_refresh("lessons")
     return web.json_response({"ok": ok})
@@ -2807,7 +2903,18 @@ async def api_cron_folders_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# The most lessons ``GET /api/lessons`` returns. Both branches of the handler
+# apply it, so the vector-store and JSONL tiers cannot disagree about the cap.
+LESSON_LIST_LIMIT = 50
+
+
 async def api_lessons(request: web.Request) -> web.Response:
+    """GET /api/lessons — up to ``LESSON_LIST_LIMIT`` lessons, oldest-first.
+
+    The vector tier selects its newest rows. The JSONL tier appends workspace
+    rows after global rows before truncating, so a workspace union is not
+    strictly the newest rows across both stores.
+    """
     state: DashboardState = request.app["state"]
     # Block lesson reads only for temporary sessions (blocks_reads=True).
     # Incognito sessions can read lessons (memory context is already injected).
@@ -2860,7 +2967,15 @@ async def api_lessons(request: web.Request) -> web.Response:
         else _get_memory(state)
     )
     vs = _lesson_mem.vector_store
-    vs_lessons = await asyncio.to_thread(vs.get_lessons) if vs else None
+    # Bounded in SQL rather than sliced afterwards. ``get_lessons()`` orders
+    # ``updated_at DESC``, so the tail-slice idiom the JSONL branch below uses --
+    # correct there, because ``load_all()`` returns file append order -- selected
+    # the OLDEST rows here and hid every recent lesson: a lesson saved through
+    # ``learn_add`` was absent from the very next ``learn_list``, which reads as a
+    # silently failed write. Passing the cap to the store keeps the ordering and
+    # the limit in one place and stops the read from materializing every lesson
+    # row (embedding blobs included) to discard all but the newest handful.
+    vs_lessons = await asyncio.to_thread(vs.get_lessons, LESSON_LIST_LIMIT) if vs else None
     if vs_lessons:
         # Deferred import: ``vector_memory`` pulls snowballstemmer plus the
         # optional numpy/faiss imports, and this helper is the handler's only
@@ -2868,7 +2983,11 @@ async def api_lessons(request: web.Request) -> web.Response:
         from kiro_crew.vector_memory import _lesson_display_text
 
         data = []
-        for e in vs_lessons[-50:]:
+        # Oldest-first, so both branches of this endpoint answer in the same
+        # order. Consumers rely on it: the Memory tab takes its recent rows from
+        # the TAIL of this list, so a newest-first response would show the oldest
+        # of the capped window there.
+        for e in reversed(vs_lessons):
             try:
                 decoded = json.loads(e["value_json"])
             except (json.JSONDecodeError, TypeError):
@@ -2898,7 +3017,7 @@ async def api_lessons(request: web.Request) -> web.Response:
                 for le in ws_lessons:
                     if le.rule.lower().strip() not in seen:
                         rows.append(le)
-        data = [_safe_lesson(le.rule, le.category, le.ts) for le in rows[-50:]]
+        data = [_safe_lesson(le.rule, le.category, le.ts) for le in rows[-LESSON_LIST_LIMIT:]]
     return web.json_response({"lessons": data})
 
 

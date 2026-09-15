@@ -1202,6 +1202,8 @@ class SubagentInfo:
     # record, and the handler answers 429 from that absence.
     error_code: str = ""
     parent_session_key: str = ""
+    memory_mode: str = field(default="persistent", kw_only=True)
+    _memory_mode_ready: bool = field(default=True, init=False, repr=False)
     agent: str = ""
     # The app that spawned this child (empty for a non-app spawn). Persisted so
     # the child's per-tool-call gate can resolve the app's Level-2 profile, not
@@ -1629,8 +1631,10 @@ class SubagentManager:
         on_orphan_dm: Callable[[str], Awaitable[bool]] | None = None,
         completion_keep: str = "head",
         completion_keep_chars: int = COMPLETION_KEEP_DEFAULT_CHARS,
+        memory_mode_for_session: Callable[[str], str] | None = None,
     ):
         self._sessions = sessions
+        self._memory_mode_for_session = memory_mode_for_session
         self._ctx_builder = ctx_builder
         self._on_done = on_done
         self._max_concurrent = max_concurrent
@@ -2246,6 +2250,43 @@ class SubagentManager:
     def running_count(self) -> int:
         return self._running_count
 
+    @property
+    def pending_work_count(self) -> int:
+        """Return accepted subagent work that a process restart would interrupt.
+
+        ``running_count`` alone stops representing work before shielded terminal
+        delivery finishes, and an unexpected-cancel recovery can be live while
+        holding no concurrency slot. Count the finite manager-owned registries
+        instead, while retaining ``running_count`` as a fail-closed floor for a
+        slot published just before its task registration. The perpetual reaper
+        is maintenance and is deliberately excluded; its one-shot orphan
+        reconciliation is finite delivery work and is included.
+        """
+        live_primary: set[int] = set()
+        for task in self._tasks.values():
+            if not task.done():
+                live_primary.add(id(task))
+
+        pending = len(self._queue) + max(max(0, int(self._running_count)), len(live_primary))
+        seen = set(live_primary)
+        extra_tasks = [*self._report_tasks, *self._followup_watchers.values()]
+        reconcile = getattr(self, "_reconcile_task", None)
+        if reconcile is not None:
+            extra_tasks.append(reconcile)
+        for task in extra_tasks:
+            marker = id(task)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if not task.done():
+                pending += 1
+
+        # A cancelled to_thread state write can outlive its run task. Its done
+        # callback removes this hold, so every entry is finite restart-sensitive
+        # work even though the worker Future has no retained awaitable here.
+        pending += len(self._abandoned_state_writers)
+        return pending
+
     def running_agents_for(self, parent_key: str) -> list[dict]:
         return self._run_events.running_agents_for_impl(parent_key)
 
@@ -2277,6 +2318,7 @@ class SubagentManager:
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _memory_mode: str | None = None,
     ) -> SubagentInfo | None:
         return self._admission.spawn_impl(
             task,
@@ -2302,6 +2344,7 @@ class SubagentManager:
             _agent_prevalidated,
             _from_queue,
             _preassigned_id,
+            _memory_mode=_memory_mode,
         )
 
     async def _safe_announce(self, info: SubagentInfo) -> None:
@@ -2342,9 +2385,18 @@ class SubagentManager:
         max_turns: int = 0,
         cwd: str = "",
         _preassigned_id: str = "",
+        _memory_mode: str | None = None,
     ) -> SubagentInfo | None:
         return self._continuation.continue_conversation_impl(
-            conv_id, task, parent_session_key, agent, model, max_turns, cwd, _preassigned_id
+            conv_id,
+            task,
+            parent_session_key,
+            agent,
+            model,
+            max_turns,
+            cwd,
+            _preassigned_id,
+            _memory_mode=_memory_mode,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:
@@ -2409,6 +2461,29 @@ class SubagentManager:
         """Return currently running (not done) subagents."""
         return [a for a in self._agents.values() if not a.done]
 
+    def has_live_shared_session(self, session_key: str) -> bool:
+        """Recognize a shared child only while its exact runtime handle is live.
+
+        Run records survive completion/restart for display and continuation;
+        they are not session authority. The runtime's queue registry is what
+        destroy() unregisters, even when the parent process keeps running.
+        """
+        for info in self._agents.values():
+            if info.done or info.reaped or not info._session_sharing:
+                continue
+            if (info.conversation_key or f"subagent:{info.id}") != session_key:
+                continue
+            provider = info._shared_provider
+            if not isinstance(provider, AcpSessionProvider):
+                continue
+            runtime, handle = provider._runtime, provider._handle
+            if (
+                runtime.is_alive()
+                and runtime._session_queues.get(handle.session_id) is handle._queue
+            ):
+                return True
+        return False
+
     @property
     def all_agents(self) -> list[SubagentInfo]:
         """Return all tracked subagents (running and done)."""
@@ -2416,6 +2491,9 @@ class SubagentManager:
 
     def batch_members_pending(self, batch_id: str) -> bool:
         return self._waves.batch_members_pending_impl(batch_id)
+
+    def wave_has_live_nested_spawns(self, batch_id: str) -> bool:
+        return self._waves.wave_has_live_nested_spawns_impl(batch_id)
 
     def finalize_batch(self, batch_id: str) -> None:
         return self._waves.finalize_batch_impl(batch_id)
@@ -2481,6 +2559,11 @@ class SubagentManager:
 
     def _queued_depth(self, parent_session_key: str) -> int:
         return self._run_events._queued_depth_impl(parent_session_key)
+
+    @property
+    def queued_count(self) -> int:
+        """Return all not-yet-registered spawns in the stagger queue."""
+        return len(self._queue)
 
     def queued_count_for(self, parent_session_key: str) -> int:
         return self._run_events.queued_count_for_impl(parent_session_key)

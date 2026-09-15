@@ -110,6 +110,44 @@ class TestInboundReplayResolvesItsSpoolWhenScheduled:
             "thread would read (and lock) whatever data home the environment names then"
         )
 
+    @pytest.mark.asyncio
+    async def test_replay_uses_live_slack_client_without_global_registration(
+        self, monkeypatch, tmp_path
+    ):
+        from kiro_crew.messaging import inbound_spool
+        from kiro_crew.slack.transport import SlackTransport
+
+        seen: list[dict[str, object]] = []
+
+        async def _record(*, transports, path=None, now=None):
+            seen.append(dict(transports))
+            return inbound_spool.ReplayReport()
+
+        monkeypatch.setattr(inbound_spool, "replay_spooled", _record)
+        orch = _make_orchestrator(slack_enabled=True, owner_id="U_OWNER")
+        live_client = MagicMock()
+        orch.slack = live_client
+        teams = object()
+        orch.dashboard_state = SimpleNamespace(channel_transports={"teams": teams})
+
+        await orch._replay_spooled_inbound(spool=tmp_path / "refused.jsonl")
+
+        assert len(seen) == 1
+        assert seen[0]["teams"] is teams
+        slack = seen[0]["slack"]
+        assert isinstance(slack, SlackTransport)
+        assert slack.client is live_client
+        assert slack.may_send_to("C1", "1700.0", principal="U_OWNER") is True
+        assert slack.may_send_to("C1", "1700.0", principal="U_REVOKED") is False
+        live_client.ensure_channel_team = AsyncMock()
+        live_client.post_message = AsyncMock(return_value="1701.0")
+        assert await slack.send_message("C1", "notice", "1700.0") == "1701.0"
+        live_client.ensure_channel_team.assert_awaited_once_with("C1")
+        live_client.post_message.assert_awaited_once_with("C1", "notice", "1700.0")
+        assert orch.dashboard_state.channel_transports == {
+            "teams": teams
+        }, "Slack replay must not widen the ordinary shared send registry"
+
 
 # ─── Helper utilities ────────────────────────────────────────────────────
 
@@ -232,11 +270,13 @@ class TestGatewayOrchestratorInit:
         cfg = KiroCrewConfig()
         cfg.slack.allowed_users = [{"slack_id": "U_STALE"}]
         with patch.object(
-            cfg, "load_credentials", return_value={
+            cfg,
+            "load_credentials",
+            return_value={
                 "SLACK_APP_TOKEN": "xapp-t",
                 "SLACK_BOT_TOKEN": "xoxb-t",
                 "KIROCREW_OWNER_ID": "U_OWNER",
-            }
+            },
         ):
             orch = GatewayOrchestrator(cfg)
         assert "U_STALE" not in orch._allowed_users
@@ -304,9 +344,7 @@ class TestOpenDmWithRetry:
         These tests assert the retry COUNT and the final result, never the delay, so
         the 5s this class spent asleep bought no coverage. The retry loop still runs.
         """
-        monkeypatch.setattr(
-            "kiro_crew.slack.retry.asyncio.sleep", AsyncMock(return_value=None)
-        )
+        monkeypatch.setattr("kiro_crew.slack.retry.asyncio.sleep", AsyncMock(return_value=None))
 
     @pytest.mark.asyncio
     async def test_success_first_attempt(self):
@@ -413,10 +451,17 @@ class TestInitServices:
                                     with patch("kiro_crew.slack.gateway.SessionManager"):
                                         with patch("kiro_crew.slack.gateway.HistoryConsolidator"):
                                             with patch("kiro_crew.slack.gateway.ChannelHistory"):
-                                                with patch("kiro_crew.agent.rebuild_agent_config", return_value=Path("/tmp/a")):
+                                                with patch(
+                                                    "kiro_crew.agent.rebuild_agent_config",
+                                                    return_value=Path("/tmp/a"),
+                                                ):
                                                     with patch(
                                                         "asyncio.create_subprocess_exec",
-                                                        new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
+                                                        new=AsyncMock(
+                                                            return_value=_fake_async_proc(
+                                                                stdout=b"kiro-cli 1.30.0"
+                                                            )
+                                                        ),
                                                     ):
                                                         try:
                                                             asyncio.run(orch._init_services())
@@ -454,10 +499,17 @@ class TestInitServices:
                                     with patch("kiro_crew.slack.gateway.SessionManager"):
                                         with patch("kiro_crew.slack.gateway.HistoryConsolidator"):
                                             with patch("kiro_crew.slack.gateway.ChannelHistory"):
-                                                with patch("kiro_crew.agent.rebuild_agent_config", return_value=Path("/tmp/a")):
+                                                with patch(
+                                                    "kiro_crew.agent.rebuild_agent_config",
+                                                    return_value=Path("/tmp/a"),
+                                                ):
                                                     with patch(
                                                         "asyncio.create_subprocess_exec",
-                                                        new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
+                                                        new=AsyncMock(
+                                                            return_value=_fake_async_proc(
+                                                                stdout=b"kiro-cli 1.30.0"
+                                                            )
+                                                        ),
                                                     ):
                                                         try:
                                                             asyncio.run(orch._init_services())
@@ -968,12 +1020,8 @@ class TestCheckForUpdates:
     async def test_no_update_available(self):
         orch = _make_orchestrator()
         orch.dashboard_state = _mock_dashboard_state()
-        with patch(
-            "kiro_crew.dashboard.handlers._do_update_check", new_callable=AsyncMock
-        ):
-            with patch(
-                "kiro_crew.dashboard.handlers._update_info", {"update_available": False}
-            ):
+        with patch("kiro_crew.dashboard.handlers._do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.dashboard.handlers._update_info", {"update_available": False}):
                 await orch._check_for_updates()
 
     @pytest.mark.asyncio
@@ -984,6 +1032,7 @@ class TestCheckForUpdates:
         orch._auto_apply_update = AsyncMock()
         import kiro_crew.dashboard.handlers as _h
         from kiro_crew.platform.governance import UpdatePins
+
         orig = _h._update_info.copy()
         # Create a config with auto_update=False
         fake_cfg = MagicMock()
@@ -1130,9 +1179,7 @@ class TestAutoApplyUpdate:
         proc = AsyncMock()
         proc.communicate = AsyncMock(return_value=(b"feat/test\n", b""))
         proc.returncode = 0
-        with patch.dict(
-            "os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}, clear=False
-        ):
+        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}, clear=False):
             with patch(
                 "asyncio.create_subprocess_exec",
                 new_callable=AsyncMock,
@@ -1172,9 +1219,7 @@ class TestBrazilInstallAndDeps:
         orch = _make_orchestrator()
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
-                with patch.object(
-                    GatewayOrchestrator, "_is_brazil_install", return_value=True
-                ):
+                with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=True):
                     asyncio.run(orch._check_missing_deps())  # should not raise, skips pip
 
     # --- _check_console_script -------------------------------------------------
@@ -1199,7 +1244,9 @@ class TestBrazilInstallAndDeps:
         orch = _make_orchestrator()
         with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": str(tmp_path)}, clear=False):
             with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=False):
-                with patch.object(gw, "sandboxed_spawn_argv_async", new_callable=AsyncMock) as spawn:
+                with patch.object(
+                    gw, "sandboxed_spawn_argv_async", new_callable=AsyncMock
+                ) as spawn:
                     asyncio.run(orch._check_console_script())
         spawn.assert_not_awaited()
 
@@ -1305,9 +1352,7 @@ class TestBrazilInstallAndDeps:
                 "sandboxed_spawn_argv_async",
                 side_effect=unavailable,
             ):
-                with patch.object(
-                    gw, "create_subprocess_limited", new_callable=AsyncMock
-                ) as spawn:
+                with patch.object(gw, "create_subprocess_limited", new_callable=AsyncMock) as spawn:
                     with patch.object(gw.logger, "error") as log_error:
                         asyncio.run(orch._check_console_script())
 
@@ -1487,11 +1532,23 @@ class TestInitCron:
         mock_cs_inst.start_reaper.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_cron_callback_single_agent(self):
-        """Cron callback runs single-agent path."""
+    async def test_cron_callback_single_agent(self, tmp_path, monkeypatch):
+        """Cron callback admits policy before the first model allocation."""
+        from kiro_crew.subagent_persistence import read_session_memory_mode
+
+        monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", tmp_path / "subagents")
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
         orch.sessions = _mock_sessions()
+        acquire = orch.sessions.get_or_create
+
+        async def checked_acquire(key, **kwargs):
+            assert read_session_memory_mode(key) == "persistent"
+            assert orch.ctx_builder._session_memory_modes[key] == "persistent"
+            return await acquire(key, **kwargs)
+
+        orch.sessions.get_or_create = AsyncMock(side_effect=checked_acquire)
         orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder._session_memory_modes = {}
         orch.ctx_builder.build_message = MagicMock(return_value=("full msg", None))
         orch.ctx_builder.hooks = MagicMock()
         orch.subagent_mgr = MagicMock()
@@ -1544,7 +1601,10 @@ class TestInitCron:
             new_callable=AsyncMock,
             return_value="cron result",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:j1", "run task")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:j1", "run task"),
+            ):
                 result = await callback(job)
 
         assert result == "cron result"
@@ -2010,7 +2070,10 @@ class TestInitCron:
             new_callable=AsyncMock,
             return_value="stable output",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:j2", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:j2", "run"),
+            ):
                 with patch("kiro_crew.sel.sel") as mock_sel:
                     mock_sel.return_value.log_tool_invocation = MagicMock()
                     result = await callback(job)
@@ -2074,7 +2137,10 @@ class TestInitCron:
             new_callable=AsyncMock,
             return_value="silent result",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:j3", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:j3", "run"),
+            ):
                 with patch("kiro_crew.sel.sel") as mock_sel:
                     mock_sel.return_value.log_tool_invocation = MagicMock()
                     result = await callback(job)
@@ -2152,14 +2218,20 @@ class TestInitSubagents:
         info = SubagentInfo(id="a1", task="t", parent_session_key="dashboard:s1")
         # Batch: two spawns + one done inside the 0.2s window -> one push.
         await on_event("subagent_spawn", info, {})
-        await on_event("subagent_spawn", SubagentInfo(id="a2", task="t", parent_session_key="dashboard:s1"), {})
+        await on_event(
+            "subagent_spawn", SubagentInfo(id="a2", task="t", parent_session_key="dashboard:s1"), {}
+        )
         await on_event("subagent_done", info, {"elapsed": 1.0})
         assert orch.dashboard_state.push_slots_update.call_count == 0  # debounced, not yet flushed
         await asyncio.sleep(0.3)
         assert orch.dashboard_state.push_slots_update.call_count == 1
 
         # A later lifecycle event schedules a fresh push.
-        await on_event("subagent_done", SubagentInfo(id="a2", task="t", parent_session_key="dashboard:s1"), {"elapsed": 1.0})
+        await on_event(
+            "subagent_done",
+            SubagentInfo(id="a2", task="t", parent_session_key="dashboard:s1"),
+            {"elapsed": 1.0},
+        )
         await asyncio.sleep(0.3)
         assert orch.dashboard_state.push_slots_update.call_count == 2
 
@@ -2441,7 +2513,10 @@ class TestNotifyNudgeExpired:
         import kiro_crew.autonudge as _an
         from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
 
-        for outcome, expect_no_action in ((MonitorOutcome.SUCCESS, True), (MonitorOutcome.BLOCKED, False)):
+        for outcome, expect_no_action in (
+            (MonitorOutcome.SUCCESS, True),
+            (MonitorOutcome.BLOCKED, False),
+        ):
             loop = self._loop()
             # NOT capped: the cap branch outranks the terminal one, so a 24-of-24
             # loop would exercise the wrong case entirely.
@@ -2540,9 +2615,7 @@ class TestInitDashboard:
 
     def test_init_mcp_discovery_handles_error(self):
         orch = _make_orchestrator()
-        with patch(
-            "kiro_crew.mcp_discovery.list_servers", side_effect=RuntimeError("fail")
-        ):
+        with patch("kiro_crew.mcp_discovery.list_servers", side_effect=RuntimeError("fail")):
             orch._init_mcp_discovery()  # should not raise
 
 
@@ -2640,7 +2713,10 @@ class TestCronFailurePaths:
             new_callable=AsyncMock,
             side_effect=RuntimeError("boom"),
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:jfail", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:jfail", "run"),
+            ):
                 with patch("kiro_crew.sel.sel") as mock_sel:
                     mock_sel.return_value.log_tool_invocation = MagicMock()
                     with pytest.raises(RuntimeError, match="boom"):
@@ -2710,7 +2786,10 @@ class TestCronFailurePaths:
             new_callable=AsyncMock,
             side_effect=RuntimeError("boom"),
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:jfail2", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:jfail2", "run"),
+            ):
                 with patch("kiro_crew.sel.sel") as mock_sel:
                     mock_sel.return_value.log_tool_invocation = MagicMock()
                     with pytest.raises(RuntimeError, match="boom"):
@@ -2776,7 +2855,10 @@ class TestCronFailurePaths:
             new_callable=AsyncMock,
             return_value="agent result",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:jmulti", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:jmulti", "run"),
+            ):
                 result = await callback(job)
 
         assert result == "agent result"
@@ -2801,12 +2883,8 @@ class TestRunGateway:
         with patch.object(cfg, "load_credentials", return_value={}):
             # The aggregate-cgroup-ceiling apply shells out to systemctl —
             # a host-service mutation the rootdir guard refuses; stub it.
-            with patch(
-                "kiro_crew.slack.gateway.ensure_agents_slice_limits", return_value=True
-            ):
-                with patch.object(
-                    GatewayOrchestrator, "run", new_callable=AsyncMock
-                ) as mock_run:
+            with patch("kiro_crew.slack.gateway.ensure_agents_slice_limits", return_value=True):
+                with patch.object(GatewayOrchestrator, "run", new_callable=AsyncMock) as mock_run:
                     await run_gateway(cfg, no_dashboard=True, no_crons=True)
         mock_run.assert_awaited_once()
 
@@ -2982,24 +3060,25 @@ class TestAutoApplyUpdateGitPath:
         instead of the sequence it covers. A test about the resolver itself
         patches it again explicitly, and that inner patch wins.
         """
-        with patch(
-            "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="",
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.commits_ahead", return_value=0
-        ), patch(
-            "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
-            return_value="/trusted/bin/git",
-        ), patch(
-            # The interpreter-floor gate reads the pinned commit with a real
-            # `git show`; against a non-repo that read FAILS, and a failed read
-            # refuses (its own tests are in TestAutoApplyUpdateResetPath).
-            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
-            return_value=None,
+        with (
+            patch("kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="",
+            ),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=True),
+            patch("kiro_crew.slack.gateway.commits_ahead", return_value=0),
+            patch(
+                "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
+                return_value="/trusted/bin/git",
+            ),
+            patch(
+                # The interpreter-floor gate reads the pinned commit with a real
+                # `git show`; against a non-repo that read FAILS, and a failed read
+                # refuses (its own tests are in TestAutoApplyUpdateResetPath).
+                "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+                return_value=None,
+            ),
         ):
             yield
 
@@ -3078,7 +3157,10 @@ class TestRunMethod:
                     with patch("kiro_crew.slack.interactions.init"):
                         with patch("kiro_crew.slack.events.SeenCache"):
                             with patch("kiro_crew.session.cleanup_orphaned_sessions"):
-                                with patch("kiro_crew.dashboard.handlers._bg_mcp_probe", new_callable=AsyncMock):
+                                with patch(
+                                    "kiro_crew.dashboard.handlers._bg_mcp_probe",
+                                    new_callable=AsyncMock,
+                                ):
                                     with patch("os._exit"):
                                         with patch("resource.getrlimit", return_value=(256, 10240)):
                                             with patch("resource.setrlimit"):
@@ -3153,9 +3235,7 @@ class TestRunMethod:
                                     new_callable=AsyncMock,
                                 ):
                                     with patch("os._exit"):
-                                        with patch(
-                                            "resource.getrlimit", return_value=(256, 10240)
-                                        ):
+                                        with patch("resource.getrlimit", return_value=(256, 10240)):
                                             with patch("resource.setrlimit"):
                                                 await orch.run()
         finally:
@@ -3168,9 +3248,7 @@ class TestRunMethod:
         assert not pid_marker.exists()
 
     @pytest.mark.asyncio
-    async def test_run_stalled_marker_write_does_not_block_shutdown(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_run_stalled_marker_write_does_not_block_shutdown(self, tmp_path, monkeypatch):
         """A hung marker write times out; the marker is cleared and _shutdown runs.
 
         Regression: an unbounded ``await self._marker_write_task`` sat before
@@ -3237,9 +3315,7 @@ class TestRunMethod:
                                     new_callable=AsyncMock,
                                 ):
                                     with patch("os._exit"):
-                                        with patch(
-                                            "resource.getrlimit", return_value=(256, 10240)
-                                        ):
+                                        with patch("resource.getrlimit", return_value=(256, 10240)):
                                             with patch("resource.setrlimit"):
                                                 await orch.run()
         finally:
@@ -3317,9 +3393,7 @@ class TestRunMethod:
                                     new_callable=AsyncMock,
                                 ):
                                     with patch("os._exit"):
-                                        with patch(
-                                            "resource.getrlimit", return_value=(256, 10240)
-                                        ):
+                                        with patch("resource.getrlimit", return_value=(256, 10240)):
                                             with patch("resource.setrlimit"):
                                                 await orch.run()
         finally:
@@ -3426,7 +3500,10 @@ class TestCronSuccessReminder:
             new_callable=AsyncMock,
             return_value="same output",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:j_remind", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:j_remind", "run"),
+            ):
                 result = await callback(job)
 
         # Should have posted (reminder path)
@@ -3492,7 +3569,9 @@ class TestSubagentDone:
         info.elapsed = 5.0
         info.started = 0.0
 
-        with patch("kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock, return_value=None):
+        with patch(
+            "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock, return_value=None
+        ):
             await on_done(info)
 
         orch.dashboard_state.notify.assert_not_called()
@@ -3895,24 +3974,25 @@ class TestAutoApplyUpdateVenvPath:
         instead of the sequence it covers. A test about the resolver itself
         patches it again explicitly, and that inner patch wins.
         """
-        with patch(
-            "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="",
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.commits_ahead", return_value=0
-        ), patch(
-            "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
-            return_value="/trusted/bin/git",
-        ), patch(
-            # The interpreter-floor gate reads the pinned commit with a real
-            # `git show`; against a non-repo that read FAILS, and a failed read
-            # refuses (its own tests are in TestAutoApplyUpdateResetPath).
-            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
-            return_value=None,
+        with (
+            patch("kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="",
+            ),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=True),
+            patch("kiro_crew.slack.gateway.commits_ahead", return_value=0),
+            patch(
+                "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
+                return_value="/trusted/bin/git",
+            ),
+            patch(
+                # The interpreter-floor gate reads the pinned commit with a real
+                # `git show`; against a non-repo that read FAILS, and a failed read
+                # refuses (its own tests are in TestAutoApplyUpdateResetPath).
+                "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+                return_value=None,
+            ),
         ):
             yield
 
@@ -3935,7 +4015,10 @@ class TestAutoApplyUpdateVenvPath:
                         with patch.object(
                             GatewayOrchestrator, "_is_brazil_install", return_value=False
                         ):
-                            with patch("kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock):
+                            with patch(
+                                "kiro_crew.slack.gateway.build_frontend_async",
+                                new_callable=AsyncMock,
+                            ):
                                 with patch("os.execv", side_effect=OSError("test")):
                                     with patch("shutil.which", return_value=None):
                                         await orch._auto_apply_update()
@@ -4337,11 +4420,15 @@ class TestStartEmbeddings:
         orch = _make_orchestrator()
         orch.vector_memory = MagicMock(embed_fn=None, embed_fn_factory=None)
         fake_embed_fn = lambda text: [0.1]  # noqa: E731
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=True), \
-             patch("kiro_crew.slack.gateway.make_sync_embed_fn",
-                   return_value=fake_embed_fn) as mock_make, \
-             patch("kiro_crew.slack.gateway.start_background_model_download",
-                   return_value=None) as mock_start:
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=True),
+            patch(
+                "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=fake_embed_fn
+            ) as mock_make,
+            patch(
+                "kiro_crew.slack.gateway.start_background_model_download", return_value=None
+            ) as mock_start,
+        ):
             await orch._start_embeddings()
         # Factory wired unconditionally (lazy rebind), fn bound immediately.
         assert orch.vector_memory.embed_fn_factory is mock_make
@@ -4354,9 +4441,12 @@ class TestStartEmbeddings:
         orch = _make_orchestrator()
         orch.vector_memory = MagicMock(embed_fn=None, embed_fn_factory=None)
         fake_task = MagicMock()
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=False), \
-             patch("kiro_crew.slack.gateway.start_background_model_download",
-                   return_value=fake_task) as mock_start:
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=False),
+            patch(
+                "kiro_crew.slack.gateway.start_background_model_download", return_value=fake_task
+            ) as mock_start,
+        ):
             await orch._start_embeddings()
         # embed_fn stays unbound (lazy rebind picks it up once the model lands)
         # but the factory is wired and the background download task is stored.
@@ -4391,20 +4481,22 @@ class TestAutoMigrateMemory:
     @staticmethod
     def _ready_embedder():
         """A shared embedder whose model is loaded (wait_ready -> True)."""
-        return MagicMock(wait_ready=MagicMock(return_value=True), is_ready=MagicMock(return_value=True))
+        return MagicMock(
+            wait_ready=MagicMock(return_value=True), is_ready=MagicMock(return_value=True)
+        )
 
     @pytest.mark.asyncio
     async def test_migrates_when_not_migrated_and_legacy_present(self):
         orch, store = self._orch_with_store(migrated=False)
         set_migrated = AsyncMock()
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=True), patch(
-            "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])
-        ), patch(
-            "kiro_crew.slack.gateway.get_shared_embedder", return_value=self._ready_embedder()
-        ), patch(
-            "kiro_crew.memory.legacy_memory_present", return_value=True
-        ), patch.object(
-            orch, "_set_memory_migrated", set_migrated
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=True),
+            patch("kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])),
+            patch(
+                "kiro_crew.slack.gateway.get_shared_embedder", return_value=self._ready_embedder()
+            ),
+            patch("kiro_crew.memory.legacy_memory_present", return_value=True),
+            patch.object(orch, "_set_memory_migrated", set_migrated),
         ):
             await orch._auto_migrate_memory()
         store.migrate_from_markdown.assert_called_once()
@@ -4421,14 +4513,14 @@ class TestAutoMigrateMemory:
     async def test_skips_migrate_when_already_migrated(self):
         orch, store = self._orch_with_store(migrated=True)
         set_migrated = AsyncMock()
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=True), patch(
-            "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])
-        ), patch(
-            "kiro_crew.slack.gateway.get_shared_embedder", return_value=self._ready_embedder()
-        ), patch(
-            "kiro_crew.memory.legacy_memory_present", return_value=True
-        ), patch.object(
-            orch, "_set_memory_migrated", set_migrated
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=True),
+            patch("kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])),
+            patch(
+                "kiro_crew.slack.gateway.get_shared_embedder", return_value=self._ready_embedder()
+            ),
+            patch("kiro_crew.memory.legacy_memory_present", return_value=True),
+            patch.object(orch, "_set_memory_migrated", set_migrated),
         ):
             await orch._auto_migrate_memory()
         store.migrate_from_markdown.assert_not_called()
@@ -4445,14 +4537,12 @@ class TestAutoMigrateMemory:
         not_ready = MagicMock(
             wait_ready=MagicMock(return_value=False), is_ready=MagicMock(return_value=False)
         )
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=True), patch(
-            "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])
-        ), patch(
-            "kiro_crew.slack.gateway.get_shared_embedder", return_value=not_ready
-        ), patch(
-            "kiro_crew.memory.legacy_memory_present", return_value=True
-        ), patch.object(
-            orch, "_set_memory_migrated", AsyncMock()
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=True),
+            patch("kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])),
+            patch("kiro_crew.slack.gateway.get_shared_embedder", return_value=not_ready),
+            patch("kiro_crew.memory.legacy_memory_present", return_value=True),
+            patch.object(orch, "_set_memory_migrated", AsyncMock()),
         ):
             await orch._auto_migrate_memory()
         not_ready.wait_ready.assert_called_once()
@@ -4462,12 +4552,11 @@ class TestAutoMigrateMemory:
     async def test_fresh_install_no_legacy_still_flips_migrated(self):
         orch, store = self._orch_with_store(migrated=False)
         set_migrated = AsyncMock()
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=True), patch(
-            "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])
-        ), patch(
-            "kiro_crew.memory.legacy_memory_present", return_value=False
-        ), patch.object(
-            orch, "_set_memory_migrated", set_migrated
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=True),
+            patch("kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])),
+            patch("kiro_crew.memory.legacy_memory_present", return_value=False),
+            patch.object(orch, "_set_memory_migrated", set_migrated),
         ):
             await orch._auto_migrate_memory()
         # No legacy → don't parse markdown, but still flip the flag + ack (0 counts).
@@ -4483,17 +4572,17 @@ class TestAutoMigrateMemory:
         # Model absent at migrate time, present after the download task resolves.
         presence = iter([False, False, True, True])
         orch._model_download_task = asyncio.ensure_future(asyncio.sleep(0))
-        with patch(
-            "kiro_crew.slack.gateway.model_file_present",
-            side_effect=lambda: next(presence, True),
-        ), patch(
-            "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])
-        ), patch(
-            "kiro_crew.slack.gateway.get_shared_embedder", return_value=self._ready_embedder()
-        ), patch(
-            "kiro_crew.memory.legacy_memory_present", return_value=True
-        ), patch.object(
-            orch, "_set_memory_migrated", AsyncMock()
+        with (
+            patch(
+                "kiro_crew.slack.gateway.model_file_present",
+                side_effect=lambda: next(presence, True),
+            ),
+            patch("kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])),
+            patch(
+                "kiro_crew.slack.gateway.get_shared_embedder", return_value=self._ready_embedder()
+            ),
+            patch("kiro_crew.memory.legacy_memory_present", return_value=True),
+            patch.object(orch, "_set_memory_migrated", AsyncMock()),
         ):
             await orch._auto_migrate_memory()
         # Migrated even though the model was absent; sweep ran after the wait.
@@ -4505,12 +4594,11 @@ class TestAutoMigrateMemory:
         orch, store = self._orch_with_store(migrated=False)
         store.migrate_from_markdown.side_effect = RuntimeError("boom")
         set_migrated = AsyncMock()
-        with patch("kiro_crew.slack.gateway.model_file_present", return_value=True), patch(
-            "kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])
-        ), patch(
-            "kiro_crew.memory.legacy_memory_present", return_value=True
-        ), patch.object(
-            orch, "_set_memory_migrated", set_migrated
+        with (
+            patch("kiro_crew.slack.gateway.model_file_present", return_value=True),
+            patch("kiro_crew.slack.gateway.make_sync_embed_fn", return_value=(lambda t: [0.1])),
+            patch("kiro_crew.memory.legacy_memory_present", return_value=True),
+            patch.object(orch, "_set_memory_migrated", set_migrated),
         ):
             # Must not raise — boot survives.
             await orch._auto_migrate_memory()
@@ -4723,24 +4811,25 @@ class TestAutoApplyUpdateResetPath:
         instead of the sequence it covers. A test about the resolver itself
         patches it again explicitly, and that inner patch wins.
         """
-        with patch(
-            "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="",
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.commits_ahead", return_value=0
-        ), patch(
-            "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
-            return_value="/trusted/bin/git",
-        ), patch(
-            # The interpreter-floor gate reads the pinned commit with a real
-            # `git show`; against a non-repo that read FAILS, and a failed read
-            # refuses (its own tests are in TestAutoApplyUpdateResetPath).
-            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
-            return_value=None,
+        with (
+            patch("kiro_crew.slack.gateway.hidden_worktree_edits", return_value=[]),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="",
+            ),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=True),
+            patch("kiro_crew.slack.gateway.commits_ahead", return_value=0),
+            patch(
+                "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
+                return_value="/trusted/bin/git",
+            ),
+            patch(
+                # The interpreter-floor gate reads the pinned commit with a real
+                # `git show`; against a non-repo that read FAILS, and a failed read
+                # refuses (its own tests are in TestAutoApplyUpdateResetPath).
+                "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+                return_value=None,
+            ),
         ):
             yield
 
@@ -4756,10 +4845,14 @@ class TestAutoApplyUpdateResetPath:
         orch.dashboard_state = ds
         secret = "https://evil.example/leak?token=AKIA" + "X" * 40
         breach = "the incoming revision requires Python >=3.12 (" + secret + ") " + "p" * 900
-        with patch.dict(os.environ, {"KIROCREW_PROJECT_DIR": str(tmp_path)}), patch(
-            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
-            return_value=breach,
-        ), patch("asyncio.create_subprocess_exec", side_effect=self._scripted_git):
+        with (
+            patch.dict(os.environ, {"KIROCREW_PROJECT_DIR": str(tmp_path)}),
+            patch(
+                "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+                return_value=breach,
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=self._scripted_git),
+        ):
             await orch._auto_apply_update()
         pushed = [c.args for c in ds.push_update_progress.call_args_list if c.args[0] == "failed"]
         assert len(pushed) == 1
@@ -4776,10 +4869,14 @@ class TestAutoApplyUpdateResetPath:
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
         orch.dashboard_state = ds
-        with patch.dict(os.environ, {"KIROCREW_PROJECT_DIR": str(tmp_path)}), patch(
-            "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
-            side_effect=gw.dep_sync.IncomingFloorUnreadable("git show timed out"),
-        ), patch("asyncio.create_subprocess_exec", side_effect=self._scripted_git):
+        with (
+            patch.dict(os.environ, {"KIROCREW_PROJECT_DIR": str(tmp_path)}),
+            patch(
+                "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
+                side_effect=gw.dep_sync.IncomingFloorUnreadable("git show timed out"),
+            ),
+            patch("asyncio.create_subprocess_exec", side_effect=self._scripted_git),
+        ):
             await orch._auto_apply_update()
         pushed = [c.args for c in ds.push_update_progress.call_args_list if c.args[0] == "failed"]
         assert len(pushed) == 1 and "could not read" in pushed[0][1]
@@ -4878,9 +4975,7 @@ class TestAutoApplyUpdateResetPath:
                             await orch._auto_apply_update()
 
         # The destructive step never ran.
-        assert not any(
-            "reset" in [str(a) for a in args] for args in spawned
-        ), spawned
+        assert not any("reset" in [str(a) for a in args] for args in spawned), spawned
         # And nothing downstream of it ran either.
         mock_build.assert_not_awaited()
         mock_execv.assert_not_called()
@@ -4979,9 +5074,7 @@ class TestAutoApplyUpdateResetPath:
                                     await orch._auto_apply_update()
 
         git_calls = [
-            [str(a) for a in args]
-            for args in spawned
-            if args and str(args[0]).endswith("git")
+            [str(a) for a in args] for args in spawned if args and str(args[0]).endswith("git")
         ]
         assert git_calls, spawned
         for argv in git_calls:
@@ -5032,9 +5125,7 @@ class TestAutoApplyUpdateResetPath:
 
         with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}):
             with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
-                with patch(
-                    "kiro_crew.slack.gateway.hidden_worktree_edits", return_value=None
-                ):
+                with patch("kiro_crew.slack.gateway.hidden_worktree_edits", return_value=None):
                     with patch("os.execv") as mock_execv:
                         with patch("shutil.which", return_value=None):
                             await orch._auto_apply_update()
@@ -5424,9 +5515,7 @@ class TestAutoApplyUpdateResetPath:
 
         with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": str(tmp_path)}):
             with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
-                with patch(
-                    "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
-                ):
+                with patch("kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock):
                     with patch("os.execv") as mock_execv:
                         with patch("shutil.which", return_value=None):
                             await orch._auto_apply_update()
@@ -5452,9 +5541,7 @@ class TestAutoApplyUpdateResetPath:
 
         with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}):
             with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
-                with patch(
-                    "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
-                ):
+                with patch("kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock):
                     with patch("os.execv") as mock_execv:
                         with patch("shutil.which", return_value=None):
                             await orch._auto_apply_update()
@@ -5484,9 +5571,7 @@ class TestAutoApplyUpdateResetPath:
 
         with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}):
             with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
-                with patch(
-                    "kiro_crew.dep_sync.sync_or_reinstall", return_value=dep_sync.REFUSED
-                ):
+                with patch("kiro_crew.dep_sync.sync_or_reinstall", return_value=dep_sync.REFUSED):
                     with patch(
                         "kiro_crew.slack.gateway.build_frontend_async",
                         new_callable=AsyncMock,
@@ -5524,9 +5609,7 @@ class TestAutoApplyUpdateResetPath:
 
         with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}):
             with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
-                with patch(
-                    "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
-                ):
+                with patch("kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock):
                     with patch("os.execv"):
                         with patch("shutil.which", return_value=None):
                             await orch._auto_apply_update()
@@ -5538,9 +5621,7 @@ class TestAutoApplyUpdateResetPath:
             and "--abbrev-ref" not in [str(a) for a in args]
         ]
         assert revparses, spawned
-        assert any("refs/remotes/origin/main^{commit}" in argv for argv in revparses), (
-            revparses
-        )
+        assert any("refs/remotes/origin/main^{commit}" in argv for argv in revparses), revparses
         # The bare form must not be what git is asked to resolve.
         assert not any("origin/main^{commit}" in argv for argv in revparses), revparses
 
@@ -5759,7 +5840,10 @@ class TestCronAcpRetry:
             return "retry success"
 
         with patch("kiro_crew.slack.gateway.stream_and_collect", side_effect=_fake_stream):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:jacp", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:jacp", "run"),
+            ):
                 result = await callback(job)
 
         assert result == "retry success"
@@ -6227,7 +6311,10 @@ class TestCronAckedItems:
             new_callable=AsyncMock,
             return_value="acked result",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:jack", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:jack", "run"),
+            ):
                 with patch("kiro_crew.sel.sel") as mock_sel:
                     mock_sel.return_value.log_tool_invocation = MagicMock()
                     result = await callback(job)
@@ -6396,9 +6483,14 @@ class TestRunSignalAndBgSession:
                             with patch("kiro_crew.slack.interactions.init"):
                                 with patch("kiro_crew.slack.events.SeenCache"):
                                     with patch("kiro_crew.session.cleanup_orphaned_sessions"):
-                                        with patch("kiro_crew.dashboard.handlers._bg_mcp_probe", new_callable=AsyncMock):
+                                        with patch(
+                                            "kiro_crew.dashboard.handlers._bg_mcp_probe",
+                                            new_callable=AsyncMock,
+                                        ):
                                             with patch("os._exit"):
-                                                with patch("resource.getrlimit", return_value=(256, 10240)):
+                                                with patch(
+                                                    "resource.getrlimit", return_value=(256, 10240)
+                                                ):
                                                     with patch("resource.setrlimit"):
                                                         await orch.run()
         finally:
@@ -6444,6 +6536,7 @@ class TestBgSessionDashboardBranch:
             orch._local_only = True
             orch._configured_host = None
             orch._dashboard_port = 6779
+
         orch._init_dashboard = _init_dash
 
         fresh_event = asyncio.Event()
@@ -6452,19 +6545,32 @@ class TestBgSessionDashboardBranch:
         with patch.object(loop, "add_signal_handler"):
             with patch("kiro_crew.shutdown_event", fresh_event):
                 with patch("kiro_crew.slack.gateway.shutdown_event", fresh_event):
-                    with patch("kiro_crew.slack.gateway.resolve_dashboard_host",
-                               return_value="127.0.0.1"):
-                        with patch("kiro_crew.slack.gateway.build_dashboard_url",
-                                   return_value="http://127.0.0.1:6779/?t=tok"):
-                            with patch("kiro_crew.slack.gateway.format_dashboard_urls",
-                                       return_value=["url-line-1", "url-line-2"]):
+                    with patch(
+                        "kiro_crew.slack.gateway.resolve_dashboard_host", return_value="127.0.0.1"
+                    ):
+                        with patch(
+                            "kiro_crew.slack.gateway.build_dashboard_url",
+                            return_value="http://127.0.0.1:6779/?t=tok",
+                        ):
+                            with patch(
+                                "kiro_crew.slack.gateway.format_dashboard_urls",
+                                return_value=["url-line-1", "url-line-2"],
+                            ):
                                 with patch("kiro_crew.slack.events.init_socket_mode"):
                                     with patch("kiro_crew.slack.interactions.init"):
                                         with patch("kiro_crew.slack.events.SeenCache"):
-                                            with patch("kiro_crew.session.cleanup_orphaned_sessions"):
-                                                with patch("kiro_crew.dashboard.handlers._bg_mcp_probe", new_callable=AsyncMock):
+                                            with patch(
+                                                "kiro_crew.session.cleanup_orphaned_sessions"
+                                            ):
+                                                with patch(
+                                                    "kiro_crew.dashboard.handlers._bg_mcp_probe",
+                                                    new_callable=AsyncMock,
+                                                ):
                                                     with patch("os._exit"):
-                                                        with patch("resource.getrlimit", return_value=(256, 10240)):
+                                                        with patch(
+                                                            "resource.getrlimit",
+                                                            return_value=(256, 10240),
+                                                        ):
                                                             with patch("resource.setrlimit"):
                                                                 await orch.run()
                                                                 # Let bg_session task drain
@@ -6507,6 +6613,7 @@ class TestBgSessionDashboardBranch:
             orch._local_only = True
             orch._configured_host = None
             orch._dashboard_port = 6779
+
         orch._init_dashboard = _init_dash
 
         # One ordered trace of both events. The URL lines are a distinctive
@@ -6528,17 +6635,24 @@ class TestBgSessionDashboardBranch:
         with patch.object(loop, "add_signal_handler"):
             with patch("kiro_crew.shutdown_event", fresh_event):
                 with patch("kiro_crew.slack.gateway.shutdown_event", fresh_event):
-                    with patch("kiro_crew.slack.gateway.resolve_dashboard_host",
-                               return_value="127.0.0.1"):
-                        with patch("kiro_crew.slack.gateway.build_dashboard_url",
-                                   return_value="http://127.0.0.1:6779/?t=tok"):
-                            with patch("kiro_crew.slack.gateway.format_dashboard_urls",
-                                       return_value=["url-line-1", "url-line-2"]):
+                    with patch(
+                        "kiro_crew.slack.gateway.resolve_dashboard_host", return_value="127.0.0.1"
+                    ):
+                        with patch(
+                            "kiro_crew.slack.gateway.build_dashboard_url",
+                            return_value="http://127.0.0.1:6779/?t=tok",
+                        ):
+                            with patch(
+                                "kiro_crew.slack.gateway.format_dashboard_urls",
+                                return_value=["url-line-1", "url-line-2"],
+                            ):
                                 with patch("builtins.print", _tracing_print):
                                     with patch("kiro_crew.slack.events.init_socket_mode"):
                                         with patch("kiro_crew.slack.interactions.init"):
                                             with patch("kiro_crew.slack.events.SeenCache"):
-                                                with patch("kiro_crew.session.cleanup_orphaned_sessions"):
+                                                with patch(
+                                                    "kiro_crew.session.cleanup_orphaned_sessions"
+                                                ):
                                                     with patch(
                                                         "kiro_crew.dashboard.handlers._bg_mcp_probe",
                                                         _tracing_probe,
@@ -6590,6 +6704,7 @@ class TestBgSessionDashboardBranch:
             orch._local_only = True
             orch._configured_host = None
             orch._dashboard_port = 6779
+
         orch._init_dashboard = _init_dash
 
         fresh_event = asyncio.Event()
@@ -6598,8 +6713,9 @@ class TestBgSessionDashboardBranch:
         with patch.object(loop, "add_signal_handler"):
             with patch("kiro_crew.shutdown_event", fresh_event):
                 with patch("kiro_crew.slack.gateway.shutdown_event", fresh_event):
-                    with patch("kiro_crew.slack.gateway.resolve_dashboard_host",
-                               return_value="127.0.0.1"):
+                    with patch(
+                        "kiro_crew.slack.gateway.resolve_dashboard_host", return_value="127.0.0.1"
+                    ):
                         with patch(
                             "kiro_crew.slack.gateway.format_dashboard_urls",
                             side_effect=RuntimeError("cannot format URL"),
@@ -6634,9 +6750,7 @@ class TestCheckMissingDepsPip:
         orch = _make_orchestrator()
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
-                with patch.object(
-                    GatewayOrchestrator, "_is_brazil_install", return_value=False
-                ):
+                with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=False):
                     mock_exec = AsyncMock(return_value=_fake_async_proc(returncode=0))
                     with patch("asyncio.create_subprocess_exec", mock_exec):
                         asyncio.run(orch._check_missing_deps())
@@ -6652,9 +6766,7 @@ class TestCheckMissingDepsPip:
         orch = _make_orchestrator()
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
-                with patch.object(
-                    GatewayOrchestrator, "_is_brazil_install", return_value=False
-                ):
+                with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=False):
                     mock_exec = AsyncMock(
                         return_value=_fake_async_proc(returncode=1, stderr=b"error")
                     )
@@ -6677,12 +6789,8 @@ class TestCheckMissingDepsPip:
         proc.communicate = MagicMock(side_effect=_communicate)
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
-                with patch.object(
-                    GatewayOrchestrator, "_is_brazil_install", return_value=False
-                ):
-                    with patch.object(
-                        GatewayOrchestrator, "_DEP_INSTALL_TIMEOUT_SECS", 0.05
-                    ):
+                with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=False):
+                    with patch.object(GatewayOrchestrator, "_DEP_INSTALL_TIMEOUT_SECS", 0.05):
                         with patch(
                             "asyncio.create_subprocess_exec",
                             AsyncMock(return_value=proc),
@@ -6738,12 +6846,8 @@ class TestCheckMissingDepsPip:
         orch = _make_orchestrator()
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
-                with patch.object(
-                    GatewayOrchestrator, "_is_brazil_install", return_value=False
-                ):
-                    with patch(
-                        "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
-                    ):
+                with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=False):
+                    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
                         task = asyncio.create_task(orch._check_missing_deps())
                         await asyncio.sleep(0.05)  # let it reach the await
                         task.cancel()
@@ -6874,12 +6978,8 @@ class TestInitServicesLoopResponsiveness:
 
         with patch("importlib.util.find_spec", return_value=None):
             with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
-                with patch.object(
-                    GatewayOrchestrator, "_is_brazil_install", return_value=False
-                ):
-                    with patch(
-                        "asyncio.create_subprocess_exec", side_effect=_async_exec
-                    ):
+                with patch.object(GatewayOrchestrator, "_is_brazil_install", return_value=False):
+                    with patch("asyncio.create_subprocess_exec", side_effect=_async_exec):
                         with patch(
                             "subprocess.run",
                             side_effect=_blocking_run,
@@ -6889,9 +6989,7 @@ class TestInitServicesLoopResponsiveness:
                                 # Above every probe deadline so a regressed
                                 # run fails on the starvation assert below,
                                 # not on a torn-down timeout.
-                                await asyncio.wait_for(
-                                    orch._check_missing_deps(), timeout=60
-                                )
+                                await asyncio.wait_for(orch._check_missing_deps(), timeout=60)
                             finally:
                                 ticker_task.cancel()
         assert state["starved"] == [], (
@@ -6916,9 +7014,7 @@ class TestInitServicesLoopResponsiveness:
             side_effect=self._make_probe(state, "rebuild-index", result=3)
         )
         mock_vm_inst = MagicMock()
-        mock_vm_inst.init = MagicMock(
-            side_effect=self._make_probe(state, "vector-init")
-        )
+        mock_vm_inst.init = MagicMock(side_effect=self._make_probe(state, "vector-init"))
         with patch("kiro_crew.slack.gateway.MemoryStore", return_value=mock_mem_inst):
             with patch("kiro_crew.vector_memory.VectorMemoryStore") as mock_vm:
                 mock_vm.return_value = mock_vm_inst
@@ -6926,14 +7022,24 @@ class TestInitServicesLoopResponsiveness:
                     with patch("kiro_crew.slack.gateway.HookManager"):
                         with patch("kiro_crew.slack.gateway.LessonStore"):
                             with patch("kiro_crew.slack.gateway.ContextBuilder"):
-                                with patch("kiro_crew.slack.gateway.ConversationLog", return_value=MagicMock()):
+                                with patch(
+                                    "kiro_crew.slack.gateway.ConversationLog",
+                                    return_value=MagicMock(),
+                                ):
                                     with patch("kiro_crew.slack.gateway.SessionManager"):
                                         with patch("kiro_crew.slack.gateway.HistoryConsolidator"):
                                             with patch("kiro_crew.slack.gateway.ChannelHistory"):
-                                                with patch("kiro_crew.agent.rebuild_agent_config", return_value=Path("/tmp/a")):
+                                                with patch(
+                                                    "kiro_crew.agent.rebuild_agent_config",
+                                                    return_value=Path("/tmp/a"),
+                                                ):
                                                     with patch(
                                                         "asyncio.create_subprocess_exec",
-                                                        new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
+                                                        new=AsyncMock(
+                                                            return_value=_fake_async_proc(
+                                                                stdout=b"kiro-cli 1.30.0"
+                                                            )
+                                                        ),
                                                     ):
                                                         ticker_task = asyncio.create_task(_ticker())
                                                         try:
@@ -6947,14 +7053,24 @@ class TestInitServicesLoopResponsiveness:
                                                             assert state["probed"] == []
                                                             orch.ctx_builder.memory = mock_mem_inst
                                                             with (
-                                                                patch("kiro_crew.context.reset_memory_caches"),
-                                                                patch("kiro_crew.memory_backup.apply_pending_member_restores", return_value={}),
+                                                                patch(
+                                                                    "kiro_crew.context.reset_memory_caches"
+                                                                ),
+                                                                patch(
+                                                                    "kiro_crew.memory_backup.apply_pending_member_restores",
+                                                                    return_value={},
+                                                                ),
                                                             ):
                                                                 assert await asyncio.wait_for(
-                                                                    asyncio.to_thread(orch._initialize_memory_worker), timeout=90
+                                                                    asyncio.to_thread(
+                                                                        orch._initialize_memory_worker
+                                                                    ),
+                                                                    timeout=90,
                                                                 )
                                                         finally:
-                                                            await asyncio.to_thread(orch._stop_memory_startup)
+                                                            await asyncio.to_thread(
+                                                                orch._stop_memory_startup
+                                                            )
                                                             ticker_task.cancel()
         assert state["starved"] == [], (
             f"loop starved during service init: {state['starved']} observed no "
@@ -7030,7 +7146,10 @@ class TestCronSlackDeliveryFailure:
             new_callable=AsyncMock,
             return_value="result",
         ):
-            with patch("kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:jslack", "run")):
+            with patch(
+                "kiro_crew.slack.gateway.build_cron_session_context",
+                return_value=("cron:jslack", "run"),
+            ):
                 result = await callback(job)
 
         assert result == "result"
@@ -7107,9 +7226,7 @@ class TestDeliverCronResponse:
         orch.sessions.get_channel = MagicMock(return_value="C123")
         orch.sessions.get_thread = MagicMock(return_value="T456")
 
-        posted = await orch._deliver_cron_response(
-            "cron:job1", "pick one\n\n[OPTIONS: Yes | No]"
-        )
+        posted = await orch._deliver_cron_response("cron:job1", "pick one\n\n[OPTIONS: Yes | No]")
 
         assert posted is True
         body = slack.post_message.call_args.args[1]
@@ -7228,14 +7345,14 @@ class TestSlackSubagentCompletionPersistence:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info()
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="synthesized response",
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=False
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=False
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized response",
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
         ):
             await on_done(info)
 
@@ -7262,14 +7379,14 @@ class TestSlackSubagentCompletionPersistence:
         # Response carries a credential-shaped token that must not reach disk raw.
         leaked = "result aws_secret_access_key=AKIAIOSFODNN7EXAMPLE done"
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value=leaked,
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=False
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=False
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value=leaked,
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
         ):
             await on_done(info)
 
@@ -7285,14 +7402,14 @@ class TestSlackSubagentCompletionPersistence:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info()
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="response",
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=False
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="response",
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=True),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
         ):
             await on_done(info)
 
@@ -7305,14 +7422,14 @@ class TestSlackSubagentCompletionPersistence:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info()
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="response",
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=False
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=True
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="response",
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=True),
         ):
             await on_done(info)
 
@@ -7326,14 +7443,14 @@ class TestSlackSubagentCompletionPersistence:
         info = self._make_info()
         orch.conv_log.append = MagicMock(side_effect=OSError("disk full"))
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="response",
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=False
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=False
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="response",
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
         ):
             # Should not raise
             await on_done(info)
@@ -7370,14 +7487,14 @@ class TestSlackSubagentCompletionPersistence:
         # Slack delivery fails (best-effort), but injection already succeeded.
         orch.slack.post_message = AsyncMock(side_effect=RuntimeError("slack down"))
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="synthesized response",
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=False
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=False
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized response",
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
         ):
             # Must not raise despite the Slack failure.
             await on_done(info)
@@ -7396,16 +7513,15 @@ class TestSlackSubagentCompletionPersistence:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info()
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            side_effect=[asyncio.TimeoutError(), "response text"],
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_temporary", return_value=False
-        ), patch(
-            "kiro_crew.slack.gateway.is_thread_incognito", return_value=False
-        ), patch(
-            "asyncio.sleep", new_callable=AsyncMock
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                side_effect=[asyncio.TimeoutError(), "response text"],
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
+            patch("asyncio.sleep", new_callable=AsyncMock),
         ):
             await on_done(info)
 
@@ -7513,11 +7629,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:direct:12345")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="synthesized reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_awaited_once_with(
@@ -7540,11 +7659,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("discord:kirocrew:direct:U999")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_awaited_once_with("C777", "reply", thread_id=None)
@@ -7576,11 +7698,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:direct:12345")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="synthesized reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         orch.slack.post_message.assert_not_awaited()
@@ -7595,11 +7720,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:direct:12345")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="synthesized reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)  # must not raise
 
         orch.dashboard_state.notify.assert_called()
@@ -7616,22 +7744,23 @@ class TestSubagentChannelTransportDelivery:
         # Origin link present at entry, gone after the first (timed-out)
         # injection attempt — exactly what reset() does to a live session.
         orch.sessions.get_origin_link = MagicMock(
-            side_effect=[ChannelLink("discord", channel_id="C777", thread_id="T1")]
-            + [None] * 8
+            side_effect=[ChannelLink("discord", channel_id="C777", thread_id="T1")] + [None] * 8
         )
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("discord:kirocrew:direct:U999")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            side_effect=[asyncio.TimeoutError, "reply after retry"],
-        ), patch("asyncio.sleep", new_callable=AsyncMock), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                side_effect=[asyncio.TimeoutError, "reply after retry"],
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
-        transport.send_message.assert_awaited_once_with(
-            "C777", "reply after retry", thread_id="T1"
-        )
+        transport.send_message.assert_awaited_once_with("C777", "reply after retry", thread_id="T1")
 
     @pytest.mark.asyncio
     async def test_peer_resolution_outcome_is_sel_audited(self):
@@ -7644,11 +7773,15 @@ class TestSubagentChannelTransportDelivery:
             on_done = mock_sm.call_args[1]["on_done"]
             info = self._make_info("telegram:kirocrew:direct:12345")
 
-            with patch(
-                "kiro_crew.slack.gateway.stream_and_collect",
-                new_callable=AsyncMock,
-                return_value="reply",
-            ), self._permit_governance(), patch("kiro_crew.slack.gateway.sel") as mock_sel:
+            with (
+                patch(
+                    "kiro_crew.slack.gateway.stream_and_collect",
+                    new_callable=AsyncMock,
+                    return_value="reply",
+                ),
+                self._permit_governance(),
+                patch("kiro_crew.slack.gateway.sel") as mock_sel,
+            ):
                 mock_sel.return_value.log_api_access = MagicMock()
                 await on_done(info)
 
@@ -7669,11 +7802,14 @@ class TestSubagentChannelTransportDelivery:
         info = self._make_info("telegram:kirocrew:direct:12345")
         leaked = "result aws_secret_access_key=AKIAIOSFODNN7EXAMPLE done"
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value=leaked,
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value=leaked,
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_awaited_once()
@@ -7690,11 +7826,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:forum:987:5")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="synthesized reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_not_awaited()
@@ -7714,11 +7853,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:forum:987:5")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_awaited_once_with("987", "reply", thread_id="5")
@@ -7734,11 +7876,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("unified:kirocrew")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_awaited_once_with("12345", "reply", thread_id=None)
@@ -7754,11 +7899,14 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("discord:kirocrew:direct:U999")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.resolve_configured_target.assert_awaited_once_with("user:U999")
@@ -7770,17 +7918,18 @@ class TestSubagentChannelTransportDelivery:
         conversation/serviceUrl) degrades to notification-only, no send."""
         transport = self._fake_transport("teams")
         transport.resolve_configured_target = AsyncMock(return_value=None)
-        orch, mock_sm = self._setup(
-            parent_channel="teams:user@example.com", transport=transport
-        )
+        orch, mock_sm = self._setup(parent_channel="teams:user@example.com", transport=transport)
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("teams:kirocrew:direct:user@example.com")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="reply",
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="reply",
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         transport.send_message.assert_not_awaited()
@@ -7794,13 +7943,16 @@ class TestSubagentChannelTransportDelivery:
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:direct:12345")
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="reply",
-        ), patch(
-            "kiro_crew.platform.governance_profiles.vet_and_audit",
-            return_value=SimpleNamespace(permitted=False),
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="reply",
+            ),
+            patch(
+                "kiro_crew.platform.governance_profiles.vet_and_audit",
+                return_value=SimpleNamespace(permitted=False),
+            ),
         ):
             await on_done(info)
 
@@ -7816,11 +7968,14 @@ class TestSubagentChannelTransportDelivery:
         info = self._make_info("telegram:kirocrew:direct:12345")
         long_reply = "\n".join(f"line {i} of the reply" for i in range(6))
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value=long_reply,
-        ), self._permit_governance():
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value=long_reply,
+            ),
+            self._permit_governance(),
+        ):
             await on_done(info)
 
         assert transport.send_message.await_count > 1
@@ -7892,25 +8047,25 @@ class TestCountInFlightWork:
         orch = _make_orchestrator()
         state = MagicMock()
         state.sessions.active_providers.return_value = [
-            _provider(True), _provider(False), _provider(True)
+            _provider(True),
+            _provider(False),
+            _provider(True),
         ]
         orch.dashboard_state = state
         orch._session_tasks = {}
         assert orch._count_in_flight_work() == 2
 
-    def test_skips_missing_accessor_and_swallows_predicate_errors(self):
+    def test_missing_accessor_and_predicate_errors_fail_closed(self):
         orch = _make_orchestrator()
         no_attr = MagicMock(spec=[])  # no has_active_turn attribute
         raising = MagicMock()
         raising.has_active_turn = MagicMock(side_effect=RuntimeError("boom"))
         state = MagicMock()
-        state.sessions.active_providers.return_value = [
-            no_attr, raising, _provider(True)
-        ]
+        state.sessions.active_providers.return_value = [no_attr, raising, _provider(True)]
         orch.dashboard_state = state
         orch._session_tasks = {}
-        # no_attr skipped, raising treated as idle, only the active one counts.
-        assert orch._count_in_flight_work() == 1
+        # Unknown provider state is unsafe for an automatic restart.
+        assert orch._count_in_flight_work() == 3
 
     def test_counts_undone_session_tasks(self):
         orch = _make_orchestrator()
@@ -7922,24 +8077,168 @@ class TestCountInFlightWork:
         orch._session_tasks = {"a": undone1, "b": done, "c": undone2}
         assert orch._count_in_flight_work() == 2
 
-    def test_active_providers_failure_is_treated_as_idle(self):
+    def test_active_providers_failure_fails_closed(self):
         orch = _make_orchestrator()
         state = MagicMock()
         state.sessions.active_providers.side_effect = RuntimeError("nope")
         orch.dashboard_state = state
         orch._session_tasks = {}
-        # A broken introspection surface must not wedge shutdown -> counts 0.
-        assert orch._count_in_flight_work() == 0
+        assert orch._count_in_flight_work() == 1
 
     def test_provider_turns_and_session_tasks_sum(self):
         orch = _make_orchestrator()
         state = MagicMock()
         state.sessions.active_providers.return_value = [_provider(True)]
+        state.workflow_service = None
         orch.dashboard_state = state
         undone = MagicMock()
         undone.done.return_value = False
         orch._session_tasks = {"x": undone}
         assert orch._count_in_flight_work() == 2
+
+    def test_counts_background_work_that_restart_would_interrupt(self):
+        orch = _make_orchestrator()
+        state = MagicMock()
+        state.sessions.active_providers.return_value = []
+        state.workflow_service.list_runs.return_value = [
+            {"status": "running"},
+            {"status": "finished"},
+            {"status": "running"},
+        ]
+        orch.dashboard_state = state
+        orch._session_tasks = {}
+        orch.subagent_mgr = SimpleNamespace(pending_work_count=5)
+        orch._running_script_ids = {"script-a", "script-b"}
+        orch.task_runner = SimpleNamespace(running=True)
+
+        assert orch._in_flight_work_counts() == (0, 10)
+        assert orch._count_in_flight_work() == 10
+
+    def test_counts_callback_reservations_and_channel_handler_tasks(self, monkeypatch):
+        orch = _make_orchestrator()
+        state = MagicMock()
+        state.sessions.active_providers.return_value = []
+        state.workflow_service = None
+        orch.dashboard_state = state
+        orch._session_tasks = {}
+        orch.sessions = SimpleNamespace(inbound_callback_count=2)
+        monkeypatch.setattr(gw.inbound_spool, "pending_refusal_write_count", lambda: 3)
+        direct = MagicMock()
+        direct.done.return_value = False
+        nested = MagicMock()
+        nested.done.return_value = False
+        finished = MagicMock()
+        finished.done.return_value = True
+        orch._handler_tasks = {direct}
+        orch._channel_handles = {
+            "teams": SimpleNamespace(_handler_tasks={direct, finished}),
+            "imessage": SimpleNamespace(_peer=SimpleNamespace(_handler_tasks={nested})),
+        }
+        orch.subagent_mgr = None
+        orch._running_script_ids = set()
+        orch.task_runner = None
+
+        assert orch._in_flight_work_counts() == (0, 7)
+
+    def test_counts_dashboard_tasks_before_provider_acquisition(self):
+        orch = _make_orchestrator()
+        state = MagicMock()
+        state.sessions.active_providers.return_value = []
+        state.workflow_service = None
+        running = MagicMock()
+        running.done.return_value = False
+        remote = MagicMock()
+        remote.done.return_value = False
+        finished = MagicMock()
+        finished.done.return_value = True
+        state._slots = {
+            "normal": SimpleNamespace(task=running, _in_stage_execution=False),
+            "remote": SimpleNamespace(task=remote, _in_stage_execution=False),
+            "finished": SimpleNamespace(task=finished, _in_stage_execution=False),
+            "stage-gap": SimpleNamespace(task=None, _in_stage_execution=True),
+        }
+        orch.dashboard_state = state
+        orch._session_tasks = {}
+        orch.sessions = None
+        orch.subagent_mgr = None
+        orch._running_script_ids = set()
+        orch.task_runner = None
+
+        assert orch._in_flight_work_counts() == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_final_drain_collects_dashboard_and_stage_tasks(self):
+        orch = _make_orchestrator()
+        normal = asyncio.create_task(asyncio.sleep(60), name="dashboard-turn")
+        remote = asyncio.create_task(asyncio.sleep(60), name="dashboard-relay")
+        stage = asyncio.create_task(asyncio.sleep(60), name="dashboard-stage:slot-a")
+        orch.dashboard_state = SimpleNamespace(
+            _slots={
+                "normal": SimpleNamespace(task=normal),
+                "remote": SimpleNamespace(task=remote),
+                "stage-gap": SimpleNamespace(task=None),
+            },
+            _background_tasks={stage},
+        )
+        try:
+            assert set(orch._live_update_handler_tasks()) >= {normal, remote, stage}
+        finally:
+            for task in (normal, remote, stage):
+                task.cancel()
+            await asyncio.gather(normal, remote, stage, return_exceptions=True)
+
+
+class TestCallbackSafeUpdateRestart:
+    @pytest.mark.asyncio
+    async def test_pre_fence_timeout_defers_without_closing_sessions(self, monkeypatch):
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        sessions = SimpleNamespace(
+            inbound_callback_count=0,
+            fence_update_restart=MagicMock(return_value=True),
+            close_all=AsyncMock(),
+        )
+        orch.sessions = sessions
+        orch._drain_update_callback_work = AsyncMock(return_value=False)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        reexec = MagicMock()
+        monkeypatch.setattr(gw.platform_compat, "reexec_python_module", reexec)
+        respawn = MagicMock(return_value="/python")
+
+        await orch._restart_after_update(respawn)
+
+        assert orch._update_apply_deferred is True
+        assert orch._pending_update_respawn is respawn
+        sessions.fence_update_restart.assert_not_called()
+        sessions.close_all.assert_not_awaited()
+        reexec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_restart_fences_then_closes_and_final_drains(self, monkeypatch):
+        order: list[str] = []
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        sessions = SimpleNamespace(inbound_callback_count=0)
+        sessions.fence_update_restart = MagicMock(side_effect=lambda: order.append("fence") or True)
+        sessions.close_all = AsyncMock(side_effect=lambda: order.append("close"))
+        orch.sessions = sessions
+
+        async def drain(*, timeout):
+            order.append(f"drain:{timeout}")
+            return True
+
+        orch._drain_update_callback_work = AsyncMock(side_effect=drain)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        monkeypatch.setattr(
+            gw.platform_compat,
+            "reexec_python_module",
+            lambda *_args, **_kwargs: order.append("exec"),
+        )
+
+        await orch._restart_after_update(lambda: "/python")
+
+        assert order == ["drain:30.0", "fence", "close", "drain:None", "exec"]
+        assert orch._pending_update_respawn is None
 
 
 class TestUnreadyChannelBadge:
@@ -7962,9 +8261,7 @@ class TestUnreadyChannelBadge:
             for key, value in values.items():
                 object.__setattr__(section, key, value)
         orch._cfg.load_credentials = lambda: {}
-        boot = tuple(
-            ChannelDescriptor(channel_type=name, start=AsyncMock()) for name in sections
-        )
+        boot = tuple(ChannelDescriptor(channel_type=name, start=AsyncMock()) for name in sections)
         return orch, boot
 
     def test_an_enabled_channel_missing_its_token_is_badged_with_the_reason(self):
@@ -8053,8 +8350,7 @@ class TestChannelTransportStartGate:
             "webex": AsyncMock(),
         }
         self._descriptors = tuple(
-            ChannelDescriptor(channel_type=name, start=mock)
-            for name, mock in mocks.items()
+            ChannelDescriptor(channel_type=name, start=mock) for name, mock in mocks.items()
         )
         return mocks
 
@@ -8251,9 +8547,7 @@ class TestProviderFailureDoesNotFallBackToLegacy:
         orch.dashboard_state = _mock_dashboard_state()
 
         provider = CommandProvider(check_command="c", apply_command="a")
-        monkeypatch.setattr(
-            "kiro_crew.platform.update_provider.resolve_provider", lambda: provider
-        )
+        monkeypatch.setattr("kiro_crew.platform.update_provider.resolve_provider", lambda: provider)
         boom = AsyncMock(side_effect=RuntimeError("provider exploded"))
         monkeypatch.setattr(orch, "_check_for_updates_via_provider", boom)
         legacy = AsyncMock()
@@ -8275,9 +8569,7 @@ class TestProviderFailureDoesNotFallBackToLegacy:
         def _boom():
             raise RuntimeError("policy unreadable")
 
-        monkeypatch.setattr(
-            "kiro_crew.platform.update_provider.resolve_provider", _boom
-        )
+        monkeypatch.setattr("kiro_crew.platform.update_provider.resolve_provider", _boom)
         legacy = AsyncMock()
         monkeypatch.setattr(orch, "_check_for_updates_legacy", legacy)
 
@@ -8308,9 +8600,7 @@ class TestWheelInstallerRejectsUnsafeCdnBase:
                 }
             }
         )
-        monkeypatch.setattr(
-            "kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: False
-        )
+        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: False)
         spawn = AsyncMock()
         monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
 
@@ -8354,9 +8644,7 @@ class TestWheelApplyReadsTheCapabilityCommand:
         # command SOURCE, which is platform-independent; the refusals themselves
         # are pinned by the two tests below.
         monkeypatch.setattr("kiro_crew.slack.gateway.sys.platform", "linux")
-        monkeypatch.setattr(
-            "kiro_crew.platform_compat.trusted_system_bin", lambda name: "/bin/sh"
-        )
+        monkeypatch.setattr("kiro_crew.platform_compat.trusted_system_bin", lambda name: "/bin/sh")
         monkeypatch.setattr(
             "kiro_crew.platform.update_provider._trusted_path_env",
             lambda: {"PATH": "/usr/bin:/bin"},
@@ -8448,6 +8736,7 @@ class TestWheelApplyReadsTheCapabilityCommand:
         await orch._auto_apply_wheel_update()
 
         spawn.assert_not_awaited()
+
     """The SSE snapshot renders the update badge from _update_info["available"],
     which only the legacy check writes. A provider carries its own result, so
     notifying without publishing it left the badge reading a stale False and the
@@ -8490,6 +8779,35 @@ class TestWheelApplyReadsTheCapabilityCommand:
         assert handlers._update_info["check_status"] == "succeeded"
         ds.push_refresh.assert_called_with("update_available")
 
+    @pytest.mark.asyncio
+    async def test_auto_update_busy_defers_provider_apply(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+        from kiro_crew.platform.update_provider import CommandProvider, UpdateCheckResult
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch._update_apply_deferred = False
+        orch._prepare_auto_update_apply = AsyncMock(return_value=False)
+        handlers._update_info.clear()
+        handlers._update_info.update({"update_available": False})
+        monkeypatch.setattr(gov, "update_required", lambda _v: False)
+
+        cfg = MagicMock()
+        cfg.auto_update = True
+        provider = CommandProvider(check_command="c", apply_command="a")
+        provider.check = AsyncMock(  # type: ignore[method-assign]
+            return_value=UpdateCheckResult(available=True, remote_version="9.9.9")
+        )
+        provider.apply = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        with patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg):
+            await orch._check_for_updates_via_provider(provider)
+
+        provider.apply.assert_not_awaited()
+        assert handlers._update_info["update_available"] is True
+        assert handlers._update_info["latest_version"] == "9.9.9"
+
 
 class TestMandatoryUpdateOnWheelInstall:
     """A policy min-version makes an update mandatory. On a wheel/cli.sh install
@@ -8531,10 +8849,11 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        # The installer may only be driven for the `wheel` stamp: a `source`
-        # install carries the same command but re-running it builds a separate
-        # venv and loops forever.
-        monkeypatch.setattr("kiro_crew.slack.gateway.distribution", lambda: "wheel")
+        # Only the managed venv may drive cli.sh automatically. Runtime
+        # ownership covers both stamped and older unstamped managed installs.
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: True
+        )
 
         apply_called = AsyncMock()
         monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
@@ -8579,7 +8898,9 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        monkeypatch.setattr("kiro_crew.slack.gateway.distribution", lambda: "wheel")
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: True
+        )
 
         wheel_apply_called = AsyncMock()
         monkeypatch.setattr(orch, "_auto_apply_update", AsyncMock())
@@ -8592,12 +8913,9 @@ class TestMandatoryUpdateOnWheelInstall:
         ds.push_refresh.assert_called_with("update_available")
 
     @pytest.mark.asyncio
-    async def test_mandatory_update_on_non_wheel_installer_badges(self, monkeypatch):
-        """An install that carries an installer command but is NOT the `wheel`
-        stamp (a cloud source tree) must notify rather than run the installer,
-        and the badge must light even when the check left `update_available`
-        False — a pre-release remote reads as not-newer while the floor still
-        mandates the update."""
+    async def test_mandatory_update_on_non_managed_installer_badges(self, monkeypatch):
+        """An install with an installer command outside the managed venv must
+        notify rather than run it, even when a floor mandates the update."""
         import kiro_crew.dashboard.handlers as handlers
         import kiro_crew.platform.update_governance as gov
 
@@ -8624,7 +8942,9 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        monkeypatch.setattr("kiro_crew.slack.gateway.distribution", lambda: "source")
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: False
+        )
 
         apply_called = AsyncMock()
         wheel_apply_called = AsyncMock()
@@ -8819,9 +9139,7 @@ class TestUncredentialedProbeRatchet:
         from kiro_crew.channels import builtin_channel_descriptors
 
         rostered = {descriptor.channel_type for descriptor in builtin_channel_descriptors()}
-        accounted = set(_uncredentialed_probe_operands()) | set(
-            _UNCREDENTIALED_PROBE_EXEMPTIONS
-        )
+        accounted = set(_uncredentialed_probe_operands()) | set(_UNCREDENTIALED_PROBE_EXEMPTIONS)
         assert rostered == accounted, (
             "rostered channels must have an uncredentialed probe row or an "
             "explicit config-only/token-driven exemption; "
@@ -8846,9 +9164,7 @@ class TestUncredentialedProbeRatchet:
         )
 
     def test_exemptions_are_not_credential_probe_rows(self) -> None:
-        overlap = set(_uncredentialed_probe_operands()) & set(
-            _UNCREDENTIALED_PROBE_EXEMPTIONS
-        )
+        overlap = set(_uncredentialed_probe_operands()) & set(_UNCREDENTIALED_PROBE_EXEMPTIONS)
         assert not overlap, (
             "a channel cannot be both credential-probed and exempt: " f"{sorted(overlap)}"
         )
@@ -9126,9 +9442,7 @@ class TestChannelSkipReasonAtTransportStart:
         assert self._channel_records(caplog) == []
 
     @pytest.mark.asyncio
-    async def test_teams_tenant_id_is_not_a_credential_operand(
-        self, caplog, monkeypatch
-    ) -> None:
+    async def test_teams_tenant_id_is_not_a_credential_operand(self, caplog, monkeypatch) -> None:
         # The trap the table must not fall into: the tenant id sits in config
         # right next to the two operands that count, but _teams_enabled never
         # reads it — app id + password present with NO tenant is fully
@@ -9200,15 +9514,15 @@ class TestAutoApplyUpdatePreconditions:
             proc.wait = AsyncMock(return_value=0)
             return proc
 
-        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}), patch(
-            "asyncio.create_subprocess_exec", side_effect=_fake_exec
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="repository declares filter.evil.smudge",
-        ), patch(
-            "kiro_crew.slack.gateway.is_primary_branch", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=True
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}),
+            patch("asyncio.create_subprocess_exec", side_effect=_fake_exec),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="repository declares filter.evil.smudge",
+            ),
+            patch("kiro_crew.slack.gateway.is_primary_branch", return_value=True),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=True),
         ):
             await orch._auto_apply_update()
 
@@ -9240,15 +9554,15 @@ class TestAutoApplyUpdatePreconditions:
             proc.wait = AsyncMock(return_value=proc.returncode)
             return proc
 
-        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}), patch(
-            "asyncio.create_subprocess_exec", side_effect=_fake_exec
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="",
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.commits_ahead", return_value=2
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}),
+            patch("asyncio.create_subprocess_exec", side_effect=_fake_exec),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="",
+            ),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=True),
+            patch("kiro_crew.slack.gateway.commits_ahead", return_value=2),
         ):
             await orch._auto_apply_update()
 
@@ -9271,15 +9585,15 @@ class TestAutoApplyUpdatePreconditions:
             proc.wait = AsyncMock(return_value=proc.returncode)
             return proc
 
-        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}), patch(
-            "asyncio.create_subprocess_exec", side_effect=_fake_exec
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="",
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=True
-        ), patch(
-            "kiro_crew.slack.gateway.commits_ahead", return_value=None
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}),
+            patch("asyncio.create_subprocess_exec", side_effect=_fake_exec),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="",
+            ),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=True),
+            patch("kiro_crew.slack.gateway.commits_ahead", return_value=None),
         ):
             await orch._auto_apply_update()
 
@@ -9307,13 +9621,14 @@ class TestAutoApplyUpdatePreconditions:
             proc.wait = AsyncMock(return_value=0)
             return proc
 
-        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}), patch(
-            "asyncio.create_subprocess_exec", side_effect=_fake_exec
-        ), patch(
-            "kiro_crew.slack.gateway.repo_exec_config_reason",
-            return_value="",
-        ), patch(
-            "kiro_crew.slack.gateway.tracks_upstream", return_value=False
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}),
+            patch("asyncio.create_subprocess_exec", side_effect=_fake_exec),
+            patch(
+                "kiro_crew.slack.gateway.repo_exec_config_reason",
+                return_value="",
+            ),
+            patch("kiro_crew.slack.gateway.tracks_upstream", return_value=False),
         ):
             await orch._auto_apply_update()
 
