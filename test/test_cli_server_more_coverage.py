@@ -685,6 +685,9 @@ class TestLogsCmdSystemd:
         self, monkeypatch, tmp_path, sel_rec, fake_execvp
     ) -> None:
         monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent.service")
+        # POSIX fall-through execs tail(1): pin the binary present so the
+        # no-tail in-process branch (Windows) does not swallow the exec.
+        monkeypatch.setattr(shutil, "which", lambda *a, **k: "/usr/bin/tail")
         log = tmp_path / "gateway.log"
         log.write_text("hi\n", encoding="utf-8", newline="\n")
         monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
@@ -729,6 +732,9 @@ class TestLogsCmdOtherSources:
     ) -> None:
         """A foreground gateway on macOS reaches the config-dir log, not the agent's."""
         launchd.plist.unlink()
+        # POSIX fall-through execs tail(1): pin the binary present so the
+        # no-tail in-process branch (Windows) does not swallow the exec.
+        monkeypatch.setattr(shutil, "which", lambda *a, **k: "/usr/bin/tail")
         fallback = tmp_path / "fallback" / "gateway.log"
         fallback.parent.mkdir()
         fallback.write_text("real\n", encoding="utf-8", newline="\n")
@@ -742,6 +748,9 @@ class TestLogsCmdOtherSources:
     ) -> None:
         """A 0-byte agent log satisfies exists(), so size is what gates the branch."""
         launchd.stdout_log.write_text("", encoding="utf-8", newline="\n")
+        # POSIX fall-through execs tail(1): pin the binary present so the
+        # no-tail in-process branch (Windows) does not swallow the exec.
+        monkeypatch.setattr(shutil, "which", lambda *a, **k: "/usr/bin/tail")
         fallback = tmp_path / "fallback" / "gateway.log"
         fallback.parent.mkdir()
         fallback.write_text("real\n", encoding="utf-8", newline="\n")

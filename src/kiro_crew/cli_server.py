@@ -2445,32 +2445,6 @@ def _sandbox_cmd(args: argparse.Namespace) -> int:
     return 2
 
 
-def _tail_log_file(path: Path, lines: int, follow: bool) -> None:
-    """Print the last *lines* of *path*, following appends when asked.
-
-    Fallback for hosts without ``tail(1)`` (Windows ships none): the caller
-    already resolved the exact file, so exec'ing an external binary buys
-    nothing over reading it here -- and exec'ing a missing binary fails with
-    a bare FileNotFoundError that reads as a Kiro Crew crash.
-    """
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        sys.stdout.write("".join(fh.readlines()[-lines:] if lines > 0 else []))
-    if not follow:
-        return
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            fh.seek(0, os.SEEK_END)
-            while True:
-                chunk = fh.read()
-                if chunk:
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-                else:
-                    time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
-
-
 def _logs_cmd(args: argparse.Namespace) -> None:
     """Tail gateway logs from the most appropriate source.
 
@@ -2572,6 +2546,7 @@ def _logs_cmd(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        return
     if shutil.which("tail") is None:
         # No tail(1) on this host (Windows ships none): read the resolved
         # file in-process instead of exec'ing a missing binary.
