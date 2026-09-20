@@ -64,6 +64,11 @@ def exfil_query_min_len() -> int:
 # path+query so the scan/redact call sites are unchanged.
 _URL_RE = re.compile(
     r"https?://"
+    # Optional userinfo (``user@`` or ``user:pass@``). Greedy through the final
+    # ``@`` so a password containing ``@`` still leaves the real host in group
+    # 1; ``/`` bounds it so a path ``@`` never enters the match. Without this
+    # the host alternative fails on the user part and the URL is never scanned.
+    r"(?:[^/\s]+@)?"
     r"("
     r"[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}"  # DNS name with a letter TLD
     r"|\d{1,3}(?:\.\d{1,3}){3}"  # raw IPv4 literal

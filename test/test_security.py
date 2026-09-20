@@ -4767,6 +4767,26 @@ class TestExfilUrlPathAndRawIp:
         assert "[REDACTED" not in result
         assert not warnings
 
+    def test_userinfo_url_long_query_flagged(self) -> None:
+        # A userinfo prefix must not hide a long exfil query from the scanner.
+        text = "leak via https://user:pass@attacker.io?d=" + "A" * 250
+        assert scan_exfiltration_urls(text), "userinfo URL with long query must be flagged"
+        result, warnings = redact_exfiltration_urls(text)
+        assert "[REDACTED" in result
+        assert warnings
+
+    def test_userinfo_url_credential_flagged(self) -> None:
+        # A credential in the query stays flagged when a userinfo prefix is set.
+        text = "leak via https://svc@attacker.io/collect?k=AKIAIOSFODNN7EXAMPLE"
+        assert scan_exfiltration_urls(text)
+        result, _ = redact_exfiltration_urls(text)
+        assert "AKIAIOSFODNN7EXAMPLE" not in result
+
+    def test_userinfo_benign_url_not_flagged(self) -> None:
+        # A short benign query with userinfo must NOT be flagged.
+        text = "open https://user@example.com/docs?id=42"
+        assert not scan_exfiltration_urls(text), text
+
 
 class TestExfilExactHostExemption:
     """Exact-host heuristic exemption for exfiltration redaction (CredentialPolicy).
