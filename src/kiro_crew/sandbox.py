@@ -1612,8 +1612,11 @@ def _materialize_sealable_ceilings() -> list[str]:
     notices. An unsealed ceiling is the one thing this function exists to prevent, so it
     refuses for the same reason ``_mount_or_die`` refuses a failed hiding mount.
 
-    Two states trigger it:
+    Three states trigger it:
 
+    * a **missing parent** for a ceiling path. Creating the parents would build
+      a writable ancestor the agent could rename through, so the safe answer is
+      to refuse rather than scaffold;
     * a **dangling symlink** squatting a ceiling path. ``os.path.exists`` follows
       symlinks, so it reads as absent to this function AND to the launcher's guard,
       while ``os.link`` refuses the name as ``EEXIST`` — the sandboxed process's write
@@ -1652,7 +1655,11 @@ def _materialize_sealable_ceilings() -> list[str]:
                 _warn_if_alias_backed(target)
             continue
         if not os.path.isdir(os.path.dirname(target)):
-            continue
+            _warn_unsealed_ceiling(target, None)
+            raise SandboxCeilingUnsealable(
+                f"cannot seal the governance ceiling {target}: its parent is not "
+                "a directory; it would stay writable inside the sandbox"
+            )
         try:
             # 0o700 needs no reassertion: a umask can only clear bits, never add them.
             os.mkdir(target, 0o700)
@@ -1690,7 +1697,11 @@ def _materialize_sealable_ceilings() -> list[str]:
             _warn_if_alias_backed(target)
             continue
         if not os.path.isdir(parent):
-            continue
+            _warn_unsealed_ceiling(target, None)
+            raise SandboxCeilingUnsealable(
+                f"cannot publish the governance ceiling {target}: its parent is "
+                "not a directory; it would stay writable inside the sandbox"
+            )
         if _publish_empty_ceiling(target, parent):
             created.append(target)
         elif not os.path.exists(target):
