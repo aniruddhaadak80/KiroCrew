@@ -435,6 +435,9 @@ def test_seed_main_home_rail_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyP
     fake_home = tmp_path / "fake_home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    # Path.home() ignores $HOME on Windows, so patch it directly; $HOME
+    # stays for the POSIX expanduser paths.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     target = fake_home / ".kirocrew"
     monkeypatch.setenv("KIROCREW_HOME", str(target))
 
@@ -455,6 +458,7 @@ def test_seed_new_home_rail_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     fake_home = tmp_path / "fake_home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     target = fake_home / ".kiro" / "crew"
     monkeypatch.setenv("KIROCREW_HOME", str(target))
 
@@ -481,6 +485,7 @@ def test_seed_main_home_rail_refuses_even_with_replace(
     target.mkdir()
     (target / "real_user_data.txt").write_text("don't delete me")
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("KIROCREW_HOME", str(target))
 
     with pytest.raises(seed_mod.SeedError) as excinfo:
@@ -495,6 +500,7 @@ def test_seed_main_home_rail_refuses_even_with_replace(
     assert (target / "real_user_data.txt").read_text(encoding="utf-8") == "don't delete me"
 
 
+@requires_symlinks
 def test_seed_main_home_rail_catches_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,6 +518,7 @@ def test_seed_main_home_rail_catches_symlink(
     symlinked_target = fake_home / "dev-home"
     symlinked_target.symlink_to(real_main)
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("KIROCREW_HOME", str(symlinked_target))
 
     with pytest.raises(seed_mod.SeedError) as excinfo:
