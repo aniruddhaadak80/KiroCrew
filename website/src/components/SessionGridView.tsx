@@ -10,6 +10,7 @@ import { emitSlotFocused } from '../hooks/useWebSocket'
 import PaneDim from './PaneDim'
 
 import { i18nT } from '../i18n/t'
+import { compareIsoTsDesc } from '../i18n/format'
 type Slot = {
   key: string
   title?: string
@@ -249,7 +250,8 @@ function PlaceholderPane({
       // and the ones waiting on them are the ones worth opening first.
       if (!!a.needs_input !== !!b.needs_input) return a.needs_input ? -1 : 1
       if (!!a.running !== !!b.running) return a.running ? -1 : 1
-      return (b.last_activity_ts || '').localeCompare(a.last_activity_ts || '')
+      // Byte-order ISO-8601 compare: see pickBoundSlot in ArtifactDetailPage.
+      return compareIsoTsDesc(a.last_activity_ts, b.last_activity_ts)
     })
 
   const ctrlBtn =

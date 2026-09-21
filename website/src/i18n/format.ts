@@ -589,3 +589,17 @@ export function collator(options?: Intl.CollatorOptions): Intl.Collator {
 export function compareText(a: string, b: string): number {
   return collator().compare(a, b)
 }
+
+/**
+ * Comparator for ISO-8601 machine timestamps, newest first, for `.sort()`.
+ *
+ * Byte order (never `localeCompare`): the stamps share one backend format, so
+ * comparison is chronological AND keeps the microsecond precision `Date.parse`
+ * drops. An ICU collator is locale-sensitive and slower, and it disagrees with
+ * the library page's own ordering when two views pick the same slot.
+ */
+export function compareIsoTsDesc(aTs: string | undefined | null, bTs: string | undefined | null): number {
+  const a = aTs || ''
+  const b = bTs || ''
+  return a < b ? 1 : a > b ? -1 : 0
+}

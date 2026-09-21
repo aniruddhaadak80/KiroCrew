@@ -39,6 +39,7 @@ import { SUPPORTED_LANGUAGES } from './languages'
 import {
   activeLocale,
   collator,
+  compareIsoTsDesc,
   compareText,
   fmtBytes,
   fmtCompact,
@@ -559,5 +560,26 @@ describe('collator / compareText', () => {
 
   it('exposes the raw collator for callers needing other options', () => {
     expect(collator({ sensitivity: 'variant' }).compare('apple', 'Apple')).not.toBe(0)
+  })
+})
+
+describe('compareIsoTsDesc', () => {
+  it('orders newest first by byte, keeping microsecond precision', () => {
+    const older = '2026-01-01T00:00:00.000001+00:00'
+    const newer = '2026-01-01T00:00:00.000002+00:00'
+    expect([older, newer].sort((a, b) => compareIsoTsDesc(a, b))).toEqual([newer, older])
+  })
+
+  it('treats missing stamps as oldest', () => {
+    expect(compareIsoTsDesc(undefined, '2026-01-01T00:00:00+00:00')).toBeGreaterThan(0)
+    expect(compareIsoTsDesc(null, null)).toBe(0)
+  })
+
+  it('is locale-invariant', async () => {
+    const stamps = ['2026-03-01T00:00:00.000000+00:00', '2026-01-01T00:00:00.000000+00:00']
+    const ordered = [...stamps].sort((a, b) => compareIsoTsDesc(a, b))
+    await withLanguage('tr', () => {
+      expect([...stamps].sort((a, b) => compareIsoTsDesc(a, b))).toEqual(ordered)
+    })
   })
 })

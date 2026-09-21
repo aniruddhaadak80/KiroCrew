@@ -46,7 +46,7 @@ import type { Artifact, ArtifactEvent, ArtifactComment, CommentAnchor, ChatSlot 
 
 import { i18nT } from '../i18n/t'
 import { errMessage } from '../utils/thunkError'
-import { fmtDateFields } from '../i18n/format'
+import { compareIsoTsDesc, fmtDateFields } from '../i18n/format'
 import ErrorNotice from '../components/ErrorNotice'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
@@ -60,8 +60,10 @@ import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 function pickBoundSlot(slots: ChatSlot[] | undefined, slug: string): ChatSlot | null {
   const matches = (slots ?? []).filter((x) => x.artifact === slug)
   if (matches.length <= 1) return matches[0] ?? null
-  return [...matches].sort((a, b) =>
-    (b.last_activity_ts || '').localeCompare(a.last_activity_ts || ''))[0]
+  // Byte-order ISO-8601 compare (same backend format): chronological AND keeps
+  // the microsecond precision Date.parse drops. Never localeCompare here; the
+  // collator order is host-dependent and disagrees with the library page.
+  return [...matches].sort((a, b) => compareIsoTsDesc(a.last_activity_ts, b.last_activity_ts))[0]
 }
 
 function readThemeVars(): Record<string, string> {
