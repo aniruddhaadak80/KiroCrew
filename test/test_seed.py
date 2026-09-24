@@ -427,8 +427,8 @@ def test_seed_main_home_rail_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyP
     """``$KIROCREW_HOME=~/.kirocrew`` exits 2 with 'refusing to seed main
     gateway home' message, even when the path doesn't exist yet.
 
-    PRD acceptance test 4. Monkeypatches ``$HOME`` so ``Path.home() /
-    '.kirocrew'`` points into ``tmp_path`` — catching developers who set
+    PRD acceptance test 4. Patches ``Path.home()`` directly and ``$HOME`` so
+    ``~/.kirocrew`` points into ``tmp_path`` — catching developers who set
     ``KIROCREW_HOME`` to their real main home would be the worst possible
     test failure mode.
     """
@@ -500,7 +500,6 @@ def test_seed_main_home_rail_refuses_even_with_replace(
     assert (target / "real_user_data.txt").read_text(encoding="utf-8") == "don't delete me"
 
 
-@requires_symlinks
 def test_seed_main_home_rail_catches_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -516,7 +515,7 @@ def test_seed_main_home_rail_catches_symlink(
     real_main.mkdir()
     (real_main / "user_data.txt").write_text("preserved")
     symlinked_target = fake_home / "dev-home"
-    symlinked_target.symlink_to(real_main)
+    make_dir_link(symlinked_target, real_main)
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("KIROCREW_HOME", str(symlinked_target))
