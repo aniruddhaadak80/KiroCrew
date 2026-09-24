@@ -19,7 +19,6 @@ from pathlib import Path
 import pytest
 from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 
-from conftest import requires_symlinks
 from kiro_crew import cron_inflight, security
 from kiro_crew.security import (
     _SECRET_KEY_LEN,
@@ -5293,7 +5292,6 @@ class TestIsSensitivePath:
 
     # ── Symlink bypass (pentest AWS-345 / AWS-62) ──
 
-    @requires_symlinks
     def test_absolute_symlink_to_aws_credentials(self, tmp_path, monkeypatch) -> None:
         """A symlink whose target resolves into ~/.aws must be caught."""
         home = tmp_path / "home"
@@ -5301,13 +5299,14 @@ class TestIsSensitivePath:
         cred = home / ".aws" / "credentials"
         cred.write_text("[default]\n")
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         ws = tmp_path / "workspace"
         ws.mkdir()
         link = ws / "cfg.ini"
         link.symlink_to(cred)  # absolute target
         assert is_sensitive_path(str(link)) is True
 
-    @requires_symlinks
     def test_relative_symlink_to_aws_credentials(self, tmp_path, monkeypatch) -> None:
         """A relative-traversal symlink target must resolve and be caught."""
         home = tmp_path / "home"
@@ -5315,6 +5314,8 @@ class TestIsSensitivePath:
         cred = home / ".aws" / "credentials"
         cred.write_text("[default]\n")
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         ws = tmp_path / "workspace" / "sub"
         ws.mkdir(parents=True)
         link = ws / "alt.txt"
@@ -5323,7 +5324,6 @@ class TestIsSensitivePath:
         link.symlink_to(_os.path.relpath(str(cred), start=str(ws)))
         assert is_sensitive_path(str(link)) is True
 
-    @requires_symlinks
     def test_base_dir_anchors_relative_path(self, tmp_path, monkeypatch) -> None:
         """A relative input is anchored against base_dir, not the process CWD."""
         home = tmp_path / "home"
@@ -5331,6 +5331,8 @@ class TestIsSensitivePath:
         cred = home / ".aws" / "credentials"
         cred.write_text("[default]\n")
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
         ws = tmp_path / "workspace"
         ws.mkdir()
         (ws / "cfg.ini").symlink_to(cred)
