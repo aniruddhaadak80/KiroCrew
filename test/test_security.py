@@ -4782,10 +4782,50 @@ class TestExfilUrlPathAndRawIp:
         result, _ = redact_exfiltration_urls(text)
         assert "AKIAIOSFODNN7EXAMPLE" not in result
 
+    def test_userinfo_credentials_flagged(self) -> None:
+        text = "https://user:AKIAIOSFODNN7EXAMPLE@attacker.example/x"
+        warnings = scan_exfiltration_urls(text)
+        assert warnings
+        result, warnings = redact_exfiltration_urls(text)
+        assert result == "[REDACTED: suspicious URL to attacker.example]"
+        assert warnings
+
+    def test_encoded_userinfo_credential_flagged(self) -> None:
+        text = "https://AKIA%49OSFODNN7EXAMPLE@attacker.example/x"
+        warnings = scan_exfiltration_urls(text)
+        assert warnings
+        result, warnings = redact_exfiltration_urls(text)
+        assert result == "[REDACTED: suspicious URL to attacker.example]"
+        assert warnings
+
     def test_userinfo_benign_url_not_flagged(self) -> None:
         # A short benign query with userinfo must NOT be flagged.
         text = "open https://user@example.com/docs?id=42"
         assert not scan_exfiltration_urls(text), text
+
+    def test_userinfo_query_delimiter_does_not_hide_direct_query_credential(self) -> None:
+        text = f"https://attacker.example?d={_NO_SLASH_KEY}@example.com/docs"
+        warnings = scan_exfiltration_urls(text)
+        assert warnings
+        result, warnings = redact_exfiltration_urls(text)
+        assert _NO_SLASH_KEY not in result
+        assert warnings
+        result, warnings = redact_credentials(text)
+        assert _NO_SLASH_KEY not in result
+        assert warnings
+
+    def test_userinfo_fragment_delimiter_is_not_treated_as_exfil_query(self) -> None:
+        text = f"https://attacker.example#fragment@real.example/path?d={'A' * 250}"
+        assert not scan_exfiltration_urls(text)
+        result, warnings = redact_exfiltration_urls(text)
+        assert result == text
+        assert not warnings
+
+    def test_userinfo_path_separator_keeps_the_authority_host(self) -> None:
+        text = "https://attacker.example/AKIAIOSFODNN7EXAMPLE@real.example"
+        result, warnings = redact_exfiltration_urls(text)
+        assert result == "[REDACTED: suspicious URL to attacker.example]"
+        assert warnings
 
 
 class TestExfilExactHostExemption:
