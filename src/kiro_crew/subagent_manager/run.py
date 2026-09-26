@@ -23,8 +23,6 @@ if TYPE_CHECKING:
         _should_block_results,
         hook_event_identity,
     )
-    from kiro_crew.sel import sel
-
     from ..subagent import (
         _CANCEL_RESUME_PREFIX,
         _ON_DONE_TIMEOUT,
