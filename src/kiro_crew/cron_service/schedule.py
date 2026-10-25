@@ -72,8 +72,26 @@ def cron_expr_matches(expr: str, dt: datetime) -> bool:
 
 
 def validate_cron_expr(expr: str) -> bool:
-    """Return True if ``expr`` is a syntactically valid 5-field cron expression."""
-    return croniter.is_valid(expr)
+    """Return True if ``expr`` is a syntactically valid 5-field cron expression.
+
+    A seconds-bearing six-field expression refuses even though croniter reads
+    one: :func:`is_due` never fires a job twice in the same UTC minute, so such
+    a schedule advertises a next run (:func:`compute_next_run_ts` advances by
+    seconds) that the due check then suppresses forever. Both writers funnel
+    through this predicate (``fields.build_job`` on create,
+    ``fields.apply_job_update`` on update), so the schedule the minute-level
+    execution contract cannot honor refuses before it persists. The one-field
+    ``@`` aliases (``@daily``, ``@yearly``) stay — they carry no seconds field.
+    """
+    if not croniter.is_valid(expr):
+        return False
+    parts = expr.split()
+    if len(parts) == 5:
+        return True
+    # The one-field ``@`` aliases (``@daily``, ``@yearly``) carry no seconds
+    # field; every other width croniter accepts either does (six fields) or
+    # never fires once a minute at all.
+    return len(parts) == 1 and expr.startswith("@")
 
 
 def _humanize_cron(expr: str, tz_name: str = "") -> str:
