@@ -82,9 +82,19 @@ pytestmark = pytest.mark.xdist_group(name="tree_scan_test_link_screen_hold_pin")
 SCREENS = frozenset({"first_linked_ancestor", "is_link_or_junction", "is_reparse_point"})
 
 #: By-name resolves in ``os``, ``os.path``, ``pathlib`` and ``shutil``. Both
-#: spellings of each question, because ``pathlib`` renames all of them.
+#: spellings of each question, because ``pathlib`` renames all of them. Plus the
+#: package's own by-name opens in ``platform_compat``: ``open_lock_file`` reaches
+#: ``os.open`` through ``open_create_or_existing``, two hops, so without naming it
+#: here the one-hop growth would drop every screen-then-lock site from the count.
+#: ``open_lock_file_for_sweep`` is the same shape -- it opens the lock by name
+#: (``os.open`` on POSIX, ``CreateFileW`` on Windows) past the one-hop reach -- so
+#: the orphan-lock sweep's screen-then-open site survives the ratchet only while
+#: it too is named here.
 PRIMITIVES = frozenset(
     {
+        "open_create_or_existing",
+        "open_lock_file",
+        "open_lock_file_for_sweep",
         "realpath",
         "readlink",
         "resolve",
@@ -170,13 +180,13 @@ RESOLVER_DEPTH = 1
 CONTROL_MODULES = (
     "acp/prompt_blocks.py",
     "apps/builtins/auto_improvement/backend/clone_setup.py",
-    "apps/builtins/aws_control/backend/backup.py",
-    "apps/builtins/issue_radar/backend/crew_store.py",
+    "apps/builtins/aws_control/backend/backup_parts/conversations.py",
+    "apps/builtins/issue_radar/backend/crew_store_unit_order.py",
     "apps/plugin_import.py",
     "dashboard/handlers/themes.py",
     "image_artifacts.py",
     "member_essential_context.py",
-    "memory.py",
+    "memory_files.py",
     "messaging/outbound_files.py",
 )
 
@@ -185,7 +195,7 @@ CONTROL_MODULES = (
 #: holding, not by being important.
 HELD_SITES = frozenset(
     {
-        ("apps/builtins/issue_radar/backend/crew_store.py", "_write_unit_order"),
+        ("apps/builtins/issue_radar/backend/crew_store_unit_order.py", "_write_unit_order"),
     }
 )
 
@@ -199,7 +209,10 @@ RELEASE_CALL = "_release_held"
 #: cannot satisfy, which is why these are numbers and a named member rather than a
 #: second copy of the lists.
 MIN_CONTROL_MODULES = 10
-REQUIRED_HELD_SITE = ("apps/builtins/issue_radar/backend/crew_store.py", "_write_unit_order")
+REQUIRED_HELD_SITE = (
+    "apps/builtins/issue_radar/backend/crew_store_unit_order.py",
+    "_write_unit_order",
+)
 
 
 def test_the_gates_own_lists_are_not_shrunk() -> None:
@@ -743,9 +756,13 @@ def test_an_ordinary_link_layout_is_not_broken_by_the_hold(
                 # under ``tmp_path`` there, and the write refuses for the host's link
                 # rather than for anything this gate is about.
                 with pytest.raises(OSError):
-                    crew_store._write_unit_order(target, ("alpha", "beta"))
+                    crew_store._write_unit_order(
+                        target, ("alpha", "beta"), max_depth=len(target.parts) + 32
+                    )
                 return
-            crew_store._write_unit_order(target, ("alpha", "beta"))
+            crew_store._write_unit_order(
+                target, ("alpha", "beta"), max_depth=len(target.parts) + 32
+            )
         assert target.read_text(encoding="utf-8") == "alpha\nbeta\n"
 
     write_under(tmp_path / "platform", force_hold=False)
@@ -782,14 +799,18 @@ def test_write_through_a_link_reaches_the_object_the_screen_inspected(
     through_link = link / "crew" / "unit-order.txt"
 
     if atomic_write_module.pinned_parent_replace_supported():
-        crew_store._write_unit_order(through_link, ("gamma",))
+        crew_store._write_unit_order(
+            through_link, ("gamma",), max_depth=len(through_link.parts) + 32
+        )
         assert settled.read_text(encoding="utf-8") == "gamma\n"
         settled.write_text("alpha\nbeta\n", encoding="utf-8")
 
     with monkeypatch.context() as patched:
         patched.setattr(atomic_write_module, "pinned_parent_replace_supported", lambda: False)
         with pytest.raises(OSError):
-            crew_store._write_unit_order(through_link, ("gamma",))
+            crew_store._write_unit_order(
+                through_link, ("gamma",), max_depth=len(through_link.parts) + 32
+            )
     assert settled.read_text(encoding="utf-8") == "alpha\nbeta\n"
 
     # Either way nothing was created outside the object the screen inspected.

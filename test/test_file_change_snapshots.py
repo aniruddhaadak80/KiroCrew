@@ -3,7 +3,8 @@
 Covers:
   * ``_truncate_snapshot`` — caps content at 200KB.
   * ``_safe_read_snapshot`` — reads through the descriptor gate; rejects sensitive
-    paths and hardlink/symlink aliases of them.
+    paths, hardlink/symlink aliases of them, and a protected directory that is
+    itself a symlink.
   * ``_snapshot_write_target`` — captures before-content for write tools only.
   * ``_flush_file_changes`` — dedups, scrubs credentials, attaches to last assistant message
     or creates a synthetic one when the turn aborts before any assistant text.
@@ -11,58 +12,48 @@ Covers:
 These tests target the file-chips feature added. They drive
 new-line coverage on chat_runner.py from ~0% to a substantial fraction without
 touching the live ACP runtime — every test stays in pure-Python land.
+
+The per-turn snapshot budget and the files a persisted snapshot omits are in
+``test_file_change_snapshots_turn_budget.py``, pending ``strReplace`` resolution,
+large-file edits, the bounded line diff and failed writes in
+``test_file_change_snapshots_edits.py``, and the fixture and helpers the three
+modules share in ``file_change_snapshots_helpers.py``.
 """
 
 from __future__ import annotations
 
 import ast
 import inspect
+import json
 import os
-import shutil
-import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
+from file_change_snapshots_helpers import short_tmp_dir_fixture  # noqa: F401
+from file_change_snapshots_helpers import _make_slot_with_assistant_message
+from turn_harness import SlotSpec, TurnScript, run_turn
 
 from conftest import requires_symlinks
+from kiro_crew.acp.types import (
+    EVENT_CLEAR_STATUS,
+    EVENT_COMPLETE,
+    EVENT_TEXT_CHUNK,
+    STOP_REASON_END_TURN,
+    AcpEvent,
+)
+from kiro_crew.dashboard.chat_persistence import _build_message_entry
 from kiro_crew.dashboard.chat_runner import (
     _MAX_SNAPSHOT,
-    _MAX_SNAPSHOT_PATH_CHARS,
-    _MAX_TURN_SNAPSHOT_CHARS,
-    _MAX_TURN_SNAPSHOT_ENTRIES,
-    _apply_turn_snapshot_budget,
     _flush_file_changes,
+    _note_reply_row,
+    _on_clear_status,
     _record_turn_snapshot,
-    _run_chat,
     _safe_read_snapshot,
     _snapshot_write_target,
     _truncate_snapshot,
-    _turn_line_changes,
 )
-from kiro_crew.dashboard.state import _ChatSlot
-from kiro_crew.security import redact
-
-
-@pytest.fixture
-def short_tmp_dir():
-    """A short-path temp dir under ``/tmp``, removed on teardown.
-
-    These tests assert on a file's PATH as it appears in message metadata, and a
-    macOS ``tmp_path`` carries high-entropy directory ids that trip
-    ``redact_credentials()`` on that field -- so the path has to come from ``/tmp``
-    rather than from ``tmp_path``. ``mkdtemp`` registers no finalizer, though, so
-    the nine inline calls this replaces each leaked a directory that survived the
-    run; ``/tmp`` is not swept per-run the way pytest's own basetemp is.
-    """
-    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "snap-", dir=short_tmp_base()))
-    try:
-        yield base
-    finally:
-        shutil.rmtree(base, ignore_errors=True)
-
+from kiro_crew.dashboard.state import _ChatSlot, row_mid
 
 # ── _truncate_snapshot ──────────────────────────────────────────────────────
 
@@ -275,7 +266,12 @@ class TestSnapshotWriteTarget:
         # File doesn't exist yet — chip should still surface with empty before.
         target = tmp_path / "new.txt"
         out = _snapshot_write_target({"command": "create", "path": str(target)})
-        assert out == {"path": str(target), "content": "", "truncated": False}
+        assert out == {
+            "path": str(target),
+            "canonical_path": os.path.realpath(str(target)),
+            "content": "",
+            "truncated": False,
+        }
 
     def test_str_replace_on_existing_file_captures_content(self, tmp_path: Path):
         f = tmp_path / "code.py"
@@ -294,13 +290,6 @@ class TestSnapshotWriteTarget:
 
 
 # ── _flush_file_changes ────────────────────────────────────────────────────
-
-
-def _make_slot_with_assistant_message() -> _ChatSlot:
-    """Build a _ChatSlot with one assistant message ready to receive file_changes."""
-    slot = _ChatSlot("test-flush")
-    slot.append("assistant", "done.", "msg msg-a", broadcast=False)
-    return slot
 
 
 class TestFlushFileChanges:
@@ -338,6 +327,132 @@ class TestFlushFileChanges:
         assert meta["file_changes"][0]["after"] == "after\n"
         # Slot's accumulator is reset for the next turn.
         assert slot._file_changes == []
+
+    def test_turn_boundary_keeps_chips_off_the_previous_turns_answer(self, short_tmp_dir: Path):
+        # Turn 1 answered; turn 2 changed a file and ended without an assistant
+        # row (error-only exit). The chips belong to turn 2, so the flush must
+        # add a synthetic anchor after the boundary, not annotate turn 1's row.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _make_slot_with_assistant_message()
+        boundary = len(slot.messages)
+        start_mid = row_mid(slot.messages[-1])
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary, turn_start_mid=start_mid)
+        assert "file_changes" not in slot.messages[0].get("meta", {})
+        assert slot.messages[-1]["role"] == "assistant"
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_trimmed_window_still_finds_this_turns_rows_by_identity(self, short_tmp_dir: Path):
+        # At the row cap every append front-trims one row and the length stays
+        # pinned, so the index captured at turn start names the wrong row. The
+        # identity of the turn-start tail row does not move with the trim.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-cap")
+        slot.append("assistant", "old answer", "msg msg-a", broadcast=False)
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)  # 2, the cap
+        start_mid = row_mid(slot.messages[-1])
+        _note_reply_row(slot, slot.append("assistant", "new answer", "msg msg-a", broadcast=False))
+        del slot.messages[:1]  # what _ChatSlot.append does at the cap
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary, turn_start_mid=start_mid)
+        assert [m["content"] for m in slot.messages] == ["change x.py", "new answer"]
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_trimmed_window_with_no_answer_never_reaches_an_earlier_turn(self, short_tmp_dir: Path):
+        # Same trim, but this turn aborted before any assistant row. The
+        # previous answer must stay clean even though the index says otherwise.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-cap-abort")
+        slot.append("assistant", "old answer", "msg msg-a", broadcast=False)
+        slot.append("user", "first", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        start_mid = row_mid(slot.messages[-1])
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        del slot.messages[:1]
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary, turn_start_mid=start_mid)
+        assert slot.messages[0]["content"] == "first"
+        assert "file_changes" not in slot.messages[0].get("meta", {})
+        assert slot.messages[-1]["content"] == ""
+
+    def test_evicted_start_row_means_every_row_is_this_turns(self, short_tmp_dir: Path):
+        # The turn-start tail row itself was trimmed away: everything left in
+        # the window arrived after it, so the newest assistant row is the anchor.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-evicted")
+        slot.append("user", "hi", "msg msg-u", broadcast=False)
+        start_mid = row_mid(slot.messages[-1])
+        _note_reply_row(slot, slot.append("assistant", "new answer", "msg msg-a", broadcast=False))
+        del slot.messages[:1]
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=1, turn_start_mid=start_mid)
+        assert [m["content"] for m in slot.messages] == ["new answer"]
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_idless_start_row_falls_back_to_the_clamped_index(self, short_tmp_dir: Path):
+        # A transcript restored from a pre-id disk format has no identity to
+        # match, so the index is the only signal. Past the end it yields no
+        # rows, which means a synthetic anchor, never an earlier turn's row.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-idless")
+        slot.append("assistant", "old answer", "msg msg-a", broadcast=False, mint_mid=False)
+        assert row_mid(slot.messages[-1]) is None
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=5, turn_start_mid=None)
+        assert "file_changes" not in slot.messages[0].get("meta", {})
+        assert slot.messages[-1]["content"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_mid_turn_clear_drops_the_text_streamed_before_it(self):
+        """Through the real ``_run_chat``: a confirmed ``/clear`` mid-turn restarts
+        the turn's text, so the reply that lands is only what streamed after it --
+        never the pre-clear draft re-appended and persisted over what the user just
+        deleted."""
+        record = await run_turn(
+            TurnScript(
+                events=[
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="PRE-CLEAR draft "),
+                    AcpEvent(kind=EVENT_CLEAR_STATUS),
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="post"),
+                    AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+                ]
+            ),
+            slot=SlotSpec(rows=[("user", "earlier"), ("assistant", "earlier answer")]),
+        )
+        assert record.stop_reason == STOP_REASON_END_TURN
+        assert not any("PRE-CLEAR" in str(row.get("content")) for row in record.history_rows)
+        assert [row["content"] for row in record.rows("assistant")][-1] == "post"
+
+    def test_the_mid_turn_clear_restarts_the_turns_start_row_id(self):
+        """Kept as a source pin: the reset it guards changes nothing observable.
+
+        The clear arm resets ``_turn_start_mid`` beside the text. Without it the
+        flush would look for the pre-clear tail row's id in a window that no
+        longer holds it -- and fall back to the whole window, exactly as the reset
+        value does, so every turn renders the same chips either way (an
+        equivalent mutant; ``test_a_mid_turn_clear_drops_the_text_streamed_before_it``
+        covers the reset that IS observable). What is left is code intent, so it
+        stays a narrow AST check, counted in ``test_source_pin_budget.py``.
+        """
+        # The EVENT_CLEAR_STATUS arm's body is the clear phase's, ``_on_clear_status``.
+        [clear] = ast.parse(inspect.getsource(_on_clear_status)).body
+        resets = {
+            target.id
+            for stmt in clear.body
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value == ""
+            for target in stmt.targets
+            if isinstance(target, ast.Name)
+        }
+        assert "_turn_start_mid" in resets, resets
 
     @pytest.mark.parametrize(
         ("before_length", "after_length"),
@@ -500,8 +615,101 @@ class TestFlushFileChanges:
         # New synthetic message appended at the end.
         last = slot.messages[-1]
         assert last["role"] == "assistant"
-        assert "stopped" in last["content"].lower()
+        # Content-less: the anchor lands after the turn's error row, and a
+        # row with text there would read as the turn's reply.
+        assert last["content"] == ""
         assert last["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_aborted_turn_with_chips_still_reads_as_interrupted(self, short_tmp_dir: Path):
+        # The runner appends the error row in its ``except`` branch and flushes
+        # in ``finally``, so the synthetic anchor follows the error row. The
+        # transcript must still read as interrupted: the anchor is looked
+        # through, the trailing error decides. On the old anchor text this
+        # returned False and the composer lost its Resume control.
+        from kiro_crew.dashboard.state import is_turn_interrupted
+
+        f = short_tmp_dir / "edit.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("aborted-turn-interrupted")
+        slot.append("user", "hi", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        slot.append("error", "⟳ Connection lost — please retry.", "msg msg-err", broadcast=False)
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary)
+        assert [m["role"] for m in slot.messages] == ["user", "error", "assistant"]
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+        assert is_turn_interrupted(slot.messages) is True
+
+    def test_injected_assistant_row_is_never_the_anchor(self, short_tmp_dir: Path):
+        # workflow_inject.py appends a workflow completion into the LIVE window
+        # as an assistant row with no in-flight guard. Landing after this turn's
+        # last append and before the flush, it is the newest assistant row in
+        # the turn, and position alone would hand it the chips. It was not
+        # recorded as this runner's reply, so a synthetic anchor is added and
+        # the injected row's meta stays exactly as written.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-injected")
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        injected = slot.append(
+            "assistant",
+            "[Workflow completion event]\nWorkflow `w` (wf_1) → **ok**",
+            "msg msg-a",
+            broadcast=False,
+            meta={"kind": "workflow_result"},
+        )
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary)
+        assert set(injected["meta"]) == {"kind", "mid"}
+        assert slot.messages[-1] is not injected
+        assert slot.messages[-1]["content"] == ""
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_own_reply_wins_over_a_later_injected_row(self, short_tmp_dir: Path):
+        # The reply this runner appended is the anchor even when an injected
+        # assistant row arrived after it.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-injected-after-reply")
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        reply = slot.append("assistant", "done", "msg msg-a", broadcast=False)
+        _note_reply_row(slot, reply)
+        injected = slot.append(
+            "assistant", "Agent `a` ✅ ok", "msg msg-a", broadcast=False, meta={"kind": "x"}
+        )
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary)
+        assert reply["meta"]["file_changes"][0]["path"] == str(f)
+        assert "file_changes" not in injected["meta"]
+        assert len(slot.messages) == 3
+        # The flush consumed the turn's identities along with its snapshots.
+        assert slot._turn_reply_mids == []
+
+    def test_flush_segment_records_the_reply_identity(self, monkeypatch):
+        # The production reply path registers its row, so the flush can tell it
+        # from an injected one without any caller threading a list through.
+        from kiro_crew.dashboard import chat_runner as cr
+
+        slot = _ChatSlot("test-flush-segment-identity")
+        slot.append("user", "hi", "msg msg-u", broadcast=False)
+        monkeypatch.setattr(cr.crew_log_emit, "on_message_sent", lambda *a, **k: None)
+        cr._flush_segment(MagicMock(), slot, "the reply", broadcast=False)
+        assert slot.messages[-1]["content"] == "the reply"
+        assert slot._turn_reply_mids == [row_mid(slot.messages[-1])]
+
+    def test_reply_identities_are_bounded_at_the_window_cap(self, monkeypatch):
+        # A row older than the window cap has been trimmed away and cannot be an
+        # anchor, so its id leaves the list; the newest ids stay.
+        from kiro_crew.dashboard import chat_runner as cr
+
+        monkeypatch.setattr(cr, "_MAX_SLOT_MESSAGES", 2)
+        slot = _ChatSlot("test-reply-ids-bounded")
+        rows = [slot.append("assistant", str(i), "msg msg-a", broadcast=False) for i in range(3)]
+        for r in rows:
+            _note_reply_row(slot, r)
+        assert slot._turn_reply_mids == [row_mid(rows[1]), row_mid(rows[2])]
 
 
 # ── Regression tests: real event ordering & content-block paths ────────────
@@ -1018,721 +1226,75 @@ class TestContentBlockRedactionAndTruncation:
         assert "file_changes" in meta
 
 
-# ── per-turn snapshot budget ────────────────────────────────────────────────
+# ── a protected directory that is itself a symlink ─────────────────────────
+
+#: An ordinary line no credential pattern recognises, so redaction cannot be what
+#: keeps it out of a chip: only the path refusal can.
+_PRIVATE_NOTE = "private-note-marker-7f3a"
 
 
-def _entry(path: str, chars: int, *, last_write: int | None = None) -> dict[str, object]:
-    """One entry whose before+after spans ``chars`` and whose two sides differ."""
-    body = chars
-    half = body // 2
-    entry: dict[str, object] = {
-        "path": path,
-        "before": "b" * half,
-        "after": "a" * (body - half),
-    }
-    if last_write is not None:
-        entry["_last_write"] = last_write
-    return entry
+@pytest.fixture(params=[(".aws", "credentials"), (".ssh", "id_ed25519")], ids=["aws", "ssh"])
+def symlinked_secret(request, tmp_path: Path, monkeypatch) -> list[str]:
+    """Spellings of a dummy secret reached through a protected dir that is a SYMLINK.
+
+    ``<home>/.aws`` points at a directory OUTSIDE the home, so the store sits
+    outside every lexical anchor: only the target that protected entry resolves
+    to, which the target set carries, fences it by its real path. Returns the
+    absolute, ``~`` and real-path spellings.
+    """
+    protected_dir, leaf = request.param
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / leaf).write_text(f"[default]\n# {_PRIVATE_NOTE}\n", encoding="utf-8")
+    (home / protected_dir).symlink_to(outside, target_is_directory=True)
+    # Path.home() reads USERPROFILE on Windows and never HOME; pin both.
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    spelled = home / protected_dir / leaf
+    assert not spelled.resolve().is_relative_to(home), "precondition: the target is outside"
+    return [str(spelled), f"~/{protected_dir}/{leaf}", os.path.realpath(spelled)]
 
 
-def _noop_entry(path: str, chars: int, *, last_write: int | None = None) -> dict[str, object]:
-    """An entry whose write changed nothing -- the format-on-save shape."""
-    same = "s" * (chars // 2)
-    entry: dict[str, object] = {"path": path, "before": same, "after": same}
-    if last_write is not None:
-        entry["_last_write"] = last_write
-    return entry
+@requires_symlinks
+class TestSymlinkedProtectedDirectory:
+    """``~/.aws`` may itself be a symlink to a directory outside the home. The
+    store is refused on every surface that feeds a file chip, through its
+    protected spelling and through its real path alike."""
 
-
-# One snapshot side at its largest: the per-file cap plus its truncation marker.
-_SIDE_AT_THE_CAP = _truncate_snapshot("x" * (_MAX_SNAPSHOT + 1)).content
-# One entry at its worst case -- both sides at the cap -- which is what a file
-# over the per-file cap on both sides stores. It exceeds the turn budget by its
-# two markers, so as a NON-protected entry it is always demoted.
-_MAXED_ENTRY_CHARS = 2 * len(_SIDE_AT_THE_CAP)
-
-
-class TestTurnSnapshotBudget:
-    @pytest.mark.parametrize("with_protected", [False, True])
-    def test_path_only_rows_share_the_aggregate_budget(self, with_protected) -> None:
-        paths = [
-            f"/{i:03d}/" + "p" * (_MAX_SNAPSHOT_PATH_CHARS - 5)
-            for i in range(_MAX_TURN_SNAPSHOT_ENTRIES)
-        ]
-        entries = [_entry(path, 0) for path in paths]
-        if with_protected:
-            entries.append(_entry("protected.py", _MAXED_ENTRY_CHARS))
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        charged = [e for e in ordered if e["path"] != "protected.py"]
-        fits = _MAX_TURN_SNAPSHOT_CHARS // _MAX_SNAPSHOT_PATH_CHARS
-        assert [e["path"] for e in charged] == paths[-fits:]
-        assert sum(len(e["path"]) for e in charged) <= _MAX_TURN_SNAPSHOT_CHARS
-        assert (demoted, dropped) == (0, len(paths) - fits)
-        if with_protected:
-            protected = next(e for e in ordered if e["path"] == "protected.py")
-            assert len(protected["before"]) + len(protected["after"]) == _MAXED_ENTRY_CHARS
-
-    def test_demoted_paths_consume_the_aggregate_budget(self) -> None:
-        paths = [
-            f"/{i:03d}/" + "p" * (_MAX_SNAPSHOT_PATH_CHARS - 5)
-            for i in range(_MAX_TURN_SNAPSHOT_ENTRIES)
-        ]
-        entries = [_entry(path, _MAXED_ENTRY_CHARS) for path in paths]
-        entries.append(_entry("protected.py", 2))
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        charged = [e for e in ordered if e.get("content_omitted")]
-        fits = _MAX_TURN_SNAPSHOT_CHARS // _MAX_SNAPSHOT_PATH_CHARS
-        assert [e["path"] for e in charged] == paths[-fits:]
-        assert (demoted, dropped) == (fits, len(paths) - fits)
-        assert all(e["before"] == e["after"] == "" for e in charged)
-        assert sum(len(e["path"]) for e in charged) <= _MAX_TURN_SNAPSHOT_CHARS
-
-    def test_path_and_content_exactly_fill_the_budget(self) -> None:
-        entries = [
-            _entry("old.py", 0),
-            _entry("fits.py", _MAX_TURN_SNAPSHOT_CHARS - len("fits.py")),
-            _entry("protected.py", 2),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert [e["path"] for e in ordered] == ["fits.py", "protected.py"]
-        assert (demoted, dropped) == (0, 1)
-        assert sum(len(ordered[0][key]) for key in ("path", "before", "after")) == (
-            _MAX_TURN_SNAPSHOT_CHARS
-        )
-
-    def test_under_budget_keeps_every_entry_untouched(self) -> None:
-        entries = [_entry("a.py", 100), _entry("b.py", 100)]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert demoted == 0
-        assert [e["path"] for e in ordered] == ["a.py", "b.py"]
-        assert all(e["before"] and e["after"] for e in ordered)
-        assert all("content_omitted" not in e for e in ordered)
-
-    def test_oldest_entries_lose_content_and_newest_keeps_it(self) -> None:
-        # Three files at the worst case: the newest is protected and each of the
-        # others alone exceeds the budget, so only the newest keeps its diff.
-        entries = [
-            _entry("oldest.py", _MAXED_ENTRY_CHARS),
-            _entry("middle.py", _MAXED_ENTRY_CHARS),
-            _entry("newest.py", _MAXED_ENTRY_CHARS),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert demoted == 2
-        # The kept diff sorts first, so it lands inside the card's visible rows.
-        assert [e["path"] for e in ordered] == ["newest.py", "oldest.py", "middle.py"]
-        assert ordered[0]["before"] and ordered[0]["after"]
-        for entry in ordered[1:]:
-            assert entry["before"] == ""
-            assert entry["after"] == ""
-            assert entry["truncated"] is True
-            assert entry["content_omitted"] is True
-            assert entry["turn_budget_chars"] == _MAX_TURN_SNAPSHOT_CHARS
-
-    def test_budget_follows_the_last_write_not_the_first(self) -> None:
-        # The turn edits early.py, then late.py, then early.py again. Dedupe
-        # order puts early.py first, but it is the file the turn touched last.
-        entries = [
-            _entry("early.py", _MAXED_ENTRY_CHARS, last_write=2),
-            _entry("late.py", _MAXED_ENTRY_CHARS, last_write=1),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert demoted == 1
-        assert ordered[0]["path"] == "early.py"
-        assert ordered[0]["before"] and ordered[0]["after"]
-        assert ordered[1]["path"] == "late.py"
-        assert ordered[1]["content_omitted"] is True
-
-    def test_an_idempotent_final_write_does_not_spend_the_protected_slot(self) -> None:
-        # A format-on-save that changed nothing is the most recent entry; the
-        # real change must keep its diff rather than fund a diff of nothing.
-        entries = [
-            _entry("real.py", _MAXED_ENTRY_CHARS, last_write=0),
-            _noop_entry("formatted.py", _MAXED_ENTRY_CHARS, last_write=1),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert demoted == 1
-        kept = next(e for e in ordered if not e.get("content_omitted"))
-        assert kept["path"] == "real.py"
-        assert kept["before"] and kept["after"]
-
-    def test_newest_entry_survives_even_when_it_alone_exceeds_the_budget(self) -> None:
-        # The protected entry is outside the budget, so its size neither drops
-        # it nor charges the small older file, which keeps its diff too.
-        entries = [_entry("old.py", 10), _entry("huge.py", _MAX_TURN_SNAPSHOT_CHARS + 1)]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert (demoted, dropped) == (0, 0)
-        assert [e["path"] for e in ordered] == ["old.py", "huge.py"]
-        assert all(e["before"] and e["after"] for e in ordered)
-
-    def test_total_kept_content_stays_within_the_budget_plus_one_entry(self) -> None:
-        # The protected entry is outside the budget, so the stored total is
-        # bounded by the budget plus one entry at its worst case, never more.
-        entries = [_entry(f"f{i}.py", 150_000) for i in range(12)]
-        ordered, _demoted, _dropped = _apply_turn_snapshot_budget(entries)
-        kept = sum(len(e["before"]) + len(e["after"]) for e in ordered)
-        assert kept <= _MAX_TURN_SNAPSHOT_CHARS + _MAXED_ENTRY_CHARS
-        assert kept > _MAX_TURN_SNAPSHOT_CHARS
-
-    def test_a_noop_entry_cannot_push_the_kept_total_past_the_bound(self) -> None:
-        # The no-op is not protected, so it is charged; the real diff is kept
-        # outside the budget. Neither can exceed the budget-plus-one-entry bound.
-        entries = [
-            _entry("real.py", _MAXED_ENTRY_CHARS, last_write=0),
-            _noop_entry("formatted.py", _MAXED_ENTRY_CHARS, last_write=1),
-        ]
-        ordered, _demoted, _dropped = _apply_turn_snapshot_budget(entries)
-        kept = sum(len(e["before"]) + len(e["after"]) for e in ordered)
-        assert kept <= _MAX_TURN_SNAPSHOT_CHARS + _MAXED_ENTRY_CHARS
-
-    def test_a_maxed_protected_entry_does_not_demote_a_small_second_file(self) -> None:
-        # The turn edits a file at the per-file cap on both sides and then a
-        # two-character file. The protected entry is not charged, so the small
-        # diff fits the budget and both are kept.
-        side = _SIDE_AT_THE_CAP
-        entries = [
-            {"path": "small.py", "before": "x", "after": "y", "_last_write": 0},
-            {"path": "big.py", "before": "b" + side[1:], "after": side, "_last_write": 1},
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert (demoted, dropped) == (0, 0)
-        assert [e["path"] for e in ordered] == ["small.py", "big.py"]
-        assert all(e["before"] and e["after"] for e in ordered)
-
-    def test_the_budget_holds_one_more_large_entry_beside_the_protected_one(self) -> None:
-        # Two maxed files where the older one is at the cap on one side only:
-        # it fits the two-cap budget and keeps its diff beside the protected
-        # entry, so a turn rewriting two large files shows both.
-        side = _SIDE_AT_THE_CAP
-        entries = [
-            {"path": "older.py", "before": side, "after": "a" * (_MAX_SNAPSHOT - 100)},
-            {"path": "newest.py", "before": side, "after": "z" + side[1:]},
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert (demoted, dropped) == (0, 0)
-        assert [e["path"] for e in ordered] == ["older.py", "newest.py"]
-
-    def test_a_turn_of_only_noop_writes_keeps_what_fits_and_demotes_the_rest(self) -> None:
-        # Nothing has a real diff, so nothing is protected; the budget alone
-        # decides, and the no-change captions that fit are kept.
-        entries = [
-            _noop_entry("a.py", _MAX_TURN_SNAPSHOT_CHARS - len("a.pyb.py"), last_write=0),
-            _noop_entry("b.py", _MAX_TURN_SNAPSHOT_CHARS - len("a.pyb.py"), last_write=1),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert demoted == 1
-        assert ordered[0]["path"] == "b.py"
-        assert ordered[0]["before"] == ordered[0]["after"] != ""
-
-    def test_a_demoted_entry_drops_the_per_file_limit_field(self) -> None:
-        # A file both individually truncated AND demoted reports one reason:
-        # the turn budget, because its content is gone for that reason.
-        entries = [
-            {
-                "path": "old.py",
-                "before": "b" + _SIDE_AT_THE_CAP[1:],
-                "after": _SIDE_AT_THE_CAP,
-                "truncated": True,
-                "snapshot_limit_chars": _MAX_SNAPSHOT,
-            },
-            _entry("newest.py", _MAXED_ENTRY_CHARS),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert demoted == 1
-        dropped = next(e for e in ordered if e.get("content_omitted"))
-        assert dropped["path"] == "old.py"
-        assert "snapshot_limit_chars" not in dropped
-
-    def test_the_internal_write_order_key_never_reaches_a_stored_entry(self) -> None:
-        entries = [_entry("a.py", 10, last_write=0), _entry("b.py", 10, last_write=1)]
-        ordered, _demoted, _dropped = _apply_turn_snapshot_budget(entries)
-        assert all("_last_write" not in e for e in ordered)
-
-    def test_the_row_count_is_bounded_even_when_every_row_is_path_only(self) -> None:
-        # A path-only row is not free, so the content budget alone would leave
-        # the number of retained rows open.
-        entries = [
-            _entry(f"/f{i}.py", _MAXED_ENTRY_CHARS, last_write=i)
-            for i in range(_MAX_TURN_SNAPSHOT_ENTRIES + 25)
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert len(ordered) == _MAX_TURN_SNAPSHOT_ENTRIES
-        assert dropped == 25
-        assert demoted == _MAX_TURN_SNAPSHOT_ENTRIES - 1
-
-    def test_the_rows_dropped_for_the_count_are_the_oldest(self) -> None:
-        entries = [
-            _entry(f"/f{i}.py", 10, last_write=i) for i in range(_MAX_TURN_SNAPSHOT_ENTRIES + 3)
-        ]
-        ordered, _demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert dropped == 3
-        kept_paths = {e["path"] for e in ordered}
-        assert {"/f0.py", "/f1.py", "/f2.py"}.isdisjoint(kept_paths)
-
-    def test_a_turn_within_the_count_keeps_a_path_for_every_file(self) -> None:
-        # The older entry alone exceeds the content budget; it must still keep
-        # its path rather than vanish from the card.
-        entries = [
-            _entry("/old.py", _MAXED_ENTRY_CHARS, last_write=0),
-            _entry("/protected.py", _MAXED_ENTRY_CHARS, last_write=1),
-        ]
-        ordered, demoted, dropped = _apply_turn_snapshot_budget(entries)
-        assert (demoted, dropped) == (1, 0)
-        assert [e["path"] for e in ordered] == ["/protected.py", "/old.py"]
-
-    def test_flush_records_paths_for_the_files_it_demotes(self, short_tmp_dir: Path) -> None:
-        paths = []
-        for index in range(3):
-            target = short_tmp_dir / f"f{index}.txt"
-            target.write_text("a" * _MAX_TURN_SNAPSHOT_CHARS)
-            paths.append(target)
-        slot = _make_slot_with_assistant_message()
-        slot._file_changes = [
-            {"path": str(p), "content": "b" * _MAX_TURN_SNAPSHOT_CHARS} for p in paths
-        ]
-        _flush_file_changes(slot)
-        changes = slot.messages[-1]["meta"]["file_changes"]
-        # Every file keeps a path; the last-written one keeps its diff and leads.
-        assert {c["path"] for c in changes} == {str(p) for p in paths}
-        assert changes[0]["path"] == str(paths[-1])
-        assert [bool(c.get("content_omitted")) for c in changes] == [False, True, True]
-        assert all("_last_write" not in c for c in changes)
-
-    def test_flush_charges_the_budget_to_the_files_written_last(self, short_tmp_dir: Path) -> None:
-        early = short_tmp_dir / "early.txt"
-        late = short_tmp_dir / "late.txt"
-        for target in (early, late):
-            target.write_text("a" * _MAX_TURN_SNAPSHOT_CHARS)
-        slot = _make_slot_with_assistant_message()
-        # early is written, then late, then early again.
-        slot._file_changes = [
-            {"path": str(early), "content": "b" * _MAX_TURN_SNAPSHOT_CHARS},
-            {"path": str(late), "content": "b" * _MAX_TURN_SNAPSHOT_CHARS},
-            {"path": str(early), "content": "ignored second before"},
-        ]
-        _flush_file_changes(slot)
-        changes = slot.messages[-1]["meta"]["file_changes"]
-        kept = next(c for c in changes if not c.get("content_omitted"))
-        assert kept["path"] == str(early)
-        # The first before is still the one stored, not the second write's.
-        assert kept["before"].startswith("b")
-
-
-class TestSnapshotPathBound:
-    def test_the_bound_is_the_windows_extended_length_ceiling(self) -> None:
-        # Windows native is a supported platform, and with the extended-length
-        # prefix a path reaches 32,767 characters; a lower bound refuses a
-        # snapshot for a file the OS can open.
-        assert _MAX_SNAPSHOT_PATH_CHARS == 32_767
-
-    def test_a_path_no_os_can_open_is_refused_at_admission(self) -> None:
-        # The path is LLM-supplied; an entry keeps it even when its content is
-        # dropped, so an unbounded one would ride onto the message regardless.
-        long_path = "/tmp/" + "a" * (_MAX_SNAPSHOT_PATH_CHARS + 1) + ".txt"
-        assert (
-            _snapshot_write_target({"command": "create", "path": long_path}, diff_old_text="")
-            is None
-        )
-
-    def test_a_windows_long_path_within_the_ceiling_is_admitted(self) -> None:
-        # Longer than any Linux pathname, shorter than the Windows ceiling: the
-        # length check lets it through to the path validator. The validator
-        # itself decides on the path's content, not its length, so the test
-        # confirms the length gate alone did not refuse it.
-        long_path = "\\\\?\\C:\\" + "a" * 8_000 + "\\file.txt"
-        assert 4_096 < len(long_path) <= _MAX_SNAPSHOT_PATH_CHARS
-        with patch("kiro_crew.dashboard.chat_runner.validate_file_path") as validate:
-            validate.return_value = None
+    def test_write_target_refuses_the_protected_spelling(self, symlinked_secret):
+        for spelling in symlinked_secret:
+            for command in ("create", "strReplace", "insert"):
+                assert _snapshot_write_target({"command": command, "path": spelling}) is None
+            # The content block's own before-text does not get past the refusal.
             assert (
-                _snapshot_write_target({"command": "create", "path": long_path}, diff_old_text="")
+                _snapshot_write_target(
+                    {"command": "strReplace", "path": spelling},
+                    diff_old_text="[default]\n",
+                    diff_path=spelling,
+                )
                 is None
             )
-            validate.assert_called_once_with(long_path)
 
-    def test_a_path_at_the_bound_is_still_captured(self, tmp_path: Path) -> None:
-        target = tmp_path / "small.txt"
-        target.write_text("after")
-        assert len(str(target)) <= _MAX_SNAPSHOT_PATH_CHARS
-        captured = _snapshot_write_target(
-            {"command": "create", "path": str(target)}, diff_old_text="before"
-        )
-        assert captured is not None
-        assert captured["path"] == str(target)
+    def test_snapshot_read_refuses_the_protected_spelling(self, symlinked_secret):
+        for spelling in symlinked_secret:
+            assert _safe_read_snapshot(spelling) is None
 
-
-class TestTurnSnapshotAccumulator:
-    def test_repeated_writes_leave_room_for_a_new_path(self, short_tmp_dir: Path) -> None:
+    def test_flush_keeps_the_contents_out_of_live_meta_and_history(self, symlinked_secret):
+        """The write chain records nothing for the protected spelling, and the flush
+        reads each AFTER through the same gate, so an entry that reached the
+        accumulator anyway adds nothing either -- not even the line redaction cannot
+        recognise -- to the live meta or to the history entry built from it."""
         slot = _make_slot_with_assistant_message()
-        early = short_tmp_dir / "early.py"
-        late = short_tmp_dir / "late.py"
-        for index in range(_MAX_TURN_SNAPSHOT_ENTRIES * 2):
-            before = "first\n" if index == 0 else "intermediate\n"
-            _record_turn_snapshot(slot, {"path": str(early), "content": before})
-        _record_turn_snapshot(slot, {"path": str(late), "content": ""})
-        early.write_text("last\n")
-        late.write_text("created\n")
-        assert _turn_line_changes(slot._file_changes) == 3
+        for spelling in symlinked_secret:
+            snapshot = _snapshot_write_target({"command": "strReplace", "path": spelling})
+            if snapshot is not None:
+                _record_turn_snapshot(slot, snapshot)
+        # Hand-built, so the flush's own after-read is under test as well.
+        for spelling in symlinked_secret:
+            slot._file_changes.append({"path": spelling, "content": ""})
         _flush_file_changes(slot)
-        stored = {fc["path"]: fc for fc in slot.messages[-1]["meta"]["file_changes"]}
-        assert set(stored) == {str(early), str(late)}
-        assert stored[str(early)]["before"] == "first\n"
-        assert stored[str(early)]["after"] == "last\n"
-
-    @pytest.mark.parametrize("row_cap", [2, 3])
-    def test_repeat_recency_drives_the_budget_at_and_below_the_cap(
-        self, short_tmp_dir: Path, monkeypatch, row_cap: int
-    ) -> None:
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_ENTRIES", row_cap)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 0)
-        slot = _make_slot_with_assistant_message()
-        early = short_tmp_dir / "early.py"
-        other = short_tmp_dir / "other.py"
-        for target in (early, other):
-            target.write_text("after\n")
-            _record_turn_snapshot(slot, {"path": str(target), "content": "first\n"})
-        _record_turn_snapshot(
-            slot,
-            {"path": str(early), "content": "intermediate\n", "truncated": True},
-        )
-        _flush_file_changes(slot)
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
-        assert stored["path"] == str(early)
-        assert stored["before"] == "first\n"
-        assert "truncated" not in stored
-        assert "_last_write" not in stored
-
-    def test_record_holds_every_distinct_path_and_keeps_first_objects(self) -> None:
-        slot = _make_slot_with_assistant_message()
-        first = {"path": "/first.py", "content": "first", "truncated": False}
-        _record_turn_snapshot(slot, first)
-        for index in range(_MAX_TURN_SNAPSHOT_ENTRIES * 5):
-            _record_turn_snapshot(slot, {"path": "/first.py", "content": "replacement"})
-        assert slot._file_changes == [first]
-        distinct = _MAX_TURN_SNAPSHOT_ENTRIES * 2
-        for index in range(distinct):
-            _record_turn_snapshot(slot, {"path": f"/f{index}.py", "content": "b"})
-            _record_turn_snapshot(slot, {"path": "/first.py", "content": "replacement"})
-        assert len(slot._file_changes) == distinct + 1
-        assert len({fc["path"] for fc in slot._file_changes}) == distinct + 1
-        assert slot._file_changes[-1] is first
-        assert first == {"path": "/first.py", "content": "first", "truncated": False}
-
-    def test_record_returns_nothing_for_the_caller_to_consult(self) -> None:
-        slot = _make_slot_with_assistant_message()
-        assert _record_turn_snapshot(slot, {"path": "/a.py", "content": ""}) is None
-        assert _record_turn_snapshot(slot, {"path": "/a.py", "content": "x"}) is None
-
-
-# ── the per-side bound after redaction ──────────────────────────────────────
-
-# One redaction unit: a short credential that the ``?token=`` pass rewrites to a
-# 22-character tag, so a side made of these grows about threefold on redaction.
-_CREDENTIAL_UNIT = "x ?token=a "
-_SIDE_BOUND = len(_SIDE_AT_THE_CAP)
-
-
-def _credential_side(pad: str, offset: int) -> str:
-    """A side of exactly ``_MAX_SNAPSHOT`` chars, dense with short credentials.
-
-    ``offset`` pad chars lead the side, so two pads give two different sides,
-    and it shifts where the post-redaction cut lands relative to the tags.
-    """
-    body = pad * offset + _CREDENTIAL_UNIT * (_MAX_SNAPSHOT // len(_CREDENTIAL_UNIT) + 1)
-    return body[:_MAX_SNAPSHOT]
-
-
-_SNAPSHOT_MARKER = _SIDE_AT_THE_CAP[_MAX_SNAPSHOT:]
-
-
-class TestRedactedSideBound:
-    # The post-redaction cut lands between two tags at offset 1 and inside a
-    # tag at offset 15.
-    @pytest.mark.parametrize("offset", [1, 15])
-    def test_the_protected_entry_stays_within_the_per_side_bound(
-        self, short_tmp_dir: Path, offset: int
-    ) -> None:
-        # The protected entry is the one the turn budget never charges, so the
-        # per-side bound is all that holds its size once redaction expands it.
-        target = short_tmp_dir / "creds.txt"
-        target.write_text(_credential_side("a", offset))
-        slot = _make_slot_with_assistant_message()
-        raw = {"path": str(target), "content": _credential_side("b", offset), "truncated": False}
-        slot._file_changes = [raw]
-        _flush_file_changes(slot)
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
-        sources = {"before": raw["content"], "after": target.read_text()}
-        for side in ("before", "after"):
-            assert len(stored[side]) <= _SIDE_BOUND, (side, len(stored[side]))
-            # The bound is a plain cut of the redacted text at the per-side cap.
-            assert stored[side] == redact(sources[side])[:_MAX_SNAPSHOT] + _SNAPSHOT_MARKER
-        assert stored["truncated"] is True
-        assert stored["snapshot_limit_chars"] == _MAX_SNAPSHOT
-        # The flag lands on the stored copy only: the accumulator entry the
-        # line count reads keeps its own flag.
-        assert raw["truncated"] is False
-
-    def test_a_side_within_the_bound_after_redaction_is_stored_unchanged(
-        self, short_tmp_dir: Path
-    ) -> None:
-        target = short_tmp_dir / "few.txt"
-        target.write_text("after " + _CREDENTIAL_UNIT)
-        slot = _make_slot_with_assistant_message()
-        slot._file_changes = [{"path": str(target), "content": "before " + _CREDENTIAL_UNIT}]
-        _flush_file_changes(slot)
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
-        assert stored["before"] == "before x ?token=[REDACTED: credential] "
-        assert stored["after"] == "after x ?token=[REDACTED: credential] "
-        assert "truncated" not in stored
-
-    def test_a_side_truncated_before_redaction_keeps_its_one_marker(
-        self, short_tmp_dir: Path
-    ) -> None:
-        target = short_tmp_dir / "big.txt"
-        target.write_text("y" * (_MAX_SNAPSHOT + 10))
-        slot = _make_slot_with_assistant_message()
-        slot._file_changes = [{"path": str(target), "content": "b"}]
-        _flush_file_changes(slot)
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
-        assert stored["after"] == _truncate_snapshot("y" * (_MAX_SNAPSHOT + 10)).content
-
-    def test_a_redacted_path_stays_within_the_path_bound(self) -> None:
-        path = ("/q ?token=a" * (_MAX_SNAPSHOT_PATH_CHARS // 11 + 1))[:_MAX_SNAPSHOT_PATH_CHARS]
-        slot = _make_slot_with_assistant_message()
-        slot._file_changes = [{"path": path, "content": "before"}]
-        _flush_file_changes(slot)
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
-        assert len(stored["path"]) <= _MAX_SNAPSHOT_PATH_CHARS
-        assert stored["path"].endswith("...")
-
-
-# ── omitted files on the persisted snapshot ────────────────────────────────
-
-
-@pytest.fixture
-def snapshot_turn():
-    """Execute the runner's actual admission and flush statements.
-
-    Extracting these statements avoids starting an ACP session or duplicating
-    the admission code. Both event sites and both exit sites must exist, and a
-    mutation to either executes in the test.
-    """
-    tree = ast.parse(inspect.getsource(_run_chat))
-    [runner] = tree.body
-    admissions = sorted(
-        (
-            node
-            for node in ast.walk(runner)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id in {"_file_snapshot", "_file_snapshot_upd"}
-        ),
-        key=lambda node: node.lineno,
-    )
-    flushes = sorted(
-        (
-            node
-            for node in ast.walk(runner)
-            if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "_flush_file_changes"
-        ),
-        key=lambda node: node.lineno,
-    )
-    assert len(admissions) == len(flushes) == 2
-
-    def run(nodes, env):
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<snapshot-turn>", "exec"), env)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs the PRODUCTION admission statements lifted out of this repo's own source by AST, never external input; a hand-copied duplicate of them is exactly what this test exists to rule out  # noqa: E501  # fmt: skip
-
-    def start(slot):
-        env = {**_run_chat.__globals__, "slot": slot}
-
-        def record(path, key="call", site=0, content="before\n"):
-            env["event"] = SimpleNamespace(tool_call_id=key)
-            env["_file_snapshot" if site == 0 else "_file_snapshot_upd"] = {
-                "path": path,
-                "content": content,
-                "truncated": False,
-            }
-            run([admissions[site]], env)
-
-        return SimpleNamespace(
-            record=record, flush=lambda site=0: run([flushes[site]], env), env=env
-        )
-
-    return start
-
-
-class TestOmittedSnapshotFiles:
-    @pytest.mark.parametrize("multiple", [2, 10])
-    def test_large_flush_visits_dropped_indices_at_most_once(self, monkeypatch, multiple):
-        from kiro_crew.dashboard import chat_runner
-
-        total = _MAX_TURN_SNAPSHOT_ENTRIES * multiple
-        visited = 0
-
-        def tracked_set(indices=()):
-            def counted_indices():
-                nonlocal visited
-                for index in indices:
-                    visited += 1
-                    yield index
-
-            return set(counted_indices())
-
-        monkeypatch.setattr(chat_runner, "set", tracked_set, raising=False)
-        monkeypatch.setattr(
-            chat_runner, "_safe_read_snapshot", lambda path: _truncate_snapshot("after\n")
-        )
-        slot = _make_slot_with_assistant_message()
-        slot._file_changes = [
-            {"path": f"/f{index}.py", "content": "before\n"} for index in range(total)
-        ]
-        _flush_file_changes(slot)
-        meta = slot.messages[-1]["meta"]
-        dropped = total - _MAX_TURN_SNAPSHOT_ENTRIES
-        assert [fc["path"] for fc in meta["file_changes"]] == [
-            f"/f{index}.py" for index in range(dropped, total)
-        ]
-        assert all(
-            fc["before"] == "before\n" and fc["after"] == "after\n" for fc in meta["file_changes"]
-        )
-        assert meta["file_changes_omitted_files"] == dropped
-        assert slot._file_changes == []
-        # Count index traversal work, not elapsed time or constructor calls.
-        assert visited <= dropped
-
-    @pytest.mark.parametrize("site", [0, 1], ids=["call", "update"])
-    def test_a_turn_past_the_row_cap_keeps_the_files_it_wrote_last(self, snapshot_turn, site):
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        extra = 50
-        total = _MAX_TURN_SNAPSHOT_ENTRIES + extra
-        for index in range(total):
-            turn.record(f"/f{index}.py", f"call-{index}", site)
-        assert len(slot._file_changes) == total
-        turn.flush(site)
-        meta = slot.messages[-1]["meta"]
-        assert {fc["path"] for fc in meta["file_changes"]} == {
-            f"/f{index}.py" for index in range(extra, total)
-        }
-        assert meta["file_changes_omitted_files"] == extra
-        assert type(meta["file_changes_omitted_files"]) is int
-        # The success path's finally flush must not change the count.
-        turn.flush(1)
-        assert slot.messages[-1]["meta"]["file_changes_omitted_files"] == extra
-
-    def test_repeating_a_path_adds_no_row_and_keeps_the_first_before(
-        self, snapshot_turn, short_tmp_dir
-    ):
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        target = short_tmp_dir / "same.py"
-        target.write_text("last\n")
-        turn.record(str(target), "a", 0, content="first\n")
-        turn.record(str(target), "a", 1, content="second\n")
-        turn.record(str(target), "b", 0, content="third\n")
-        assert len(slot._file_changes) == 1
-        turn.flush()
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
-        assert stored["before"] == "first\n"
-        assert stored["after"] == "last\n"
-        assert "file_changes_omitted_files" not in slot.messages[-1]["meta"]
-
-    def test_row_cap_and_path_budget_drops_are_counted_as_files(self, snapshot_turn, monkeypatch):
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_ENTRIES", 2)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 0)
-        slot = _ChatSlot("stopped")
-        turn = snapshot_turn(slot)
-        for index in range(3):
-            turn.record(f"/f{index}.py", f"call-{index}")
-            turn.record(f"/f{index}.py", f"call-{index}-again", site=1)
-        turn.flush(1)
-        meta = slot.messages[-1]["meta"]
-        assert [fc["path"] for fc in meta["file_changes"]] == ["/f2.py"]
-        assert meta["file_changes_omitted_files"] == 2
-        assert slot._dirty
-
-    def test_the_count_is_absent_when_nothing_was_omitted(self, snapshot_turn):
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        turn.record("/a.py")
-        turn.record("/b.py", site=1)
-        turn.flush()
-        meta = slot.messages[-1]["meta"]
-        assert len(meta["file_changes"]) == 2
-        assert "file_changes_omitted_files" not in meta
-
-    def test_demoted_files_keep_their_path_and_are_not_counted(self, snapshot_turn, monkeypatch):
-        # A demoted file stays on the message as a path, so it is not omitted.
-        # The synthetic-message branch carries no zero count either.
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 20)
-        slot = _ChatSlot("stopped")
-        turn = snapshot_turn(slot)
-        for index in range(3):
-            turn.record(f"/f{index}.py", f"call-{index}", content="x" * 50)
-        turn.flush()
-        meta = slot.messages[-1]["meta"]
-        assert len(meta["file_changes"]) == 3
-        assert sum(bool(fc.get("content_omitted")) for fc in meta["file_changes"]) == 2
-        assert "file_changes_omitted_files" not in meta
-
-    def test_the_count_is_dropped_files_only_beside_a_demoted_one(self, snapshot_turn, monkeypatch):
-        # Room for one path beside the protected entry: /f1.py is demoted to its
-        # path, /f0.py is dropped, and only the dropped one is counted.
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 10)
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        for index in range(3):
-            turn.record(f"/f{index}.py", f"call-{index}", content="x" * 50)
-        turn.flush()
-        meta = slot.messages[-1]["meta"]
-        assert sorted(fc["path"] for fc in meta["file_changes"]) == ["/f1.py", "/f2.py"]
-        assert meta["file_changes_omitted_files"] == 1
-
-    def test_a_flush_without_drops_clears_an_earlier_count_on_its_message(self, monkeypatch):
-        slot = _make_slot_with_assistant_message()
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_ENTRIES", 1)
-        for path in ("/a.py", "/b.py"):
-            _record_turn_snapshot(slot, {"path": path, "content": "before"})
-        _flush_file_changes(slot)
-        assert slot.messages[-1]["meta"]["file_changes_omitted_files"] == 1
-        _record_turn_snapshot(slot, {"path": "/c.py", "content": "before"})
-        _flush_file_changes(slot)
-        meta = slot.messages[-1]["meta"]
-        assert [fc["path"] for fc in meta["file_changes"]] == ["/c.py"]
-        assert "file_changes_omitted_files" not in meta
-
-    def test_line_count_covers_the_latest_writes_past_the_row_cap(self, short_tmp_dir):
-        slot = _make_slot_with_assistant_message()
-        total = _MAX_TURN_SNAPSHOT_ENTRIES + 5
-        for index in range(total):
-            target = short_tmp_dir / f"f{index}.py"
-            target.write_text("after\n")
-            _record_turn_snapshot(slot, {"path": str(target), "content": "before\n"})
-        # One removed and one added line per file, the latest five included.
-        assert _turn_line_changes(slot._file_changes) == 2 * total
-        latest = slot._file_changes[-5:]
-        assert _turn_line_changes(latest) == 10
-
-    def test_the_spec_describes_the_flush_side_cap_and_the_file_count(self):
-        spec = (
-            Path(__file__).parents[1] / "docs/system-specs/modules/learn-cron-dashboard.md"
-        ).read_text(encoding="utf-8")
-        paragraph = next(p for p in spec.split("\n\n") if p.startswith("The in-turn accumulator"))
-        assert "every distinct path" in paragraph
-        assert "file_changes_omitted_files" in paragraph
-        assert "file_changes_omitted_writes" not in paragraph
-        assert "_MAX_OMITTED_WRITES" not in paragraph
-        assert "_TurnOverflowLines" not in paragraph
-        snapshots = next(p for p in spec.split("\n\n") if p.startswith("**File-change snapshots**"))
-        assert f"`_MAX_SNAPSHOT` ({_MAX_SNAPSHOT:,}) bounds one snapshot side" in snapshots
-        assert (
-            f"`_MAX_TURN_SNAPSHOT_CHARS` ({_MAX_TURN_SNAPSHOT_CHARS:,}) bounds the aggregate "
-            "path+before+after characters outside the protected entry"
-        ) in snapshots
-        assert _MAX_TURN_SNAPSHOT_CHARS == 2 * _MAX_SNAPSHOT
-        assert (
-            "protects the most recent one whose content actually differs without charging it; "
-            f"the total character bound is therefore {_MAX_TURN_SNAPSHOT_CHARS:,} plus that "
-            "entry's two snapshot sides, truncation markers and path."
-        ) in snapshots
+        message = slot.messages[-1]
+        assert _PRIVATE_NOTE not in json.dumps(message.get("meta", {}))
+        assert _PRIVATE_NOTE not in json.dumps(_build_message_entry(message))

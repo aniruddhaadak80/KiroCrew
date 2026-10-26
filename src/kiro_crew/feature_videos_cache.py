@@ -299,6 +299,10 @@ def cache_ceiling_bytes(max_mb: float) -> int:
 #: ``_download_entry`` keeps its ``(ok, error)`` shape.
 DENIED_MID_ENTRY = "download denied by the governance ceiling"
 
+#: The error for an entry whose poster or clip host the policy's ``hosts`` list
+#: does not permit. The pass goes on to the next entry, which may name another host.
+HOST_DENIED = "host not permitted by the governance ceiling"
+
 #: Failure reason for an entry whose media landed but whose receipt could not be
 #: written. The media stays on disk; without the receipt it reads as not cached,
 #: so the next pass re-fetches it and tries the receipt again.
@@ -440,6 +444,7 @@ class FeatureVideoCache:
         self.status: dict[str, object] = {
             "download_state": STATE_IDLE,
             "downloading": None,
+            "downloading_title": None,
             "error": "",
         }
 
@@ -538,7 +543,9 @@ class FeatureVideoCache:
                     logger.info("feature-video download stopped: the ceiling now denies it")
                     self._set_state(STATE_DENIED)
                     return False
-                self._set_state(STATE_DOWNLOADING, downloading=entry.id)
+                self._set_state(
+                    STATE_DOWNLOADING, downloading=entry.id, downloading_title=entry.title
+                )
                 ok, err = await asyncio.to_thread(self._download_entry, entry, current, rate)
                 if err == DENIED_MID_ENTRY:
                     logger.info("feature-video download stopped: the ceiling now denies it")
@@ -599,10 +606,16 @@ class FeatureVideoCache:
         *folder* is held open for the whole entry, so the directory the poster
         landed in is the directory the clip lands in and the receipts are written
         to — no step between them re-resolves the folder's name.
+
+        Each request is first held to the policy's ``hosts`` list
+        (:func:`manifest_mod.host_denied`); a refused host fails this entry only.
         """
+        poster_url = current.asset_url(entry.poster)
+        if manifest_mod.host_denied(poster_url):
+            return False, HOST_DENIED
         poster_ok, poster_err = asset_downloader.download_to(
             folder.describe(entry.poster),
-            current.asset_url(entry.poster),
+            poster_url,
             sha256=entry.poster_sha256,
             # A bound, not a declared length: the manifest carries a poster sha but
             # no poster byte count, and max_bytes caps the transfer without
@@ -625,9 +638,12 @@ class FeatureVideoCache:
         # the poster's permit.
         if manifest_mod.download_denied():
             return False, DENIED_MID_ENTRY
+        clip_url = current.asset_url(entry.file)
+        if manifest_mod.host_denied(clip_url):
+            return False, HOST_DENIED
         clip_ok, clip_err = asset_downloader.download_to(
             folder.describe(entry.file),
-            current.asset_url(entry.file),
+            clip_url,
             sha256=entry.sha256,
             size=entry.bytes,
             resume=True,
@@ -642,8 +658,24 @@ class FeatureVideoCache:
             return False, RECEIPT_FAILED
         return True, ""
 
-    def _set_state(self, state: str, *, downloading: str | None = None, error: str = "") -> None:
-        self.status = {"download_state": state, "downloading": downloading, "error": error}
+    def _set_state(
+        self,
+        state: str,
+        *,
+        downloading: str | None = None,
+        downloading_title: str | None = None,
+        error: str = "",
+    ) -> None:
+        # The title is taken from the SAME entry as the id, in the same
+        # assignment, so the status route can never pair one clip's id with
+        # another clip's title. An empty manifest title is reported as None, so
+        # the client has one "no title" value to test rather than two.
+        self.status = {
+            "download_state": state,
+            "downloading": downloading,
+            "downloading_title": (downloading_title or None) if downloading else None,
+            "error": error,
+        }
 
     def note_denied(self) -> None:
         """Record that the ceiling refused a transfer, for the status endpoint."""

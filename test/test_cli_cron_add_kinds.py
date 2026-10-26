@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -24,6 +25,7 @@ import pytest
 from kiro_crew.cli_commands import _cron, _format_schedule
 from kiro_crew.config.loader import config_dir
 from kiro_crew.cron import CronSchedule
+from kiro_crew.validation import MODEL_NAME_HINT
 
 
 def test_at_schedule_uses_configured_timezone_when_job_timezone_is_unset(monkeypatch):
@@ -365,17 +367,32 @@ class TestOneShot:
             svc_cls.return_value.add_job.assert_not_called()
         assert "could not parse time" in err
 
-    def test_timezone_with_at_is_refused(self, home, capsys):
-        # --timezone never reaches parse_time_string (the --at string is read
-        # in the configured tz), so pairing them would render a wall clock the
-        # operator never typed. The pair is refused before anything is written.
+    def test_timezone_with_at_reads_the_time_in_that_zone(self, home, monkeypatch):
+        # --timezone is the zone the --at clock time is read in, exactly as
+        # cron_add and POST /api/crons read at_time. The configured zone is UTC
+        # and the job's zone is 14 hours ahead, so a clock read in the wrong one
+        # lands on a different hour in the job's zone.
+        monkeypatch.setattr("kiro_crew.cron.get_local_tz", lambda: ("UTC", ZoneInfo("UTC")))
         with (
             patch("kiro_crew.cli_commands.CronService") as svc_cls,
             patch("kiro_crew.cli_commands.sel"),
         ):
-            err = _refused(_ns(at="in 2 hours", timezone="Asia/Tokyo"), capsys)
+            svc = svc_cls.return_value
+            svc.add_job.return_value = _mock_job()
+            _cron(_ns(at="23:59", timezone="Pacific/Kiritimati"))
+            kwargs = svc.add_job.call_args.kwargs
+        assert kwargs["timezone"] == "Pacific/Kiritimati"
+        local = datetime.fromtimestamp(kwargs["at_ts"], tz=ZoneInfo("Pacific/Kiritimati"))
+        assert (local.hour, local.minute) == (23, 59)
+
+    def test_invalid_timezone_with_at_is_refused(self, home, capsys):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            err = _refused(_ns(at="23:59", timezone="Not/AZone"), capsys)
             svc_cls.return_value.add_job.assert_not_called()
-        assert "--timezone applies to --cron only" in err
+        assert "invalid timezone" in err
 
     def test_timezone_with_every_refused(self, home, capsys):
         with (
@@ -384,7 +401,7 @@ class TestOneShot:
         ):
             err = _refused(_ns(every=300, timezone="Asia/Tokyo"), capsys)
             svc_cls.return_value.add_job.assert_not_called()
-        assert "--timezone applies to --cron only" in err
+        assert "--timezone applies to --cron and --at only" in err
 
     def test_timezone_with_cron_still_succeeds(self, home):
         with (
@@ -429,7 +446,7 @@ class TestRefusals:
                 "--timeout 3000 plus cleanup exceeds the 1800s wake budget",
             ),
             ({"every": 300, "channel": "not a channel"}, "invalid channel ID format"),
-            ({"every": 300, "model": "bad model!"}, "invalid model format"),
+            ({"every": 300, "model": "bad model!"}, f"invalid model format ({MODEL_NAME_HINT})"),
         ],
         ids=[
             "no schedule",
@@ -637,9 +654,11 @@ class TestDenialAudit:
             patch("kiro_crew.cli_commands.sel") as sel,
         ):
             sel.return_value.log_api_access.side_effect = RuntimeError("sel unavailable")
-            _refused(_ns(message="", every=300, shell_command="echo $(id)"), capsys)
+            err = _refused(_ns(message="", every=300, shell_command="echo $(id)"), capsys)
             svc_cls.return_value.add_job.assert_not_called()
             sel.return_value.log_api_access.assert_called_once()
+        assert "command substitution" in err
+        assert "sel unavailable" not in err
 
     @pytest.mark.parametrize(
         "spec",
@@ -737,15 +756,19 @@ class TestDenialAudit:
         assert denial["resources"] == "kind=script"
         assert "must be a valid Python identifier" in denial["error"]
 
-    def test_valid_script_function_name_reaches_add_job(self, home):
+    def test_valid_script_function_name_reaches_add_job(self, home, capsys):
         script = _write_script()
         with (
             patch("kiro_crew.cli_commands.CronService") as svc_cls,
-            patch("kiro_crew.cli_commands.sel"),
+            patch("kiro_crew.cli_commands.sel") as sel,
         ):
             svc_cls.return_value.add_job.return_value = _mock_job()
             _cron(_ns(message="", every=300, script=f"{script}:run"))
             svc_cls.return_value.add_job.assert_called_once()
+        stored = svc_cls.return_value.add_job.call_args.kwargs["script"]
+        assert stored == f"{script.resolve()}:run"
+        assert self._denials(sel) == []
+        assert capsys.readouterr().out.startswith("Added job: j1 (job) [")
 
     def test_blocked_script_body_leaves_a_denied_sel_event(self, home, capsys):
         script = _write_script("import os\nopen(os.path.expanduser('~/.aws/credentials'))\n")
@@ -795,18 +818,20 @@ class TestDenialAudit:
         (denial,) = self._denials(sel)
         assert denial["resources"] == f"kind={kind}"
 
-    def test_permitted_capability_lets_the_create_through(self, home):
+    def test_permitted_capability_lets_the_create_through(self, home, capsys):
         with (
             patch("kiro_crew.cli_commands.CronService") as svc_cls,
-            patch("kiro_crew.cli_commands.sel"),
+            patch("kiro_crew.cli_commands.sel") as sel,
             patch(
                 "kiro_crew.cli_commands._vet_cron_capability_governance", return_value=None
             ) as gate,
         ):
             svc_cls.return_value.add_job.return_value = _mock_job()
             _cron(_ns(every=300))
-            gate.assert_called_once()
+            gate.assert_called_once_with("cron:cli_add")
             svc_cls.return_value.add_job.assert_called_once()
+        assert self._denials(sel) == []
+        assert capsys.readouterr().out.startswith("Added job: j1 (job) [")
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +944,8 @@ class TestArgparse:
     def test_help_copy_numbers_track_the_production_bounds(self, monkeypatch, capsys):
         # The two flag descriptions quote ranges and defaults. Each number is
         # read back from the code that enforces it, so a bound that moves in
-        # cron.py or validation.py fails here instead of leaving stale prose.
+        # cron_service/ (model.py, execution.py) or validation.py fails here
+        # instead of leaving stale prose.
         from kiro_crew import cli
         from kiro_crew.cron import _JOB_TIMEOUT_SECS, _SUBPROC_CLEANUP_ALLOWANCE_SECS
         from kiro_crew.validation import CRON_ADD_SCHEMA

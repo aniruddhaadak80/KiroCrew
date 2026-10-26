@@ -1,6 +1,7 @@
 import { memo, useState, useCallback, useEffect, useRef } from 'react'
 
 import { i18nT } from '../i18n/t'
+import { useTouchReplay } from '../hooks/useTouchReplay'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 export interface TocEntry { level: number; text: string; index: number }
 
@@ -217,7 +218,18 @@ const MarkdownOutlineRail = memo(function MarkdownOutlineRail({ containerRef }: 
 
   useEffect(() => () => { clearTimeout(closeTimer.current); animCancel.current?.() }, [])
 
-  const open = useCallback(() => { clearTimeout(closeTimer.current); setExpanded(true) }, [])
+  // A touch tap's replayed mouseenter (and the focus its mousedown gives the
+  // tick) is not a hover: expanding synchronously on it makes iOS read the tap
+  // as a hover and drop the tick's click. Recorded on the <nav> through React's
+  // synthesized pointer events -- the nav itself is pointer-events-none, so a
+  // native listener there would never fire, but the ticks' pointer events
+  // bubble up to it (see useTouchReplay).
+  const { fromTouch, pointerProps } = useTouchReplay()
+  const open = useCallback(() => {
+    if (fromTouch()) return
+    clearTimeout(closeTimer.current)
+    setExpanded(true)
+  }, [fromTouch])
   // Small grace period on leave so a quick mouse path off a tick doesn't flicker.
   const scheduleClose = useCallback(() => { closeTimer.current = setTimeout(() => { setExpanded(false); setFocused(-1) }, 120) }, [])
   const jumpTo = useCallback((entry: TocEntry, i: number) => {
@@ -247,6 +259,7 @@ const MarkdownOutlineRail = memo(function MarkdownOutlineRail({ containerRef }: 
     <nav
       aria-label={i18nT('components.markdownToc.table_of_contents')}
       className="absolute inset-y-0 right-0 z-20 pointer-events-none select-none"
+      {...pointerProps}
       onMouseEnter={open}
       onMouseLeave={scheduleClose}
       onFocusCapture={open}
@@ -292,7 +305,7 @@ const MarkdownOutlineRail = memo(function MarkdownOutlineRail({ containerRef }: 
           `focused` highlight via the focusable ticks behind it. */}
       <div
         ref={flyoutRef}
-        className={`${expanded ? 'pointer-events-auto opacity-100 translate-x-0' : 'opacity-0 translate-x-2'} absolute top-1/2 right-2 -translate-y-1/2 w-[230px] max-h-[80%] overflow-y-auto scrollbar-overlay rounded-lg border border-border bg-bg-elevated shadow-xl py-1.5 transition-all duration-150`}
+        className={`${expanded ? 'pointer-events-auto opacity-100 translate-x-0' : 'opacity-0 translate-x-2'} absolute top-1/2 right-2 -translate-y-1/2 w-[230px] max-h-[80%] overflow-y-auto rounded-lg border border-border bg-bg-elevated shadow-xl py-1.5 transition-all duration-150`}
         aria-hidden
       >
         <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-muted">{i18nT('components.markdownToc.contents')}</div>

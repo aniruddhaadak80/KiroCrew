@@ -41,7 +41,11 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Callable
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER, split_trailing_protocol_suffix
+from kiro_crew.constants import (
+    OPTIONS_RE_TRAILER,
+    relocate_glued_tail_marker,
+    split_trailing_protocol_suffix,
+)
 from kiro_crew.messaging.approval import (
     TIMEOUT_NOTICE,
     abandon_approval,
@@ -97,7 +101,7 @@ _ERROR_TEXT = "Something went wrong on my side. Please try again."
 
 def _strip_options(text: str) -> str:
     """Drop the dashboard-only [OPTIONS: ...] trailer (no buttons here)."""
-    return OPTIONS_RE_TRAILER.sub("", text).strip()
+    return OPTIONS_RE_TRAILER.sub("", relocate_glued_tail_marker(text)).strip()
 
 
 class WhatsAppRenderer(Renderer):
@@ -116,6 +120,7 @@ class WhatsAppRenderer(Renderer):
         session_key: str = "",
         approval_session_key: str | None = None,
         upload_root: "Callable[[], str] | None" = None,
+        scratch_root: "Callable[[], str] | None" = None,
     ) -> None:
         super().__init__(capabilities)
         self._transport = transport
@@ -134,6 +139,10 @@ class WhatsAppRenderer(Renderer):
         #: uploads: reply text is untrusted (a prompt-injected agent chooses what
         #: it writes), and an unbounded root would let it name any host file.
         self._upload_root = upload_root
+        #: Resolves the session's own ``$KIROCREW_SCRATCH`` directory, admitted
+        #: beside the cwd root only (``outbound_files.session_scratch_root``
+        #: re-checks it is one allocation under the managed scratch root).
+        self._scratch_root = scratch_root
         self._last_tool = ""
         self._last_purpose = ""
         self._buf: list[str] = []
@@ -640,7 +649,17 @@ class WhatsAppRenderer(Renderer):
             # Mirrors the sibling channel: a relative root would be resolved
             # against the gateway's cwd, which is not the agent's workspace.
             return
-        plan = await plan_uploads_off_loop(self.text(), within_root=root)
+        scratch = ""
+        if self._scratch_root is not None:
+            try:
+                scratch = self._scratch_root()
+            except Exception:  # noqa: BLE001: no scratch means the cwd root alone
+                logger.debug("whatsapp: could not resolve the scratch root", exc_info=True)
+        plan = await plan_uploads_off_loop(
+            self.text(),
+            within_root=root,
+            scratch_root=scratch if isinstance(scratch, str) and os.path.isabs(scratch) else "",
+        )
         rejections = list(plan.rejections)
         for outbound in plan.files:
             try:

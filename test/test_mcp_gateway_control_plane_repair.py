@@ -416,6 +416,10 @@ def test_the_fingerprint_sees_the_managed_launch_so_an_upgrade_regenerates_overl
         pooling_enabled=True,
         forward_env=False,
         identity_keys=(),
+        # Pinned, because this test varies the managed launch alone. Every
+        # fingerprint input is keyword-only and required so a new one cannot
+        # be forgotten at a call site and silently stop invalidating.
+        read_buffer_limit=64 * 1024 * 1024,
     )
     monkeypatch.setattr(
         agent_mod,

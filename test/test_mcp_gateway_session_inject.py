@@ -20,7 +20,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +31,7 @@ from kiro_crew.mcp_gateway.session_servers import (
     injection_server_names,
     pooled_session_servers,
 )
+from kiro_crew.testing.wait import wait_until
 
 
 def _stub(**over):
@@ -541,7 +541,7 @@ def test_every_call_site_passes_the_session_checkout():
     whether the scope reached it. Covers the ``asyncio.to_thread(fn, ...)`` form,
     which is how four of the sites call these. A keyword carrying a DEAD value is
     invisible here by construction, which is what the client-seam test in
-    ``test_acp_session_mcp.py`` covers instead.
+    ``test_acp_session_mcp_client_seam.py`` covers instead.
     """
     import ast
 
@@ -866,15 +866,15 @@ def test_real_kiro_cli_prefers_session_injected_server():
             timeout=180,
             check=False,
         )
-        deadline = time.time() + 5
-        while time.time() < deadline and not (root / "marks" / "INJECTED").exists():
-            time.sleep(0.2)
-        assert (root / "marks" / "INJECTED").exists(), (
-            "session/new-injected server never launched — ACP injection is not "
-            "taking effect at all; pooling cannot work through this channel\n"
-            f"driver exit: {result.returncode}\n"
-            f"driver stdout: {result.stdout[-2000:]}\n"
-            f"driver stderr: {result.stderr[-2000:]}"
+        wait_until(
+            (root / "marks" / "INJECTED").exists,
+            describe=lambda: (
+                "session/new-injected server never launched — ACP injection is not "
+                "taking effect at all; pooling cannot work through this channel\n"
+                f"driver exit: {result.returncode}\n"
+                f"driver stdout: {result.stdout[-2000:]}\n"
+                f"driver stderr: {result.stderr[-2000:]}"
+            ),
         )
         assert not (root / "marks" / "FROM_SPEC").exists(), (
             "the agent spec's same-named server ALSO launched: session/new "

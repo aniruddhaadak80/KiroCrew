@@ -43,6 +43,14 @@ Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
   the host's answer (bounded by ``PERMISSION_WAIT_SECS``) and reflects it: a
   reject/cancel outcome yields ``status: "failed"`` on the tool_call_update.
   On timeout it reports ``completed``, preserving the never-block guarantee.
+* ``[[ELICIT:form]]`` / ``[[ELICIT:url]]`` in the prompt -> a tool_call, then an
+  MCP server's elicitation as the server->client request the launch shape would
+  carry (``_kiro/mcp/elicitation`` on the KAS relay, ``elicitation/create``
+  otherwise). The fake WAITS for the host's answer (bounded by
+  ``PERMISSION_WAIT_SECS``) and echoes it as the reply text,
+  ``ELICIT_ANSWER <json>``, so a test reads exactly what the host sent; a
+  non-accept answer fails the tool call. Headless-safe: the host's drivers
+  answer an elicitation themselves whenever no consumer can ask a person.
 * ``[[SLOW]]`` -> stream ``SLOW_CHUNKS`` chunks with a delay, checking for a
   ``session/cancel`` between each. A cancel ends the turn early with
   ``stopReason: "cancelled"`` (the ACP soft-stop ack the host waits for).
@@ -54,6 +62,17 @@ Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
   chunk, so the host's ``soft_pending`` state lasts ~250ms on average and a
   loaded browser can miss it entirely; the wind-down makes that state
   observable while still acking well inside the budget.
+* ``[[SLOW_HOLD:<token>]]`` at the start of a line -> a cancel-aware slow
+  stream that HOLDS after ``SLOW_HOLD_AFTER_CHUNKS`` chunk(s) until the file
+  ``slow_hold_path($KIROCREW_FAKE_ACP_HOLD_DIR, token)`` exists, then streams
+  the rest ``SLOW_HOLD_CHUNK_DELAY_SECS`` apart. A test creates that file once
+  it has observed what it orders on, so an ordering across two turns is
+  constructed rather than raced against ``SLOW_CHUNK_DELAY_SECS``.
+  Line-anchored, so a transcript quoting the prompt (``User: [[SLOW_HOLD:...]]``,
+  as the auto-title job sends it) is data and never holds. Bounded by
+  ``SLOW_HOLD_WAIT_SECS``: a hold nobody releases fails the turn with a JSON-RPC
+  error naming the token, an unset hold directory fails it at once, and a
+  ``session/cancel`` during the hold acks with ``stopReason: "cancelled"``.
 * ``[[ERROR]]`` -> reply with a JSON-RPC error instead of a result.
 * ``[[MAXTOKENS]]`` / ``[[REFUSAL]]`` -> alternate terminal ``stopReason``.
 
@@ -69,18 +88,24 @@ selectable from a real gateway. Run standalone as
 live-test harness both point ``KIROCREW_KIRO_BIN`` at a launcher that runs it).
 ``AcpClient`` invokes it as ``<launcher> acp [--agent NAME ...]`` -- argv is
 ignored on that path and the protocol is driven entirely over stdio. The
-``--version`` and ``whoami`` commands return deterministic success so the
-offline gateway exercises the same first-run readiness gate as production.
+``--version`` and ``whoami`` (with any flags) commands return deterministic
+success so the offline gateway exercises the same first-run readiness gate as
+production, and ``chat --list-models`` prints a fixed catalog so the
+dashboard's model picker (``/api/models``) has rows to show instead of a 503
+for a silent child.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import os
 import queue
+import re
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 PROTOCOL_VERSION = "2025-08-22"
@@ -91,6 +116,29 @@ REPLY_TEXT = "pong from the fake ACP backend"
 FAKE_VERSION = "kiro-cli fake-e2e"
 FAKE_IDENTITY = "fake-e2e-user"
 
+# The catalog ``chat --list-models --format json`` prints. Shaped like the real
+# CLI's payload (``{"models": [{model_name, model_id, description,
+# context_window_tokens}]}``) because ``api_models`` rejects anything else with
+# a 503, and every row names a model this fake will happily "run": it answers
+# every prompt the same way whatever model the picker selects. Two rows so the
+# picker has something to switch between.
+FAKE_MODEL_CATALOG: dict[str, Any] = {
+    "models": [
+        {
+            "model_name": "fake-model-fast",
+            "model_id": "fake-model-fast",
+            "description": "Fake e2e model (fast)",
+            "context_window_tokens": 200_000,
+        },
+        {
+            "model_name": "fake-model-large",
+            "model_id": "fake-model-large",
+            "description": "Fake e2e model (large context)",
+            "context_window_tokens": 1_000_000,
+        },
+    ]
+}
+
 # Prompt sentinels. Absent by default so a plain prompt stays text-only.
 TOOL_TRIGGER = "[[TOOL]]"
 PERMISSION_TRIGGER = "[[PERMISSION]]"
@@ -98,6 +146,16 @@ PERMISSION_TRIGGER = "[[PERMISSION]]"
 # reflects it in the tool_call_update status. Distinct from PERMISSION_TRIGGER,
 # whose fire-and-forget behaviour existing specs rely on.
 GATED_PERMISSION_TRIGGER = "[[GATED]]"
+# ``[[ELICIT:form]]`` / ``[[ELICIT:url]]``: an MCP server's elicitation raised mid
+# tool call. The fake emits the tool_call, then the server->client elicitation
+# request -- ``_kiro/mcp/elicitation`` when launched as the KAS engine
+# (``--agent-engine v3``), the standard ``elicitation/create`` otherwise -- WAITS
+# for the host's answer (bounded by PERMISSION_WAIT_SECS) and echoes it as the
+# reply text (``ELICIT_ANSWER <json>``), so a test reads exactly what the host
+# sent. An unanswered ask echoes ``ELICIT_ANSWER null``.
+ELICIT_TRIGGER_PREFIX = "[[ELICIT:"
+_ELICIT_RE = re.compile(r"\[\[ELICIT:(form|url)\]\]")
+ELICIT_ANSWER_PREFIX = "ELICIT_ANSWER "
 # A turn long enough for a host to press Stop mid-flight. SLOW honours
 # session/cancel; SLOW_NOACK deliberately ignores it so the host's soft-stop
 # budget expires (the "Stop Failed, Session Reset" path). SLOW_LATEACK honours
@@ -125,6 +183,19 @@ SLOW_CHUNK_TEXT = "fake slow chunk "
 # ends cooperatively) and roughly 12x the ~250ms window a plain SLOW cancel
 # leaves, which is too short for a loaded browser to paint.
 SLOW_LATEACK_CHUNKS = 6
+# The ordered slow stream (see the module docstring). The token is restricted to
+# a safe file-name alphabet, so the release path is always a direct child of the
+# test-owned directory the environment names, never a path the prompt chose.
+SLOW_HOLD_TRIGGER_PREFIX = "[[SLOW_HOLD:"
+_SLOW_HOLD_TOKEN = r"[A-Za-z0-9_-]{1,64}"
+_SLOW_HOLD_RE = re.compile(r"^[ \t]*\[\[SLOW_HOLD:(" + _SLOW_HOLD_TOKEN + r")\]\]", re.MULTILINE)
+# Inherited: the gateway hands its own environment to the agent child it spawns.
+SLOW_HOLD_DIR_ENV = "KIROCREW_FAKE_ACP_HOLD_DIR"
+SLOW_HOLD_AFTER_CHUNKS = 1
+# The hold supplies the ordering window, so the rest of the stream need not be slow.
+SLOW_HOLD_CHUNK_DELAY_SECS = 0.05
+# Never block forever: a test releases its hold long before this.
+SLOW_HOLD_WAIT_SECS = 60.0
 # How long a gated permission waits for the host's answer before giving up.
 # Bounded on purpose: the headless backend suite has nothing to resolve a modal,
 # and a hang there would stall the whole turn.
@@ -140,6 +211,76 @@ _SESSIONS: dict[str, tuple[list[dict[str, Any]], str]] = {}
 #: ``_meta.kiro.customAgents`` as each session/new declared them, by session id:
 #: the roster the relay reports readiness for is read from here on set_mode.
 _SESSION_AGENTS: dict[str, list[dict[str, Any]]] = {}
+
+#: Opt-in native-store emulation, OFF unless this names a directory. With it set
+#: the fake behaves like a KAS store: ``session/new`` mints a unique
+#: ``sess_<uuid>`` id and creates ``<dir>/<id>/``, every ``session/prompt``
+#: builds the request a model would see -- the whole conversation so far, not
+#: just the new prompt -- and appends it to ``<dir>/<id>/messages.jsonl`` and to
+#: the append-only ``<dir>/requests.jsonl``, and ``_kiro/session/delete`` removes
+#: ``<dir>/<id>/`` (KAS's delete drops the record; kiro-cli's terminate does not,
+#: so terminate leaves it). Tests read ``requests.jsonl`` to see what each turn
+#: would have sent and the directory to see which records outlived their session.
+NATIVE_STORE_ENV = "KIROCREW_FAKE_ACP_STORE_DIR"
+NATIVE_REQUEST_LOG = "requests.jsonl"
+_NATIVE_SID_RE = re.compile(r"^sess_[0-9a-f-]{36}$")
+#: The conversation each session has had, by session id, for the request above.
+_HISTORY: dict[str, list[str]] = {}
+
+
+def _native_store() -> str:
+    return os.environ.get(NATIVE_STORE_ENV, "")
+
+
+def _native_record(store: str, session_id: str) -> str | None:
+    """``<store>/<session_id>`` when the id has the minted shape, else ``None``."""
+    if not _NATIVE_SID_RE.fullmatch(session_id):
+        return None
+    return os.path.join(store, session_id)
+
+
+def _native_new(store: str, session_id: str, cwd: str) -> None:
+    record = _native_record(store, session_id)
+    if record is None:
+        return
+    os.makedirs(record, exist_ok=True)
+    with open(os.path.join(record, "session.json"), "w", encoding="utf-8") as fh:
+        json.dump({"id": session_id, "pid": os.getpid(), "cwd": cwd}, fh)
+
+
+def _native_prompt(store: str, session_id: str, text: str) -> None:
+    history = _HISTORY.setdefault(session_id, [])
+    history.append(text)
+    request = "\n".join(history)
+    line = json.dumps(
+        {
+            "sid": session_id,
+            "pid": os.getpid(),
+            "turn": len(history),
+            "cwd": (_SESSIONS.get(session_id) or ([], ""))[1],
+            "request_chars": len(request),
+            "request": request,
+        }
+    )
+    record = _native_record(store, session_id)
+    if record is not None and os.path.isdir(record):
+        with open(os.path.join(record, "messages.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    with open(os.path.join(store, NATIVE_REQUEST_LOG), "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def _native_delete(store: str, session_id: str) -> None:
+    """Remove exactly one minted record: a direct child of *store*, never a link."""
+    _HISTORY.pop(session_id, None)
+    record = _native_record(store, session_id)
+    if record is None or os.path.islink(record) or not os.path.isdir(record):
+        return
+    for name in os.listdir(record):
+        os.unlink(os.path.join(record, name))
+    os.rmdir(record)
+
+
 # The KAS relay's engine flag (kas_transport.KAS_RELAY_ENGINE_FLAG; spelled here
 # so this module stays stdlib-only). Its presence in argv is what tells a KAS
 # spawn from a kiro-cli one, and only the KAS spawn reports MCP readiness.
@@ -158,6 +299,27 @@ _TOOL_CALL_ID = "fake-tool-1"
 # pill can otherwise drop (falling back to the literal command line).
 _TOOL_PURPOSE = "Say hello from the fake backend"
 _PERMISSION_REQ_ID = 9001
+_ELICIT_REQ_ID = 9002
+_ELICIT_FORM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "confirm": {"type": "boolean", "title": "Confirm", "description": "Really do it"},
+        "reason": {"type": "string", "maxLength": 80},
+    },
+    "required": ["confirm"],
+}
+
+
+def slow_hold_trigger(token: str) -> str:
+    """The prompt marker that holds a slow stream on *token* (module docstring)."""
+    if not re.fullmatch(_SLOW_HOLD_TOKEN, token):
+        raise ValueError(f"slow-hold token must match {_SLOW_HOLD_TOKEN}: {token!r}")
+    return f"{SLOW_HOLD_TRIGGER_PREFIX}{token}]]"
+
+
+def slow_hold_path(hold_dir: str, token: str) -> str:
+    """The file whose existence releases the stream held on *token*."""
+    return os.path.join(hold_dir, token)
 
 
 def _send(obj: dict[str, Any]) -> None:
@@ -413,7 +575,92 @@ def _emit_tool_call(session_id: str, *, with_permission: bool, gated: bool = Fal
     )
 
 
-def _stream_slowly(session_id: str, *, cancel_aware: bool, ack_after_chunks: int = 0) -> bool:
+def _emit_elicitation(session_id: str, mode: str) -> str:
+    """Raise an MCP elicitation mid tool call and echo the host's answer.
+
+    The request rides the method a real engine of this launch shape would use:
+    KAS nests the fields under ``params.elicitation`` on ``_kiro/mcp/elicitation``;
+    every other harness sends them flat on ``elicitation/create``. Returns the
+    reply text: ``ELICIT_ANSWER`` plus the host's JSON-RPC ``result`` (or an
+    ``error`` object), ``null`` when nothing arrived in time.
+    """
+    _update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": _TOOL_CALL_ID,
+            "title": "@elicit_probe/confirm_delete",
+            "kind": "other",
+            "status": "pending",
+            "rawInput": {"item": "probe.txt", "mode": mode},
+        },
+    )
+    body: dict[str, Any] = {"mode": mode, "message": "Really delete probe.txt?"}
+    if mode == "url":
+        body.update({"elicitationId": "e-fake-1", "url": "https://example.com/confirm"})
+    else:
+        body["requestedSchema"] = _ELICIT_FORM_SCHEMA
+    if _KAS_RELAY:
+        params: dict[str, Any] = {
+            "sessionId": session_id,
+            "toolCallId": _TOOL_CALL_ID,
+            "elicitation": body,
+        }
+        method = "_kiro/mcp/elicitation"
+    else:
+        params = {"sessionId": session_id, "toolCallId": _TOOL_CALL_ID, **body}
+        method = "elicitation/create"
+    _send({"jsonrpc": "2.0", "id": _ELICIT_REQ_ID, "method": method, "params": params})
+    answer = _await_inbox(
+        lambda m: m.get("method") is None and m.get("id") == _ELICIT_REQ_ID,
+        PERMISSION_WAIT_SECS,
+    )
+    if answer is None:
+        echoed: Any = None
+    elif "error" in answer:
+        echoed = {"error": answer["error"]}
+    else:
+        echoed = answer.get("result")
+    accepted = isinstance(echoed, dict) and echoed.get("action") == "accept"
+    _update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": _TOOL_CALL_ID,
+            "status": "completed" if accepted else "failed",
+        },
+    )
+    return ELICIT_ANSWER_PREFIX + json.dumps(echoed, sort_keys=True)
+
+
+class _SlowHoldExpired(Exception):
+    """A held stream was not released within ``SLOW_HOLD_WAIT_SECS``."""
+
+
+def _hold_until_released(session_id: str, released: Callable[[], bool]) -> bool:
+    """Wait until *released* answers True. True if a session/cancel came first.
+
+    Polls like :func:`_await_inbox`, and raises :class:`_SlowHoldExpired` at
+    ``SLOW_HOLD_WAIT_SECS`` rather than block a turn forever.
+    """
+    deadline = time.monotonic() + SLOW_HOLD_WAIT_SECS
+    while not released():
+        if _cancel_requested(session_id):
+            return True
+        if time.monotonic() >= deadline:
+            raise _SlowHoldExpired
+        time.sleep(_POLL_INTERVAL_SECS)
+    return False
+
+
+def _stream_slowly(
+    session_id: str,
+    *,
+    cancel_aware: bool,
+    ack_after_chunks: int = 0,
+    hold: Callable[[], bool] | None = None,
+    delay: float | None = None,
+) -> bool:
     """Stream SLOW_CHUNKS chunks with a delay. True if cancelled mid-stream.
 
     cancel_aware=False models an agent stuck in a long tool call that cannot
@@ -428,10 +675,18 @@ def _stream_slowly(session_id: str, *, cancel_aware: bool, ack_after_chunks: int
     The cancel observation is LATCHED because `_cancel_requested` consumes the
     message from the inbox: a second call after the wind-down starts would
     return False and the ack would never fire.
+
+    *hold*, when given, is asked before chunk ``SLOW_HOLD_AFTER_CHUNKS``: the
+    stream waits there until it answers True (:func:`_hold_until_released`),
+    and a cancel during that wait ends the turn as cancelled. *delay* replaces
+    ``SLOW_CHUNK_DELAY_SECS`` between chunks.
     """
     cancelled = False
     winding_down = 0
     for i in range(SLOW_CHUNKS):
+        if hold is not None and i == SLOW_HOLD_AFTER_CHUNKS:
+            if _hold_until_released(session_id, hold):
+                return True
         if cancel_aware and not cancelled and _cancel_requested(session_id):
             cancelled = True
             winding_down = ack_after_chunks
@@ -446,7 +701,7 @@ def _stream_slowly(session_id: str, *, cancel_aware: bool, ack_after_chunks: int
                 "content": {"type": "text", "text": f"{SLOW_CHUNK_TEXT}{i} "},
             },
         )
-        time.sleep(SLOW_CHUNK_DELAY_SECS)
+        time.sleep(SLOW_CHUNK_DELAY_SECS if delay is None else delay)
     # A cancel arriving during the final sleep still counts.
     return bool(cancelled or (cancel_aware and _cancel_requested(session_id)))
 
@@ -475,16 +730,25 @@ def _handle(msg: dict[str, Any]) -> None:
     elif method == "session/new":
         # Warm reset creates the new handle before destroying the old one.
         # Reusing an ID makes old.destroy() remove the new runtime event queue.
-        _SESSION_ID = f"fake-{next(_SESSION_IDS)}"
+        store = _native_store()
+        if store:
+            _SESSION_ID = f"sess_{uuid.uuid4()}"
+        else:
+            _SESSION_ID = f"fake-{next(_SESSION_IDS)}"
         params = msg.get("params") or {}
         _SESSIONS[_SESSION_ID] = (params.get("mcpServers") or [], params.get("cwd") or "")
         _SESSION_AGENTS[_SESSION_ID] = _custom_agents(params)
+        if store:
+            _native_new(store, _SESSION_ID, params.get("cwd") or "")
         _result(req_id, {"sessionId": _SESSION_ID})
         _report_mcp_ready(_SESSION_ID)
     elif method in ("_kiro.dev/session/terminate", "_kiro/session/delete"):
         params = msg.get("params") or {}
         _SESSIONS.pop(str(params.get("sessionId", "")), None)
         _SESSION_AGENTS.pop(str(params.get("sessionId", "")), None)
+        store = _native_store()
+        if store and method == "_kiro/session/delete":
+            _native_delete(store, str(params.get("sessionId", "")))
         _result(req_id, {})
     elif method == "session/set_mode":
         # Reported again here, not only after session/new: the host counts every
@@ -506,6 +770,9 @@ def _handle(msg: dict[str, Any]) -> None:
             return
         servers, cwd = session
         text = _prompt_text(params)
+        store = _native_store()
+        if store:
+            _native_prompt(store, session_id, text)
         if "[[WF_E2E:" in text:
             from kiro_crew.testing.workflow_memory_scenario import respond
 
@@ -524,6 +791,19 @@ def _handle(msg: dict[str, Any]) -> None:
             # A JSON-RPC error instead of a result: the turn fails, not stops.
             _error(req_id)
             return
+        elicit = _ELICIT_RE.search(text)
+        if elicit is not None:
+            # The echo IS the reply: a test reads the host's answer off it.
+            echoed = _emit_elicitation(session_id, elicit.group(1))
+            _update(
+                session_id,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": echoed},
+                },
+            )
+            _result(req_id, {"stopReason": "end_turn"})
+            return
         if GATED_PERMISSION_TRIGGER in text:
             _emit_tool_call(session_id, with_permission=True, gated=True)
         elif PERMISSION_TRIGGER in text:
@@ -531,7 +811,30 @@ def _handle(msg: dict[str, Any]) -> None:
         elif TOOL_TRIGGER in text:
             _emit_tool_call(session_id, with_permission=False)
 
-        if SLOW_NOACK_TRIGGER in text:
+        holds = _SLOW_HOLD_RE.findall(text)
+        if holds:
+            token = holds[-1]
+            hold_dir = os.environ.get(SLOW_HOLD_DIR_ENV, "")
+            if not hold_dir:
+                _error(req_id, message=f"fake ACP backend: a slow hold needs {SLOW_HOLD_DIR_ENV}")
+                return
+            release = slow_hold_path(hold_dir, token)
+            try:
+                cancelled = _stream_slowly(
+                    session_id,
+                    cancel_aware=True,
+                    hold=lambda: os.path.exists(release),
+                    delay=SLOW_HOLD_CHUNK_DELAY_SECS,
+                )
+            except _SlowHoldExpired:
+                _error(
+                    req_id,
+                    message=f"fake ACP backend: slow hold {token!r} was not released "
+                    f"within {SLOW_HOLD_WAIT_SECS:g}s",
+                )
+                return
+            stop_reason = "cancelled" if cancelled else "end_turn"
+        elif SLOW_NOACK_TRIGGER in text:
             _stream_slowly(session_id, cancel_aware=False)
             stop_reason = "end_turn"
         elif SLOW_LATEACK_TRIGGER in text:
@@ -580,8 +883,19 @@ def main() -> None:
     if args == ["--version"]:
         print(FAKE_VERSION)
         return
-    if args == ["whoami"]:
+    if args[:1] == ["whoami"]:
+        # Flags after the subcommand (``--format json``, which the dashboard's
+        # credit refresh passes) are accepted and ignored. Answering here keeps
+        # that call off the ACP loop below, which would wait on stdin.
         print(FAKE_IDENTITY)
+        return
+    if args[:2] == ["chat", "--list-models"]:
+        # The dashboard's model picker spawns
+        # ``kiro-cli chat --list-models --format json --no-interactive`` and
+        # treats empty stdout as a 503. Flags after the subcommand are accepted
+        # and ignored; the payload is JSON regardless, which is what the one
+        # caller asks for.
+        print(json.dumps(FAKE_MODEL_CATALOG))
         return
     if args == ["acp", "--help"]:
         # The readiness probe runs this to confirm the `acp` subcommand exists

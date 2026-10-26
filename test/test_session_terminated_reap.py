@@ -26,6 +26,7 @@ probe that cannot answer.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock
 
@@ -33,6 +34,7 @@ import pytest
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import await_until
 
 # Far larger than any wall-clock this test spends, so every reap asserted below
 # is on the terminated-owner axis and never on the idle clock.
@@ -504,7 +506,9 @@ class TestPendingInjectionIsSpared:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_an_injection_starting_inside_the_rss_probe_await_spares_it(self, cfg) -> None:
+    async def test_an_injection_starting_inside_the_rss_probe_await_spares_it(
+        self, cfg, caplog
+    ) -> None:
         """The RSS ceiling reaches ``reset`` through the same suspending wrapper.
 
         So it inherits the same window, and closing it only on the idle sweep's
@@ -539,10 +543,15 @@ class TestPendingInjectionIsSpared:
             patch.object(session_mod.platform_compat, "IS_WINDOWS", False),
             patch("kiro_crew.session._build_child_map", return_value={}),
             patch("kiro_crew.session._rss_mb_from_tree", return_value=2048),
+            caplog.at_level(logging.DEBUG, logger="kiro_crew.session"),
         ):
             await mgr._rss_threshold_check()
 
         recycled.assert_not_awaited()
+        assert mgr._cleanup_boundary().state.rss_recycled == {}
+        assert (
+            f"RSS recycle: session {key} began an injection mid-check; skipping" in caplog.messages
+        )
 
     @pytest.mark.asyncio
     async def test_the_rss_ceiling_still_recycles_when_nothing_is_injecting(self, cfg) -> None:
@@ -573,6 +582,8 @@ class TestPendingInjectionIsSpared:
             await mgr._rss_threshold_check()
 
         recycled.assert_awaited_once()
+        assert recycled.await_args.args[0] == key
+        assert set(mgr._cleanup_boundary().state.rss_recycled) == {key}
 
     @pytest.mark.asyncio
     async def test_an_injection_starting_while_reset_awaits_the_lock_spares_it(self, cfg) -> None:
@@ -665,9 +676,9 @@ class TestPendingInjectionIsSpared:
         """
         from pathlib import Path
 
-        import kiro_crew.slack.gateway as gateway_mod
+        from kiro_crew.slack.gateway_runtime import service_boot
 
-        src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
+        src = Path(service_boot.__file__).read_text(encoding="utf-8")
         assert (
             "self.sessions.set_injection_probe(" in src
         ), "the gateway installs no injection probe"
@@ -692,9 +703,9 @@ class TestConcurrency:
         mgr.set_active_dashboard_slots({finished})
         mgr.set_active_dashboard_slots(set())
 
-        await asyncio.wait_for(
+        await await_until(
             asyncio.gather(mgr._expire_idle(NEVER_IDLE), mgr._expire_idle(NEVER_IDLE)),
-            timeout=10,
+            what="two concurrent idle sweeps both finishing",
         )
 
         assert finished not in mgr._sessions

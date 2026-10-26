@@ -16,7 +16,6 @@ what produces drift you then cannot fix without a re-record.
 Script file format (JSON):
 
 {
-  "voice": "en-US-AndrewMultilingualNeural",
   "gap": 0.4,
   "lines": [
     {"role":"intro","eyebrow":"THE FEATURE","title":"Command Bar",
@@ -165,7 +164,8 @@ def tool(name: str) -> str:
                 return exe
         except Exception:
             pass
-    raise SystemExit(f"{name} not found -- run scripts/deps.py --install")
+    deps = pathlib.Path(__file__).resolve().with_name("deps.py")
+    raise SystemExit(f"{name} not found -- run {deps} --install")
 
 
 def measure(path: pathlib.Path) -> float:
@@ -182,6 +182,8 @@ def measure(path: pathlib.Path) -> float:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     return round(float(out.stdout.strip()), 3)
@@ -297,7 +299,11 @@ def synthesize(
         ]
         with _staged_output(out) as stage:
             argv[argv.index("--output_file") + 1] = stage
-            proc = subprocess.run(argv, input=text, capture_output=True, text=True)
+            # piper reads UTF-8 on stdin; the locale code page would mangle or
+            # refuse (UnicodeEncodeError on Windows) non-ASCII narration.
+            proc = subprocess.run(
+                argv, input=text, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
             if proc.returncode != 0 or not pathlib.Path(stage).exists():
                 raise SystemExit(f"piper failed: {(proc.stderr or proc.stdout)[-400:]}")
         return out
@@ -326,10 +332,11 @@ def synthesize(
             argv += ["--region", aws_region]
         with _staged_output(out) as stage:
             argv.append(stage)
-            proc = subprocess.run(argv, capture_output=True, text=True)
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
             if proc.returncode != 0 or not pathlib.Path(stage).exists():
                 raise SystemExit(f"polly failed: {(proc.stderr or proc.stdout)[-400:]}")
-        return out
         return out
     raise SystemExit(f"unknown provider {provider!r}; expected piper or polly")
 

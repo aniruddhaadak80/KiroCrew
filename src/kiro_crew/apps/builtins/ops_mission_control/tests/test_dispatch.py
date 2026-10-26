@@ -262,6 +262,37 @@ class TestClaimCap(_HomeIsolated):
         self.assertEqual(len(result.claimed), dispatch.DEFAULT_MAX_CLAIMS_PER_CYCLE)
 
 
+class TestDispatchKnobsAreReadOffTheLoop(_HomeIsolated):
+    async def test_every_knob_read_runs_on_a_worker_thread(self):
+        """The claim cap and both stale thresholds come from ``config.json`` on disk.
+
+        ``run_cycle`` runs on the gateway's event loop every heartbeat, so a read of
+        that file on the loop stalls every session for as long as the disk takes.
+        The three reads sit between steps that are already offloaded; each must be
+        offloaded too.
+        """
+        import threading
+
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+        real_read_config = dispatch.read_config
+
+        def _recording_read_config():
+            threads.append(threading.get_ident())
+            return real_read_config()
+
+        self._add_source([self._signal()])
+        with mock.patch.object(dispatch, "read_config", _recording_read_config):
+            result = await dispatch.run_cycle()
+
+        self.assertEqual(len(result.claimed), 1)
+        # Cap, stale threshold, needs-human threshold: all three were read.
+        self.assertEqual(len(threads), 3)
+        self.assertNotIn(loop_thread, threads)
+
+
 class TestLedgerWiring(_HomeIsolated):
     """The point of the whole app: a repeat failure arrives with its answer."""
 
@@ -1279,17 +1310,17 @@ class TestTheBriefRedactsProviderMetadata(_HomeIsolated):
         return dispatch.investigation_brief(dispatch.ClaimedIncident(incident=incident))
 
     def test_a_credential_in_the_title_is_redacted(self):
-        brief = self._brief_for(title="worker used AKIAIOSFODNN7EXAMPLE and 403'd")
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", brief)
+        brief = self._brief_for(title="worker used glpat-IOSFODNN7EXAMPLE and 403'd")
+        self.assertNotIn("glpat-IOSFODNN7EXAMPLE", brief)
         self.assertIn("403", brief)  # redaction, not truncation
 
     def test_a_credential_in_the_resource_is_redacted(self):
-        brief = self._brief_for(title="t", resource="arn:aws:x/AKIAIOSFODNN7EXAMPLE")
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", brief)
+        brief = self._brief_for(title="t", resource="arn:aws:x/glpat-IOSFODNN7EXAMPLE")
+        self.assertNotIn("glpat-IOSFODNN7EXAMPLE", brief)
 
     def test_a_token_in_the_provider_url_query_is_redacted(self):
-        brief = self._brief_for(title="t", url="https://x.example/a?key=AKIAIOSFODNN7EXAMPLE")
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", brief)
+        brief = self._brief_for(title="t", url="https://x.example/a?key=glpat-IOSFODNN7EXAMPLE")
+        self.assertNotIn("glpat-IOSFODNN7EXAMPLE", brief)
 
     def test_fields_this_app_owns_are_not_mangled(self):
         """`source`/`severity`/`fingerprint` are ours; redacting them could only corrupt a

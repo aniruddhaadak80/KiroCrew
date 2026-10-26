@@ -3,16 +3,16 @@
 //
 // SECURITY MODEL
 // ==============
-// The iframe uses sandbox="allow-scripts allow-popups
-// allow-popups-to-escape-sandbox" with srcdoc, giving it a null origin. The
-// LLM content runs in an isolated context — it cannot access parent DOM,
-// cookies, localStorage, or navigate the parent page. allow-popups (+escape)
-// lets target="_blank" links open in a real new tab; reverse-
-// tabnabbing stays blocked by the mandated rel="noopener noreferrer" on
-// widget links. A bare absolute link (no target) would otherwise navigate the
-// sandboxed frame itself, so EXTERNAL_LINK_TARGET_SHIM_BODY rewrites it to
-// _blank + noopener at click time (hosts that withhold allow-popups opt out
-// via rewriteBareLinks: false). Same security model as Claude's artifacts (Anthropic).
+// The iframe uses sandbox="allow-scripts" (AGENT_PAGE_SANDBOX) with no popup
+// grant, giving it a null origin. The LLM content runs in an isolated context —
+// it cannot access parent DOM, cookies, localStorage, navigate the parent page,
+// or open a window of its own. Links open through the host instead: the
+// `linkBridge` option injects LINK_BRIDGE_SHIM_BODY, which hands a `_blank` or
+// bare web link click, and `window.open`, to the host's `useFrameLinkBridge`,
+// gives each web link its URL as a hover title, and the host opens the URL after
+// a real click in that frame. Callers that do not set `linkBridge` (an exported copy, the mochi
+// pet frame) keep EXTERNAL_LINK_TARGET_SHIM_BODY or opt out of it with
+// `rewriteBareLinks: false`.
 //
 // DOMPurify is NOT applied because it strips <script> tags, which are
 // required for widget interactivity (Chart.js, D3, Tailwind CDN, etc.).
@@ -38,11 +38,30 @@
 //
 // Used by:
 // - WidgetFrame.tsx (inline <mcwidget> rendering in chat)
-// - ArtifactDetailPage.tsx (full-screen artifact view at /artifacts/<slug>)
+// - useArtifactDetailPageDocument.ts (full-screen artifact view at /artifacts/<slug>)
 
 import { parseCssColor, relativeLuminance } from './iconContrast'
-import { TAILWIND_RUNTIME_PATH } from './vendorPaths'
+import { TAILWIND_RUNTIME_PATH as TAILWIND_RUNTIME_PATH_ROOT } from './vendorPaths'
+import { withBase } from './basePath'
+/** The runtime's served path under this build's base (the bare path in the stock build). */
+const TAILWIND_RUNTIME_PATH = withBase(TAILWIND_RUNTIME_PATH_ROOT)
 import { sanitizeCssValue } from './cssSanitize'
+
+/** The sandbox grants for every frame that holds an agent-written page: saved
+ * artifacts (`ArtifactBody`), library thumbnails (`ArtifactThumbs`), a teammate's
+ * shared artifact (`RemoteArtifactDetailPage`) and chat widgets (`WidgetFrame`,
+ * inline and popped out). The same grant as a crewmate's Dashboard frame
+ * (`CREW_DASHBOARD_SANDBOX`). No `allow-popups`: links leave through the host's
+ * link bridge (`linkBridge` here, `useFrameLinkBridge` in the host). Mirrored by
+ * the `/sandbox-doc/` response header in `dashboard/handlers/sandbox_doc.py`. */
+export const AGENT_PAGE_SANDBOX = 'allow-scripts'
+
+/** How long a click or key press stays a live user activation: 5 s in Chromium,
+ * and so in the desktop app. Within this long of a click or key outside the
+ * asking frame, the link bridges cannot tie a live activation to that frame, so
+ * they show the "Open <host>" button instead of opening. */
+export const ACTIVATION_LIFESPAN_MS = 5000
+
 
 /** CSS custom properties the parent app exposes to widgets. Resolved against
  * document.documentElement and serialized into the sandboxed srcdoc so widget
@@ -74,10 +93,24 @@ export const THEME_VAR_NAMES = [
 // A null-origin iframe cannot use 'self', which is why the origin is spelled out.
 // jsdelivr/cdnjs remain for widget-authored Chart.js/D3 (same-origin + SRI is a
 // follow-up). Tailwind v4 emits CSS as inline <style>, so style-src needs no CDN.
-const cspFor = (scriptOrigin: string): string =>
+//
+// `offlineScripts` DROPS those two origins, and a crewmate's dashboard sets it.
+// `connect-src 'none'` stops a page phoning home with fetch or a WebSocket, but a
+// permitted script ORIGIN is a second channel: a page may append
+// `<script src="https://cdn.jsdelivr.net/x.js?d=<encoded fields>">` and the browser
+// sends that query out. For a widget that is the accepted trade recorded above --
+// the author is the person reading it. A crewmate's dashboard page is different on
+// both counts: it is filled with that crewmate's own task titles, summaries and
+// costs, and since the preview/apply pair it can be authored by an AGENT and
+// accepted by somebody who read the rendering rather than the markup. The product
+// already states the property -- "a chart drawn from a CDN renders as a hole rather
+// than as a call home" -- so a dashboard document permitting those origins
+// contradicted the frame's own contract. A page draws its chart from the inline
+// script it ships, which stays permitted.
+const cspFor = (scriptOrigin: string, offlineScripts = false): string =>
   "default-src 'none'; " +
-  `script-src 'unsafe-inline' ${scriptOrigin}${TAILWIND_RUNTIME_PATH} ` +
-  "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; " +
+  `script-src 'unsafe-inline' ${scriptOrigin}${TAILWIND_RUNTIME_PATH}` +
+  (offlineScripts ? '; ' : ' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; ') +
   "style-src 'unsafe-inline'; " +
   "img-src data: blob:; font-src data:; connect-src 'none'; " +
   "form-action 'none'; base-uri 'none';"
@@ -85,6 +118,18 @@ const cspFor = (scriptOrigin: string): string =>
 const BASE_BODY_CSS =
   "body { margin: 0; padding: 16px; font-family: -apple-system, " +
   "BlinkMacSystemFont, 'Segoe UI', sans-serif; }"
+
+/** `cspFor`'s policy with `'unsafe-inline'` swapped for a nonce, so only a script
+ * the HOST built runs: page-authored <script>, inline handlers and javascript:
+ * URLs are all refused by the browser. A crewmate's report uses it
+ * (`pageScripts: false`): the page is a static snapshot by contract, and a page
+ * script could navigate its own frame to a host the crewmate's egress rules
+ * forbid. Throws rather than return a policy that still admits inline script. */
+function withScriptNonce(policy: string, nonce: string): string {
+  const inline = "script-src 'unsafe-inline' "
+  if (!policy.includes(inline)) throw new Error('cspFor no longer grants inline script; update withScriptNonce')
+  return policy.replace(inline, `script-src 'nonce-${nonce}' `)
+}
 
 /** Sub-threshold height jitter (px) the in-iframe reporter ignores. Animated
  * widgets (canvas, CSS transitions) reflow the body by a pixel or two every
@@ -96,6 +141,21 @@ const HEIGHT_REPORT_EPSILON_PX = 2
  * between a low and high value keeps cancelling this timer, so the shrink
  * never fires and the reporter goes quiet on the high value. */
 const HEIGHT_REPORT_SHRINK_MS = 200
+/** How long the document may stay taller than the frame's viewport, with the
+ * viewport height unchanged, before the reporter gives the frame back its own
+ * vertical scroll. A self-sizing host grows the frame to a reported height
+ * within a frame or two, and every viewport resize restarts this window, so
+ * only a frame held at a fixed height (expanded view, popout, thumbnail)
+ * outlasts it. */
+const HEIGHT_REPORT_FIT_GRACE_MS = 300
+/** How far (px) the rounded-up content height may exceed the frame's viewport
+ * and still count as fitting. A frame's CSS height is a whole pixel, but its
+ * viewport can come out up to a pixel shorter once the engine snaps it to
+ * device pixels at a fractional display scale, and clientHeight rounds that
+ * value either way. Without this slack a self-sizing frame sized to its exact
+ * report reads as too short, gets its scrollbar back, and the loop the
+ * overflow handling exists to break resumes. */
+const HEIGHT_REPORT_FIT_SLACK_PX = 1
 
 /** How long the loading indicator waits before uncovering the widget anyway.
  * This is a HANG backstop, not a compile budget: the indicator normally clears
@@ -120,7 +180,7 @@ const TW_ERROR_INLINE_HANDLER =
   `window.__mcTwError=1;window.dispatchEvent(new Event('${TW_ERROR_EVENT}'))`
 
 /** Body of the height-reporter script. Defined as a string literal — the only
- * interpolation is the two numeric tuning constants above (never LLM/user
+ * interpolation is the numeric tuning constants above (never LLM/user
  * content; the LLM `html` never reaches here). Set as a script element via
  * textContent below; the iframe re-parses and executes it via the standard
  * <script> mechanism.
@@ -133,31 +193,95 @@ const TW_ERROR_INLINE_HANDLER =
  * to the parent. The one deliberate exception is the window `load` re-report
  * below: quietness must never extend across a load event the parent can
  * observe, because parent surfaces treat post-load silence as the frame no
- * longer showing this document. */
+ * longer showing this document.
+ *
+ * It also hides the frame's own vertical scrollbar while the frame holds the
+ * whole document. A classic (space-taking) scrollbar is the one thing that
+ * feeds the frame's size back into the content's height: a frame that is a
+ * fraction of a pixel short of its content shows a scrollbar, the narrower
+ * viewport re-wraps the text taller, the frame grows, the scrollbar goes, the
+ * text re-wraps shorter, the frame shrinks, and the cycle repeats every half
+ * second. With the vertical overflow hidden while everything fits, the width
+ * the content lays out at does not depend on the frame's height, so the
+ * height settles. Once the document stays taller than a viewport that is not
+ * resizing (see HEIGHT_REPORT_FIT_GRACE_MS) the scroll comes back, so a
+ * fixed-height frame keeps scrolling its content. */
 const HEIGHT_REPORTER_BODY = `(function(){
   var EPS = ${HEIGHT_REPORT_EPSILON_PX};
   var SHRINK_MS = ${HEIGHT_REPORT_SHRINK_MS};
+  var FIT_GRACE_MS = ${HEIGHT_REPORT_FIT_GRACE_MS};
+  var FIT_SLACK = ${HEIGHT_REPORT_FIT_SLACK_PX};
   var lastSent = -1;      // last height actually posted to the parent
   var shrinkTimer = null;
   var rafId = 0;
   var raf = window.requestAnimationFrame || function(cb){ return setTimeout(cb, 16); };
   var unraf = window.cancelAnimationFrame || clearTimeout;
+  var root = document.documentElement;
+  // The document's own inline overflow-y, restored whenever the frame scrolls.
+  var authoredOverflowY = root.style.overflowY;
+  var clipped = false;
+  // Set when the grace window hands the scroll back; holds until the viewport
+  // changes height.
+  var released = false;
+  var fitTimer = null;
+  var viewH = root.clientHeight;
   function send(h){
     lastSent = h;
     parent.postMessage({type:'mc-widget-height', height:h}, '*');
   }
   function measure(){
-    // Use body.scrollHeight (content height) — NOT max(body, documentElement).
-    // documentElement.scrollHeight is at least the iframe's own viewport
-    // height, so once the iframe grows it can never report smaller, ratcheting
-    // the frame taller and taller (capped at MAX_HEIGHT) and never shrinking
-    // back to the actual content. body is content-sized (margin:0, no height),
-    // so its scrollHeight tracks the real content and can shrink.
-    return document.body.scrollHeight;
+    // The bottom of body's margin box, from the top of the document, rounded
+    // UP to a whole pixel. A frame sized to a rounded-down height is short of
+    // its content by a fraction of a pixel, which is enough to overflow.
+    //
+    // Measured on body, NOT documentElement: documentElement.scrollHeight is at
+    // least the iframe's own viewport height, so once the iframe grows it can
+    // never report smaller, ratcheting the frame taller and taller (capped at
+    // MAX_HEIGHT) and never shrinking back to the actual content. body is
+    // content-sized (no height), so its box tracks the real content and can
+    // shrink. The larger of its box and its scrollHeight covers content that
+    // overflows the box (absolutely positioned children, a fixed body height);
+    // its top offset covers its own margin, a child margin collapsed through
+    // its top edge, and any padding on html.
+    var b = document.body;
+    var r = b.getBoundingClientRect();
+    var top = r.top + (window.scrollY || 0);
+    var marginBottom = parseFloat(window.getComputedStyle(b).marginBottom) || 0;
+    return Math.ceil(top + Math.max(r.height, b.scrollHeight) + marginBottom);
+  }
+  function setClipped(on){
+    if (on === clipped) return;
+    clipped = on;
+    root.style.overflowY = on ? 'hidden' : authoredOverflowY;
+  }
+  function fits(h){
+    // clientHeight on the root element is the viewport height less any
+    // scrollbar, so a horizontal scrollbar never counts as room.
+    return h <= root.clientHeight + FIT_SLACK;
+  }
+  function fit(h){
+    if (fits(h)){
+      if (fitTimer){ clearTimeout(fitTimer); fitTimer = null; }
+      // Once the scroll is back, a fit while the scrollbar shows is not a fit
+      // at full width: content that keeps its aspect ratio gets shorter when
+      // the scrollbar narrows it, and clipping again would widen it past the
+      // viewport and toggle the scrollbar forever. Only a viewport resize
+      // (see the resize handler) clears the latch.
+      if (!released) setClipped(true);
+      return;
+    }
+    if (!clipped || fitTimer) return;
+    // Taller than the frame. A self-sizing host is about to grow it; give the
+    // scroll back only if the viewport has not resized by the time this fires.
+    fitTimer = setTimeout(function(){
+      fitTimer = null;
+      if (!fits(measure())){ released = true; setClipped(false); }
+    }, FIT_GRACE_MS);
   }
   function evaluate(){
     rafId = 0;
     var h = measure();
+    fit(h);
     if (lastSent < 0){ send(h); return; }            // first measurement
     if (Math.abs(h - lastSent) <= EPS){              // within deadband — ignore jitter
       if (shrinkTimer){ clearTimeout(shrinkTimer); shrinkTimer = null; }
@@ -198,6 +322,19 @@ const HEIGHT_REPORTER_BODY = `(function(){
     rafId = raf(evaluate);
   }
   new ResizeObserver(schedule).observe(document.body);
+  window.addEventListener('resize', function(){
+    // A frame that changes height is being sized by its host: restart the
+    // grace window so a frame catching up with a growth never gets its
+    // scrollbar back. A height-only resize leaves body's box unchanged, so the
+    // ResizeObserver above does not see it; re-measure here to re-check fit.
+    var h = root.clientHeight;
+    if (h !== viewH){
+      viewH = h;
+      released = false;
+      if (fitTimer){ clearTimeout(fitTimer); fitTimer = null; }
+    }
+    schedule();
+  });
   window.addEventListener('load', function(){
     // Re-report UNCONDITIONALLY after load, bypassing the deadband. The parent
     // surface re-arms its silence window on EVERY iframe load event (an engine
@@ -213,6 +350,9 @@ const HEIGHT_REPORTER_BODY = `(function(){
     // the parent can observe is followed by a report.
     setTimeout(function(){ lastSent = -1; schedule(); }, 100);
   });
+  // Start without a vertical scrollbar, so a frame still growing to its first
+  // report never flashes one; fit() hands the scroll back if it stays short.
+  setClipped(true);
   schedule();
   document.addEventListener('click', function(e){
  // NOTE: this isTrusted check runs INSIDE the sandboxed iframe
@@ -242,15 +382,6 @@ const HEIGHT_REPORTER_BODY = `(function(){
   });
 })();`
 
-/** Same-origin path to the Tailwind v4 browser runtime. A Vite plugin
- * (tailwindRuntimePlugin in vite.config.ts) copies @tailwindcss/browser's IIFE
- * build here at build time from the tracked npm dependency — so it is served
- * from the dashboard's own origin (not the public CDN that locked-down networks block) and is
- * NOT a committed blob (supply-chain guidance). Prefixed with window.location.origin
- * below because the sandboxed iframe is null-origin and can't use a bare path.
- * Defined once in ./vendorPaths and imported above so the consumer path can't
- * drift from vite.config.ts's dev-serve + build-emit sites. */
-
 /** Tailwind v4 browser build: dark mode is driven by a `.dark` class on <body>
  * (set below) via a custom variant — NOT the v3 `tailwind.config` global, which
  * v4 removed. The @tailwindcss/browser runtime auto-injects preflight + theme +
@@ -278,16 +409,6 @@ const COMMENT_HIGHLIGHT_CSS =
   "border-radius:10px 10px 10px 2px;box-shadow:0 1px 3px rgba(0,0,0,.35);cursor:pointer}" +
   ".mc-cmt-bubble.unread{background:var(--warn,#e0a000);color:var(--warn-fg,#1a1a1a)}"
 
-/** In-iframe comment bridge. Vanilla JS string — no LLM/user
- * interpolation (no `${}`), set via textContent and re-parsed by the iframe.
- * Brings anchored commenting + highlights into the sandboxed HTML render that
- * the parent cannot reach directly:
- *   - mouseup with a text selection -> postMessage 'mc-comment-select'
- *     {quote, prefix, suffix, rect} so the parent opens the comment popover;
- *   - 'mc-comment-highlights' {anchors:[{id,quote,prefix,suffix}]} -> wrap each
- *     matched run in <mark.mc-cmt-hl data-cid> (click -> 'mc-comment-highlight-click');
- *   - 'mc-comment-scroll-to' {id} -> scroll the mark into view + flash it;
- *   - posts 'mc-comment-ready' once so the parent pushes the initial set. */
 /** Guards against the "unsafe centering" clip: artifacts that lay out with
  * `body { display:flex; align-items:center }` (or grid `place-items:center`)
  * clip the TOP of their content — unreachable by scrolling — whenever the
@@ -407,7 +528,11 @@ const CLIPBOARD_FALLBACK_SHIM_BODY = `(function(){
 
 /** Absolute web links inside the sandboxed document open OUTSIDE it.
  *
- * The frame's sandbox grants `allow-popups allow-popups-to-escape-sandbox`, so
+ * The default for a caller that sets neither `linkBridge` nor
+ * `rewriteBareLinks: false` -- today the exported copy the artifact page
+ * downloads. Every dashboard frame that holds an agent-written page sets
+ * `linkBridge` instead (see LINK_BRIDGE_SHIM_BODY). Where it runs, the frame or
+ * window is assumed to grant popups, so
  * a link with `target="_blank"` becomes a window-open request the host handles
  * -- in the desktop app that is `setWindowOpenHandler` -> `shell.openExternal`,
  * i.e. the user's own default browser with their own logins; in a plain browser
@@ -455,6 +580,103 @@ const CLIPBOARD_FALLBACK_SHIM_BODY = `(function(){
  * popups are already allowed); it is a usability fix for the
  * frame-replaced-by-login-page case.
  */
+/**
+ * Touch relay: reports this frame's single-finger touches to the parent, so a
+ * host's drawer gesture can follow a drag that began over the frame.
+ *
+ * A touch that lands on an iframe is delivered to the frame's own document and
+ * never reaches the host page, so a host panel holding a full-width frame (the
+ * phone Crewmates side panel's Dashboard) had nowhere a closing drag could start.
+ * The relay posts `{type: 'mc-frame-touch', phase, x, y}` in frame coordinates;
+ * the host maps them onto the frame element and decides what, if anything, they
+ * mean.
+ *
+ * It stands down for a touch the frame's own content owns -- inside a
+ * horizontally scrollable element, an editable, or an active text selection --
+ * the same deference the host gesture applies to its own DOM. Passive listeners:
+ * the frame keeps scrolling exactly as before. Not a security boundary: any
+ * script in the frame can post the same shape, so a host must treat the
+ * messages as untrusted (accept them only from the frame's window, only while
+ * the gesture they can drive is harmless).
+ */
+const FRAME_TOUCH_RELAY_BODY = `(function(){
+  function scrollsX(n){
+    for(;n&&n.nodeType===1;n=n.parentElement){
+      if(n.scrollWidth-n.clientWidth>1){var o=getComputedStyle(n).overflowX;if(o==='auto'||o==='scroll')return true;}
+    }
+    return false;
+  }
+  function editable(n){
+    for(;n&&n.nodeType===1;n=n.parentElement){
+      if(n.isContentEditable||n.tagName==='INPUT'||n.tagName==='TEXTAREA'||n.tagName==='SELECT')return true;
+    }
+    return false;
+  }
+  var on=false;
+  function send(phase,e){
+    var t=(e.touches&&e.touches[0])||(e.changedTouches&&e.changedTouches[0]);
+    if(!t)return;
+    parent.postMessage({type:'mc-frame-touch',phase:phase,x:t.clientX,y:t.clientY},'*');
+  }
+  var opts={passive:true,capture:true};
+  window.addEventListener('touchstart',function(e){
+    if(on&&e.touches.length>1){send('cancel',e);on=false;return;}
+    var sel=window.getSelection?window.getSelection():null;
+    on=e.touches.length===1&&!scrollsX(e.target)&&!editable(e.target)&&!(sel&&!sel.isCollapsed);
+    if(on)send('start',e);
+  },opts);
+  window.addEventListener('touchmove',function(e){if(on)send('move',e);},opts);
+  window.addEventListener('touchend',function(e){if(on){on=false;send('end',e);}},opts);
+  window.addEventListener('touchcancel',function(e){if(on){on=false;send('cancel',e);}},opts);
+})();`
+
+/** A static page's links do nothing when clicked. Installed (with the nonce) ahead
+ * of the page, as capture-phase listeners on the window that the page has no
+ * script to undo, so a click cannot navigate the frame to a host carrying the
+ * page's text. A click or auxclick loses its default action when any node on its
+ * path is an `a` or `area` (HTML or SVG), whatever its `href`, since an SVG
+ * animation can change the href a click follows. Every other click keeps its
+ * default, so a `<details>` still opens. The path is the whole tree: a static
+ * page has no shadow root, since its declarative ones are dropped (see
+ * STATIC_PAGE_DROPPED) and it has no script to attach one. */
+const STATIC_LINK_GUARD_BODY = `(function(){function stop(e){` +
+  `var p=e.composedPath?e.composedPath():[];for(var i=0;i<p.length;i++){` +
+  `var l=p[i]&&p[i].localName;if(l==='a'||l==='area'){e.preventDefault();return;}}}` +
+  `window.addEventListener('click',stop,true);window.addEventListener('auxclick',stop,true);})();`
+
+/** Page markup that leaves the frame with no script and no click: a refresh
+ * `meta`, a `link` hint, and `noscript`, which the host parses with scripting
+ * off and the frame with scripting on, so its content is read twice. Plus a
+ * declarative shadow root, which the host's parsers keep as a `template` and the
+ * frame's attaches, so markup inside it is out of the host's reach. */
+const STATIC_PAGE_DROPPED = 'meta, link, noscript, template[shadowrootmode], template[shadowroot]'
+/** Rounds of parse, drop and re-serialize before the page is given up. */
+const STATIC_PAGE_SETTLE_ROUNDS = 3
+
+/** The finished document, parsed exactly as the frame will parse it, with every
+ * {@link STATIC_PAGE_DROPPED} element in the body removed until a parse finds
+ * none. Checked on the final string rather than on the fragment, because markup
+ * can re-parse into a different tree than the one first built. A page that has
+ * not settled after {@link STATIC_PAGE_SETTLE_ROUNDS} keeps only the host's own
+ * scripts: the check fails closed. */
+function settleStaticPage(serialized: string, nonce: string): string {
+  let out = serialized
+  for (let round = 0; round < STATIC_PAGE_SETTLE_ROUNDS; round++) {
+    const parsed = new DOMParser().parseFromString(out, 'text/html')
+    const found = Array.from(parsed.body.querySelectorAll(STATIC_PAGE_DROPPED))
+    if (found.length === 0) return out
+    for (const el of found) el.remove()
+    out = `<!DOCTYPE html>\n${parsed.documentElement.outerHTML}`
+  }
+  const parsed = new DOMParser().parseFromString(out, 'text/html')
+  if (parsed.body.querySelectorAll(STATIC_PAGE_DROPPED).length === 0) return out
+  for (const child of Array.from(parsed.body.childNodes)) {
+    const host = child.nodeName === 'SCRIPT' && (child as Element).getAttribute('nonce') === nonce
+    if (!host) child.remove()
+  }
+  return `<!DOCTYPE html>\n${parsed.documentElement.outerHTML}`
+}
+
 const EXTERNAL_LINK_TARGET_SHIM_BODY = `(function(){
   window.addEventListener('click', function(e){
     var path = typeof e.composedPath === 'function' ? e.composedPath() : null;
@@ -470,6 +692,242 @@ const EXTERNAL_LINK_TARGET_SHIM_BODY = `(function(){
   }, true);
 })();`
 
+/** Links leave the frame through the host, never through a popup of its own.
+ *
+ * Injected by `linkBridge` for the frames that hold agent-written pages (saved
+ * artifacts, library thumbnails, a teammate's shared artifact, chat widgets).
+ * Those frames are `sandbox="allow-scripts"` with no popup grant, so a page
+ * cannot open a window itself; this hands the request to the host instead, as
+ * `{type: 'kirocrew-dashboard:open', url}` -- the message the crew pages already
+ * post. The host (`useFrameLinkBridge`) opens it only for a web URL and only right
+ * after a real click in this frame, once per click.
+ *
+ *   - A middle-click on a web link is handled the same way (it asks for a new
+ *     tab whatever the target).
+ *   - A click on a link that would open a window (`target="_blank"` or any other
+ *     target but `_self`) or that would navigate this frame to another site (a
+ *     bare absolute `http(s)` link) is cancelled here and, when its href is an
+ *     absolute `http(s)` URL, posted to the host. Fragment and relative links
+ *     with no target keep their in-frame behaviour; other schemes on a
+ *     window-opening link are cancelled and not posted.
+ *   - `window.open` is replaced by the same post and returns null, so a page
+ *     that opens from script reaches the host too.
+ *   - `data-action` anchors are the composer pre-fill buttons; their own handler
+ *     owns them, so they are skipped.
+ *   - Each click or key in the frame is reported as
+ *     `{type: 'kirocrew-dashboard:input'}`, so the host does not open a SIBLING
+ *     frame's request at once on that click (it offers its "Open <host>"
+ *     button instead).
+ *
+ * A link click is decided a task after dispatch, after every page handler, so a
+ * page that cancels it keeps that and nothing is posted. A plain click is left to
+ * the sandbox, which refuses the window it would open (a bare web link is made
+ * window-opening first, so it cannot navigate this frame away); a middle or
+ * modified click, which opens a tab even without `allow-popups`, is cancelled at
+ * once. Does nothing when the document has no parent (a downloaded
+ * copy opened as a file, a document opened top-level), where ordinary links work.
+ * A web link without a title gets its resolved URL as one on hover or focus, so
+ * the URL shows before a click. Not a security boundary on its own: any page
+ * script can post the same message, which is why the host checks the frame, the
+ * URL and the gesture before opening.
+ */
+const LINK_BRIDGE_SHIM_BODY = `(function(){
+  if (window.parent === window) return;
+  var T = 'kirocrew-dashboard:open';
+  var P = window.parent;
+  // Each click or key here is reported, so the host can tell that a live
+  // activation may be this frame's when a sibling frame asks to open a link.
+  function input(){ try { P.postMessage({ type: 'kirocrew-dashboard:input' }, '*'); } catch (_) {} }
+  ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchend'].forEach(function(t){
+    window.addEventListener(t, input, { capture: true, passive: true });
+  });
+  // A protocol-relative link (//host/path) takes the scheme of this document's
+  // base, as the browser resolves it: the dashboard's for a srcdoc frame. Only that
+  // form is resolved; a relative path stays the frame's own navigation.
+  function scheme(){
+    try { var b = new URL(document.baseURI); if (b.protocol === 'http:' || b.protocol === 'https:') return b.protocol; } catch (_) {}
+    return 'https:';
+  }
+  function web(raw){
+    var s = String(raw).trim(), u;
+    if (s.slice(0, 2) === '//') s = scheme() + s;
+    try { u = new URL(s); } catch (_) { return null; }
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : null;
+  }
+  function ask(raw){
+    var url = web(raw);
+    if (!url) return;
+    try { P.postMessage({ type: T, url: url }, '*'); } catch (_) {}
+  }
+  // An SVG link may carry its address as xlink:href instead of href.
+  var XLINK = 'http://www.w3.org/1999/xlink';
+  function hrefOf(n){
+    return n.getAttribute('href') || (typeof n.getAttributeNS === 'function' ? n.getAttributeNS(XLINK, 'href') : '') || '';
+  }
+  function linkOf(e){
+    // The composed path crosses shadow roots, so a link that wraps a custom
+    // element's shadow content is still found; closest() alone stops at the root.
+    var path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+    for (var i = 0; i < path.length; i++) {
+      var n = path[i];
+      if (n && n.nodeType === 1 && (n.localName === 'a' || n.localName === 'area')
+        && (n.hasAttribute('href') || (typeof n.hasAttributeNS === 'function' && n.hasAttributeNS(XLINK, 'href')))) return n;
+    }
+    return null;
+  }
+  // What a link event would do here: null to leave it to the frame, else the
+  // link, the URL to post (null for a non-web scheme) and whether it is bare.
+  function planOf(e, middle){
+    var a = linkOf(e);
+    if (!a || (typeof a.closest === 'function' && a.closest('[data-action]'))) return null;
+    var target = (a.getAttribute('target') || '').trim().toLowerCase();
+    var url = web(hrefOf(a));
+    if (!middle && target === '_self') return null;
+    if (!middle && !target && !url) return null;
+    if (middle && !url) return null;
+    return { a: a, url: url, bare: !middle && !target };
+  }
+  // A link click is decided a task after dispatch, so every page handler, a
+  // window-level one included, has run: a page that cancels it (an in-page panel,
+  // onclick="return false") keeps that and nothing is posted. A plain click is not
+  // cancelled here: the window it would open is refused by the sandbox, and a bare
+  // web link is made window-opening first so it cannot navigate this frame away.
+  // A middle or modified click opens a tab even without allow-popups, so that one
+  // must be cancelled before its default runs: by a listener added to window now,
+  // during capture, which therefore runs after every bubbling window listener the
+  // page registered. The page has had its say by then in whatever form
+  // (preventDefault, return false, returnValue), and defaultPrevented reads all of
+  // them. A page that stops the click before window keeps its own handling, and
+  // nothing is posted.
+  function decide(e, p, now){
+    if (!now) {
+      setTimeout(function(){ if (!e.defaultPrevented && p.url) ask(p.url); }, 0);
+      return;
+    }
+    window.addEventListener(e.type, function(ev){
+      if (ev !== e || e.defaultPrevented) return;
+      e.preventDefault();
+      if (p.url) ask(p.url);
+    }, { once: true });
+  }
+  window.addEventListener('click', function(e){
+    var p = planOf(e, false);
+    if (!p) return;
+    if (p.bare) { p.a.setAttribute('target', '_blank'); p.a.setAttribute('rel', 'noopener noreferrer'); }
+    decide(e, p, e.ctrlKey || e.metaKey || e.shiftKey);
+  }, true);
+  // Hover shows where a link goes, as in a session: a web link without a title
+  // gets its resolved URL as one. Some hosts (the desktop app) show no status
+  // bar for a framed link, so the title is the only place the URL appears.
+  function titleLink(e){
+    var a = linkOf(e);
+    if (!a || a.hasAttribute('title')) return;
+    var url = web(hrefOf(a));
+    if (url) a.setAttribute('title', url);
+  }
+  window.addEventListener('mouseover', titleLink, true);
+  window.addEventListener('focusin', titleLink, true);
+  // A middle-click asks for a new tab whatever the target, which the frame cannot open.
+  window.addEventListener('auxclick', function(e){
+    if (e.button !== 1) return;
+    var p = planOf(e, true);
+    if (p) decide(e, p, true);
+  }, true);
+  // A plain assignment, not a locked property: a page script that declares its
+  // own top-level open (function or const) must still run. The sandbox already
+  // refuses a native popup, and the host checks every request.
+  try { window.open = function(u){ ask(u); return null; }; } catch (_) {}
+})();`
+
+/** The host half of the link bridge for a widget popped out into its own tab
+ * (`WidgetFrame`'s "Open in new tab"). That tab is a wrapper page the dashboard
+ * writes, holding the widget in an `AGENT_PAGE_SANDBOX` frame, so React and
+ * `useFrameLinkBridge` are not there to answer the frame's open message. This
+ * script is: the same checks (the message comes from the frame, the URL is an
+ * absolute `http(s)` URL with no user name or password, the person just clicked
+ * with the frame focused), then a `noopener,noreferrer` open, once per click,
+ * when the click is tied to the frame: focus came into it from the tab, and no
+ * click or key in the tab itself (a Tab into the frame) is still live. Otherwise
+ * it shows the same "Open <host>" button as the dashboard (`FrameLinkChip`),
+ * whose click is the person's own in the tab. */
+const POPOUT_LINK_BRIDGE_BODY = `(function(){
+  var T = 'kirocrew-dashboard:open';
+  var LIFE = ${ACTIVATION_LIFESPAN_MS};
+  // The tab's own clicks and keys, never the frame's. This script runs as the
+  // tab loads, before any input in it.
+  var last = -Infinity, entered = false, chip = null;
+  ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchend'].forEach(function(t){
+    window.addEventListener(t, function(e){
+      last = Date.now();
+      if (chip && (t === 'keydown' || t === 'pointerdown') && !chip.contains(e.target)) drop();
+    }, true);
+  });
+  // Focus coming into the frame from the tab blurs the tab's window.
+  window.addEventListener('blur', function(){ entered = document.activeElement === document.querySelector('iframe'); });
+  window.addEventListener('focus', function(){ entered = false; });
+  function drop(){ if (chip) { chip.remove(); chip = null; } }
+  function offer(href, host){
+    drop();
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = LABEL.split('%HOST%').join(host);
+    b.title = href;
+    b.setAttribute('data-frame-link-chip', '');
+    b.setAttribute('style', 'position:fixed;top:8px;right:8px;z-index:2147483647;padding:4px 10px;' +
+      'border-radius:6px;border:1px solid GrayText;background:Canvas;color:CanvasText;' +
+      'font:13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)');
+    b.addEventListener('click', function(){ drop(); window.open(href, '_blank', 'noopener,noreferrer'); });
+    b.addEventListener('keydown', function(e){ if (e.key === 'Escape') drop(); });
+    document.body.appendChild(b);
+    chip = b;
+    // Focus leaves the frame, so the page cannot ask again on the same click.
+    try { b.focus(); } catch (_) {}
+  }
+  function clicked(){
+    var f = document.querySelector('iframe');
+    var ua = navigator.userActivation;
+    return f && ua && ua.isActive && document.activeElement === f ? f : null;
+  }
+  function go(f, href){
+    // Once per click: focus leaves the frame, so a frame posting again from the
+    // same click fails the focus check until the next real click.
+    try { f.blur(); } catch (_) {}
+    window.open(href, '_blank', 'noopener,noreferrer');
+  }
+  window.addEventListener('message', function(e){
+    var f = document.querySelector('iframe');
+    if (!f || !e.source || e.source !== f.contentWindow) return;
+    var d = e.data;
+    if (!d || typeof d !== 'object' || d.type !== T || typeof d.url !== 'string') return;
+    if (!d.url) return;
+    var u;
+    try { u = new URL(d.url); } catch (_) { return; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+    if (u.username || u.password) return;
+    if (!clicked()) return;
+    if (entered && Date.now() - last >= LIFE) go(f, u.href);
+    else offer(u.href, u.host);
+  });
+})();`
+
+/** The popped-out widget tab's link bridge: fixed first-party text and the
+ * button's localized *label*, in which `%HOST%` stands for the link's host. No
+ * widget content. */
+export function popoutLinkBridgeScript(label: string): string {
+  return `var LABEL = ${JSON.stringify(label).replace(/</g, '\\u003c')};\n${POPOUT_LINK_BRIDGE_BODY}`
+}
+
+/** In-iframe comment bridge. Vanilla JS string — no LLM/user
+ * interpolation (no `${}`), set via textContent and re-parsed by the iframe.
+ * Brings anchored commenting + highlights into the sandboxed HTML render that
+ * the parent cannot reach directly:
+ *   - mouseup with a text selection -> postMessage 'mc-comment-select'
+ *     {quote, prefix, suffix, rect} so the parent opens the comment popover;
+ *   - 'mc-comment-highlights' {anchors:[{id,quote,prefix,suffix}]} -> wrap each
+ *     matched run in <mark.mc-cmt-hl data-cid> (click -> 'mc-comment-highlight-click');
+ *   - 'mc-comment-scroll-to' {id} -> scroll the mark into view + flash it;
+ *   - 'mc-comment-active' {id} -> mark that comment's highlights and bubble active;
+ *   - posts 'mc-comment-ready' once so the parent pushes the initial set. */
 const COMMENT_BRIDGE_BODY = `(function(){
   var PFX = 32;
   function selectionContext(){
@@ -699,26 +1157,49 @@ const LIGHT_CANVAS_FALLBACK_VARS: Readonly<Record<(typeof THEME_VAR_NAMES)[numbe
   '--info': '#1d4ed8',
 }
 
+// The Tailwind token grammar the class regexes below share, kept in one place
+// so a new hue, stop or variant form is added once. Each piece is written as a
+// regex literal and read back through `.source`, so the escapes are exactly
+// what a hand-written literal would hold.
+//
+// TW_VARIANT_PREFIX: a token boundary, then optional variant prefixes in
+// Tailwind's full token syntax -- `hover:`, `md:`, `@md:`, `*:`, and bracketed
+// arbitrary variants such as `min-[300px]:` or `[&:hover]:` (name capped at 64
+// chars, bracket body at 256, so a long attribute value cannot make the scan
+// quadratic).
+const TW_VARIANT_PREFIX = /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*/.source
+// Every default Tailwind hue, as a regex alternation.
+const TW_HUES =
+  /slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose/.source
+// The end of a class token: end of input, a separator, or an opacity `/`.
+const TW_CLASS_END = /(?=$|[\s"'`\/])/.source
+
+/** A Tailwind background-class detector: `bg-<solid>` or `bg-<hue>-<stop>` for
+ * every default hue, behind any variant prefix. `solid` and `stops` are regex
+ * alternations (`'white'`, `'50|100|200'`). No flags: callers only `.test()`. */
+function twBgClassRe(solid: string, stops: string): RegExp {
+  return new RegExp(`${TW_VARIANT_PREFIX}bg-(?:${solid}|(?:${TW_HUES})-(?:${stops}))${TW_CLASS_END}`)
+}
+
 // Tailwind utility classes that paint a light background: `bg-white` and the
-// 50/100/200 stops of every default hue. Optional variant prefixes are
-// allowed in Tailwind's full token syntax -- `hover:`, `md:`, `@md:`, `*:`, and
-// bracketed arbitrary variants such as `min-[300px]:` or `[&:hover]:` (name
-// capped at 64 chars, bracket body at 256, so a long attribute value cannot
-// make the scan quadratic); `dark:` is handled separately below.
-const LIGHT_TAILWIND_BG_RE =
-  /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*bg-(?:white|(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200))(?=$|[\s"'`\/])/
+// 50/100/200 stops of every default hue; `dark:` is handled separately below.
+const LIGHT_TAILWIND_BG_RE = twBgClassRe('white', '50|100|200')
 // The mirror of LIGHT_TAILWIND_BG_RE: `bg-black` and the 700-950 stops. A
 // widget carrying one of these next to a light card is a mixed palette, and
 // flipping it wholesale to light would only trade which half is unreadable.
-const DARK_TAILWIND_BG_RE =
-  /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*bg-(?:black|(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:700|800|900|950))(?=$|[\s"'`\/])/
+const DARK_TAILWIND_BG_RE = twBgClassRe('black', '700|800|900|950')
+// A `dark:` variant, bare or behind chained prefixes such as `md:dark:`.
+const DARK_VARIANT_RE = new RegExp(`${TW_VARIANT_PREFIX}dark:`)
 // Inline `background` / `background-color` declarations carrying a literal
 // color. Captures the value for a luminance check.
 const INLINE_BG_DECL_RE = /background(?:-color)?\s*:\s*(#[0-9a-f]{3,8}\b|rgba?\([^)]*\)|white\b)/gi
 // Tailwind arbitrary-value backgrounds (`bg-[#f0fdf4]`, `bg-[rgb(250,250,250)]`,
 // `bg-[white]`), which neither regex above sees. Captures the literal for the
 // same luminance check; `_` inside the brackets is Tailwind's space escape.
-const ARBITRARY_BG_CLASS_RE = /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*bg-\[(#[0-9a-f]{3,8}|rgba?\([^\]]*\)|white)\]/gi
+const ARBITRARY_BG_CLASS_RE = new RegExp(
+  `${TW_VARIANT_PREFIX}${/bg-\[(#[0-9a-f]{3,8}|rgba?\([^\]]*\)|white)\]/.source}`,
+  'gi',
+)
 
 /** Relative luminance (0..1) of a CSS `#hex` / `rgb()` / `white` literal, or
  * null when it cannot be parsed. `parseCssColor` (the favicon-contrast parser)
@@ -792,7 +1273,7 @@ function isLightCanvasAuthored(html: string): boolean {
   if (!html) return false
   const styled = styledSurfaces(html)
   if (/var\(\s*--/.test(styled)) return false
-  if (/(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*dark:/.test(styled)) return false
+  if (DARK_VARIANT_RE.test(styled)) return false
   if (DARK_TAILWIND_BG_RE.test(styled)) return false
   let sawLight = LIGHT_TAILWIND_BG_RE.test(styled)
   for (const re of [INLINE_BG_DECL_RE, ARBITRARY_BG_CLASS_RE]) {
@@ -824,11 +1305,25 @@ export function resolveWidgetTheme(
   return { themeVars, mode }
 }
 
+/** Common "surface" names no theme defines, pointed at the injected names they
+ * mean. A widget reaching for `var(--surface, #1e1e1e)` otherwise always gets
+ * its dark literal, which is unreadable under a light theme. Each alias is a
+ * `var()` reference, so it follows the theme (and the light-canvas fallback),
+ * and when its target is missing the widget's own fallback still applies. */
+const THEME_VAR_ALIASES: Readonly<Record<string, (typeof THEME_VAR_NAMES)[number]>> = {
+  '--surface': '--card',
+  '--surface-secondary': '--bg-elevated',
+}
+
 function buildThemeCss(vars: Record<string, string>, mode: 'dark' | 'light'): string {
-  const rootBody = Object.entries(vars).map(([k, v]) => `${k}:${v}`).join(';')
+  const declarations = Object.entries(vars).map(([k, v]) => `${k}:${v}`)
   // No readable vars means no theme to apply, and inventing one is worse than
   // the browser's own defaults — a guard pins that this path emits no `:root`.
-  if (!rootBody) return ''
+  if (!declarations.length) return ''
+  for (const [alias, target] of Object.entries(THEME_VAR_ALIASES)) {
+    if (!(alias in vars)) declarations.push(`${alias}:var(${target})`)
+  }
+  const rootBody = declarations.join(';')
   return (
     `:root{${rootBody};color-scheme:${mode}}` +
     // On the root element as well as the body: background propagates from html
@@ -891,6 +1386,13 @@ export function recloneScripts(root: ParentNode, doc: Document): void {
   }
 }
 
+/** 128 random bits as hex: a CSP nonce, so attribute-safe as written. */
+function mintScriptNonce(): string {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 interface BuildSrcdocOptions {
   html: string
   themeVars: Record<string, string>
@@ -907,6 +1409,20 @@ interface BuildSrcdocOptions {
    * injected its compiled CSS. Set for widgets heavy enough that the compile is
    * perceptible; without it a slow widget renders as a blank box. */
   showLoadingOverlay?: boolean
+  /** Drop the CDN script origins from this document's CSP, leaving inline script
+   * and the pinned same-origin Tailwind runtime. Set by a crewmate's dashboard: its
+   * page is filled with that crewmate's own crew-log data and can be authored by an
+   * agent, so a permitted script origin is an exfiltration channel that
+   * `connect-src 'none'` does not close. Off by default, so no widget surface
+   * changes. */
+  offlineScripts?: boolean
+  /** Let the page's own scripts run. On by default. Set false by a crewmate's
+   * report: the document CSP then admits only the host's scripts, each carrying a
+   * nonce minted for this document, so a page script, inline handler or
+   * `javascript:` URL never runs while the height reporter and comment bridge do.
+   * The page's links are inert and its refresh `meta`, `link` and `noscript` are
+   * dropped (see settleStaticPage), so nothing moves the frame without a script. */
+  pageScripts?: boolean
   /** Localized label for that indicator. Required when `showLoadingOverlay` is
    * set — the iframe cannot reach the parent's i18n catalog, so an untranslated
    * default here would visibly flip to English mid-load in every non-English
@@ -918,6 +1434,16 @@ interface BuildSrcdocOptions {
    * `allow-popups`: there a `_blank` link is a blocked popup (a dead click),
    * so in-frame navigation must be left alone. */
   rewriteBareLinks?: boolean
+  /** Hand links and `window.open` to the host's link bridge (see
+   * LINK_BRIDGE_SHIM_BODY) instead of opening them in the frame. Set by every
+   * host that frames an agent-written page with `AGENT_PAGE_SANDBOX` and renders
+   * `useFrameLinkBridge`. Replaces `rewriteBareLinks` when set. Off by default,
+   * so a downloaded or exported copy keeps ordinary links. */
+  linkBridge?: boolean
+  /** Report the frame's touches to the parent (see FRAME_TOUCH_RELAY_BODY), for
+   * a host whose drawer gesture must be able to start over the frame. Off by
+   * default: nothing else listens for them. */
+  relayTouches?: boolean
 }
 
 /** Build the srcdoc HTML for a sandboxed widget iframe. The LLM `html`
@@ -933,6 +1459,10 @@ export function buildSrcdoc({
   showLoadingOverlay = false,
   loadingLabel = '',
   rewriteBareLinks = true,
+  linkBridge = false,
+  offlineScripts = false,
+  pageScripts = true,
+  relayTouches = false,
 }: BuildSrcdocOptions): string {
   // A widget hardcoded for a light canvas renders on a light canvas even when
   // the dashboard is dark -- see resolveWidgetTheme. Resolved once here so the
@@ -972,10 +1502,20 @@ export function buildSrcdoc({
   // path returns above), so location.origin is always defined.
   const scriptOrigin = window.location.origin
 
+  // Minted per document and never derived from the page, so a page cannot carry it.
+  const nonce = pageScripts ? '' : mintScriptNonce()
+  const hostScript = (): HTMLScriptElement => {
+    const script = doc.createElement('script')
+    if (nonce) script.setAttribute('nonce', nonce)
+    return script
+  }
+
   // <meta CSP>
   const csp = doc.createElement('meta')
   csp.setAttribute('http-equiv', 'Content-Security-Policy')
-  csp.setAttribute('content', cspFor(scriptOrigin))
+  csp.setAttribute('content', nonce
+    ? withScriptNonce(cspFor(scriptOrigin, offlineScripts), nonce)
+    : cspFor(scriptOrigin, offlineScripts))
   head.appendChild(csp)
 
   // Tailwind v4 dark-mode directives (compiled by the runtime on load). Placed
@@ -1048,7 +1588,7 @@ export function buildSrcdoc({
   // on-load attempt sees the wrapper too; without user activation its fallback
   // still fails rather than gaining an ambient clipboard-write path.
   // textContent assignment only — no LLM/user content interpolated.
-  const clipboardShim = doc.createElement('script')
+  const clipboardShim = hostScript()
   clipboardShim.textContent = CLIPBOARD_FALLBACK_SHIM_BODY
   body.appendChild(clipboardShim)
 
@@ -1057,10 +1597,32 @@ export function buildSrcdoc({
   // capture-phase listener is registered ahead of any widget-authored one.
   // Skipped for hosts whose sandbox withholds popups, where the rewrite would
   // be a dead click. textContent assignment only.
-  if (rewriteBareLinks) {
-    const linkTargetShim = doc.createElement('script')
+  if (linkBridge) {
+    // The frame grants no popups: links and window.open go to the host's
+    // link bridge (see LINK_BRIDGE_SHIM_BODY). textContent assignment only.
+    const linkBridgeShim = hostScript()
+    linkBridgeShim.textContent = LINK_BRIDGE_SHIM_BODY
+    body.appendChild(linkBridgeShim)
+  } else if (rewriteBareLinks) {
+    const linkTargetShim = hostScript()
     linkTargetShim.textContent = EXTERNAL_LINK_TARGET_SHIM_BODY
     body.appendChild(linkTargetShim)
+  }
+
+  // A static page's links are inert (see STATIC_LINK_GUARD_BODY), registered
+  // ahead of the page. textContent assignment only.
+  if (nonce) {
+    const linkGuard = hostScript()
+    linkGuard.textContent = STATIC_LINK_GUARD_BODY
+    body.appendChild(linkGuard)
+  }
+
+  // Touch relay (see FRAME_TOUCH_RELAY_BODY), ahead of the LLM html so its
+  // capture-phase listeners are registered first. textContent assignment only.
+  if (relayTouches) {
+    const touchRelay = hostScript()
+    touchRelay.textContent = FRAME_TOUCH_RELAY_BODY
+    body.appendChild(touchRelay)
   }
 
   // Parse LLM html into a document fragment via the typed DOM API. The
@@ -1090,7 +1652,7 @@ export function buildSrcdoc({
     overlay.appendChild(doc.createTextNode(loadingLabel))
     body.insertBefore(overlay, body.firstChild)
 
-    const revealScript = doc.createElement('script')
+    const revealScript = hostScript()
     revealScript.textContent = `(function(){
       var el=document.getElementById('mc-tw-loading');
       if(!el)return;
@@ -1119,14 +1681,14 @@ export function buildSrcdoc({
 
   // Height reporter (optional). textContent assignment, not template-literal.
   if (includeHeightReporter) {
-    const reporter = doc.createElement('script')
+    const reporter = hostScript()
     reporter.textContent = HEIGHT_REPORTER_BODY
     body.appendChild(reporter)
   }
 
   // Unsafe-centering guard: keeps the top of flex/grid-centered artifact
   // bodies reachable when the content overflows the iframe viewport.
-  const safeCenter = doc.createElement('script')
+  const safeCenter = hostScript()
   safeCenter.textContent = SAFE_CENTER_GUARD_BODY
   body.appendChild(safeCenter)
 
@@ -1136,7 +1698,7 @@ export function buildSrcdoc({
     const hlStyle = doc.createElement('style')
     hlStyle.textContent = COMMENT_HIGHLIGHT_CSS
     head.appendChild(hlStyle)
-    const bridge = doc.createElement('script')
+    const bridge = hostScript()
     bridge.textContent = COMMENT_BRIDGE_BODY
     body.appendChild(bridge)
   }
@@ -1170,10 +1732,16 @@ export function buildSrcdoc({
   //     body script executes, so only the element's own handler is free of
   //     that ordering hazard. Static trusted string — no LLM content.
   const serialized = `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
-  return serialized.replace(
+  const finished = serialized.replace(
     /<meta name="x-script-placeholder" data-src="([^"]*)">/,
-    (_match, src) => `<script src="${src}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"></script>`,
+    // With a nonce the inline `onerror` would be refused, so the tag drops it; the
+    // overlay's hang backstop still uncovers the page.
+    (_match, src) => nonce
+      ? `<script src="${src}" crossorigin="anonymous" nonce="${nonce}"></script>`
+      : `<script src="${src}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"></script>`,
   )
+  // A static page also loses what navigates the frame without a script.
+  return nonce ? settleStaticPage(finished, nonce) : finished
 }
 
 /** SSR fallback for environments without a DOM. Used only by unit tests

@@ -81,6 +81,117 @@ async function fetchAssetWithRetry(request) {
   return lastResponse || Response.error()
 }
 
+// ── Web Push ────────────────────────────────────────────────────────────────
+// Chromium and Firefox deliver the push payload to this classic `push` handler.
+// (Safari/iOS 18.4+ renders the same Declarative Web Push JSON natively and does
+// not fire this event — the one payload shape covers both worlds.) The only
+// sender is _web_push_payload, which always emits `{ web_push: 8030,
+// notification: {...} }`, so we read exactly that shape.
+// A window client is the full dashboard unless its path says otherwise. A
+// standalone app-window document (/app-windows/<app>/<name>.html) is a separate
+// application on the same origin. A popout (/popout/...) or embed (/embed/...)
+// window runs the dashboard's socket but mounts only its own frame, with no
+// notification banner. None of them shows a general note or hosts the
+// dashboard's routes, so none stands in for a dashboard tab: it is never asked
+// to swallow a push and never takes a notification click.
+const NON_DASHBOARD_PREFIXES = ['/app-windows/', '/popout/', '/embed/']
+
+function isDashboardClient(client) {
+  try {
+    const pathname = new URL(client.url).pathname
+    return !NON_DASHBOARD_PREFIXES.some(prefix => pathname.startsWith(prefix))
+  } catch {
+    return false
+  }
+}
+
+// How long a push waits for a visible dashboard tab to say it is connected.
+// Short: the answer is a synchronous store read in the page, and on a timeout
+// the banner is shown anyway, so a slow or frozen tab costs at most a duplicate.
+const PUSH_PROBE_TIMEOUT_MS = 500
+
+// Ask one dashboard tab whether its live connection is up. A worker's memory does
+// not survive termination and a push often wakes a fresh one, so it asks at push
+// time instead of remembering. Resolves true only on an explicit
+// `{ connected: true }` reply (the page side is lib/swConnectedProbe.ts).
+function askConnected(client) {
+  return new Promise(resolve => {
+    let done = false
+    const finish = value => {
+      if (done) return
+      done = true
+      resolve(value)
+    }
+    setTimeout(() => finish(false), PUSH_PROBE_TIMEOUT_MS)
+    try {
+      const channel = new MessageChannel()
+      channel.port1.onmessage = ev => finish(!!(ev.data && ev.data.connected === true))
+      client.postMessage({ type: 'kc-push-probe' }, [channel.port2])
+    } catch {
+      finish(false)
+    }
+  })
+}
+
+self.addEventListener('push', e => {
+  if (!e.data) return
+  let payload
+  try {
+    payload = e.data.json()
+  } catch {
+    return
+  }
+  const n = payload && payload.notification
+  if (!n || !n.title) return
+  // Suppress the OS banner only when a visible dashboard tab on this device says
+  // its live connection is up: that tab gets the same note over the WebSocket
+  // and shows it in-app, so a banner too would double-notify. Visibility alone
+  // is not enough: a tab whose /api/ws was refused (its sign-in expired) is
+  // still visible but receives nothing, so it must not swallow the push. Every
+  // other outcome (no visible dashboard, no answer, a timeout, an older page
+  // without the listener) shows the banner. Only dashboard documents are asked:
+  // a standalone app window does not render general notes.
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+      const visible = clients.filter(c => isDashboardClient(c) && c.visibilityState === 'visible')
+      return Promise.all(visible.map(askConnected)).then(answers => answers.some(Boolean))
+    }).then(handled => {
+      if (handled) return
+      // A hidden tab may already have shown this note (useNativeNotification).
+      // n.tag is the gateway's native_notification_tag, the same value that
+      // tab used, so this banner replaces it rather than adding a second one.
+      return self.registration.showNotification(n.title, {
+        body: n.body || '',
+        tag: n.tag || 'kirocrew-notif',
+        data: n.data || { url: n.navigate || '/' },
+        icon: '/icon-192.png',
+        badge: '/icon-192.png',
+      })
+    })
+  )
+})
+
+// Bring the notification's deep link forward without replacing an open page.
+// An open tab can hold unsaved work (a settings draft lives only in React state),
+// and WindowClient.navigate() reloads the document with no page-side guard, so a
+// tab is only reused when it already shows the target. A deep link elsewhere
+// opens its own window; a plain "/" click just focuses an open tab.
+self.addEventListener('notificationclick', e => {
+  e.notification.close()
+  const target = (e.notification.data && (e.notification.data.url || e.notification.data.navigate)) || '/'
+  const targetHref = new URL(target, self.location.origin).href
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+      const focusable = clients.filter(c => 'focus' in c && isDashboardClient(c))
+      const onTarget = focusable.find(c => c.url === targetHref)
+      if (onTarget) return onTarget.focus()
+      if (target === '/' && focusable.length) return focusable[0].focus()
+      if (self.clients.openWindow) return self.clients.openWindow(target)
+      if (focusable.length) return focusable[0].focus()
+    })
+  )
+})
+
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return
   const url = new URL(e.request.url)
@@ -88,6 +199,18 @@ self.addEventListener('fetch', e => {
   // ── Skip rules (let the browser handle these natively) ──────────────
   // Cross-origin (CDN scripts, analytics, RUM)
   if (url.origin !== self.location.origin) return
+  // A URL carrying a `token` query parameter is a sign-in link (the owner's
+  // `kirocrew token` link, `/?token=...`). Only the gateway's auth middleware can
+  // honour it: it exchanges the link token for a session cookie and redirects. If
+  // the worker answers instead, the exchange never happens — the cached shell
+  // boots with no session, /api/status answers 403 and the page reads "Session
+  // expired". That is exactly what a phone did when the network-first fetch below
+  // failed and fell back to the cached shell. So the worker never answers such a
+  // request (navigation or otherwise) and, being skipped here, never caches its
+  // response either. Placed before every other rule so no later prefix can
+  // re-claim it. The name is checked by presence, not value: an empty or stale
+  // token is still the gateway's to judge.
+  if (url.searchParams.has('token')) return
   // Core API
   if (url.pathname.startsWith('/api')) return
   // Single-use sandboxed documents for artifact/widget iframes. Two reasons this
@@ -139,6 +262,23 @@ self.addEventListener('fetch', e => {
   // as a broken image until the tab reloads. Let the browser fetch them natively.
   if (url.pathname === '/logo.png') return
   if (url.pathname.startsWith('/static/')) return
+  // The AudioContext worklet module for dictation / streaming STT, fetched by
+  // `audioWorklet.addModule('/pcm-worklet.js')` when a voice session mounts (a new
+  // chat, meetings transcription). It gets the SAME retry as hashed assets and
+  // /vendor/ stubs, and for the same reason: `addModule` is called ONCE with no
+  // retry of its own, and a voice session cannot start without this module, so a
+  // single transient 5xx there is a boot-critical failure fetchAssetWithRetry
+  // exists to prevent — the same proxy-capacity 5xx (the tailscale case above)
+  // that dead-pages /assets/ and /vendor/. Without this branch the path was not
+  // skipped: it fell through to the network-first shell handler below, which
+  // already intercepted it but fetched it ONCE with no retry, so a transient 5xx
+  // rejected the one-shot addModule. Routing it through fetchAssetWithRetry adds
+  // the retry (two extra tries with jitter) without changing anything else; the
+  // response is still never cached.
+  if (url.pathname === '/pcm-worklet.js') {
+    e.respondWith(fetchAssetWithRetry(e.request))
+    return
+  }
 
   // ── Shell navigation: network-first, fall back to cached shell ──────
   e.respondWith(

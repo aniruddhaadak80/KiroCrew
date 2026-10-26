@@ -17,7 +17,7 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  *
  * ## Why a hook and not six `useQuery` calls
  *
- * Six surfaces render a model picker (ChatPage, ChatPane, ChatSidebar's bulk
+ * Six surfaces render a model picker (ChatPage, ChatPane, chat-sidebar/bulkModelSwitch.tsx's bulk
  * switcher, AgentsPage, Settings ▸ Chat, KiroCrewAgentsPage) and all six used
  * the SAME query key — deliberately, so kiro-cli's `--list-models` is spawned
  * once — while each declared its own `queryFn`. React Query stores one cache
@@ -38,7 +38,7 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  * cannot supply a shape, only read one.
  *
  * `enabled` is the one option callers still control, because it is per-observer
- * and cannot corrupt the cached value: ChatSidebar's bulk switcher passes
+ * and cannot corrupt the cached value: chat-sidebar/bulkModelSwitch.tsx's bulk switcher passes
  * `false` until its panel opens so merely rendering the sidebar does not spawn
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
@@ -54,7 +54,20 @@ export function useAvailableModelsQuery({ enabled }: AvailableModelsOptions = {}
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
-  return { ...query, data: query.data ?? PLACEHOLDER, isDegraded }
+  return {
+    // Getters, not a `...query` spread. React Query re-renders an observer
+    // only for the result fields it read, and a spread reads every field, so
+    // each fetch's `isFetching`/`fetchStatus`/`dataUpdatedAt` flips re-rendered
+    // ChatPage and every split pane even when the model list was unchanged.
+    // A getter reads its field only when the caller does.
+    get data() { return query.data ?? PLACEHOLDER },
+    get error() { return query.error },
+    get isError() { return query.isError },
+    get isFetching() { return query.isFetching },
+    get isSuccess() { return query.isSuccess },
+    refetch: query.refetch,
+    isDegraded,
+  }
 }
 
 export function useAvailableModels(options: AvailableModelsOptions = {}): ModelInfo[] {

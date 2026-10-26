@@ -249,7 +249,8 @@ class TestSwitchedOffOutsideOwnerView:
             if "/tests/" not in f.as_posix() and needle.search(f.read_text(encoding="utf-8"))
         }
         assert files == {
-            "src/kiro_crew/dashboard/handlers/files.py",  # api_file_read + api_file_diff, owner only
+            "src/kiro_crew/dashboard/file_api/editor.py",  # api_file_read + api_file_diff, owner only
+            "src/kiro_crew/dashboard/handlers/files.py",  # the facade binds the editor's redactor
             "src/kiro_crew/platform/context.py",
             "src/kiro_crew/security/redaction.py",
             "src/kiro_crew/security/redaction_switch.py",
@@ -262,11 +263,22 @@ class TestSwitchedOffOutsideOwnerView:
         fan one chunk to every connected client besides. An owner-view seam there
         would advertise a raw transcript it cannot deliver."""
         import inspect
+        import sys
+        from pathlib import Path
 
         from kiro_crew.dashboard import chat_runner, chat_utils
 
-        assert "owner_view" not in inspect.getsource(chat_runner)
-        assert "owner_view" not in inspect.getsource(chat_utils)
+        assert "owner_view" not in "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
+        # The facade and the owner modules it serves the moved code from.
+        family = (chat_utils.__name__, *chat_utils._OWNERS)
+        assert "owner_view" not in "\n".join(inspect.getsource(sys.modules[n]) for n in family)
 
     def test_file_viewer_opens_the_scope_only_for_the_owner(self):
         """The file viewer is the ONE surface, fed by two handlers that MUST agree:

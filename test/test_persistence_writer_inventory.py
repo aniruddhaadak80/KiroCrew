@@ -30,11 +30,17 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
 
+# A gate here parses a whole tree, so the module has its own ``tree_scan`` group
+# and takes that group's per-test timeout (``TREE_SCAN_TIMEOUT_SECS`` in conftest.py).
+pytestmark = pytest.mark.xdist_group(name="tree_scan_persistence_writer_inventory")
+
+
 #: Methods that commit something to a persistent memory store.
 _WRITE_PRIMITIVES = frozenset(
     {
         "write_lesson",
         "write_episodic",
+        "write_episodic_outcome",
         "set_semantic",
         "set_semantic_if_absent",
         "write_preferences",
@@ -51,14 +57,21 @@ _WRITE_PRIMITIVES = frozenset(
 GATED_AUTOMATIC = {
     # One consolidation pass writes lessons, semantic, episodic, preferences and
     # projects. Gated in _consolidate plus all three automatic entry points.
-    "history_consolidation.py::_save_lessons",
-    "history_consolidation.py::_write_structured_memory",
-    "history_consolidation.py::_consolidate",
+    "history_consolidation_memory.py::_save_lessons",
+    "history_consolidation_memory.py::_write_structured_memory",
+    "history_consolidation_pass.py::_append_history_under_hold",
+    "history_consolidation_pass.py::_write_preferences",
+    "history_consolidation_pass.py::_write_projects",
+    "history_consolidation_pass.py::_consolidate",
     # Distils a lesson from a repeatedly failing task; gated before the LLM call.
-    "taskrunner.py::_extract_lesson",
+    "taskrunner_parts/run_reporting.py::_extract_lesson",
     # The enforcement point behind the learn_add MCP tool: every transport that
     # posts a lesson (tool, dashboard, direct HTTP) is refused by this one check.
-    "dashboard/handlers/cron.py::api_lessons_create",
+    "dashboard/handlers/cron_lessons.py::api_lessons_create",
+    # The "Dashboard: ..." history line every owner mutation leaves in Global
+    # memory: automatic, so it is skipped while the switch is off.
+    "dashboard/handlers/change_cards.py::_record_memory",
+    "dashboard/handlers/change_cards.py::_write",
 }
 
 #: Writers that are deliberately NOT gated, each with the reason it is exempt.
@@ -81,11 +94,14 @@ EXEMPT = {
     # Store-internal writes. The storage layer is deliberately NOT the gate (see
     # the module docstring): these are reached from the classified entry points
     # or from an explicit migration/import the user asked for.
-    "vector_memory.py::write_lesson": "storage primitive",
-    "vector_memory.py::seed_item_if_absent": "storage primitive",
-    "vector_memory.py::import_memory": "explicit user-initiated import",
-    "vector_memory.py::migrate_from_markdown": "explicit one-shot migration",
-    "vector_memory.py::promote_episodic_patterns": "explicit dashboard action",
+    "vector_memory_runtime/lesson_write.py::write_lesson": "storage primitive",
+    "vector_memory_runtime/episodic_write.py::write_episodic": (
+        "storage primitive (bool wrapper of write_episodic_outcome)"
+    ),
+    "vector_memory_member.py::seed_item_if_absent": "storage primitive",
+    "vector_memory_runtime/bulk_ingest.py::import_memory": "explicit user-initiated import",
+    "vector_memory_runtime/bulk_ingest.py::migrate_from_markdown": "explicit one-shot migration",
+    "vector_memory_runtime/bulk_ingest.py::promote_episodic_patterns": "explicit dashboard action",
     # A one-shot, user-initiated import (merge-only, never tombstones).
     "onboarding_import.py::_write_instruction": "user-initiated one-shot import",
     "onboarding_import.py::_write_memory": "user-initiated one-shot import",
@@ -94,6 +110,7 @@ EXEMPT = {
     "eval/bench/ingest.py::ingest_instance": "bench harness, isolated workspace",
     "eval/bench/member_v2.py::_insert": "bench harness, isolated workspace",
     "eval/bench/member_v2.py::_edge_report": "bench harness, isolated workspace",
+    "eval/bench/lesson_recall.py::_write_rules": "bench harness, isolated workspace",
     # Ops-dispatch semantic-recall tests seed a VectorMemoryStore under their own
     # tmp path (never the live store) to exercise the query-vector ranking and
     # cold-model fallback paths.
@@ -102,14 +119,12 @@ EXEMPT = {
     ),
     # The CLI's own explicit `kirocrew learn add`, which carries its own check
     # (a refusal message rather than a silent skip) — see cli_commands.
-    "cli_commands.py::_learn": "carries its own refusal",
-    # KNOWN GAP, flagged for a maintainer ruling rather than silently widened:
-    # an installed app's sweep projects its ops ledger into the shared episodic
-    # store, so it writes while the switch is off. It is app-scoped and reached
-    # only through that app's own trigger, but "no automatic memory writes" does
-    # not currently hold for it.
+    "cli_commands_learn.py::_learn": "carries its own refusal",
+    # The app's nightly sweep gates its only caller, routes._index_ledger_safely,
+    # before constructing the vector store. This function stays policy-free so
+    # its isolated projection tests can inject a fake store directly.
     "apps/builtins/ops_mission_control/backend/ledger_index.py::import_pending": (
-        "app-scoped sweep; ungated pending a ruling"
+        "internal helper; automatic caller carries the persistence gate"
     ),
 }
 

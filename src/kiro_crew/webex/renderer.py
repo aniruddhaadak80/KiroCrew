@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -61,6 +62,7 @@ from kiro_crew.messaging.renderer import (
 from kiro_crew.messaging.split import bounded_for_delivery, chunk_utf8_bytes
 from kiro_crew.messaging.tables import TABLE_POLICY_CARDS
 from kiro_crew.messaging.transport import TransportCapabilities
+from kiro_crew.preview_text import drop_format_chars
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.webex.cards import approval_card, options_card, usable_choices
 from kiro_crew.webex.client import WEBEX_MAX_TEXT
@@ -210,8 +212,37 @@ def _safe_tool_label(raw: str) -> str:
     purpose — hands the room the intact key. So the scan runs on the form that
     actually ships.
     """
-    stripped = _MD_CONTROL_RE.sub("", " ".join((raw or "").split()))[:_TOOL_LABEL_MAX]
+    # NFKC and the Cf drop come FIRST: fullwidth ``［x］（url）`` folds to real
+    # brackets here, where the strip can see them, instead of in a client that
+    # normalizes after we are done; and an invisible character cannot hide a
+    # ``:`` or ``.`` from the card's autolink defang below.
+    folded = drop_format_chars(unicodedata.normalize("NFKC", raw or ""))
+    stripped = _MD_CONTROL_RE.sub("", " ".join(folded.split()))[:_TOOL_LABEL_MAX]
     return webex_display_safe(stripped)
+
+
+# A word joiner: invisible, and it breaks the token a client autolinker scans for.
+_WJ = "\u2060"
+# A scheme separator (``https:``, ``mailto:``, ``javascript:``) and a host dot
+# (``www.x``, ``evil.example``, ``a@b.co``), including the ideographic full stop
+# that IDNA treats as a dot and NFKC leaves alone. ``&`` too, so a client that
+# decodes ``&#58;`` / ``&#46;`` before it autolinks never sees an entity.
+_AUTOLINK_SEP_RE = re.compile(r"[:&.\u3002]")
+
+
+def _card_tool_label(label: str) -> str:
+    """A ``_safe_tool_label`` result that a card TextBlock cannot autolink.
+
+    The strip removes ``[text](url)`` syntax, but the Webex client also autolinks
+    a BARE ``https://x`` or ``www.x`` in a TextBlock, which would plant a
+    clickable target in the one card the user is asked to trust. A word joiner
+    after every ``:`` and ``&`` and before every dot breaks each link shape (and
+    any HTML entity) while the text reads the same. Card only: the text prompt wraps the label in a code span,
+    which no client links.
+    """
+    return _AUTOLINK_SEP_RE.sub(
+        lambda m: m.group() + _WJ if m.group() in ":&" else _WJ + m.group(), label
+    )
 
 
 class WebexRenderer(Renderer):
@@ -257,6 +288,8 @@ class WebexRenderer(Renderer):
         # file is not disclosed beyond the allow-list, and a trusted root.
         self._uploads_allowed = uploads_allowed
         self._upload_root = ""
+        # The session's own scratch directory, set only beside a valid root.
+        self._scratch_root = ""
         self._started = False
         self._finalized = False
 
@@ -332,7 +365,9 @@ class WebexRenderer(Renderer):
             # renderer-owned CHECK necessarily runs after the dispatcher has
             # already looked the decision up.
             attachments = [
-                approval_card(tool, nonce=self._mint_approval_nonce(rid), request_id=rid)
+                approval_card(
+                    _card_tool_label(tool), nonce=self._mint_approval_nonce(rid), request_id=rid
+                )
             ]
         await self._client.send_message(
             self._room_id, text, attachments=attachments, parent_id=self._thread_id
@@ -621,14 +656,22 @@ class WebexRenderer(Renderer):
         body = split_options_trailer(raw, hide_partial=True)[0]
         return strip_control_comments(body, hide_partial=True).strip()
 
-    def authorize_upload_root(self, root: str) -> None:
+    def authorize_upload_root(self, root: str, scratch_root: str = "") -> None:
         """Authorize the provider's resolved cwd as the upload root.
 
         A non-absolute root disables uploads rather than widening to the whole
         filesystem: extraction confines reads to this directory, so an unusable
         value must fail closed.
+
+        *scratch_root* is the session's own ``$KIROCREW_SCRATCH`` directory. It
+        is admitted only beside a valid cwd, and extraction re-checks that it is
+        one allocation under the managed scratch root
+        (``outbound_files.session_scratch_root``) before it counts.
         """
         self._upload_root = root if os.path.isabs(root) else ""
+        self._scratch_root = (
+            scratch_root if self._upload_root and os.path.isabs(scratch_root) else ""
+        )
 
     def _uploads_enabled(self) -> bool:
         """Whether local files in the reply may be uploaded.
@@ -653,7 +696,10 @@ class WebexRenderer(Renderer):
         """
         try:
             result = await extract_local_refs_off_loop(
-                text, within_root=self._upload_root, limits=_UPLOAD_LIMITS
+                text,
+                within_root=self._upload_root,
+                limits=_UPLOAD_LIMITS,
+                scratch_root=self._scratch_root,
             )
         except Exception:
             logger.warning("Webex: outbound file extraction failed", exc_info=True)

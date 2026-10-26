@@ -731,7 +731,7 @@ def test_the_publishing_tool_never_writes_the_record_itself():
     """
     from pathlib import Path as _P
 
-    src = (_P(agent_panel.__file__).parent / "mcp_panel.py").read_text()
+    src = (_P(agent_panel.__file__).parent / "mcp_panel.py").read_text(encoding="utf-8")
     assert "agent_panel" not in src, (
         "mcp_panel imports the panel store; the record directory is masked from "
         "sandboxed processes, so writes must stay on the gateway's HTTP route"
@@ -1181,3 +1181,78 @@ def test_a_lone_surrogate_does_not_become_a_500(tmp_path, monkeypatch):
     # Round-trips through the same encoding the ceiling check uses.
     json.dumps(record, ensure_ascii=False).encode("utf-8")
     assert "\ud800" not in json.dumps(record["data"])
+
+
+# ------------------------------------------------------------ docked opt-in
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("<div>no opt-in here</div>", None),
+        ("<!--kirocrew:docked-->", agent_panel.DOCKED_DEFAULT_HEIGHT),
+        ("<!--kirocrew:docked height=180-->", 180),
+        ("<!--kirocrew:docked height=2-->", agent_panel.DOCKED_HEIGHT_RANGE[0]),
+        ("<!--kirocrew:docked height=9999-->", agent_panel.DOCKED_HEIGHT_RANGE[1]),
+        ("<!--kirocrew:docked height=abc-->", None),
+    ],
+)
+def test_docked_height_reads_the_templates_opt_in(document, expected):
+    assert agent_panel.docked_height(document) == expected
+
+
+def test_a_crew_cannot_opt_its_panel_into_the_docked_frame():
+    """The opt-in belongs to the template. Published data that spells the marker
+    lands in the island escaped, so the composed document carries no opt-in."""
+    _publish(data={"line": "<!--kirocrew:docked height=320-->"})
+    document = agent_panel.render_record(agent_panel.read(CREW))
+    assert document is not None
+    assert agent_panel.docked_height(document) is None
+
+
+def test_every_shipped_template_stays_off_the_docked_frame():
+    """A shipped template that opted in would mint a frame in every drawer that
+    falls back to it; the native summary is the default for those."""
+    for template_id in SHIPPED:
+        assert agent_panel.docked_height(agent_panel.resolve_template(template_id)) is None
+
+
+# ------------------------------------------------- conductor board fields
+
+
+def _board_fields() -> list[str]:
+    from kiro_crew.conductor_board_contract import ConductorBoardPanel
+
+    return list(ConductorBoardPanel.__annotations__)
+
+
+def test_a_conductor_board_naming_none_of_its_fields_is_refused():
+    """The board would render empty while the tool said "Published"."""
+    with pytest.raises(agent_panel.PanelError) as err:
+        _publish(template="kirocrew-conductor", data={"cycle": 47, "fleet": 3})
+    assert err.value.code == "no_known_keys"
+    for field in _board_fields():
+        assert field in str(err.value), f"the refusal does not name {field!r}"
+    assert agent_panel.read(CREW) is None, "a refused publish still wrote a record"
+
+
+@pytest.mark.parametrize(
+    ("template", "data"),
+    [
+        pytest.param(
+            "kirocrew-conductor",
+            {"done": "1 of 2", "cycle": 47},
+            id="test_a_conductor_board_with_one_known_field_is_stored_whole",
+        ),
+        pytest.param(
+            "default",
+            {"anything": 1, "at": "all"},
+            id="test_a_template_with_no_contract_accepts_any_keys",
+        ),
+    ],
+)
+def test_a_publish_the_contract_does_not_refuse_is_stored_whole(template, data):
+    _publish(template=template, data=data)
+    assert agent_panel.read(CREW)["data"] == data

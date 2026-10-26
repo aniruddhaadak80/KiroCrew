@@ -1,0 +1,489 @@
+[
+  {
+    "agent_capabilities": {
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": false,
+        "sse": false
+      },
+      "promptCapabilities": {
+        "audio": false,
+        "embeddedContext": false,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "delete": {},
+        "list": {}
+      }
+    },
+    "agent_version": "0.0.34",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "config_options": [
+      {
+        "category": "model",
+        "currentValue": "stub/stub-model",
+        "description": "Select the model for this session",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "description": null,
+            "name": "stub/Stub",
+            "value": "stub/stub-model"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "medium",
+        "description": "Set the reasoning effort for this session",
+        "id": "thought_level",
+        "name": "Thinking",
+        "options": [
+          {
+            "description": null,
+            "name": "Thinking: medium",
+            "value": "medium"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "modes": {
+      "advertised": true,
+      "current": "medium",
+      "ids": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    "session_id": "pi-session-1"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      0,
+      128000
+    ],
+    "usage_cost": null
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "content": "should not exist",
+          "path": "zt-written.txt"
+        },
+        "title": "write",
+        "tool_call_id": "call_write_2",
+        "tool_input": "{\n  \"content\": \"should not exist\",\n  \"path\": \"zt-written.txt\"\n}",
+        "tool_kind": "edit",
+        "wire_title": "write"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "raw_tool_params": {
+          "content": "should not exist",
+          "path": "zt-written.txt"
+        },
+        "tool_call_id": "call_write_2",
+        "tool_input": "{\n  \"content\": \"should not exist\",\n  \"path\": \"zt-written.txt\"\n}"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "yes",
+            "label": "Yes"
+          },
+          {
+            "id": "no",
+            "label": "No"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "content": "should not exist",
+          "path": "zt-written.txt"
+        },
+        "shell_classified": true,
+        "title": "write",
+        "tool_call_id": "call_write_2",
+        "tool_input": "{\n  \"content\": \"should not exist\",\n  \"path\": \"zt-written.txt\"\n}",
+        "tool_kind": "edit"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "yes",
+      "once": "yes",
+      "reject": "no"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_write_2",
+        "tool_output": "Denied by the Kiro Crew tool gate",
+        "tool_output_bytes": 33,
+        "tool_output_digest": "46d4ecb0b0613d69fadbca561b56cea2cbb18829888c60babf0928b0c53927bf",
+        "tool_status": "failed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Tool result: Denied by the Kiro Crew tool gate"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Tool result: Denied by the Kiro Crew tool gate",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      1643,
+      128000
+    ],
+    "usage_cost": null
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "stop_reason": "end_turn"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "tool_call",
+        "title": "touch zt-touched.txt",
+        "tool_call_id": "call_bash_6",
+        "tool_kind": "execute",
+        "wire_title": "touch zt-touched.txt"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "tool_call_update",
+        "title": "touch zt-touched.txt",
+        "tool_call_id": "call_bash_6",
+        "tool_kind": "execute",
+        "wire_title": "touch zt-touched.txt"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "yes",
+            "label": "Yes"
+          },
+          {
+            "id": "no",
+            "label": "No"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "command": "touch zt-touched.txt"
+        },
+        "request_id": 1,
+        "shell_classified": true,
+        "title": "bash",
+        "tool_call_id": "call_bash_6",
+        "tool_input": "{\n  \"command\": \"touch zt-touched.txt\"\n}",
+        "tool_kind": "execute"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "yes",
+      "once": "yes",
+      "reject": "no"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_bash_6",
+        "tool_status": "failed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Tool result: Denied by the Kiro Crew tool gate"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Tool result: Denied by the Kiro Crew tool gate",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      1748,
+      128000
+    ],
+    "usage_cost": null
+  },
+  {
+    "frame": "response",
+    "id": 4,
+    "stop_reason": "end_turn"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "text": "ping"
+        },
+        "title": "mcp__probe_server__echo",
+        "tool_call_id": "call_mcp__probe_server__echo_10",
+        "tool_input": "{\n  \"text\": \"ping\"\n}",
+        "tool_kind": "other",
+        "wire_title": "mcp__probe_server__echo"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "raw_tool_params": {
+          "text": "ping"
+        },
+        "tool_call_id": "call_mcp__probe_server__echo_10",
+        "tool_input": "{\n  \"text\": \"ping\"\n}"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "yes",
+            "label": "Yes"
+          },
+          {
+            "id": "no",
+            "label": "No"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "text": "ping"
+        },
+        "request_id": 2,
+        "shell_classified": true,
+        "title": "mcp__probe_server__echo",
+        "tool_call_id": "call_mcp__probe_server__echo_10",
+        "tool_input": "{\n  \"text\": \"ping\"\n}",
+        "tool_kind": "other"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "yes",
+      "once": "yes",
+      "reject": "no"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_mcp__probe_server__echo_10",
+        "tool_output": "Denied by the Kiro Crew tool gate",
+        "tool_output_bytes": 33,
+        "tool_output_digest": "46d4ecb0b0613d69fadbca561b56cea2cbb18829888c60babf0928b0c53927bf",
+        "tool_status": "failed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Tool result: Denied by the Kiro Crew tool gate"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Tool result: Denied by the Kiro Crew tool gate",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      1862,
+      128000
+    ],
+    "usage_cost": null
+  },
+  {
+    "frame": "response",
+    "id": 5,
+    "stop_reason": "end_turn"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "title": "frobnicate",
+        "tool_call_id": "call_frobnicate_14",
+        "tool_kind": "other",
+        "wire_title": "frobnicate"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_frobnicate_14",
+        "tool_output": "Tool frobnicate not found",
+        "tool_output_bytes": 25,
+        "tool_output_digest": "c79f7f4d15d7df1e3b2d7196d94e6689e469afb6ff698366f085b821bb0bbddb",
+        "tool_status": "failed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Tool result: Tool frobnicate not found"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Tool result: Tool frobnicate not found",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      1960,
+      128000
+    ],
+    "usage_cost": null
+  },
+  {
+    "frame": "response",
+    "id": 6,
+    "stop_reason": "end_turn"
+  }
+]

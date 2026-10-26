@@ -83,7 +83,7 @@ TrackedProbe = Callable[[str], bool]
 #: as distinct from the extraction upload whose filename sanitizer maps any
 #: non-raster mime to ``.bin``. A channel joins this list only once it has that
 #: verb; every other channel is a skip.
-DOCUMENT_CHANNELS = ("telegram", "discord")
+DOCUMENT_CHANNELS = ("telegram", "discord", "wecom")
 
 _DASHBOARD_PREFIX = "dashboard:"
 
@@ -325,7 +325,7 @@ async def resolve_slack(
         channel = target_channel
     else:
         try:
-            creds = KiroCrewConfig.load().load_credentials()
+            creds = await asyncio.to_thread(KiroCrewConfig.load().load_credentials)
             owner_id = creds.get("KIROCREW_OWNER_ID", "")
             if owner_id:
                 channel = await slack.open_dm(owner_id)

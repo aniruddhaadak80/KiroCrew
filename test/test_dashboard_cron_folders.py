@@ -310,7 +310,6 @@ class TestCronFolderDeleteStateMethod:
             {"id": "f2", "name": "Keep", "order": 1},
         ]
 
-        # Mock crons service
         job_in_folder = MagicMock()
         job_in_folder.id = "job1"
         job_in_folder.folder_id = "f1"
@@ -645,10 +644,13 @@ class TestCronFoldersPersistence:
         # The two gateway startup paths call load_folders(); each must also
         # call load_cron_folders() immediately after.
         import inspect
+        from pathlib import Path
 
         import kiro_crew.dashboard.server as server_mod
 
-        src = inspect.getsource(server_mod)
+        src = inspect.getsource(server_mod) + (
+            Path(server_mod.__file__).parent / "server_runtime" / "api_entrypoint.py"
+        ).read_text(encoding="utf-8")
         assert src.count("await asyncio.to_thread(state.load_cron_folders)") >= 2
 
 

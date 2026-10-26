@@ -19,6 +19,19 @@ const SUPERVISOR_PATH = path.join(__dirname, "..", "gateway-supervisor.js");
 const { createGatewaySupervisor } = require(SUPERVISOR_PATH);
 const { createWindowLifecycle } = require("../window-lifecycle");
 
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
+
 function fakeStore(initial = {}) {
   const data = { ...initial };
   return {
@@ -96,8 +109,12 @@ test("parseRemoteCrewFields reads a save and rejects a dismissal", () => {
       binPath: "~/.local/bin/kirocrew",
       remotePort: "5477",
       remotePath: "~/.toolbox/bin",
+      manageTunnel: false,
     },
   );
+  // Only a literal true opts in: a truthy string from a tampered form does not.
+  assert.strictEqual(parseRemoteCrewFields(JSON.stringify({ host: "h", manageTunnel: true })).manageTunnel, true);
+  assert.strictEqual(parseRemoteCrewFields(JSON.stringify({ host: "h", manageTunnel: "yes" })).manageTunnel, false);
 });
 
 test("saveRemoteCrewConfig stores a validated crew under the launch port", () => {
@@ -116,8 +133,17 @@ test("saveRemoteCrewConfig stores a validated crew under the launch port", () =>
       binPath: "~/.local/bin/kirocrew",
       remotePort: "5477",
       remotePath: "~/.toolbox/bin:/usr/bin",
+      manageTunnel: false,
     },
   });
+});
+
+test("saveRemoteCrewConfig records the managed-tunnel opt-in, and clears it when unchecked", () => {
+  const store = fakeStore();
+  saveRemoteCrewConfig(store, 5477, { host: "devbox", manageTunnel: true });
+  assert.strictEqual(store.data.remoteHosts[5477].manageTunnel, true);
+  saveRemoteCrewConfig(store, 5477, { host: "devbox" });
+  assert.strictEqual(store.data.remoteHosts[5477].manageTunnel, false);
 });
 
 test("saveRemoteCrewConfig defaults the binary path and keeps a stored name", () => {
@@ -131,6 +157,7 @@ test("saveRemoteCrewConfig defaults the binary path and keeps a stored name", ()
     binPath: DEFAULT_REMOTE_BIN,
     remotePort: "",
     remotePath: "",
+    manageTunnel: false,
   });
 });
 
@@ -163,7 +190,9 @@ test("saveRemoteCrewConfig writes nothing when the form is refused", () => {
 });
 
 test("the failure dialog offers the crew form and retries once it is saved", () => {
-  const source = fs.readFileSync(SUPERVISOR_PATH, "utf8");
+  const source = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
 
   assert.match(
     source,
@@ -239,15 +268,15 @@ test("one parser and one writer serve both surfaces", () => {
 test("remoteCrewDraft normalizes whatever the form reopens on", () => {
   assert.deepStrictEqual(
     remoteCrewDraft(),
-    { host: "", binPath: "", remotePort: "", remotePath: "" },
+    { host: "", binPath: "", remotePort: "", remotePath: "", manageTunnel: false },
   );
   assert.deepStrictEqual(
     remoteCrewDraft({ host: "myhost", remotePort: 5477 }),
-    { host: "myhost", binPath: "", remotePort: "5477", remotePath: "" },
+    { host: "myhost", binPath: "", remotePort: "5477", remotePath: "", manageTunnel: false },
   );
   assert.deepStrictEqual(
     remoteCrewDraft({ defaultName: "My Crew" }),
-    { host: "", binPath: "", remotePort: "", remotePath: "" },
+    { host: "", binPath: "", remotePort: "", remotePath: "", manageTunnel: false },
   );
 });
 
@@ -299,6 +328,7 @@ function captureDialogHtml(storeData, actions = ["mc-action:quit"]) {
     destroy() { this.destroyed = true; },
     on() {}, once() {}, removeListener() {},
     webContents: {
+      isDestroyed() { return false; },
       loadFile() {}, loadURL() {}, send() {},
       on() {}, once() {}, removeListener() {},
     },
@@ -435,9 +465,11 @@ test("a refused save reopens the form on the typed values, not on the empty stor
 // The dashboard's own "Set Remote Host" prompt writes the same store, so it
 // takes the same validated path. Driving it here is what proves the two
 // surfaces cannot drift apart again.
-function lifecycleHarness(tabPort, savedFields) {
+function lifecycleHarness(tabPort, savedFields, { platform = "test" } = {}) {
   const store = fakeStore({});
   const messageBoxes = [];
+  const forms = [];
+  const syncs = [];
   const tab = {
     _mcBackendUrl: `http://localhost:${tabPort}`,
     isDestroyed: () => false,
@@ -454,7 +486,8 @@ function lifecycleHarness(tabPort, savedFields) {
 
     // Production attaches its listeners AFTER calling loadURL, because a real
     // load is asynchronous. Firing inline would reach no listener at all.
-    loadURL() {
+    loadURL(url) {
+      forms.push(decodeURIComponent(url.replace(/^data:text\/html;charset=utf-8,/, "")));
       setImmediate(() => {
         for (const handler of this.handlers["page-title-updated"] || []) {
           handler({}, JSON.stringify(savedFields));
@@ -479,14 +512,15 @@ function lifecycleHarness(tabPort, savedFields) {
     store,
     backendUrl: "http://localhost:5476",
     port: 5476,
-    fetchLocalToken: async () => "",
+    mintLocalToken: async () => "",
     fetchRemoteToken: async () => ({ token: "" }),
     requestQuit() {},
     connectWindow: async () => {},
-    platform: "test",
+    syncTunnel: () => { syncs.push(true); },
+    platform,
   });
 
-  return { lifecycle, store, messageBoxes };
+  return { lifecycle, store, messageBoxes, forms, syncs };
 }
 
 // The close handler runs on the tick after loadURL, so the assertions wait for
@@ -508,8 +542,46 @@ test("the dashboard prompt stores a crew through the shared validated writer", a
     binPath: DEFAULT_REMOTE_BIN,
     remotePort: "",
     remotePath: "",
+    manageTunnel: false,
   });
   assert.strictEqual(messageBoxes.at(-1).type, "info");
+});
+
+test("the dashboard prompt carries the managed-tunnel opt-in to the store", async () => {
+  const { lifecycle, store } = lifecycleHarness("5478", {
+    host: "clouddesk",
+    binPath: "",
+    remotePort: "5476",
+    remotePath: "",
+    manageTunnel: true,
+  });
+  await lifecycle.promptRemoteHost();
+  await settle();
+
+  assert.strictEqual(store.data.remoteHosts["5478"].manageTunnel, true);
+});
+
+test("Set Remote Host offers the tunnel option on the launch port and applies it at once", async () => {
+  const { lifecycle, store, forms, syncs } = lifecycleHarness("5476", {
+    host: "clouddesk",
+    manageTunnel: false,
+  });
+  await lifecycle.promptRemoteHost();
+  await settle();
+
+  assert.match(forms[0], /id="mt"/, "the launch port's form must offer the off switch");
+  assert.strictEqual(store.data.remoteHosts["5476"].manageTunnel, false);
+  assert.strictEqual(syncs.length, 1, "a save must re-apply the tunnel choice without a relaunch");
+});
+
+test("Set Remote Host leaves the option out for other tabs and on Windows", async () => {
+  for (const [tabPort, platform] of [["5478", "test"], ["5476", "win32"]]) {
+    const { lifecycle, forms, syncs } = lifecycleHarness(tabPort, { host: "clouddesk" }, { platform });
+    await lifecycle.promptRemoteHost();
+    await settle();
+    assert.doesNotMatch(forms[0], /id="mt"/, `${tabPort}/${platform} must not offer it`);
+    if (tabPort !== "5476") assert.strictEqual(syncs.length, 0);
+  }
 });
 
 test("the dashboard prompt refuses a crew on a port the lookup cannot key", async () => {
@@ -526,4 +598,34 @@ test("the dashboard prompt refuses a crew on a port the lookup cannot key", asyn
 
   assert.strictEqual(store.data.remoteHosts, undefined, "nothing is stored");
   assert.strictEqual(messageBoxes.at(-1).title, "Invalid Input");
+});
+
+test("the Developer panel's local-gateway help names the tunnel option verbatim in every catalog (#3810)", () => {
+  // The Settings row tells a client-only user to switch this option on, and
+  // the form label is English-only, so a rename here must not leave every
+  // locale pointing at a control that no longer exists. en-XA is the
+  // generated pseudolocale and mangles it by design.
+  const { TUNNEL_OPTION_LABEL } = require("../remote-crew-setup");
+  const menuSource = fs.readFileSync(path.join(__dirname, "..", "app-menu.js"), "utf8");
+  const MENU_LABEL = /label: "(Set Remote Host…)"/.exec(menuSource)?.[1];
+  assert.ok(MENU_LABEL, "app-menu.js no longer has a Set Remote Host… item");
+  const dir = path.join(__dirname, "..", "..", "src", "i18n", "locales");
+  for (const file of fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "en-XA.json" && f !== "en.manual.json")) {
+    const catalog = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+    const text = catalog.pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers;
+    assert.ok(text.includes(TUNNEL_OPTION_LABEL), `${file} does not quote "${TUNNEL_OPTION_LABEL}"`);
+    // The menu item the copy sends the user to; read from the menu source so
+    // renaming it there fails here.
+    assert.ok(text.includes(MENU_LABEL), `${file} does not quote "${MENU_LABEL}"`);
+  }
+});
+
+test("the local-gateway guide link targets a heading that exists in the remote guide (#3810)", () => {
+  const panel = fs.readFileSync(path.join(__dirname, "..", "..", "src", "pages", "settings", "DeveloperPanel.tsx"), "utf8");
+  const anchor = /LOCAL_GATEWAY_TUNNEL_GUIDE = '[^'#]*remote-and-mobile\.md#([a-z0-9-]+)'/.exec(panel)[1];
+  const guide = fs.readFileSync(path.join(__dirname, "..", "..", "..", "docs", "guides", "remote-and-mobile.md"), "utf8");
+  // GitHub's slug: lowercase, drop punctuation except hyphens, spaces to hyphens.
+  const slugs = guide.split("\n").filter((l) => /^#{1,6} /.test(l))
+    .map((l) => l.replace(/^#+ /, "").toLowerCase().replace(/[^\p{L}\p{N} -]/gu, "").replace(/ /g, "-"));
+  assert.ok(slugs.includes(anchor), `no heading in remote-and-mobile.md slugs to #${anchor}`);
 });

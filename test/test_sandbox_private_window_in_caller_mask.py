@@ -6,15 +6,14 @@ hidden, and a directory created in the tree AFTER the profile was built is
 covered because the mask is over the whole tree rather than per leaf.
 
 The primitive is honoured for TIER-masked trees and for a CALLER-masked tree
-(``extra_hidden_dirs``) on both backends, and each builder reaches that the same
-way: ``_build_launcher_script`` extends ``hidden_dirs`` with
-``extra_hidden_dirs`` before it computes ``_private_window_spellings``, and
-``_build_seatbelt_profile`` computes its windows against the caller's targets as
-well as the tier list before it emits blanket denies over them. A builder that
-omitted the caller's targets would swallow the window: the child loses read AND
-write on its own directory. Fail-closed, so the spawn breaks rather than leaking,
-but it leaves the primitive enforced on one platform only for exactly the shape
-that needs it.
+(``extra_hidden_dirs``) on both backends, and each plan reaches that the same
+way: the namespace plan joins ``extra_hidden_dirs`` to the tier's masks before it
+computes the private windows, and the Seatbelt plan computes its windows against
+the caller's targets as well as the tier list before the profile emits blanket
+denies over them. A plan that omitted the caller's targets would swallow the
+window: the child loses read AND write on its own directory. Fail-closed, so the
+spawn breaks rather than leaking, but it leaves the primitive enforced on one
+platform only for exactly the shape that needs it.
 
 That shape is the durable-data view for an app-bundle cron script: mask the whole
 ``apps/`` ancestor so no app's ``.app_secret`` is reachable -- including an app
@@ -23,20 +22,40 @@ live at its real path on its real inode, so provisioned dependencies
 (``data/.kirocrew-deps``, whose swap renames require one filesystem) and logs
 survive the run instead of landing in a tree that is deleted afterwards.
 
-Every assertion here is lexical, over the two builders' output. No test in this
-repo executes ``sandbox-exec`` or ``unshare``, so these pin the POLICY the
-builders emit, which is what the two backends were disagreeing about.
+Most assertions here are lexical: over the namespace plan
+(``sandbox._spawn_plan``) and over the Seatbelt profile text. No test in this repo
+executes ``sandbox-exec`` or ``unshare``, so these pin the POLICY the two backends
+are handed, which is what they were disagreeing about. The one ORDER property --
+the window staged before its parent is masked, and bound back before any file
+mask -- is read off the mounts the launcher program's own stages make against a
+stand-in libc.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
+import sys
+from pathlib import Path
 
 import pytest
+from test_sandbox_launcher_program import CoveringLibc, launch, refusal
 
 from kiro_crew import sandbox
+from kiro_crew import sandbox_launcher_program as program
+from kiro_crew import sandbox_plan
+
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """The namespace plan asks the HOST's ``ssh -V`` for accept-new support.
+
+    The private-window lists the plan hands the launcher do not depend on that
+    answer, and a real ssh spawned from the test process is a host dependency this
+    module is not about. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+
 
 _HOME = os.path.expanduser("~")
 _APPS = os.path.join(_HOME, ".kiro", "crew", "apps")
@@ -70,11 +89,9 @@ def _denied(path: str, hidden: list[str], windows: list[str]) -> bool:
 
 
 def _launcher_view(**kwargs: object) -> tuple[list[str], list[str], list[str]]:
-    script = sandbox._build_launcher_script("cc", **kwargs)  # type: ignore[arg-type]
-    hidden = json.loads(re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S).group(1))
-    files = json.loads(re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1))
-    windows = json.loads(re.search(r"PRIVATE_DIRS = (\[.*?\])\n", script, re.S).group(1))
-    return hidden, files, windows
+    """The masked dirs, masked files and private windows the Linux launcher is handed."""
+    plan = sandbox._spawn_plan("namespace", "cc", **kwargs)  # type: ignore[arg-type]
+    return list(plan.sensitive_dirs), list(plan.sensitive_files), list(plan.windows)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Seatbelt profile only")
@@ -100,7 +117,27 @@ class TestSeatbeltHonoursAWindowInsideACallerMask:
     def test_a_sibling_app_in_the_masked_tree_gets_no_exception(self) -> None:
         lines = _seatbelt(extra_hidden_dirs=(_APPS,), extra_private_dirs=(_DATA,))
         assert not any(_SIBLING in ln and "require-not" in ln for ln in lines)
-        assert not any(ln.lstrip().startswith("(allow") and _APPS in ln for ln in lines)
+        allows = [ln.strip() for ln in lines if ln.lstrip().startswith("(allow") and _APPS in ln]
+        assert allows == [
+            f"(allow file-read-metadata (literal {json.dumps(_BUNDLE)}))",
+            f"(allow file-read-metadata (literal {json.dumps(_APPS)}))",
+        ], allows
+
+    def test_the_masked_ancestors_of_a_window_stay_stat_able(self) -> None:
+        """``realpath`` of the window lstat()s every component above it, so a
+        blanket ``file-read*`` deny on the masked root breaks any harness that
+        canonicalizes its own $TMPDIR (the Copilot CLI fails session/new with
+        "Directory does not exist or cannot be accessed"). The re-open is
+        metadata-only and literal: no listing, no read, no sibling."""
+        lines = _seatbelt(extra_hidden_dirs=(_APPS,), extra_private_dirs=(_DATA,))
+        deny_at = max(
+            i for i, ln in enumerate(lines) if ln in _rules_for(lines, "file-read*", _APPS)
+        )
+        for ancestor in (_APPS, _BUNDLE):
+            rule = f"(allow file-read-metadata (literal {json.dumps(ancestor)}))"
+            at = [i for i, ln in enumerate(lines) if ln.strip() == rule]
+            assert at and at[0] > deny_at, (ancestor, "must follow the deny: last match wins")
+        assert not any("(allow" in ln and "subpath" in ln and _APPS in ln for ln in lines)
 
     def test_an_exposed_file_keeps_its_read_carve_out_beside_a_window(self) -> None:
         """A tree can carry both: the window (read-write, its own state) and a
@@ -145,14 +182,52 @@ class TestTheTwoBackendsAgreeOnACallerMask:
             for ln in _rules_for(lines, "file-read*", _APPS)
         ), "the Linux launcher honours this window; Seatbelt must too"
 
-    def test_the_launcher_stages_the_window_before_it_masks_the_parent(self) -> None:
-        script = sandbox._build_launcher_script(
-            "cc", extra_hidden_dirs=(_APPS,), extra_private_dirs=(_DATA,)
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"), reason="the namespace launcher is Linux-only"
+    )
+    def test_the_launcher_stages_the_window_before_it_masks_the_parent(
+        self, tmp_path: Path
+    ) -> None:
+        """The same spawn shape over a real tree, planned and then placed by the program.
+
+        A window is staged before its parent tree is masked (the mask shadows the real
+        path) and bound back inside the mask before any single file is masked.
+        """
+        home = tmp_path / "home"
+        apps = home / ".kiro" / "crew" / "apps"
+        data = apps / "demo-app" / "data"
+        data.mkdir(parents=True)
+        (data / "state.json").write_text("{}")
+        (apps / "demo-app" / ".app_secret").write_text("secret")
+        (apps / "other-app").mkdir()
+        (apps / "other-app" / ".app_secret").write_text("sibling secret")
+        netrc = home / ".netrc"
+        netrc.write_text("machine x\n")
+        plan = sandbox_plan.plan_confinement(
+            sandbox_plan.SandboxRequest(
+                tier="cc", extra_hidden_dirs=(str(apps),), extra_private_dirs=(str(data),)
+            ),
+            sandbox_plan.PlanHost(home=str(home), cc_files=(".netrc",)),
         )
-        stage = script.index("staging private window")
-        reopen = script.index("opening private window")
-        mask_file = script.index("hiding sensitive file")
-        assert stage < reopen < mask_file
+        libc = CoveringLibc()
+        run = launch(tmp_path, sandbox_plan.namespace_payload(plan), libc=libc)
+
+        assert refusal(program.place_masks, run) is None
+
+        targets = [call.target_path for call in libc.calls]
+        stages = [i for i, target in enumerate(targets) if os.path.dirname(target) == run.tmpfs_src]
+        assert stages, "the window was never staged"
+        stage = stages[0]
+        reopen = targets.index(str(data))
+        mask_parent = targets.index(str(apps))
+        mask_file = targets.index(str(netrc))
+        assert stage < mask_parent < reopen < mask_file
+        # And what that order buys: the app's own data is live in the masked tree, the
+        # sibling app is gone, and the file mask landed.
+        assert sorted(os.listdir(apps)) == ["demo-app"]
+        assert sorted(os.listdir(apps / "demo-app")) == ["data"]
+        assert (data / "state.json").read_text() == "{}"
+        assert netrc.read_text() == ""
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX backends only")
@@ -204,7 +279,7 @@ class TestTwoWindowsInTheScratchMask:
     masked scratch root -- its own directory and the tree's
     (``agent_scratch``): both are re-exposed read-write, every other tree stays
     hidden, and the two builders agree. The primitive is N-ary by construction
-    (``_private_window_spellings`` iterates); this pins that the second entry is
+    (``sandbox_plan.private_windows`` iterates); this pins that the second entry is
     honoured exactly like the first rather than assuming it."""
 
     _KWARGS = {"extra_private_dirs": (_OWN_SCRATCH, _TREE_SCRATCH)}

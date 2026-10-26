@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
+from body_stream_helpers import attach_json_body
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactFolderStore, ArtifactNotFoundError, ArtifactStore
@@ -60,7 +61,7 @@ def _request(
     req.match_info = match or {}
     req.query = query or {}
     encoded = json.dumps(body).encode() if isinstance(body, dict) else b""
-    req.read = AsyncMock(return_value=encoded)
+    attach_json_body(req, encoded)
     req.app = {"state": MagicMock(), "_restricted_session": restricted}
     return req
 
@@ -172,6 +173,17 @@ class TestFolderUpdate:
             _request(body={"parent_id": b["id"]}, match={"id": a["id"]})
         )
         assert resp.status == 400
+
+    @pytest.mark.parametrize("raw", ["1e999", "-1e999"])
+    @pytest.mark.asyncio
+    async def test_infinite_order_400(self, stores, patch_restricted, raw: str) -> None:
+        """JSON reads ``1e999`` as an infinite float: a 400, never a 500."""
+        _store, fstore = stores
+        f = fstore.create("A")
+        body = json.loads(f'{{"order": {raw}}}')
+        resp = await api_artifact_folder_update(_request(body=body, match={"id": f["id"]}))
+        assert resp.status == 400
+        assert fstore.get(f["id"])["order"] == f["order"]
 
     @pytest.mark.asyncio
     async def test_unknown_404(self, stores, patch_restricted) -> None:

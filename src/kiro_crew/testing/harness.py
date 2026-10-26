@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterator, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.dashboard.crash_dump_store import dump_replay_lines, newest_dump_with_stacks
 from kiro_crew.kiro_prerequisite import FAKE_ACP_TEST_MODE_ENV
 from kiro_crew.testing import fake_acp_backend
 
@@ -96,8 +97,49 @@ EXIT_DRAIN_SECONDS = 2.0
 SHIM_ENCODING = "oem"
 
 # Sentinel prefix the gateway prints to stdout once the dashboard is bound.
-# Owned by ``slack/gateway.py``; if you change it there, update here too.
+# Owned by ``slack/gateway_runtime/service_boot.py``; if you change it there, update here too.
 READY_PREFIX = "KIROCREW_READY:"
+
+
+def crash_dump_diagnostic(home: Path) -> str:
+    """The gateway's loop-stall stack dump, if its watchdog wrote one into *home*.
+
+    The watchdog's dump-then-exit (``dashboard/loop_watchdog.py``) writes every
+    thread's stack into ``<home>/logs/crash-dumps/`` and never into stderr, so a
+    gateway the alarm ended shows up in the captured stderr as silence followed
+    by ``exit=-14``. The harness removes the HOME right after, which makes this
+    file the one place the blocking frame can be read from: it is folded into
+    :meth:`GatewayHandle.diagnostics` so the frame reaches the test's failure
+    message instead of a directory nobody uploads.
+
+    The stacks come through :func:`~kiro_crew.dashboard.crash_dump_store.dump_replay_lines`
+    with its journal caps lifted: every thread, wedged thread first. The
+    journal's 120-line / 8 KiB budget is wrong for a failure message. A loop
+    thread caught at a syscall boundary (``selectors.select``, ``stat``) while
+    every visible worker is parked is waiting to reacquire the GIL from some
+    OTHER thread inside a long native call, and ``faulthandler`` lists threads
+    newest-first, so a capped replay ends before that thread -- the one stack
+    that says what stalled the gateway. The reader's own file bound (a few
+    MiB) is the only cap left.
+
+    Empty when no dump with stacks exists -- a header-only file is the sentinel
+    every boot opens and says nothing. Never raises: a missing or unreadable
+    directory is a gateway that produced no dump, and the diagnostic it would
+    decorate must still be reported.
+    """
+    try:
+        dump = newest_dump_with_stacks(home / "logs" / "crash-dumps")
+        if dump is None:
+            return ""
+        lines, truncated = dump_replay_lines(dump, max_lines=sys.maxsize, max_bytes=sys.maxsize)
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+        return ""
+    if not lines:
+        return ""
+    text = "\n".join(lines)
+    if truncated:
+        text += "\n... (dump truncated; wedged thread shown first)"
+    return f"\n--- loop-stall crash dump ({dump.name}) ---\n{text}"
 
 
 @dataclass(frozen=True)
@@ -249,12 +291,11 @@ class _StdoutPump:
     subprocess PIPE there raises rather than polling it. A reader thread behaves
     identically on all three platforms.
 
-    Why the queue: the thread would otherwise read ahead without bound, and the
-    READY waiter needs a *bounded* wait so the deadline is checked even while
-    the child is alive and silent -- the one guarantee the old selector poll
-    provided. ``queue.Queue.get(timeout=...)`` gives exactly that, without a
-    busy loop, and it does not spin on EOF the way a selector does (EOF is
-    permanently readable).
+    Why the queue: the READY waiter needs a *bounded* wait so the deadline is
+    checked even while the child is alive and silent.
+    ``queue.Queue.get(timeout=...)`` gives exactly that, without a busy loop,
+    and it does not spin on EOF the way a selector does (EOF is permanently
+    readable).
 
     Why one thread for the whole run and not one per phase: two readers on one
     pipe race for the same bytes. Before READY, chunks go to the queue for the
@@ -265,7 +306,7 @@ class _StdoutPump:
     """
 
     #: Chunks retained after handoff, for post-mortem diagnostics of a failed
-    #: run. Matches the previous ``deque(maxlen=256)`` drain.
+    #: run.
     TAIL_CHUNKS = 256
 
     def __init__(self, stdout: IO[bytes]) -> None:
@@ -441,6 +482,12 @@ def _wait_for_ready_line(
         return None, buffer
 
     buf = b""
+    # Bounded tail for diagnostics: mirrors the pump's post-READY tail so
+    # a long-running silent subprocess cannot grow this without limit.
+    # Chunks beyond the cap are counted (not retained) so the timeout
+    # message can report truncation.
+    stdout_received: deque[bytes] = deque(maxlen=_StdoutPump.TAIL_CHUNKS)
+    _stdout_dropped = 0  # chunks evicted by the deque cap
     while True:
         if proc.poll() is not None:
             # Scan whatever the reader captures up to EOF before declaring the
@@ -449,17 +496,46 @@ def _wait_for_ready_line(
             payload, buf = _scan(buf + pump.drain_until_eof(EXIT_DRAIN_SECONDS))
             if payload is not None:
                 return payload
+            _trunc_exit = (
+                f" [{_stdout_dropped} earlier chunk(s) dropped]" if _stdout_dropped else ""
+            )
+            stdout_at_exit = (
+                b"".join(stdout_received).decode("utf-8", errors="replace")[-2000:] + _trunc_exit
+            )
             raise GatewaySpawnError(
                 f"gateway subprocess exited with code {proc.returncode} "
                 f"before emitting {READY_PREFIX} line.\n"
-                f"--- stderr (last) ---\n{_stderr_tail()}"
+                f"--- stderr (last) ---\n{_stderr_tail()}\n"
+                f"--- stdout (so far) ---\n{stdout_at_exit}"
             )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            alive = proc.poll() is None
+            has_any_output = bool(stdout_received) or bool(stderr_buffer)
+            # Build a diagnostic that names whether the process is alive, what
+            # it wrote to stdout, and what state it is in.  Stderr is empty
+            # for the whole Python import phase, so a cold-import stall is
+            # named by the liveness state and by `cold_hint`, which fires when
+            # neither stream has produced output.
+            _trunc = f" [{_stdout_dropped} earlier chunk(s) dropped]" if _stdout_dropped else ""
+            stdout_so_far = (
+                b"".join(stdout_received).decode("utf-8", errors="replace")[-2000:] + _trunc
+            )
+            stderr_so_far = _stderr_tail()
+            process_state = f"alive (pid {proc.pid})" if alive else f"exited {proc.returncode}"
+            cold_hint = (
+                "\n(no output from subprocess — likely still in cold import "
+                "phase; raise KIROCREW_HARNESS_READY_TIMEOUT if the runner is slow)"
+                if not has_any_output
+                else ""
+            )
             raise GatewaySpawnError(
                 f"gateway did not emit {READY_PREFIX} line within "
-                f"{timeout:.1f}s. Override with KIROCREW_HARNESS_READY_TIMEOUT.\n"
-                f"--- stderr (last) ---\n{_stderr_tail()}"
+                f"{timeout:.1f}s [{process_state}]. "
+                f"Override with KIROCREW_HARNESS_READY_TIMEOUT.\n"
+                f"--- stderr (last) ---\n{stderr_so_far}\n"
+                f"--- stdout (so far) ---\n{stdout_so_far}"
+                f"{cold_hint}"
             )
         # Cap each wait at 0.5s so the deadline + poll() checks above run
         # frequently even if the subprocess goes silent.
@@ -471,8 +547,13 @@ def _wait_for_ready_line(
             # EOF on stdout without READY. The child may still be alive (it can
             # close stdout and keep running), so keep honouring the deadline and
             # the exit check rather than failing here; the queue is empty from
-            # now on, so each iteration sleeps its 0.5s instead of spinning.
+            # now on, so each iteration sleeps its 0.5 s instead of spinning.
+            # Deliberate: a child that closes stdout but keeps running must not
+            # be failed immediately; the deadline and the exit check own the verdict.
             continue
+        if len(stdout_received) == _StdoutPump.TAIL_CHUNKS:
+            _stdout_dropped += 1
+        stdout_received.append(chunk)
         payload, buf = _scan(buf + chunk)
         if payload is not None:
             return payload
@@ -797,8 +878,6 @@ def _terminate_process_group(
     # ``start_new_session=True`` so their own teardown can killpg them) are the
     # standing example; killed mid-probe with the gateway, they keep writing
     # security events into the HOME this function's answer allows removing.
-    # Each is attributed by creation identity (``created_after``) so a stray
-    # whose dead parent's pid was recycled to the gateway is never signalled.
     escaped: dict[int, str] = {}
     for child, known_token in (known_descendants or {}).items():
         group = platform_compat.pgroup_of(child)
@@ -842,8 +921,8 @@ def _terminate_process_group(
         # process primitives live: `os.getpgid` does not exist on Windows, and
         # the portability gate reads an added line naming it as a break whether
         # or not the branch is reachable there. `None` means the membership
-        # could not be read, and the original `except OSError: continue` is
-        # preserved for it -- an unknown group is not evidence of an escape.
+        # could not be read, and that child is skipped: an unknown group is not
+        # evidence of an escape.
         group = platform_compat.pgroup_of(child)
         if group is None or group == pgid:
             continue  # unknown, or the group kill covers it
@@ -868,8 +947,51 @@ def _terminate_process_group(
     # rmtree that follows never races a child still unwinding from SIGKILL.
     if not (swept and _await_group_gone(pgid)):
         return False
-    escaped_ended = _end_escaped_descendants(escaped)
-    return escaped_ended and not root_already_exited
+    return _end_escaped_descendants(escaped)
+
+
+def _sigkill_if_identity_matches(pid: int, token: str) -> None:
+    """SIGKILL *pid* only if its creation identity still equals *token*.
+
+    On POSIX ``kill_pid_pinned`` is a plain ``os.kill`` that leaves the identity
+    check to its caller, so the check is made here. Where Linux offers a pidfd,
+    the process is pinned BEFORE its identity is read: a pid reissued after the
+    pin cannot retarget the fd, and one reissued before it reads a different
+    start time. Without a pidfd (macOS) the identity is re-read just before the
+    kill, which narrows the window but cannot close it. Errors from the signal
+    propagate; the caller treats them as nothing left to end.
+    """
+    if not platform_compat.IS_WINDOWS and _pidfd_sigkill_if_identity_matches(pid, token):
+        return
+    # Windows: the primitive itself holds the verified handle across the
+    # terminate. POSIX without a usable pidfd: the re-read is the only check.
+    if platform_compat.IS_WINDOWS or platform_compat.process_start_time(pid) == token:
+        platform_compat.kill_pid_pinned(pid, token, platform_compat.SIGKILL)
+
+
+def _pidfd_sigkill_if_identity_matches(pid: int, token: str) -> bool:
+    """Pinned half of :func:`_sigkill_if_identity_matches`; False if no pidfd.
+
+    False means this host cannot pin (no wrapper, an old kernel answering
+    ENOSYS, a sandbox answering EPERM) and the caller falls back. True means the
+    pid was handled here: signalled, spared on a mismatch, or already gone.
+    """
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_send_signal is None:
+        return False
+    try:
+        fd = pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        if platform_compat.process_start_time(pid) == token:
+            pidfd_send_signal(fd, platform_compat.SIGKILL)
+    finally:
+        os.close(fd)
+    return True
 
 
 def _end_escaped_descendants(escaped: dict[int, str]) -> bool:
@@ -882,7 +1004,7 @@ def _end_escaped_descendants(escaped: dict[int, str]) -> bool:
     """
     for child, token in escaped.items():
         with contextlib.suppress(OSError):
-            platform_compat.kill_pid_pinned(child, token, platform_compat.SIGKILL)
+            _sigkill_if_identity_matches(child, token)
     deadline = time.monotonic() + GROUP_EXIT_WAIT_SECONDS
     while True:
         alive = [
@@ -940,9 +1062,10 @@ def harness_environment(
     Layered over the caller's ``os.environ`` so supported production knobs the
     test process exports (``KIROCREW_EMBED_MODEL_URL``, ``OLLAMA_MODELS``) reach
     the gateway, then pinned: the data home, the agent-spec home, the test-rig
-    marker, unbuffered stdout, and -- unless ``skip_model_download`` is False --
-    the ``KIROCREW_SKIP_MODEL_DOWNLOAD=1`` escape hatch. That flag is the ONLY
-    default a caller can drop, and only through this keyword: it is what a
+    marker, unbuffered stdout, the app store's off-network switch
+    (``KIROCREW_SKIP_APP_STORE_FETCH=1``), and -- unless ``skip_model_download``
+    is False -- the ``KIROCREW_SKIP_MODEL_DOWNLOAD=1`` escape hatch. That flag is
+    the ONLY default a caller can drop, and only through this keyword: it is what a
     dedicated download-failure evidence gateway needs, because the production
     download manager honours the same flag for the dashboard's Retry click as
     for the boot-time background task. A caller that drops it must also export
@@ -957,7 +1080,7 @@ def harness_environment(
         # ``kirocrew gateway`` boot runs ``rebuild_agent_config``, which writes the
         # managed MCP specs into ``kiro_agents_dir()``. Left at the default that
         # resolves the operator's real machine-wide ``~/.kiro/agents`` -- and the
-        # spawned gateway is an ordinary (non-worktree) install, so ``agent.py``'s
+        # spawned gateway is an ordinary (non-worktree) install, so ``agent_parts/shared_home.py``'s
         # write guard takes the "writing its own shared home" branch and does NOT
         # decline. It would then stamp this throwaway checkout's venv + tmp data
         # home into the real install's specs, breaking every managed MCP call on
@@ -980,6 +1103,15 @@ def harness_environment(
         # "Created default config") would block-buffer when stdout is a
         # pipe and could mask early failures.
         "PYTHONUNBUFFERED": "1",
+        # The app store answers from the bundled seed, never the live CDN or a
+        # clone of a listed repository: a harness gateway is the offline rig the
+        # browser specs run against, and ``GET /api/apps/registry`` otherwise
+        # pays an uncached HTTPS round trip per listing, bounded only by the
+        # catalog's fetch timeout -- the specs' ready budget. Spelled literally,
+        # like the model-download switch below: ``apps.official_catalog`` owns
+        # the name (``SKIP_FETCH_ENV``) and this module does not import the apps
+        # package.
+        "KIROCREW_SKIP_APP_STORE_FETCH": "1",
     }
     if skip_model_download:
         # Embeddings are default-on; never let a harness-spawned gateway
@@ -1173,7 +1305,7 @@ def spawn_feature_gateway(
                 return (
                     f"gateway pid {proc.pid} exit={proc.poll()!r}\n"
                     f"--- stderr (last) ---\n{err}\n"
-                    f"--- stdout after READY (last) ---\n{out}"
+                    f"--- stdout after READY (last) ---\n{out}" + crash_dump_diagnostic(home)
                 )
 
             def _restart(skip_model_download: Optional[bool] = None) -> GatewayHandle:

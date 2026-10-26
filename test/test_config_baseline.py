@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from kiro_crew.config.schema import SCHEMA_REGISTRY
 
@@ -292,7 +293,7 @@ class TestSpawnQueueWaitHelpMatchesTheDaemon:
         along, is exactly that trap).
         """
         sites = {
-            "src/kiro_crew/config/sections.py": _schema_help(_SPAWN_QUEUE_WAIT_PATH),
+            "src/kiro_crew/config/integration_sections.py": _schema_help(_SPAWN_QUEUE_WAIT_PATH),
             "config-baseline.json": _baseline_help(_SPAWN_QUEUE_WAIT_PATH),
             _SPAWN_QUEUE_WAIT_DOC: _doc_paragraph_about(
                 _SPAWN_QUEUE_WAIT_DOC, "spawn_queue_wait_secs"
@@ -330,7 +331,7 @@ class TestSpawnQueueWaitHelpMatchesTheDaemon:
         shipped = McpGatewayConfig().spawn_queue_wait_secs
         assert float(stub_mod._RECONNECT_TOTAL_BUDGET_SECS) == float(shipped)
         for name, text in (
-            ("src/kiro_crew/config/sections.py", _schema_help(_SPAWN_QUEUE_WAIT_PATH)),
+            ("src/kiro_crew/config/integration_sections.py", _schema_help(_SPAWN_QUEUE_WAIT_PATH)),
             ("config-baseline.json", _baseline_help(_SPAWN_QUEUE_WAIT_PATH)),
         ):
             assert f"above {shipped}" in text, (
@@ -428,6 +429,7 @@ class TestCommittedBaselineParity:
         # Exercise real Git conversion without inheriting host/repository overrides.
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        env.update(git_maintenance_off_entries(env))
         git = [
             "git",
             "-c",

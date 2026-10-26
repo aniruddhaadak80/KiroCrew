@@ -11,6 +11,7 @@ import pytest
 
 from kiro_crew.slack import events as events_mod
 from kiro_crew.slack.events import _publish_home_tab
+from kiro_crew.testing.wait import finished
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -486,7 +487,7 @@ class TestPublishHomeTabSessions:
         new_callable=AsyncMock,
         return_value="*SSO:* ✅",
     )
-    async def test_taskrunner_session_rendered_under_autopilot(
+    async def test_taskrunner_session_rendered_under_task_runner(
         self, _mw, _fmt, _yolo, tmp_path, monkeypatch
     ):
         sess_dir = tmp_path / "sessions"
@@ -502,7 +503,8 @@ class TestPublishHomeTabSessions:
         await _publish_home_tab(orch, "U123")
 
         text = str(orch.slack.views_publish.call_args[1]["view"]["blocks"])
-        assert "Autopilot / task runner" in text
+        assert "*Task runner*" in text
+        assert "Autopilot" not in text
         assert "Refactor login" in text
         assert "mc_session_resume_taskrunner_run-foo" in text
 
@@ -864,7 +866,7 @@ class TestHomeTabCollectorConcurrency:
             "_collect_recent_sessions_off_loop",
             self._tracking_collector(observed),
         )
-        await asyncio.wait_for(_publish_home_tab(_make_orch(), "U2"), timeout=5)
+        await finished(_publish_home_tab(_make_orch(), "U2"), "the second home-tab publish", timeout=5)
 
         assert observed == [1]
 
@@ -907,3 +909,108 @@ async def test_home_tab_skill_loader_and_listing_run_off_loop(tmp_path, monkeypa
         assert all(thread != loop_thread for thread in threads)
     finally:
         loader.close()
+
+
+@pytest.mark.asyncio
+async def test_home_tab_mcp_server_listing_runs_off_loop(monkeypatch):
+    """``list_servers`` reads the agent config, ``mcp.json`` and every
+    provider's global config (``~/.claude.json`` is routinely megabytes), so
+    opening the Home tab must not run it on the event loop thread. The
+    disabled filter still applies to what the worker thread returns."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    threads = []
+
+    def list_servers():
+        threads.append(threading.get_ident())
+        return [
+            SimpleNamespace(name="builder-mcp", disabled=False),
+            SimpleNamespace(name="figma", disabled=True),
+        ]
+
+    loader = MagicMock()
+    loader.list_skills.return_value = []
+    monkeypatch.setattr(events_mod, "list_servers", list_servers)
+    monkeypatch.setattr(events_mod, "_get_skills_loader", lambda: loader)
+    monkeypatch.setattr(events_mod, "is_yolo_mode", lambda: False)
+    monkeypatch.setattr("kiro_crew.sso_status.get_sso_status_line", AsyncMock(return_value="ready"))
+    orch = _make_orch(slack=SimpleNamespace(views_publish=AsyncMock()))
+
+    await _publish_home_tab(orch, "U123")
+
+    orch.slack.views_publish.assert_awaited_once()
+    assert len(threads) == 1
+    assert threads[0] != loop_thread
+    text = str(orch.slack.views_publish.call_args[1]["view"]["blocks"])
+    assert "MCP Integrations (1)" in text
+    assert "builder-mcp" in text
+    assert "figma" not in text
+
+
+@dataclass
+class FakeCronJobTZ:
+    """A cron job that carries its own timezone, like the real CronJob."""
+
+    name: str = "tz-job"
+    enabled: bool = True
+    timezone: str = ""
+    schedule: object = field(default_factory=lambda: MagicMock())
+
+
+class TestPublishHomeTabCronTimezone:
+    """App Home cron rows honour each job's own timezone."""
+
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    @patch(
+        "kiro_crew.sso_status.get_sso_status_line",
+        new_callable=AsyncMock,
+        return_value="*SSO:* ✅",
+    )
+    async def test_uses_each_jobs_own_timezone(self, _mw, _yolo):
+        """A job's own timezone is passed to format_schedule, not the config zone."""
+        orch = _make_orch(
+            cron_svc=FakeCronService([FakeCronJobTZ(timezone="Asia/Seoul")]),
+        )
+        captured: dict = {}
+
+        def _capture(_schedule, tz_name=""):
+            captured["tz_name"] = tz_name
+            return "0 9 * * *"
+
+        cfg = SimpleNamespace(timezone="America/New_York")
+        with (
+            patch("kiro_crew.slack.events.format_schedule", side_effect=_capture),
+            patch("kiro_crew.slack.events.KiroCrewConfig.load", return_value=cfg),
+        ):
+            await _publish_home_tab(orch, "U123")
+
+        assert captured.get("tz_name") == "Asia/Seoul"
+
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    @patch(
+        "kiro_crew.sso_status.get_sso_status_line",
+        new_callable=AsyncMock,
+        return_value="*SSO:* ✅",
+    )
+    async def test_falls_back_to_configured_zone_when_job_has_none(self, _mw, _yolo):
+        """A job with no timezone falls back to the existing App Home zone."""
+        orch = _make_orch(
+            cron_svc=FakeCronService([FakeCronJobTZ(timezone="")]),
+        )
+        captured: dict = {}
+
+        def _capture(_schedule, tz_name=""):
+            captured["tz_name"] = tz_name
+            return "0 9 * * *"
+
+        cfg = SimpleNamespace(timezone="America/New_York")
+        with (
+            patch("kiro_crew.slack.events.format_schedule", side_effect=_capture),
+            patch("kiro_crew.slack.events.KiroCrewConfig.load", return_value=cfg),
+        ):
+            await _publish_home_tab(orch, "U123")
+
+        assert captured.get("tz_name") == "America/New_York"

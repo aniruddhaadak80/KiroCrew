@@ -23,12 +23,15 @@ from typing import Any
 
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_NO_BUDGET,
+    DENY_CAUSE_APPROVAL_OVERSIZE,
     DENY_CAUSE_APPROVAL_TIMEOUT,
     DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+    DENY_CAUSE_AUDIT_UNAVAILABLE,
     DENY_CAUSE_BATCH_CASCADE,
     DENY_CAUSE_HOOK_ERROR,
     DENY_CAUSE_INVALID_NAME,
     DENY_CAUSE_POLICY,
+    DENY_CAUSE_SURFACE_POLICY,
     STEER_NOTICE_BOUND_SECS,
 )
 from kiro_crew.deny_guidance import remediation_for
@@ -54,6 +57,15 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "use an allowed alternative (for a shell command, a read-only variant), use "
         "a different tool, or — if the block is correct and you genuinely cannot "
         "proceed — say so and stop with the reason.",
+    ),
+    DENY_CAUSE_SURFACE_POLICY: (
+        "was refused by the tool policy of the surface this turn runs on, not by a "
+        "safety rule about the call itself",
+        "the reason above says what this surface permits -- nothing at all, or only "
+        "calls provably read-only. Nothing about the action was judged, so do not "
+        "look for a sanctioned form of it here: continue with what you can do "
+        "without the tool, and if you genuinely cannot, say so and stop with the "
+        "reason.",
     ),
     DENY_CAUSE_INVALID_NAME: (
         "was refused because its tool name failed validation",
@@ -99,6 +111,22 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "delivery failed, so the action itself was never judged — do not "
         "abandon it or route around it on this evidence. State the permission "
         "you need and why, then continue with what you can do without it.",
+    ),
+    DENY_CAUSE_APPROVAL_OVERSIZE: (
+        "was auto-declined because its approval card was too long for this "
+        "channel to show in full",
+        "a reader who cannot see the whole request cannot approve it, so the "
+        "action itself was never judged — do not abandon it or route around it "
+        "on this evidence. The reason above gives the limit: split the request "
+        "into shorter steps that each fit it and reissue them one at a time; if "
+        "it cannot be split, say so and stop with the reason.",
+    ),
+    DENY_CAUSE_AUDIT_UNAVAILABLE: (
+        "was refused because the host could not write the audit record its approval requires",
+        "treat this as a host fault, not a verdict against the action: it was "
+        "approved, and the surface refused to run it unrecorded. Retrying the "
+        "identical call is reasonable once; if it is refused again, say what "
+        "happened rather than working around it silently.",
     ),
 }
 
@@ -149,8 +177,9 @@ def build_refusal_steer_notice(
     # Class-specific remediation, for the policy cause only. The non-policy
     # causes judged nothing about the action — an invalid tool name is the
     # model's own malformed output, a hook fault is a host fault, a cascaded
-    # batch member was never reached, and an expired approval prompt was simply
-    # never answered — so naming a sanctioned alternative there would answer a
+    # batch member was never reached, an expired approval prompt was simply
+    # never answered, and a surface-policy refusal says only what the surface
+    # permits — so naming a sanctioned alternative there would answer a
     # question nobody asked and imply the action itself had been refused.
     remediation = (
         remediation_for(reason, title, credential_tool_hint=credential_tool_hint)
@@ -193,7 +222,7 @@ async def steer_refusal_notice(
     Must be awaited while the ``session/request_permission`` is still
     unanswered — see :func:`build_refusal_steer_notice` for why that ordering is
     what makes the notice race-free. Opt-in by positive capability
-    (``provider.supports_steer``), never by harness identity; ``getattr`` because
+    (``provider.supports_refusal_steer``), never by harness identity; ``getattr`` because
     the reject paths also run against minimal test doubles. *title* is redacted
     here (it is provider-authored text); *reason* is the caller's own wording.
 
@@ -203,20 +232,81 @@ async def steer_refusal_notice(
     while ``CancelledError`` propagates, because the caller is the one that
     knows how to answer the wire while it unwinds.
     """
-    if not getattr(provider, "supports_steer", False):
-        return ""
+    # The capability probe lives in ``steer_notice_into_refused_turn`` alone,
+    # so the gate has one spelling; building first only costs a redaction pass.
     try:
         title_safe, _ = redact_exfiltration_urls(title or "")
         title_safe, _ = redact_credentials(title_safe)
         notice = build_refusal_steer_notice(title_safe, reason, cause=cause)
-        if not notice:
-            return ""
+    except Exception:
+        logger.debug("deny-cause steer notice failed; the reject still runs", exc_info=True)
+        return ""
+    if not notice:
+        return ""
+    sent = await steer_notice_into_refused_turn(provider, notice, bound_secs=bound_secs)
+    return notice if sent else ""
+
+
+async def steer_notice_into_refused_turn(
+    provider: Any,
+    notice: str,
+    *,
+    bound_secs: float = STEER_NOTICE_BOUND_SECS,
+) -> bool:
+    """Send an already-built *notice* into the turn of a call being refused.
+
+    The probe-and-bounded-send half of :func:`steer_refusal_notice`, shared
+    with callers that author their own text: ``kirocrew chat``'s ``o`` answer
+    steers the person's typed reply this way. Same ordering contract -- await it
+    while the ``session/request_permission`` is still unanswered -- and the same
+    capability gate, ``supports_refusal_steer``. The caller owns redaction of
+    whatever it put in *notice*.
+
+    True only when the provider accepted the write. No capability, an empty
+    notice, a steer failure, or the bound expiring is False and swallowed at
+    debug -- the caller's reject must still run -- while ``CancelledError``
+    propagates to the caller, which knows how to answer the wire as it unwinds.
+    """
+    if not notice or not getattr(provider, "supports_refusal_steer", False):
+        return False
+    try:
         sent = await asyncio.wait_for(provider.steer(notice), timeout=bound_secs)
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.debug("deny-cause steer notice failed; the reject still runs", exc_info=True)
-        return ""
+        logger.debug("refused-turn steer failed; the reject still runs", exc_info=True)
+        return False
     # A provider that answers False did not write the notice; report that
-    # honestly rather than claim an explanation the model never received.
-    return notice if sent is not False else ""
+    # honestly rather than claim a message the model never received.
+    return sent is not False
+
+
+#: How many times one sub-agent run resumes a turn its backend ended because the
+#: host refused a call. Each resume is a fresh model turn that may hit the gate
+#: again, so the count is bounded; past it the cancelled ending stands.
+REFUSED_TURN_RESUME_MAX = 3
+
+
+def build_refused_turn_resume_prompt(title: str, reason: str, *, cause: str) -> str:
+    """The prompt that resumes a turn the backend ended on a host refusal.
+
+    Codex answers its only reject option for a shell command (``cancel``,
+    ``ReviewDecision::Abort``) by aborting the WHOLE turn, so the steered notice
+    never reaches a model inference and the model is left with ``aborted by
+    user``. The sub-agent run sends this as the next prompt on the same session
+    instead: the same notice, plus the fact that the turn was stopped. *title*
+    and *reason* are redacted here, as :func:`steer_refusal_notice` does.
+    Returns ``""`` when there is nothing to say.
+    """
+    title_safe, _ = redact_exfiltration_urls(title or "")
+    title_safe, _ = redact_credentials(title_safe)
+    reason_safe, _ = redact_exfiltration_urls(reason or "")
+    reason_safe, _ = redact_credentials(reason_safe)
+    notice = build_refusal_steer_notice(title_safe, reason_safe, cause=cause)
+    if not notice:
+        return ""
+    return (
+        f"{notice}\n\nThe backend ended your previous turn when this call was "
+        "refused, so the refused call did not run. Continue the task from where "
+        "you stopped, in a way the host allows."
+    )

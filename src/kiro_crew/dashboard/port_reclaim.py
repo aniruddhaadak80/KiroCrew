@@ -56,6 +56,7 @@ import subprocess
 from collections.abc import Awaitable, Callable
 
 from kiro_crew import platform_compat
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger("kiro_crew.dashboard.port_reclaim")
 
@@ -93,7 +94,7 @@ def _listeners_on_port(port: int) -> list[int] | None:
     try:
         out = subprocess.check_output(
             [lsof_bin, "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
-            text=True,
+            **UTF8_TEXT,
             stderr=subprocess.DEVNULL,
             timeout=5,
         ).strip()
@@ -267,6 +268,10 @@ async def reclaim_stale_gateway_port(
     # Resolve the identity check (structural command-line match — the same gate
     # as `kirocrew stop`). Bound to an explicit non-Optional local so the call
     # sites below type-check cleanly.
+    #
+    # argv stays the gate here: this path SIGKILLs, and no other proof exists. The caller already holds this home's gateway.lock, so the lock
+    # cannot vouch for the holder, and the holder is reclaimed only because it
+    # does not answer, so it proved nothing over HTTP either.
     checker: Callable[[int], bool]
     if is_kirocrew is not None:
         checker = is_kirocrew

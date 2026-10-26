@@ -47,6 +47,7 @@ from kiro_crew.security.redaction import (
     _HTML_REF_QUEST,
     _TOKEN_PARAM_NAME_RE,
     _TOKEN_PARAM_VALUE_CLASS,
+    _credential_matches,
 )
 
 # Mirror the live pass-4 wrapper exactly while keeping the oracle's span and
@@ -108,8 +109,8 @@ def _reference_redact_credentials(text: str) -> tuple[str, list[str]]:
     warnings: list[str] = []
     taken: list[tuple[int, int, str]] = []
 
-    # 1. plaintext credential patterns — ungated full scan
-    for m in _CREDENTIAL_PATTERNS.finditer(text):
+    # 1. plaintext credential patterns — ungated full scan, JSON-header-validated JWT hits
+    for m in _credential_matches(text):
         warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
         taken.append((m.start(), m.end(), _REDACTED_CREDENTIAL_TAG))
 
@@ -925,7 +926,11 @@ def test_differential_test_detects_a_too_narrow_prefilter(
     passing because both sides share a defect.
     """
     import kiro_crew.security as security
+    from kiro_crew.security import redaction
 
+    # The anchors below disarm the Python gate; the native gate does not read
+    # them, so switch it off for this control.
+    monkeypatch.setattr(redaction, "_NATIVE_GATE", None)
     monkeypatch.setattr(
         security, "_CREDENTIAL_PREFILTER_LITERALS", ("this-anchor-matches-nothing",)
     )

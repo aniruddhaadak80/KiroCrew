@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal } from './overlayRoot'
 import { Search, X, Pin, MessageSquare, Clock, Plus, RotateCw } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 
 import { useAppSelector } from '../store'
+import { selectSlotsWithLiveLastTs } from '../store/slotLastTs'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import type { Result, ResourceProvider } from './commandPalette/types'
@@ -28,6 +29,7 @@ import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 import { useVisualViewport } from '../hooks/useVisualViewport'
+import { focusComposerNow } from '../pages/chat/composerFocus'
 /**
  * Search Everywhere command palette.
  *
@@ -89,6 +91,13 @@ export interface CommandPaletteProps {
    * Optional — when omitted, ⌘Enter on a session falls back to plain open.
    */
   openInSplit?: (ref: SessionRef) => void
+  /**
+   * The query the palette opens with: keys the host caught before the palette
+   * mounted, as when a contributed overlay's chunk failed to load. Read at mount
+   * only. A host that keeps the palette mounted across opens passes none, so its
+   * every open starts empty.
+   */
+  initialQuery?: string
 }
 
 /** Stable no-op so `useActionsProvider` always gets a defined callback. */
@@ -113,6 +122,7 @@ export default function CommandPalette({
   onClose,
   openShortcuts,
   openInSplit,
+  initialQuery = '',
 }: CommandPaletteProps) {
   const vv = useVisualViewport()
   // P0 providers. Each is memoized inside its hook, so identities are stable.
@@ -196,14 +206,20 @@ export default function CommandPalette({
     registerProvider(settings)
   }, [sessions, prompts, artifacts, apps, pages, actions, settings])
 
-  const [query, setQuery] = useState('')
+  // The opening query, fixed at mount so a later prop change cannot rewrite what the
+  // reader is typing. Each open starts from it.
+  const [mountQuery] = useState(initialQuery)
+  const [query, setQuery] = useState(mountQuery)
   const [scope, setScope] = useState<string | null>(null)
   // Debounced query drives the actual fetch so we don't hit the network (and,
   // for artifacts/sessions, re-scan content server-side) on every keystroke.
-  const [debouncedQuery, setDebouncedQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState(mountQuery)
   const resultsRef = useRef<Result[]>([])
 
   const inputRef = useRef<HTMLInputElement | null>(null)
+  // What held focus before the palette opened, refocused when it is dismissed.
+  // Cleared when a row is chosen: the chosen action owns focus.
+  const restoreFocusRef = useRef<HTMLElement | null>(null)
   const q = query.trim()
   const providerById = useMemo(
     () => Object.fromEntries(tabs.map((t) => [t.id, t])),
@@ -253,6 +269,7 @@ export default function CommandPalette({
    */
   const dispatchEnter = useCallback(
     (result: Result, withModifier: boolean) => {
+      restoreFocusRef.current = null
       // Skills are a navigation target in the palette: Enter opens the skills
       // catalog (to view/edit them) rather than inserting a $skill token —
       // there's no per-skill deep link yet, so all skill rows go to the catalog.
@@ -346,7 +363,7 @@ export default function CommandPalette({
   // change — a re-memoized provider identity alone does nothing. Fold a
   // fingerprint of that live state into the key so status dots and MRU order
   // update while the palette is open instead of freezing at open-time.
-  const slots = useAppSelector((s) => s.dashboard.slots)
+  const slots = useAppSelector(selectSlotsWithLiveLastTs)
   const unreadSlots = useAppSelector((s) => s.dashboard.unreadSlots)
   const slotStatusDetail = useAppSelector((s) => s.chat.slotStatusDetail ?? {})
   // Rows render a tool status through toolStatusLabel, so the purpose-vs-raw-title
@@ -359,16 +376,14 @@ export default function CommandPalette({
       activeProvider.id === 'recents'
         ? slots
             .map((s) => {
-              const detail = slotStatusDetail[s.key]
-              // The status string that can change under a stable `kind`: a tool
-              // phase's agent-written purpose, any other phase's label. Only a
-              // fingerprint input — the row itself renders via toolStatusLabel.
-              const detailText = detail?.kind === 'tool' ? detail.purpose ?? '' : detail?.label ?? ''
+              // Every status field, not just `kind`: the row renders through
+              // toolStatusLabel, which reads the purpose, the raw tool name, the
+              // derived title or action and a phase's label, and any of them
+              // can change under a stable `kind`.
+              const detail = JSON.stringify(slotStatusDetail[s.key] ?? null)
               return `${s.key}:${s.running ? 1 : 0}${s.pending_approval ? 1 : 0}${
                 s.pinned ? 1 : 0
-              }:${slotRecency(s).timestamp ?? ''}:${
-                detail?.kind ?? ''
-              }:${detailText}:${detail?.ts ?? ''}`
+              }:${slotRecency(s).timestamp ?? ''}:${detail}`
             })
             .join('|') + `#${unreadSlots.join(',')}#${simplifiedToolNames ? 1 : 0}`
         : '',
@@ -427,12 +442,22 @@ export default function CommandPalette({
   // Reset query + scope each time the palette (re)opens, and focus input.
   useEffect(() => {
     if (!open) return
-    setQuery('')
+    setQuery(mountQuery)
     setScope(null)
-    setDebouncedQuery('')
+    setDebouncedQuery(mountQuery)
+    const prev = document.activeElement
+    restoreFocusRef.current = prev instanceof HTMLElement && prev !== document.body ? prev : null
     const id = requestAnimationFrame(() => inputRef.current?.focus())
-    return () => cancelAnimationFrame(id)
-  }, [open])
+    return () => {
+      cancelAnimationFrame(id)
+      const back = restoreFocusRef.current
+      restoreFocusRef.current = null
+      if (!back) return // a row was chosen, or nothing was focused
+      // Gone: fall back to the chat composer, under the quick-search surfaces' rules.
+      if (back.isConnected) back.focus()
+      else focusComposerNow()
+    }
+  }, [open, mountQuery])
 
   // Window-capture listener for the two keys the shared hook doesn't own the
   // way the palette needs: Tab (cycle category) and ⌥/Alt+Enter (preview).
@@ -544,7 +569,7 @@ export default function CommandPalette({
     </div>
   )
 
-  return createPortal(
+  return <OverlayPortal>{
     // The backdrop's onMouseDown is click-outside dismissal, a pointer-only
     // convenience: Escape closes the palette through useListKeyboardNav, so the
     // keyboard already has the same exit and needs no path to this element.
@@ -818,7 +843,6 @@ export default function CommandPalette({
               })}
         </div>
       </div>
-    </div>,
-    document.body,
-  )
+    </div>
+  }</OverlayPortal>
 }

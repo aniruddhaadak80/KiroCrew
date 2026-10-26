@@ -1,13 +1,14 @@
 # Member Event Log
 
 Owners: `kiro_crew.eventlog`, `kiro_crew.eventlog_hooks`,
-`kiro_crew.dashboard.handlers.members`, `kiro_crew.dashboard.websocket_hub`,
+`kiro_crew.dashboard.handlers.members` (served from its `members_<role>` owners),
+`kiro_crew.dashboard.websocket_hub`,
 `website/src/state/memberProjectionStore.ts`, `website/src/state/useMemberProjection.ts`,
 `website/src/api/membersQuery.ts`
 
 ## 1. Purpose
 
-`kiro_crew.eventlog` gives every crew member one append-only log and derives the Members page's state from it. Before this module the page assembled each roster row at request time from thirteen sources — the agents config, a binding file, a rules file, a rotated activity file, the in-memory slot table, the auto-nudge registry and several client caches — and refreshed by re-fetching the whole roster on a coarse `refresh` frame plus a 60-second patrol poll. None of those sources recorded *what changed*, and a stop that the auto-nudge registry had forgotten collapsed into "no patrol scheduled".
+`kiro_crew.eventlog` gives every crew member one append-only log and derives the Members page's state from it. It replaces assembling each roster row at request time from many sources (the agents config, a binding file, a rules file, an activity file, the in-memory slot table, the auto-nudge registry, client caches), none of which recorded *what changed*.
 
 The log is the record; every view is a fold of it. A change appends one event,
 the event folds into projections, and changed projected values are pushed to
@@ -32,6 +33,16 @@ Each member's log is a `member`-kind **crew log**, so it lives at `<data_home>/c
 
 A third kind rather than a second mechanism, because the protection is named at the root: `crew-log` is masked from a sandboxed process (`sandbox._CREW_HIDDEN_LEAVES`) and refused to the agent's own file tools (`security.paths._CREW_SECRET_LEAVES`), so a kind placed under it inherits both. Dispatch trust reads this log, and an append-only record an agent can rewrite is not an append-only record — that property has to hold by where the file lives, not by someone remembering to add a second fence entry when a new log appears.
 
+**One door removes a member's whole unit, and the roster is what opens it.** `MemberEventLogService.remove_unit` calls the store's `remove_unit` and drops this service's cached log and name for that slug in the same step, and the dashboard's crew-delete route is its only caller: the member whose config record has gone has no reader left for its history, and nothing else collects it, because the retention sweep ages a `session` unit from its `session/closed` and a member log has no such entry. Other member-delete paths do not reach this door; `crew-log-core.md` names them and says why widening the reach is a separate decision. The caller's reason arrives as a predicate the store calls as its `guard`, so it is re-asked under the removal's own lease hold — a same-name member created between the delete and the removal derives the same slug, and that unit is then its history. The predicate takes no argument deliberately: whether a member is still in the roster is a property of the config, not of the file, so re-reading the log there would answer a question nobody asked. The caller holds `memory_store_namespace_lock` across both the predicate and the unlink, because the predicate reads config and another process allocating the same member id would otherwise land inside that gap. `crew-log-core.md` states the authorization and its fail-closed direction in full.
+
+**A removal takes the member's pre-log activity source too, and that is what makes it mean anything.** Those rows are the member's own history from before the log existed. They live OUTSIDE the unit under `members/<slug>/`, while the marker recording that they were folded lives INSIDE it -- so a removal that took only the unit would leave the history on disk AND re-arm the fold, because the next fresh `ensure` finds no marker and reads the source again. That next `ensure` is not hypothetical: appends are queued on an ordered executor, so one submitted before the removal runs on a worker after it, and `kirocrew-core` is a second writer process besides the gateway. Removing the source settles it for every writer at once, where a process-local bar could not: a later append then recreates at most an empty header, which carries nothing. Every name the fold reads is covered -- the live file, its one rotation, and the retired names the fold renames them to. **A unit the store does not find leaves that source behind too, so the cleanup runs for an absent unit as well, and there it re-asks the roster itself.** A member whose log was never written, or whose fold has not run, has its history ONLY in that source, so skipping it there would leave the delete having removed nothing at all. The store calls the predicate as its guard only when there is a unit to hold, so for an absent one there is no answer to inherit; the predicate raising rather than answering keeps the source, which is the direction every other decision here takes.
+
+**The directory is PINNED to a descriptor and the leaves are unlinked by BASENAME against it.** `members.member_dir` resolves and then only containment-checks the result, so `members/<slug>` swapped for a link to a PEER's directory resolves inside the members root, passes that check, and returns the peer's real directory -- where these four names are ordinary files, so a link test on the leaves is false and the unlink destroys a live member's history. For a member whose own fold has not run, that file is the sole copy. `members/<slug>` is deliberately agent-writable, which is what makes the swap reachable. A test on the NAME cannot close that, whatever it tests for: the test and the unlink are separate syscalls, and whoever can plant the link chooses when. `platform_compat.pin_directory` refuses a link AS IT OPENS -- POSIX through `O_DIRECTORY | O_NOFOLLOW`, Windows by opening a reparse point as itself, so it answers for a junction as well as a symlink -- and every unlink then names a basename against that descriptor, so a later swap of the name reaches nothing. Windows has no `dir_fd`; there the same handle is what closes the window, because a directory held open without `FILE_SHARE_DELETE` can be neither renamed nor deleted, nor can any directory above it. **`O_NOFOLLOW` binds the FINAL component only, so the members ROOT is pinned first and the slug is opened relative to it**: `members_root()` is an unresolved path under the data home and nothing seals the `members` component, so a link planted there redirects an open of `members/<slug>` however carefully that leaf is no-followed, and the unlinks land outside the member area entirely. Two pins settle it -- the root refuses a link as it opens, and the slug is opened THROUGH that descriptor, so neither name is re-resolved from a string afterwards. The leaf test is kept as well, and it is not a second guess at the directory: it covers a single file swapped inside a directory that is genuinely this member's, where the worst case is removing a link rather than the file it names. The step REPORTS rather than shrugging: every name is attempted even after one refuses, and the answer is true only when none of the four is left -- including one left deliberately, because a name that is a link is a name the fold can still read through. A false answer keeps the unit, and with it the marker that stops the fold reading whatever survived.
+
+**The companion cleanup runs INSIDE the unit's cross-process lease.** `store.remove_unit` acquires that lease `sole` and cannot share it, so a caller that removed the legacy source after the function RETURNED would do it in the window between the release and its own next line -- where another process's `ensure` creates the unit afresh and folds the source back, because the fold's completion marker died with the unit. The source removal is therefore handed to `remove_unit` as its `in_hold` action, which runs FIRST -- before the unit's own contents, because the fold's completion marker is part of that unit, so destroying it while the source survives arms the fold instead of finishing the job. A false answer from the step keeps the unit, its marker and the source, and reports `failed`. The parameter is optional, so the session delete funnel and the retention sweep pass nothing and are unaffected.
+
+**The absent-unit branch takes that lease itself.** The race it has to win is a peer creating the very unit the store just failed to find and folding this source into it, and the lease is a file beside the unit's segments -- so the directory is created to carry it, the lease is taken, the source goes, and the directory goes again. That directory holds no segment, and `unit_ids` proves identity from a segment header and skips a directory with none, so it is not a unit to any reader while it exists; a lease that cannot be had answers false with the source untouched. **One residual remains, stated rather than implied.** A contending writer still makes the removal answer `owned`, in which case nothing is removed at all -- which is honest rather than a half-done delete, and is why no retry is added: `REMOVE_OWNED` does not distinguish a contending lease holder from the guard finding the slug claimed again by a recreated namesake, and that second case is a correct refusal a retry would hammer.
+
 Line 1 is a header, not an event:
 
 ```
@@ -40,7 +51,7 @@ Line 1 is a header, not an event:
 
 Every later line is a crew log entry, which this module presents as the envelope `{"type", "seq", "time", "data"}`. Two translations live in the adapter and nowhere else, so nothing above it changes:
 
-- **`seq`.** This module's `seq` IS the crew log's entry number: the header is 0 and the first event is 1, on the wire exactly as in the file. An earlier revision subtracted one at the boundary so the first event read as 0; that made the wire number permanently disagree with the stored one for the benefit of clients that all ship in this same change, so it was removed rather than left for an external contributor to build on. `last_seq` is read off the newest event rather than counted from the list, because a damaged committed line is skipped on load and a counted cursor would then hand a subscriber a position that re-delivers an event it already folded.
+- **`seq`.** This module's `seq` IS the crew log's entry number: the header is 0 and the first event is 1, on the wire exactly as in the file. No offset is applied at the boundary, so the wire number always agrees with the stored one. `last_seq` is read off the newest event rather than counted from the list, because a damaged committed line is skipped on load and a counted cursor would then hand a subscriber a position that re-delivers an event it already folded.
 - **Contributed types.** A crew log keeps one guest type namespace, `app:<name>/<action>`, and grants it to the `member` kind; the contribution protocol spells the same thing `<app>/<action>`. The stored form carries the `app:` prefix so the log's own ownership rule decides the write, and the emitter is derived from the type so a caller cannot attribute an entry to a different app. Reads give the protocol spelling back.
 
 Damage is answered at three grains. A torn trailing line — trailing bytes that are not a complete line — is repaired by truncating to the last committed byte, and load then returns normally. A damaged line *inside* the committed region costs a reader that line and nothing else: refusing the whole file would turn one unreadable entry into a member whose entire history is unopenable, and the entry is unrecoverable either way. An unreadable **header** is fatal and raises `LogCorrupt`, because without it nothing in the file is attributable to this member; `members.record_activity` reports that as `False` and `members.read_activity` as `[]` rather than raising.
@@ -57,17 +68,59 @@ header rather than the directory name, and only when it folds back to the direct
 it was found in — the fold is not reversible, and a directory carrying another
 unit's id must not be enumerated as that other unit.
 
+**Service retirement.** `MemberEventLogService.close()` releases every cached `MemberLog`'s write lease at once, drops the caches and clears the projection registry's back-reference to the service. The service sits in a reference cycle, so leaving the release to the cyclic collector would strand an open descriptor under a torn-down directory on Windows. `set_service` closes the service it replaces, and `get_service` closes the outgoing one when a data-home change forces a rebuild. Afterwards the service answers reads as empty and re-opens on demand.
+
+**The pending-append ceiling is RESERVED, not merely checked.** The future a caller
+adds to the outstanding set does not exist until the pool accepts the work, so the
+set cannot be added to while the decision is being made. A check alone therefore lets
+several callers each pass a count that was true for all of them and then each add,
+putting the set past the ceiling by one per caller. Reservations are counted
+alongside the set and released the moment the future joins it, which makes the
+decision and the claim one step.
+
+**Queue acceptance is not a completed write, and only a caller that keeps a
+RECORD of the write has to care.** `submit` answers whether the append was
+queued; the append itself runs later on the ordered worker and can still fail
+there. A caller that keeps no record loses exactly the event it handed over,
+which the queue's ceiling already documents. A caller that keeps a CHECKPOINT
+loses every later retry too, because its next pass compares against a checkpoint
+claiming the event was written -- so the worker reports a failed append back and
+the next pass recomputes exactly those transitions. The report carries a
+CORRECTION rather than a key, because the two directions need opposite ones: a
+failed open is retried by leaving the key absent from the checkpoint, while a
+failed close has to put it BACK, since the checkpoint has already moved past that
+key and removing it again computes nothing. That is the rule the slot
+open/close path follows, and it is why the message and patrol paths correctly do
+not read the answer.
+
+Queued appends are drained before every HARD exit. `os._exit` skips `atexit`, so
+the module's own hook does not run on the gateway's shutdown paths; both of them
+drain explicitly, beside the sibling drain the session log already does there, and
+a test asserts no hard exit in that module is left without one.
+
+The drain waits for RESERVATIONS as well as registered futures. `submit` takes its
+reservation, releases the lock to call `pool.submit`, and only then registers the
+future, so for the length of that call an append is counted in the reservation count
+and absent from the outstanding set. A drain that reads only the set sees nothing
+there, answers that the log is complete, and the force-exit path that asked goes
+straight to `os._exit` -- losing an append with no replay to recover it. There is
+nothing to wait on inside that window, because the future does not exist yet, so a
+reservation is polled at a short interval until it becomes one. The poll is bounded
+by the drain's existing deadline rather than added to it, and a drain with nothing
+outstanding still returns immediately.
+
 ## 3. Event vocabulary
 
 `kiro_crew.eventlog.types` is the closed vocabulary; `MemberLog.append()` rejects any other type.
 
 | event | data | appended by |
 |---|---|---|
-| `member/config` | the roster's config-derived fields plus `changed: [field, ...]` | `handlers.agents` after a save that changed at least one roster field; `handlers.members.api_members` when the folded roster disagrees with the agents config (hand-edited config) |
+| `member/config` | the roster's config-derived fields plus `changed: [field, ...]` | `dashboard.agent_admin.crew_update` (reached through the `handlers.agents` facade) after a save that changed at least one roster field; `handlers.members.api_members` when the folded roster disagrees with the agents config (hand-edited config) |
 | `member/binding` | `{slot_key}` | `handlers.members.api_member_thread` after the DM binding is written |
 | `member/rules` | `{text}` | `handlers.members.api_member_rules_put` after the rules file is written |
-| `member/message` | `{ts, preview?}` — `preview` only for a SPEECH row (`user` / `assistant` with visible text); a machinery row (tool call, auto-nudge turn, envelope, say-nothing reply) carries `ts` alone, so the roster's `last_message` keeps the last thing said while `last_active_ts` still bumps. The payload is built by `eventlog_hooks.member_message_payload`, whose preview is `preview_text.speech_preview` (strip markdown → redact → cap at 120 with `…`) — the same function the cold roster read uses through `last_speech_info`, so the fold and the read agree byte for byte | `DashboardState._broadcast_chat_message` for a member DM slot |
-| `activity/record` | the participation record, including `ts` | `members.record_activity` (replaces the former `activity.jsonl`) |
+| `member/reset` | `{reset_at}` — ISO-8601, the server's clear time; the chat pane folds every row written before it | `handlers.members.api_member_fresh_start`, on a `cleared` outcome only; a queued clear appends nothing |
+| `member/message` | `{ts, preview?}` — `preview` only for a SPEECH row (`user` / `assistant` with visible text); a machinery row (tool call, auto-nudge turn, envelope, say-nothing reply) carries `ts` alone, so the roster's `last_message` keeps the last thing said while `last_active_ts` still bumps. The payload is built by `eventlog_hooks.member_message_payload`, whose preview is `preview_text.speech_preview` (strip markdown → redact → cap at 120 with `…`) — the same function the cold roster read uses through `last_speech_info`, so the fold and the read agree byte for byte | `DashboardState._record_member_row`, wired as `Slot._on_row`, for every LIVE appended row on a member DM slot |
+| `activity/record` | the participation record, including `ts` and `via` | `members.record_activity` (replaces the former `activity.jsonl`): `via="chat"` from the chat runner when a session opens on the member, `via="select_crew"` from `mcp_core` on a crew bind, `via="auto-improvement"` from the auto-improvement crew runner when it opens a crew session, `via="spawn"` from the sub-agent run turn when a `spawn_run(crew=...)` run's session opens; a respawn of the run adds none, and a continuation records nothing |
 | `slot/opened` · `slot/closed` | `{slot_key}` · `{slot_key, reason}` | the `slots` broadcast, diffing member-driven slots against the previous set |
 | `patrol/started` · `patrol/stopped` | `{slot_key}` · `{slot_key, reason}` | the auto-nudge state callback in `slack.gateway` |
 
@@ -85,7 +138,7 @@ A fold resumes from a **savepoint** instead of replaying the whole log. One JSON
 
 Two conditions decide that, not one, because equality cannot reach the second. The identity block covers what is fixed once a fold is done. The **prefix digest** covers whether the bytes the state was folded from are still the bytes in the file, and this log needs it on its own terms: a damaged committed line is skipped on load, so a cold fold omits what it contributed while a savepoint written before the damage keeps it, and a resumed fold never revisits the region below its watermark. Without the digest those two reads disagree for the life of the member, which is the one thing a savepoint may not do — lagging is allowed, holding a value no later read reproduces is not. The predicate is `kiro_crew.crew_log.checkpoint.prefix_admit`, the same one the crew log calls, over the `raw_prefix_digest` and `raw_records_through` helpers that sit on `CrewLog` precisely so one mechanism serves both clients. A payload carrying no witness says nothing about its own bytes and is refused, which retires every file written before the witness existed at the cost of one cold fold. Growth above the boundary is not a change: the walk stops at the record count the witness names.
 
-The digest is read **before** the fold consumes the file and re-checked after the pass, because one read afterwards can certify bytes the pass never saw — a consumed record that changed in between would be hashed together with state folded from its earlier value, and every later resume would recompute those same changed bytes, match, and serve that state for good. Resolving the record boundary decodes one record at a time, so it runs only where the threshold below could earn a write, or where a resume has a prefix to answer for; a load that resumed nothing and can write nothing pays nothing for it. A witness certifies one boundary, so a unit standing at another seq is skipped and waits for a pass whose witness covers it.
+The digest is read **before** the fold consumes the file and re-checked after the pass, because one read afterwards can certify bytes the pass never saw — a consumed record that changed in between would be hashed together with state folded from its earlier value, and every later resume would recompute those same changed bytes, match, and serve that state for good. Resolving the record boundary decodes one record at a time, so it runs only where the threshold below could earn a write, or where a resume has a prefix to answer for; a load that resumed nothing and can write nothing pays nothing for it. A witness certifies one boundary, so a unit standing at another seq is skipped and waits for a pass whose witness covers it. The reader side has a residual: a savepoint whose witness names a seq below its own watermark is still admitted, because the kernel hands `admit` the identity and the witness but not the watermark it restores, so entries between the two are covered by neither check. This writer cannot produce such a file (it stamps one witness per pass); it takes an edit inside the member's fenced log directory. `test_member_savepoint_prefix.py::test_a_witness_below_its_own_watermark_is_still_admitted` pins today's answer.
 
 That recheck governs the restored **state** and not only the write. The identity block and the digest are both read while the savepoints load, so a change below the watermark inside the same pass is admitted on bytes that were still intact, and a resumed fold never returns to that region to notice. Refusing the write is not enough there: the state is already in the registry and would be served for the life of the instance while disagreeing with every cold fold. So a resume whose prefix stopped holding — and one that produced no witness to check, which leaves nothing to compare — is discarded and the pass folds from the start instead. A pass that resumed nothing skips the recheck, having already folded the whole file through its own tail.
 
@@ -99,16 +152,70 @@ One unit's state blocks the shortcut today: `DrivingProjection` holds its open s
 
 | key | view | fold |
 |---|---|---|
-| `roster` | the roster row minus `running`, with `name` and `slug` overlaid from the header | last-wins over `member/config`, `member/binding`, `member/message` |
+| `roster` | the roster row minus `running`, with `name` and `slug` overlaid from the header | last-wins over `member/config`, `member/binding`, `member/reset` (→ `reset_at`), `member/message` — except `last_active_ts`, which is MONOTONE (see below) |
 | `activity` | `{recent: [record...] (≤50, newest first), today, week}` | ring buffer of `activity/record`; counts derived from each record's `ts` at view time |
 | `wake` | `{patrol: armed \| stopped \| none, slot_key?, stopped_reason?, since?}` | `patrol/started` / `patrol/stopped` last-wins |
 | `driving` | `{open: [slot_key...]}` | set add on `slot/opened`, remove on `slot/closed` |
+
+**`last_active_ts` is the one monotone field in the `roster` fold, and it is what the Mates roster's Recent sort orders by.** "When was this member last active" is an answer time only ever moves forward, so a fold that took each `member/message`'s `ts` last-wins could only ever be wrong when it moved DOWN — and one writer moves it down by design: `reconcile_member_preview` corrects a stale quote by appending a `member/message` carrying the TRANSCRIPT's epoch, which is the last thing SAID and is therefore older than any machinery turn since. Under last-wins that correction reset recency to the last speech on every roster read, in an append-only log with no compaction and nothing to reopen it, so a mate the user had just messaged sank back to where its quote was from. Taking the greater keeps both writers honest: the correction still lands its quote, and no writer has to know what the recency was before it. `_parse_ts` normalises the event's value first, so an ISO string folds to epoch seconds and a `None`, a bool or a non-number leaves the held value alone rather than becoming an ordering key.
+
+**The monotone rule has a ceiling.** Before the compare, `RosterProjection.apply` clamps the candidate `ts` to the fold's own wall clock plus `_FUTURE_TS_SKEW` (300 s). Monotone-greatest has no upper bound and the log is append-only, so a `ts` from a jumped-forward clock (VM resume, NTP step, hand-edited ISO string) would otherwise latch for the life of the store and pin the member atop Recent. A clamped future `ts` still advances a staler recency, but never past the present plus that tolerance; skew inside the tolerance passes unchanged.
+
+**The roster read takes its `last_active_ts` from this fold, floored by the transcript.** `handlers/members_roster.py` `_recency_for_row` reads the response's own `roster` projection block and returns `max(folded, transcript)`. The fold is the authority because it sees what the transcript cannot: a machinery turn that carries no speech, and a row appended but not yet flushed to disk. The transcript's speech-only epoch stays as a FLOOR, not a rival — these events ride a best-effort hook a queue ceiling may drop, and a member whose log cannot answer at all (no log yet, a slug shared by two members, a read the store will not prove — every one of which answers an empty `values`) has only the transcript. Because the row and the projection block it ships now carry the ONE value, the client's higher-seq-wins merge has one reading to reconcile rather than two: `MembersPage` merges `last_active_ts` as the GREATER of row and pushed frame, which is what lets a live `member_projection` frame reorder the roster with no refetch. `last_message` keeps the opposite rule for the reason given under the reconcile below.
+
+**`reset_at` keeps only the latest reset.** It is last-wins like every other field here, so a second fresh start overwrites the first and the pane folds everything above the newest boundary after a reload — including rows an earlier boundary had already unfolded. The earlier `member/reset` events stay in the log as the record of when each clear happened, and no read consults them: the pane draws one divider, so the fold needs one boundary.
 
 `MemberEventLogService.snapshot(slug)` returns `{asOfSeq, values}` for all four. `history(slug, before, limit)` returns a newest-first page of envelopes.
 
 ## 5. Load-time closers
 
-An open span whose owner is gone is closed by the reader, not by a bystander writing live. `eventlog_hooks.reconcile_members_at_startup()` runs once the auto-nudge service and the slot table have been restored: for every member whose `wake` says `armed` while the service holds no loop for that slot, it appends `patrol/stopped {reason: "interrupted"}`; for every `driving.open` slot absent from the slot table it appends `slot/closed {reason: "interrupted"}`. The closer is written, so the next reader does not recompute it, and a second run appends nothing. A patrol killed by a gateway restart therefore renders as "Patrol stopped — interrupted" instead of "no patrol scheduled".
+An open span whose owner is gone is closed by the reader, not by a bystander writing live. `eventlog_hooks.reconcile_members_at_startup()` runs once the auto-nudge service and the slot table have been restored. It first resolves every configured name that can claim a slug, including malformed legacy names, so a filtered name cannot make another claimant appear unique. It reconciles only members with dispatchable display names, a resolved unique slug, and either no log header or a header holding that exact member name. A header equal to the slug (the nameless-writer placeholder) is ambiguous, not owned: a retired member without a `member_id` whose name folded onto itself leaves nothing reserving the slug once pruned, so a recreated display-name member can be allocated the identical identity; the sweep skips such a log rather than write one member's state into another's, and the roster read (`handlers/members_roster.py`) serves that log's projection but never reconciles config or preview into it. Skipped non-dispatchable names and unresolved slugs are reported as aggregate counts. Ambiguous slugs, placeholder and foreign headers, and per-slug failures report only the path-safe slug, never the display name, header value, or exception text. For every admitted member whose `wake` says `armed` while the service holds no loop for that slot, reconciliation appends `patrol/stopped {reason: "interrupted"}`; for every `driving.open` slot absent from the slot table it appends `slot/closed {reason: "interrupted"}`. The closer is written, so the next reader does not recompute it, and a second run appends nothing. A patrol killed by a gateway restart therefore renders as "Patrol stopped — interrupted" instead of "no patrol scheduled".
+
+A boot CLOSER is re-validated under the lock that writes it. The startup reconcile
+decides each closer from a snapshot and appends it afterwards, and it runs as a
+background task concurrent with the gateway going live -- so a slot it read as
+durably open can legitimately be reopened, or a patrol re-armed, before the closer
+lands. The log is append-only with no compaction, so a closer written after a live
+open is a permanent regression of the projection, and not a self-correcting one: a
+later restart's reconcile reads the state as closed and has no reason to reopen it.
+The closer therefore goes through an append that re-asks whether the state it closes
+is still there, handed the CURRENT projection rather than the caller's snapshot, and
+writes nothing when it is not. Declining is a normal outcome, not a failure: it means
+the state closed itself while the reconcile was deciding.
+
+Coming back unplaced is the outcome that is neither a write nor a decline, and it
+has two forms. Foreign writes can keep moving the tail out from under every attempt,
+and the append then raises `CloserTailContention`; or write ownership can stay held
+elsewhere for the whole contention budget, and the store refuses the append instead.
+Both report the same three facts -- the closer is unplaced, nothing was learned about
+whether it applied, and the closers below it are unaffected -- so the sweep treats
+them as one; a refusal also carries the store's guarantee that nothing was written,
+which is what makes another attempt safe. It answers them in two ways. Within one
+member, each closer's contention is contained and re-raised only after its siblings
+have been attempted, so one unlucky closer cannot suppress the rest -- without that, a
+contended patrol closer would leave the same member's interrupted slots untouched.
+Across members, the contended ones are collected and swept a second time, because each
+step re-decides from a fresh snapshot under its own predicate and so is safe to run
+twice. A member still contended after that pass keeps its interrupted state until the
+next boot re-decides, and the warning above says so.
+
+`emit` never PROPAGATES a failure, because a caller recording a transition must
+not be brought down by its own bookkeeping, but it does not discard the outcome
+either.
+It answers whether the event landed, so a caller whose only record is this event can
+tell an omitted transition from one that never happened, and it reports a failure
+rather than logging it at debug, because that distinction is the one a projection
+built from this log exists to make. The two boundary writers do not need the answer:
+each fences its change through an authoritative store first and answers 500 when the
+fence itself fails, so their event is a second copy rather than the record.
+
+A placeholder therefore survives only where resolution comes up empty: a member the
+config does not carry at the moment their first event is written. Should that member
+later appear in the roster under a name the slug does not equal, the comparison must
+not read the placeholder as a second member -- a slug is a lossy fold, so it differs
+from almost every real name, and blanking the member's own state over a value that
+was never a name is the wrong answer. `logged_name` reports what the header holds,
+and the roster read is where the placeholder is recognised.
 
 ## 6. Transport
 
@@ -149,18 +256,26 @@ leak operator-supplied text through a key. Two keys whose redaction collides mer
 which requires both to have carried a credential, so what is lost is already-redacted
 content.
 
-Two WebSocket frames, both `{type, data}` like every other broadcast and both classified owner-only in `ws_event_scope`:
+Two WebSocket frames, both `{type, data}` like every other broadcast and both classified owner-only in `ws_event_scope` (`MEMBER_LOG_EVENTS`). Owner-only here means the owner's dashboard socket alone, not every dashboard user: `WebSocketHub._ws_client_allowed` also refuses them to a non-owner dashboard session (a Telegram, Teams or Webex allowlist link), audited `owner_only`, and `ws.py` sends the `members_subscribed` baseline only on an owner connect. The REST reads that carry the same data, `GET /api/members`, `GET /api/members/{slug}/projections` and `GET /api/members/{slug}/activity`, apply the same boundary: after the app-caller guard and before any config or log read, `require_owner_dashboard_request` answers a non-owner 403 `owner_only`, and a granted read leaves an `allowed` SEL record (`members.list.read`, `members.projections.read`, `members.activity.read`), as the briefing and rules reads do:
 
 | frame | data | client rule |
 |---|---|---|
-| `members_subscribed` | `{lastSeqs: {slug: seq}}`, sent once to a new owner socket right after the connect snapshot | drop held rows whose `seq` exceeds `lastSeq`, plus cached slugs omitted from the readable baseline; if anything was dropped, repair BOTH reads that own those values, because the truncation drops every key a slug holds while a roster row carries the `roster` view alone. Each is RESET rather than invalidated: invalidating a query with no enabled observer only marks it stale, so its pre-rollback block stays cached and the next mount seeds the store at the sequence the server just rolled back, after which higher-seq-wins rejects the authoritative lower-seq baseline and the rolled-back value repaints as live. Neither read is exempt — the per-member one is disabled while no member is open, and the roster's only observer away from the members page is the crewmates gate, which holds it enabled only while eligible |
+| `members_subscribed` | `{lastSeqs: {slug: seq}}`, sent once to a new owner socket right after the connect snapshot | drop held rows whose `seq` exceeds `lastSeq`, plus cached slugs omitted from the readable baseline; if anything was dropped, repair BOTH reads that own those values, because the truncation drops every key a slug holds while a roster row carries the `roster` view alone. Each is RESET rather than invalidated: invalidating a query with no enabled observer only marks it stale, so its pre-rollback block stays cached and the next mount seeds the store at the sequence the server just rolled back, after which higher-seq-wins rejects the authoritative lower-seq baseline and the rolled-back value repaints as live. Neither read is exempt — the per-member one is disabled while no member is open, and the roster's only observer away from the members page is the mates gate, which holds it enabled only while eligible |
 | `member_projection` | `{slug, key, value, seq}` — a whole projected value, emitted only when a unit's view changed | higher `seq` wins; a replay or a stale frame is dropped without checking contiguity |
 
 The two rules are deliberately different. A whole-value frame needs no gap detection because a stale frame is simply lost to a newer one; only a delta channel would need a contiguity check, and this transport carries none.
 
 The baseline closes a race that reading it would otherwise open. Reading `lastSeqs` offloads to a thread, because on a first dashboard connect it parses every uncached member log and would otherwise stall the serving loop. The socket is already registered for owner broadcasts by then, so a `member_projection` append landing in that window would be delivered ahead of a baseline computed before it, and the prune rule would delete the newer row with no correction until that slug next changes.
 
-Sending the baseline before registration does not fix it: the connect snapshot is the first frame a socket receives by contract, and `test_chat_send_echo_scope` reads that frame and treats its arrival as proof the socket is registered for echoes, so a baseline ahead of it fails four backend shards plus the E2E lane. The remedy is per-socket suppression rather than reordering. The socket is marked pending before the offloaded read; `client_allowed`, the predicate the fan-out already consults per socket, refuses `member_projection` to a marked socket and records the slug; once the baseline is sent the mark is cleared and each recorded slug's current projection is replayed. The mark is released on the read's failure path too, because a socket left marked would be suppressed for the rest of its life. The replay goes through the service's `redacted_snapshot`, so it runs the same network-boundary redaction as the broadcast instead of becoming a second egress path, and whole-value frames plus higher-seq-wins make replaying a value newer than the suppressed one harmless.
+Sending the baseline before registration does not fix it: the connect snapshot is the first frame a socket receives by contract, and `test_chat_send_echo_scope` reads that frame and treats its arrival as proof the socket is registered for echoes, so a baseline ahead of it would break that ordering. The remedy is per-socket suppression rather than reordering. The socket is marked pending before the offloaded read; `client_allowed`, the predicate the fan-out already consults per socket, refuses `member_projection` to a marked socket and records the slug; once the baseline is sent the mark is cleared and each recorded slug's current projection is replayed. The mark is released on the read's failure path too, because a socket left marked would be suppressed for the rest of its life. The replay goes through the service's `redacted_snapshot`, so it runs the same network-boundary redaction as the broadcast instead of becoming a second egress path, and whole-value frames plus higher-seq-wins make replaying a value newer than the suppressed one harmless.
+
+**A projection frame whose redaction fails is DROPPED, never published raw.** The
+redaction on the WebSocket egress exists because a folded view carries operator free
+text -- an activity record's `project` can embed a credential or a presigned URL.
+Falling back to the unredacted value would publish exactly what the redaction was
+added to withhold, and would do it on the one input redaction could not handle, so
+the failure mode would leak more reliably than the success path protects. A dropped
+frame costs one projection update that the next change to that projection re-sends.
 
 ## 7. Client
 
@@ -208,9 +323,9 @@ row therefore carries
 this log. The rows are not dropped -- they are that member's real history as far as
 anything can tell, and discarding them would lose activity the dashboard has always
 shown. `_activity_key` strips the marker before hashing, so the marker changes no
-row's migration identity: a row a pass before this rule appended bare still dedupes
-against the marked one a later pass writes, and no member gets a duplicate for having
-been migrated by the older code.
+row's migration identity: a stored row without it, such as a live `record_activity`
+entry, has the same identity as that row with the marker added, so a stored row of
+either shape is one match for the same legacy row.
 
 **The legacy file is decoded with replacement, not strictly.** The fold already skips
 a line it cannot parse as JSON, but that guard sits on the parse, and a strict decode
@@ -219,14 +334,6 @@ malformed byte in an agent-writable file would then propagate out of the migrati
 and make every later activity write fail, losing those records permanently.
 Replacement turns the byte into U+FFFD, which makes the line invalid JSON and sends
 it down the skip path that already exists.
-
-**A projection frame whose redaction fails is DROPPED, never published raw.** The
-redaction on the WebSocket egress exists because a folded view carries operator free
-text -- an activity record's `project` can embed a credential or a presigned URL.
-Falling back to the unredacted value would publish exactly what the redaction was
-added to withhold, and would do it on the one input redaction could not handle, so
-the failure mode would leak more reliably than the success path protects. A dropped
-frame costs one projection update that the next change to that projection re-sends.
 
 The first `ensure(slug, name)` for a member with no log creates the header. The
 legacy fold then resumes under the member unit's cross-process lease,
@@ -265,6 +372,51 @@ comparison per member and nothing is remembered between requests. A member with 
 log has no folded state to be stale, so neither reconcile runs for one, which is what
 keeps the roster read free of writes.
 
+That comparison is between two things of different ages, and each side has its own
+guard. The config side is older: `api_members` loads it once and reaches the row loop
+several reads later, so a save landing in between writes `config.json` AND appends its
+own `member/config`, leaving the fold carrying the NEW values while the request still
+holds the old ones — and the comparison then reads the save as drift and appends the
+pre-save snapshot over it, durably, because the fold is last-wins per field. So the
+request loads through `load_config_with_content_stamp`, which returns the config
+together with a digest bound INSIDE the load: the cache entry carries the digest of the
+bytes it was parsed from, so a hit reports its own provenance and a miss reports what
+it just read. A digest read around the load instead is defeated by a replacement
+presenting the same stat fingerprint, because the load then answers from cache while
+those reads hash the new bytes. `reconcile_member_config` takes the digest as a
+REQUIRED argument and refuses unless the live config is still those bytes.
+
+A digest names BYTES, so it is available whenever both files were read whole or were
+absent — "neither file exists" is a valid state with a digest of its own, and a document
+that read whole but would not parse still has bytes to name. Only a read that never
+completed leaves nothing to name, and that load binds no digest.
+
+Currency is therefore not the whole condition. The roster corrects the log FROM the
+config, so it reconciles only while that config is both current AND faithful: a file
+that would not parse leaves field DEFAULTS standing in for what the operator wrote, and
+correcting the log from those defaults would overwrite good values because of a typo —
+the same projection regression the currency check exists to prevent. `degraded_sections`
+is what reports faithfulness, and the roster folds both conditions into the stamp it
+passes, so no row can reach the reconcile without them. The rows still render either
+way; only the correcting write is withheld. The log side is younger
+but can still move: the correcting append goes through
+`append_closer_if_still_applies` with `_config_is_still_at`, so a writer committing
+between the comparison and the write keeps its newer word. All of these refusals are
+ordinary — the next roster read compares afresh.
+
+The startup sweep reconciles through the same single entry, under the same two
+conditions. It cannot meet them from the config object the gateway hands it: that was
+loaded when the gateway was constructed, and the sweep runs later as a background task
+with the HTTP port already listening, so a dashboard save can have landed in between
+and those values are no longer the operator's word. The sweep therefore loads config
+itself, in its own worker thread, and passes that load's digest — so a save that landed
+while the sweep was queued is what reaches the log, rather than being overwritten by
+it. Absent or degraded provenance withholds the member/config write and nothing else:
+the closers below are decided from live process state against the log, never from config
+content, so they still land. There is deliberately no second, exempt entry point — a
+caller that cannot name its bytes must not reconcile, and an exemption reachable by
+passing an empty stamp is one a caller reaches by accident.
+
 It reconciles the roster's `last_message` the same way
 (`eventlog_hooks.reconcile_member_preview`): the transcript's speech-only read is the
 authority, so a fold still quoting a machinery preview written before the preview
@@ -276,7 +428,7 @@ chat — and a second read appends nothing. The correction is written through
 observed them BEFORE its transcript read, re-asked under the per-slug lock against
 the newest state the fold has made visible, and the append is then admitted only
 while the log's tail is still the seq that fold reached, so a `member/message` the
-crewmate speaks while the read is in flight refuses the older answer instead of
+mate speaks while the read is in flight refuses the older answer instead of
 being overwritten by it (the fold is last-wins by append order, so a stale append
 would otherwise regress both fields durably).
 
@@ -369,15 +521,6 @@ after `ensure`, after two appends or after a read. Retrying is safe because the
 store refuses before it writes, so no attempt can double-write, and exhausting the
 budget re-raises so the callers' reporting still runs.
 
-**A truncation drops the row AND asks for the baseline back.** When the server's
-`lastSeqs` sit below a cached row, that row records something that did not happen and
-is dropped -- but the truth is whatever the server holds at its own seq, and the
-client-side store is a cache that cannot produce it. So the truncation answers whether
-it dropped anything and the socket handler refetches the roster, whose rows carry each
-slug's baseline. Seeding is higher-seq-wins, so the refetch cannot overwrite a newer
-value that arrives meanwhile. A silent drop would render a blank card that reads
-exactly like a member who has no such projection.
-
 **The legacy activity file is folded in ONCE and then retired.** The fold dedupes by
 counting matching rows, which cannot tell a row it has not reached from a row written
 after it finished -- so counting alone would leave that agent-writable file a way to
@@ -422,91 +565,6 @@ write, so dropping the reload and invalidating only moves the same parse to the 
 append: measured identical either way. Making an append cheap means reading the header
 without parsing the events, which changes what this class promises and is tracked
 separately rather than folded in here.
-
-**The pending-append ceiling is RESERVED, not merely checked.** The future a caller
-adds to the outstanding set does not exist until the pool accepts the work, so the
-set cannot be added to while the decision is being made. A check alone therefore lets
-several callers each pass a count that was true for all of them and then each add,
-putting the set past the ceiling by one per caller. Reservations are counted
-alongside the set and released the moment the future joins it, which makes the
-decision and the claim one step.
-
-**Queue acceptance is not a completed write, and only a caller that keeps a
-RECORD of the write has to care.** `submit` answers whether the append was
-queued; the append itself runs later on the ordered worker and can still fail
-there. A caller that keeps no record loses exactly the event it handed over,
-which the queue's ceiling already documents. A caller that keeps a CHECKPOINT
-loses every later retry too, because its next pass compares against a checkpoint
-claiming the event was written -- so the worker reports a failed append back and
-the next pass recomputes exactly those transitions. The report carries a
-CORRECTION rather than a key, because the two directions need opposite ones: a
-failed open is retried by leaving the key absent from the checkpoint, while a
-failed close has to put it BACK, since the checkpoint has already moved past that
-key and removing it again computes nothing. That is the rule the slot
-open/close path follows, and it is why the message and patrol paths correctly do
-not read the answer.
-
-Queued appends are drained before every HARD exit. `os._exit` skips `atexit`, so
-the module's own hook does not run on the gateway's shutdown paths; both of them
-drain explicitly, beside the sibling drain the session log already does there, and
-a test asserts no hard exit in that module is left without one.
-
-The drain waits for RESERVATIONS as well as registered futures. `submit` takes its
-reservation, releases the lock to call `pool.submit`, and only then registers the
-future, so for the length of that call an append is counted in the reservation count
-and absent from the outstanding set. A drain that reads only the set sees nothing
-there, answers that the log is complete, and the force-exit path that asked goes
-straight to `os._exit` -- losing an append with no replay to recover it. There is
-nothing to wait on inside that window, because the future does not exist yet, so a
-reservation is polled at a short interval until it becomes one. The poll is bounded
-by the drain's existing deadline rather than added to it, and a drain with nothing
-outstanding still returns immediately.
-
-A boot CLOSER is re-validated under the lock that writes it. The startup reconcile
-decides each closer from a snapshot and appends it afterwards, and it runs as a
-background task concurrent with the gateway going live -- so a slot it read as
-durably open can legitimately be reopened, or a patrol re-armed, before the closer
-lands. The log is append-only with no compaction, so a closer written after a live
-open is a permanent regression of the projection, and not a self-correcting one: a
-later restart's reconcile reads the state as closed and has no reason to reopen it.
-The closer therefore goes through an append that re-asks whether the state it closes
-is still there, handed the CURRENT projection rather than the caller's snapshot, and
-writes nothing when it is not. Declining is a normal outcome, not a failure: it means
-the state closed itself while the reconcile was deciding.
-
-Coming back unplaced is the outcome that is neither a write nor a decline, and it
-has two forms. Foreign writes can keep moving the tail out from under every attempt,
-and the append then raises `CloserTailContention`; or write ownership can stay held
-elsewhere for the whole contention budget, and the store refuses the append instead.
-Both report the same three facts -- the closer is unplaced, nothing was learned about
-whether it applied, and the closers below it are unaffected -- so the sweep treats
-them as one; a refusal also carries the store's guarantee that nothing was written,
-which is what makes another attempt safe. It answers them in two ways. Within one
-member, each closer's contention is contained and re-raised only after its siblings
-have been attempted, so one unlucky closer cannot suppress the rest -- without that, a
-contended patrol closer would leave the same member's interrupted slots untouched.
-Across members, the contended ones are collected and swept a second time, because each
-step re-decides from a fresh snapshot under its own predicate and so is safe to run
-twice. A member still contended after that pass keeps its interrupted state until the
-next boot re-decides, and the warning above says so.
-
-`emit` never PROPAGATES a failure, because a caller recording a transition must
-not be brought down by its own bookkeeping, but it does not discard the outcome
-either.
-It answers whether the event landed, so a caller whose only record is this event can
-tell an omitted transition from one that never happened, and it reports a failure
-rather than logging it at debug, because that distinction is the one a projection
-built from this log exists to make. The two boundary writers do not need the answer:
-each fences its change through an authoritative store first and answers 500 when the
-fence itself fails, so their event is a second copy rather than the record.
-
-A placeholder therefore survives only where resolution comes up empty: a member the
-config does not carry at the moment their first event is written. Should that member
-later appear in the roster under a name the slug does not equal, the comparison must
-not read the placeholder as a second member -- a slug is a lossy fold, so it differs
-from almost every real name, and blanking the member's own state over a value that
-was never a name is the wrong answer. `logged_name` reports what the header holds,
-and the roster read is where the placeholder is recognised.
 
 The migration is resumable, per item. `ensure` returning early on `log.exists()`
 meant a process that died between `create` and the end of the migration left that

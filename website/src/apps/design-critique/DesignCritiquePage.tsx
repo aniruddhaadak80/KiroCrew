@@ -35,6 +35,7 @@ import type {
   Scope,
   Screen,
   Sel,
+  SlotData,
   StagedItem,
 } from './types'
 
@@ -136,6 +137,11 @@ export default function DesignCritiquePage() {
    */
   const [askPending, setAskPending] = useState(false)
   const threadRef = useRef<HTMLDivElement>(null)
+  /** The open thread, read when a turn fails after an await. The composer
+   *  draft is shared by every thread, so a failed question goes back into it
+   *  only while its own thread is still the one on screen. */
+  const openAskIdRef = useRef(openAskId)
+  openAskIdRef.current = openAskId
 
   const narrow = useNarrow(rootRef)
 
@@ -192,8 +198,21 @@ export default function DesignCritiquePage() {
     throw TIMEOUT()
   }
 
+  /** How many rows the slot holds right now -- the baseline a follow-up's poll
+   *  measures new rows against. Read BEFORE the send goes out. */
+  const slotLength = async (slotKey: string): Promise<number> => {
+    const d = await designCritiqueApi.getSlot(slotKey)
+    return Array.isArray(d && d.messages) ? (d.messages as unknown[]).length : 0
+  }
+
   // Follow-up answers are prose, not JSON — so this waits for text, not a schema.
-  const pollForText = async (slotKey: string): Promise<string> => {
+  // Only an assistant row appended AFTER `seen` (the slot's length before the
+  // send) counts as the answer: the thread shares one slot, so its previous
+  // answer is always the latest assistant row, and a send whose POST never
+  // landed (the wire reports a rejected fetch as indeterminate, not failed)
+  // would otherwise be "answered" by it -- the previous reply persisted under
+  // the new question. With no new row the loop runs to its timeout instead.
+  const pollForText = async (slotKey: string, seen: number): Promise<string> => {
     const began = Date.now()
     let misses = 0
     while (Date.now() - began < 3 * 60 * 1000) {
@@ -203,7 +222,8 @@ export default function DesignCritiquePage() {
       try { d = await designCritiqueApi.getSlot(slotKey) }
       catch { if (++misses >= 8) throw new Error('lost contact'); continue }
       misses = 0
-      const c = lastAssistant(d && d.messages)
+      const rows: SlotData['messages'] = (d && Array.isArray(d.messages)) ? d.messages : []
+      const c = lastAssistant((rows ?? []).slice(seen))
       if (d && !d.running && c && c.trim()) return c.trim()
     }
     throw TIMEOUT()
@@ -757,13 +777,15 @@ export default function DesignCritiquePage() {
         const k = await openSlot()
         askSlotRef.current = k
         await send(k, ASK_CONTEXT(report as Report, screens))
-        await pollForText(k).catch(() => {})
+        await pollForText(k, 0).catch(() => {})
       }
+      // Baseline first, then send: the answer must be a row that did not exist yet.
+      const seen = await slotLength(askSlotRef.current)
       await send(askSlotRef.current, seedWith
         ? ASK_PROMPT(seedWith, question)
         : 'Follow-up on the same highlighted text: ' + (question || 'Say more.') +
           '\n\nSame rules: 2-4 plain sentences, no bullets, no headings.')
-      const text = await pollForText(askSlotRef.current)
+      const text = await pollForText(askSlotRef.current, seen)
       setAsks(prev => {
         const next = prev.map(a => a.id === askId
           ? { ...a, turns: a.turns.map(t => (t.t === stamp ? { ...t, a: text, pending: false } : t)) }
@@ -778,6 +800,9 @@ export default function DesignCritiquePage() {
       setAsks(prev => prev.map(a => a.id === askId
         ? { ...a, turns: a.turns.map(t => (t.t === stamp ? { ...t, a: msg, pending: false, failed: true } : t)) }
         : a))
+      // Hand the question back so a retry is one Enter, not a retype. Never
+      // over a draft the user has already started.
+      if (openAskIdRef.current === askId) setAskDraft(d => d || question)
     } finally {
       // Every exit path, including the early cancelled return above, or the next
       // follow-up would be refused for the rest of the session.

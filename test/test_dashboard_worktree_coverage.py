@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from kiro_crew.dashboard.handlers import worktree as wt
 
@@ -178,32 +179,40 @@ class TestRunGit:
 
 
 class TestDirSlugEdges:
-    def test_trailing_slash_is_ignored(self):
-        assert wt._dir_slug("feat/thing/") == "thing"
-
-    def test_bare_name_has_no_segments(self):
-        assert wt._dir_slug("hotfix") == "hotfix"
+    @pytest.mark.parametrize(
+        "branch, slug",
+        [
+            pytest.param("feat/thing/", "thing", id="trailing_slash_is_ignored"),
+            pytest.param("hotfix", "hotfix", id="bare_name_has_no_segments"),
+        ],
+    )
+    def test_dir_slug(self, branch, slug):
+        assert wt._dir_slug(branch) == slug
 
     def test_slug_is_bounded(self):
         assert len(wt._dir_slug("feat/" + "z" * 400)) == wt._MAX_DIR_SLUG
 
 
 class TestGitError:
-    def test_empty_output_is_a_generic_message(self):
-        assert wt._git_error(_proc(["git"], 1, "", "")) == "git failed"
+    @pytest.mark.parametrize(
+        "stdout, stderr, message",
+        [
+            pytest.param("", "", "git failed", id="empty_output_is_a_generic_message"),
+            pytest.param(
+                "from stdout", "", "from stdout", id="stdout_is_used_when_stderr_is_empty"
+            ),
+            pytest.param(None, None, "git failed", id="none_streams_are_tolerated"),
+        ],
+    )
+    def test_git_error(self, stdout, stderr, message):
+        assert wt._git_error(_proc(["git"], 1, stdout, stderr)) == message
 
     def test_blank_leading_lines_are_skipped(self):
         proc = _proc(["git"], 1, "", "\n\n   \nfatal: real reason\nnoise\n")
         assert wt._git_error(proc) == "fatal: real reason"
 
-    def test_stdout_is_used_when_stderr_is_empty(self):
-        assert wt._git_error(_proc(["git"], 1, "from stdout", "")) == "from stdout"
-
     def test_message_is_truncated(self):
         assert len(wt._git_error(_proc(["git"], 1, "", "x" * 900))) == 300
-
-    def test_none_streams_are_tolerated(self):
-        assert wt._git_error(_proc(["git"], 1, None, None)) == "git failed"
 
 
 class TestNormPath:
@@ -253,30 +262,41 @@ class TestResolveBaseRefAndCommit:
         git.table = {("rev-parse", "--verify", "--quiet", "origin/HEAD"): (0, "abc123\n", "")}
         assert wt._resolve_base_ref("/srv/repo") == "origin/HEAD"
 
-    def test_empty_output_falls_back_to_head(self, git):
-        git.table = {("rev-parse",): (0, "  \n", "")}
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            pytest.param((0, "  \n", ""), id="empty_output_falls_back_to_head"),
+            pytest.param((128, "", "fatal"), id="failed_probe_falls_back_to_head"),
+        ],
+    )
+    def test_falls_back_to_head(self, git, reply):
+        git.table = {("rev-parse",): reply}
         assert wt._resolve_base_ref("/srv/repo") == "HEAD"
 
-    def test_failed_probe_falls_back_to_head(self, git):
-        git.table = {("rev-parse",): (128, "", "fatal")}
-        assert wt._resolve_base_ref("/srv/repo") == "HEAD"
-
-    def test_resolve_commit_returns_the_sha(self, git):
-        git.table = {("rev-parse",): (0, "deadbeef\n", "")}
-        assert wt._resolve_commit("/srv/repo", "HEAD") == "deadbeef"
-
-    def test_resolve_commit_is_empty_on_failure(self, git):
-        git.table = {("rev-parse",): (1, "", "")}
-        assert wt._resolve_commit("/srv/repo", "nope") == ""
+    @pytest.mark.parametrize(
+        "reply, ref, sha",
+        [
+            pytest.param(
+                (0, "deadbeef\n", ""), "HEAD", "deadbeef", id="resolve_commit_returns_the_sha"
+            ),
+            pytest.param((1, "", ""), "nope", "", id="resolve_commit_is_empty_on_failure"),
+        ],
+    )
+    def test_resolve_commit(self, git, reply, ref, sha):
+        git.table = {("rev-parse",): reply}
+        assert wt._resolve_commit("/srv/repo", ref) == sha
 
 
 class TestGitToplevel:
-    def test_non_repo_is_none(self, git):
-        git.table = {("rev-parse",): (128, "", "fatal: not a git repository")}
-        assert wt._git_toplevel("/srv/plain") is None
-
-    def test_blank_toplevel_is_none(self, git):
-        git.table = {("rev-parse",): (0, "\n", "")}
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            pytest.param((128, "", "fatal: not a git repository"), id="non_repo_is_none"),
+            pytest.param((0, "\n", ""), id="blank_toplevel_is_none"),
+        ],
+    )
+    def test_is_none(self, git, reply):
+        git.table = {("rev-parse",): reply}
         assert wt._git_toplevel("/srv/plain") is None
 
     def test_toplevel_is_realpathed(self, git, tmp_path):
@@ -318,27 +338,32 @@ class TestWorktreeBranches:
         assert trees[wt._norm_path("/srv/repo-wt-detached")] == ""
         assert trees[wt._norm_path("/srv/repo-wt-odd")] == "refs/tags/v1"
 
-    def test_branch_field_without_a_worktree_is_ignored(self, git):
-        git.table = {("worktree", "list"): (0, "branch refs/heads/orphan\0", "")}
-        assert wt._worktree_branches("/srv/repo") == {}
-
-    def test_empty_listing_is_an_empty_mapping(self, git):
-        git.table = {("worktree", "list"): (0, "", "")}
+    @pytest.mark.parametrize(
+        "listing",
+        [
+            pytest.param(
+                "branch refs/heads/orphan\0", id="branch_field_without_a_worktree_is_ignored"
+            ),
+            pytest.param("", id="empty_listing_is_an_empty_mapping"),
+        ],
+    )
+    def test_no_branches(self, git, listing):
+        git.table = {("worktree", "list"): (0, listing, "")}
         assert wt._worktree_branches("/srv/repo") == {}
 
 
 class TestWorktreeExtensionOn:
-    def test_extension_probe_failure_is_false(self, git):
-        git.table = {("config", "--local", "--includes", "--bool"): (1, "", "")}
-        assert wt._worktree_extension_on("/srv/repo") is False
-
-    def test_extension_disabled_is_false(self, git):
-        git.table = {("config", "--local", "--includes", "--bool"): (0, "false\n", "")}
-        assert wt._worktree_extension_on("/srv/repo") is False
-
-    def test_extension_enabled_is_true(self, git):
-        git.table = {("config", "--local", "--includes", "--bool"): (0, "true\n", "")}
-        assert wt._worktree_extension_on("/srv/repo") is True
+    @pytest.mark.parametrize(
+        "reply, enabled",
+        [
+            pytest.param((1, "", ""), False, id="extension_probe_failure_is_false"),
+            pytest.param((0, "false\n", ""), False, id="extension_disabled_is_false"),
+            pytest.param((0, "true\n", ""), True, id="extension_enabled_is_true"),
+        ],
+    )
+    def test_extension_on(self, git, reply, enabled):
+        git.table = {("config", "--local", "--includes", "--bool"): reply}
+        assert wt._worktree_extension_on("/srv/repo") is enabled
 
 
 class TestWorktreeProbeFailureClassifier:
@@ -721,8 +746,17 @@ def sync_env(monkeypatch, tmp_path):
         add=(0, "", ""),
         add_raises=None,
         cleanups=[],
+        # The probes a reuse runs against an existing worktree: its own config
+        # scope, its working tree, and the branch's commits beyond the base.
+        dest_filter="",
+        status=(0, "", ""),
+        ahead=(0, "0\n", ""),
     )
-    monkeypatch.setattr(wt, "_checkout_filter", lambda r: state.checkout_filter)
+    monkeypatch.setattr(
+        wt,
+        "_checkout_filter",
+        lambda r: state.checkout_filter if r == state.root else state.dest_filter,
+    )
     monkeypatch.setattr(wt, "_worktree_branches", lambda r: state.registered)
     monkeypatch.setattr(wt, "_resolve_base_ref", lambda r: state.base)
     monkeypatch.setattr(wt, "_resolve_commit", lambda r, ref: state.sha)
@@ -733,6 +767,10 @@ def sync_env(monkeypatch, tmp_path):
             if state.add_raises is not None:
                 raise state.add_raises
             return _proc(args, *state.add)
+        if args[:2] == ["--no-optional-locks", "status"]:
+            return _proc(args, *state.status)
+        if args[:2] == ["rev-list", "--count"]:
+            return _proc(args, *state.ahead)
         return _proc(args)
 
     monkeypatch.setattr(wt, "_run_git", fake_run)
@@ -786,6 +824,65 @@ class TestCreateWorktreeSync:
         assert status == 200
         assert payload["reused"] is True
         assert payload["base"] == ""
+
+    def test_the_retry_inspects_the_tree_without_writing_its_index(self, sync_env, monkeypatch):
+        os.mkdir(sync_env.dest)
+        sync_env.registered = {wt._norm_path(sync_env.dest): "feat/x"}
+        calls: list[tuple[list[str], str]] = []
+        inner = wt._run_git
+
+        def recording(args, cwd):
+            calls.append((list(args), cwd))
+            return inner(args, cwd)
+
+        monkeypatch.setattr(wt, "_run_git", recording)
+        payload, status = wt._create_worktree_sync(sync_env.root, "feat/x")
+        assert status == 200 and payload["reused"] is True
+        assert (
+            ["--no-optional-locks", "status", "--porcelain", "--ignore-submodules=all"],
+            sync_env.dest,
+        ) in calls
+        assert (["rev-list", "--count", "c0ffee..refs/heads/feat/x"], sync_env.root) in calls
+
+    def test_a_reused_worktree_with_uncommitted_changes_is_a_409(self, sync_env):
+        os.mkdir(sync_env.dest)
+        sync_env.registered = {wt._norm_path(sync_env.dest): "feat/x"}
+        sync_env.status = (0, " M app.py\n?? notes.md\n", "")
+        payload, status = wt._create_worktree_sync(sync_env.root, "feat/x")
+        assert status == 409
+        assert payload["code"] == "worktree_in_use"
+        assert "uncommitted changes" in payload["error"]
+        assert os.path.isdir(sync_env.dest), "the in-use worktree was removed"
+        assert sync_env.cleanups == []
+
+    def test_a_reused_worktree_whose_branch_has_new_commits_is_a_409(self, sync_env):
+        os.mkdir(sync_env.dest)
+        sync_env.registered = {wt._norm_path(sync_env.dest): "feat/x"}
+        sync_env.ahead = (0, "2\n", "")
+        payload, status = wt._create_worktree_sync(sync_env.root, "feat/x")
+        assert status == 409
+        assert payload["code"] == "worktree_in_use"
+        assert "commits that are not on HEAD" in payload["error"]
+        assert sync_env.cleanups == []
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("dest_filter", "filter.evil.clean"),
+            ("status", (128, "", "fatal: not a git repository")),
+            ("sha", ""),
+            ("ahead", (128, "", "fatal: bad revision")),
+            ("ahead", (0, "not a number\n", "")),
+        ],
+    )
+    def test_a_reused_worktree_git_cannot_inspect_is_a_409(self, sync_env, field, value):
+        os.mkdir(sync_env.dest)
+        sync_env.registered = {wt._norm_path(sync_env.dest): "feat/x"}
+        setattr(sync_env, field, value)
+        payload, status = wt._create_worktree_sync(sync_env.root, "feat/x")
+        assert status == 409
+        assert payload["code"] == "worktree_in_use"
+        assert "could not confirm" in payload["error"]
 
     def test_a_different_branch_at_the_destination_is_a_409(self, sync_env):
         os.mkdir(sync_env.dest)
@@ -883,6 +980,179 @@ class TestCreateWorktreeSync:
 
 
 # ── _allowed_repo_roots ──────────────────────────────────────────────────
+
+
+class TestCreateWorktreeSyncRealGit:
+    """The reuse rule against real git output, on a synthetic repository.
+
+    Only the OS-sandbox wrapper is replaced: ``_run_git`` becomes a plain ``git``
+    call with hermetic config, so the porcelain and count parsing meet the real
+    command. A retry finds the tree exactly as ``worktree add`` left it; a tree
+    another session worked in is refused.
+    """
+
+    BRANCH = "followup/add-rate-limiting"
+
+    @pytest.fixture
+    def real_repo(self, tmp_path, monkeypatch):
+        empty_cfg = tmp_path / "gitconfig"
+        empty_cfg.write_text("", encoding="utf-8")
+        env = dict(os.environ)
+        env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(empty_cfg),
+                "GIT_AUTHOR_NAME": "Synthetic",
+                "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
+                "GIT_COMMITTER_NAME": "Synthetic",
+                "GIT_COMMITTER_EMAIL": "synthetic@example.invalid",
+            }
+        )
+        env.update(git_maintenance_off_entries(env))
+
+        def plain_git(args, cwd, *, stdout_decoder=None):
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+            )
+
+        monkeypatch.setattr(wt, "_run_git", plain_git)
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        for args in (
+            ["init", "-q"],
+            ["add", "app.py"],
+            ["commit", "-q", "-m", "base"],
+        ):
+            proc = plain_git(args, str(root))
+            assert proc.returncode == 0, proc.stderr
+        return os.path.realpath(str(root)), plain_git
+
+    def _first_create(self, root: str) -> str:
+        payload, status = wt._create_worktree_sync(root, self.BRANCH)
+        assert status == 200 and payload["reused"] is False, payload
+        return payload["path"]
+
+    def test_an_untouched_worktree_is_reused_on_retry(self, real_repo):
+        root, _ = real_repo
+        dest = self._first_create(root)
+        payload, status = wt._create_worktree_sync(root, self.BRANCH)
+        assert status == 200
+        assert payload["reused"] is True and payload["path"] == dest
+
+    def test_a_worktree_with_uncommitted_edits_is_refused(self, real_repo):
+        root, _ = real_repo
+        dest = self._first_create(root)
+        with open(os.path.join(dest, "app.py"), "w", encoding="utf-8") as fh:
+            fh.write("print('half-done edit by another session')\n")
+        payload, status = wt._create_worktree_sync(root, self.BRANCH)
+        assert status == 409, payload
+        assert payload["code"] == "worktree_in_use"
+
+    def test_a_worktree_with_another_sessions_commits_is_refused(self, real_repo):
+        root, git = real_repo
+        dest = self._first_create(root)
+        with open(os.path.join(dest, "app.py"), "w", encoding="utf-8") as fh:
+            fh.write("print('v2 by another session')\n")
+        for args in (["add", "app.py"], ["commit", "-q", "-m", "work"]):
+            proc = git(args, dest)
+            assert proc.returncode == 0, proc.stderr
+        payload, status = wt._create_worktree_sync(root, self.BRANCH)
+        assert status == 409, payload
+        assert payload["code"] == "worktree_in_use"
+
+
+class TestWorktreeInUseIgnoresSubmodules:
+    """The reuse probe's ``status`` must not run a submodule's content filter.
+
+    ``_checkout_filter`` screens only the superproject's config, so before this
+    change the recursive ``status`` ran a filter driver a submodule carried in its
+    own config -- repository-controlled code. The witness is a marker file the
+    filter touches: a recursive ``status`` creates it, the fixed probe does not.
+    """
+
+    def _git(self, env, cwd, *args):
+        proc = subprocess.run(
+            ["git", "-c", "protocol.file.allow=always", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc
+
+    @pytest.fixture
+    def superproject_with_a_filtered_submodule(self, tmp_path, monkeypatch):
+        empty_cfg = tmp_path / "gitconfig"
+        empty_cfg.write_text("", encoding="utf-8")
+        env = dict(os.environ)
+        env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(empty_cfg),
+                "GIT_AUTHOR_NAME": "Synthetic",
+                "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
+                "GIT_COMMITTER_NAME": "Synthetic",
+                "GIT_COMMITTER_EMAIL": "synthetic@example.invalid",
+            }
+        )
+        env.update(git_maintenance_off_entries(env))
+
+        def plain_git(args, cwd, *, stdout_decoder=None):
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=60,
+            )
+
+        monkeypatch.setattr(wt, "_run_git", plain_git)
+        marker = tmp_path / "FILTER_RAN"
+        subsrc = tmp_path / "subsrc"
+        subsrc.mkdir()
+        (subsrc / "tracked.txt").write_text("aaaa\n", encoding="utf-8")
+        (subsrc / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+        self._git(env, str(subsrc), "init", "-q", "-b", "main")
+        self._git(env, str(subsrc), "add", "-A")
+        self._git(env, str(subsrc), "commit", "-q", "-m", "sub")
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        self._git(env, str(root), "init", "-q", "-b", "main")
+        self._git(env, str(root), "add", "app.py")
+        self._git(env, str(root), "commit", "-q", "-m", "base")
+        self._git(env, str(root), "submodule", "add", "-q", str(subsrc), "sub")
+        self._git(env, str(root), "commit", "-q", "-m", "add sub")
+        # A session initialized the submodule and it carries a clean filter whose
+        # driver touches the marker; a same-size edit makes status run it.
+        self._git(env, str(root / "sub"), "config", "filter.evil.clean", f"touch '{marker}'; cat")
+        (root / "sub" / "tracked.txt").write_text("bbbb\n", encoding="utf-8")
+        return os.path.realpath(str(root)), marker
+
+    def test_the_reuse_probe_does_not_run_a_submodule_filter(
+        self, superproject_with_a_filtered_submodule
+    ):
+        root, marker = superproject_with_a_filtered_submodule
+        assert not marker.exists()
+        reason = wt._worktree_in_use(root, root, "main")
+        assert not marker.exists(), (
+            "the reuse probe recursed into the submodule and ran its clean filter "
+            f"(marker {marker} was created); reason={reason!r}"
+        )
+        # The superproject tree itself is untouched, so it reads as reusable.
+        assert reason == "", reason
 
 
 class TestAllowedRepoRoots:
@@ -1210,6 +1480,36 @@ class TestEndpointCreateOutcomes:
                 assert (await resp.json())["path"] == created
         assert audit.log_api_access.call_args.kwargs["outcome"] == "allowed"
         assert "Created worktree" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scoped_to", ["", "proj-wt-x", os.path.join("proj-wt-x", "src")])
+    async def test_a_reused_worktree_open_in_a_session_is_refused(
+        self, repo_dir, audit, monkeypatch, scoped_to
+    ):
+        reused = repo_dir.parent / "proj-wt-x"
+        (reused / "src").mkdir(parents=True)
+        reused_path = os.path.realpath(str(reused))
+        monkeypatch.setattr(
+            wt,
+            "_create_worktree_sync",
+            lambda root, branch: (
+                {"ok": True, "path": reused_path, "branch": branch, "base": "", "reused": True},
+                200,
+            ),
+        )
+        projects = [str(repo_dir)] + ([str(repo_dir.parent / scoped_to)] if scoped_to else [])
+        async with TestClient(TestServer(_make_app(*projects))) as client:
+            resp = await client.post(
+                "/api/worktree/create", json={"repo": str(repo_dir), "branch": "feat/x"}
+            )
+            body = await resp.json()
+        if not scoped_to:
+            assert resp.status == 200 and body["reused"] is True
+            return
+        assert resp.status == 409
+        assert body["code"] == "worktree_in_use"
+        assert "a session is already open in it" in body["error"]
+        assert audit.log_api_access.call_args.kwargs["outcome"] == "error"
 
     @pytest.mark.asyncio
     async def test_a_refusal_status_is_audited_as_error(self, repo_dir, audit, monkeypatch):

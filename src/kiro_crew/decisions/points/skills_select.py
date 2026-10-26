@@ -62,6 +62,7 @@ import logging
 import math
 import time
 import uuid
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -131,8 +132,12 @@ def selected_skills(
     session_key: str | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     history_source: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+    unusable: Collection[str] = (),
 ) -> list[str] | None:
     """The oracle's selection for *text*, or ``None`` to keep the baseline.
+
+    *unusable* is the matcher's own: skills the turn cannot use are not on the
+    menu, so the pick and the baseline arm both leave them out.
 
     Runs on the CALLER's thread, which in production is an executor worker. The
     order below is the contract:
@@ -175,7 +180,12 @@ def selected_skills(
             return None
         baseline: list[str] = []
         candidates = candidates_from_loader(
-            skills_loader, text, project_dir, session_key=session_key, baseline_out=baseline
+            skills_loader,
+            text,
+            project_dir,
+            session_key=session_key,
+            baseline_out=baseline,
+            unusable=unusable,
         )
         if not candidates:
             return None
@@ -315,7 +325,9 @@ async def _ask_one(
             options=keys + [NONE_OPTION],
         )
     ]
-    answers = await core.decide(POINT, state, questions, session_key=session_key, extra=extra)
+    answers = await core.decide(
+        POINT, state, questions, session_key=session_key, extra=extra, unclipped=text
+    )
     picked = read_answer(answers, keys)
     return picked, (_probability_of(answers) if picked is not None else None)
 
@@ -452,13 +464,15 @@ def candidates_from_loader(
     *,
     session_key: str | None = None,
     baseline_out: list[str] | None = None,
+    unusable: Collection[str] = (),
 ) -> list[dict[str, str]]:
     """Every skill *text* could load, best-scoring first, capped and screened.
 
     Walks the same ``(name, file, within)`` triples and the same frontmatter
     reader ``get_triggered_skills`` uses, so eligibility cannot drift from the
     baseline's own notion of it — and so a confined project skill is read through
-    the descriptor-pinned reader rather than by path.
+    the descriptor-pinned reader rather than by path. A skill in *unusable* is
+    skipped here exactly as the matcher skips it.
 
     Scoring is only an ORDER here: a skill below ``MIN_TRIGGER_OVERLAP`` is still
     offered, which is the whole point of asking. A NEGATIVE trigger that matches
@@ -495,7 +509,7 @@ def candidates_from_loader(
         key = str(name or "")
         # An over-long key is dropped, never shortened: the answer is resolved by
         # name downstream.
-        if not key or len(key) > MAX_KEY_CHARS:
+        if not key or len(key) > MAX_KEY_CHARS or key in unusable:
             continue
         try:
             meta = skills_loader._cached_frontmatter(skill_file, within=within)

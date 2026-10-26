@@ -1,11 +1,17 @@
 import { Fragment } from 'react'
-import { BarChart3 } from 'lucide-react'
+import { BarChart3, ChartArea } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
-import { Card, CardTitle, Badge } from '../../components/ui'
+import { Btn, Card, CardTitle, Badge } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useProvider } from '../../providers'
 import { providerUsageQuery } from '../../api/providerUsageQuery'
+import { api } from '../../api/client'
+import { reportsCredits } from '../../api/acpBackend'
+import { failedWithNoData } from '../../api/queryState'
+import { reportForError } from '../../utils/errorReport'
+import type { AcpBackendConfig } from '../../api/acpBackend'
 import { TokenDailyChart } from './TokenDailyChart'
+import { TokenStackedAreaChart } from './TokenStackedAreaChart'
 import { formatCost } from '../../utils/formatCost'
 
 import { fmtNumber, fmtPercent } from '../../i18n/format'
@@ -40,6 +46,24 @@ export default function UsageTab() {
   const provider = useProvider()
   const { data, error: queryErr } = useQuery(providerUsageQuery(provider))
   const err = queryErr ? (queryErr instanceof Error ? queryErr.message : String(queryErr)) : ''
+  // The spend chart stacks credits, so it shows only once a LOADED config names
+  // a default harness that bills in them (kiro-cli, KAS); on a harness that
+  // bills in tokens or dollars its rows carry no credits, and the chart would
+  // call turns that did run "no spend". Read positively, never as "not claude";
+  // crew members on another harness (member_acp_backend) write to the same
+  // store and count whatever credits they recorded.
+  const cfgQuery = useQuery<AcpBackendConfig>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  const creditsHarness = reportsCredits(cfgQuery.data)
+  // A config read that failed with nothing cached is said where the card would
+  // stand: on a kiro-cli install a silent absence would read as "this harness
+  // has no credits". `failedWithNoData`, not `isError`, so the notice holds
+  // through the retry instead of blinking out; the failed request's report
+  // rides along for the agent hand-off, since the message is a translated
+  // sentence no journal entry matches.
+  const harnessUnread = failedWithNoData(cfgQuery)
 
   if (!provider.capabilities.usageBilling) return (
     <Card>
@@ -104,25 +128,49 @@ export default function UsageTab() {
         </Card>
       )}
 
+      {/* Whole-install spend by channel / agent / model / session start week,
+          from the per-turn shards -- the Daily History credits below, decomposed.
+          It fetches its own series, so it renders beside the usage report
+          regardless of what the provider's report carries. */}
+      {creditsHarness ? (
+        <Card>
+          <CardTitle><ChartArea className="lucide-inline" /> {i18nT('pages.overview.usageTab.spend_over_time')}</CardTitle>
+          <TokenStackedAreaChart />
+        </Card>
+      ) : harnessUnread ? (
+        <Card>
+          <ErrorNotice message={i18nT('pages.overview.usageTab.harness_unread')} report={reportForError(cfgQuery.error)} askAgent testId="usage-series-harness-unread" />
+          <Btn className="mt-3 min-h-11" disabled={cfgQuery.isFetching} onClick={() => void cfgQuery.refetch()}>
+            {i18nT('pages.overview.usageSeriesChart.retry')}
+          </Btn>
+        </Card>
+      ) : null}
+
       <Card>
         <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.session_activity_30_days')}</CardTitle>
-        {s.refusedTranscripts > 0 && (
-          <ErrorNotice
-            variant="inline"
-            askAgent
-            className="mb-4"
-            message={i18nT('pages.overview.usageTab.refused_transcripts_warning', { count: s.refusedTranscripts })}
-          />
+        {data.refreshing ? (
+          <div data-testid="usage-session-refreshing" className="skeleton h-32 rounded" />
+        ) : (
+          <>
+            {s.refusedTranscripts > 0 && (
+              <ErrorNotice
+                variant="inline"
+                askAgent
+                className="mb-4"
+                message={i18nT('pages.overview.usageTab.refused_transcripts_warning', { count: s.refusedTranscripts })}
+              />
+            )}
+            <div className="grid grid-cols-3 gap-4 max-[600px]:grid-cols-1 mb-4">
+              <PeriodCard label={i18nT('pages.overview.usageTab.today')} p={s.today} />
+              <PeriodCard label={i18nT('pages.overview.usageTab.this_week')} p={s.thisWeek} />
+              <PeriodCard label={i18nT('pages.overview.usageTab.this_month')} p={s.thisMonth} />
+            </div>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
+              <Row label={i18nT('pages.overview.usageTab.total_sessions_30d')} value={s.total} />
+              <Row label={i18nT('pages.overview.usageTab.avg_messages_session')} value={s.avgMsgsPerSession} />
+            </div>
+          </>
         )}
-        <div className="grid grid-cols-3 gap-4 max-[600px]:grid-cols-1 mb-4">
-          <PeriodCard label={i18nT('pages.overview.usageTab.today')} p={s.today} />
-          <PeriodCard label={i18nT('pages.overview.usageTab.this_week')} p={s.thisWeek} />
-          <PeriodCard label={i18nT('pages.overview.usageTab.this_month')} p={s.thisMonth} />
-        </div>
-        <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
-          <Row label={i18nT('pages.overview.usageTab.total_sessions_30d')} value={s.total} />
-          <Row label={i18nT('pages.overview.usageTab.avg_messages_session')} value={s.avgMsgsPerSession} />
-        </div>
       </Card>
 
       {s.dailyHistory.length > 0 && (

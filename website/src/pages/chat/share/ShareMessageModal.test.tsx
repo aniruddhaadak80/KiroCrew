@@ -8,17 +8,39 @@ import { SHARE_REPO_URL } from './shareSupport'
 const toBlobMock = vi.fn(async () => new Blob(['png-bytes'], { type: 'image/png' }))
 vi.mock('html-to-image', () => ({ toBlob: (...args: unknown[]) => toBlobMock(...args) }))
 
+// The dialog reads `social_share_sites` from the dashboard config. Every site is
+// permitted unless a test says otherwise.
+const dashCfgMock = vi.fn(async (): Promise<Record<string, unknown>> => ({ social_share_sites: ['x', 'linkedin'] }))
+vi.mock('../../../api/dashboardConfigQuery', () => ({ fetchDashboardConfig: () => dashCfgMock() }))
+
 describe('ShareMessageModal', () => {
+  // happy-dom serves navigator.clipboard from a prototype getter, so a stub is an
+  // own property that shadows it for every later test until it is removed.
+  const origClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+  const stubClipboard = (value: unknown) =>
+    Object.defineProperty(navigator, 'clipboard', { value, configurable: true })
+
   beforeEach(() => {
-    toBlobMock.mockClear()
+    // Reset, not clear: a clear keeps a once-implementation that a test queued
+    // but stopped before consuming, and the next test's export receives it.
+    toBlobMock.mockReset()
+    dashCfgMock.mockReset()
+    dashCfgMock.mockResolvedValue({ social_share_sites: ['x', 'linkedin'] })
     // jsdom lacks object URLs; downloadBlob needs both halves.
     URL.createObjectURL = vi.fn(() => 'blob:mock')
     URL.revokeObjectURL = vi.fn()
   })
-  afterEach(() => { vi.restoreAllMocks() })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    // The ClipboardItem stubs, and the clipboard itself: neither is a spy.
+    vi.unstubAllGlobals()
+    if (origClipboard) Object.defineProperty(navigator, 'clipboard', origClipboard)
+    else delete (navigator as unknown as Record<string, unknown>).clipboard
+  })
 
-  const renderModal = (over: Partial<Parameters<typeof ShareMessageModal>[0]> = {}) =>
-    render(
+  // Async: the dialog reads its site list on mount, and that answer lands inside act.
+  const renderModal = async (over: Partial<Parameters<typeof ShareMessageModal>[0]> = {}) => {
+    const view = render(
       <ShareMessageModal
         onClose={over.onClose ?? (() => {})}
         messageText={over.messageText ?? 'Triaged 47 issues overnight and opened two PRs.'}
@@ -27,20 +49,23 @@ describe('ShareMessageModal', () => {
         copy={over.copy}
       />,
     )
+    await act(async () => { await dashCfgMock.mock.results.at(-1)?.value?.catch(() => {}) })
+    return view
+  }
 
-  it('uses the chat wording when no copy override is given', () => {
+  it('uses the chat wording when no copy override is given', async () => {
     // The load-bearing half for every existing call site: the defaults ARE the chat
     // strings, so omitting `copy` must change nothing about this dialog.
-    renderModal({ prevUserText: 'How many issues did you triage?' })
+    await renderModal({ prevUserText: 'How many issues did you triage?' })
     expect(screen.getByText('Turn this reply into a share card you can post anywhere.'))
       .toBeInTheDocument()
     expect(screen.getByText('Include my question')).toBeInTheDocument()
   })
 
-  it('lets a non-chat host replace the two strings that name the shared thing', () => {
+  it('lets a non-chat host replace the two strings that name the shared thing', async () => {
     // A surface sharing something that is not a reply needs its own wording; the chat
     // defaults assert a reply and a question it does not have.
-    renderModal({
+    await renderModal({
       prevUserText: 'Feature videos',
       copy: {
         description: 'Turn this feature video into a share card you can post anywhere.',
@@ -56,20 +81,20 @@ describe('ShareMessageModal', () => {
     expect(screen.queryByText('Include my question')).not.toBeInTheDocument()
   })
 
-  it('leaves the sharing mechanics copy alone when overridden', () => {
+  it('leaves the sharing mechanics copy alone when overridden', async () => {
     // Only the two subject-naming strings are parameterised. The export controls and
     // the policy/limit copy describe the mechanics and are identical on every surface.
-    renderModal({
+    await renderModal({
       prevUserText: 'Feature videos',
       copy: { description: 'Custom subtitle', includeQuestion: 'Custom checkbox' },
     })
     expect(screen.getByText('Share to social media')).toBeInTheDocument()
     expect(screen.getByTestId('share-download')).toBeInTheDocument()
-    expect(screen.getByTestId('share-x')).toBeInTheDocument()
+    expect(await screen.findByTestId('share-x')).toBeInTheDocument()
   })
 
-  it('renders the card with the message excerpt and a prefilled caption', () => {
-    renderModal()
+  it('renders the card with the message excerpt and a prefilled caption', async () => {
+    await renderModal()
     expect(screen.getByTestId('share-card')).toHaveTextContent('Triaged 47 issues overnight')
     const caption = screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement
     expect(caption.value).toContain(SHARE_REPO_URL)
@@ -85,38 +110,38 @@ describe('ShareMessageModal', () => {
     const tab = { opener: {} as unknown, location: { href: '' } }
     vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window)
     vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
-    Object.defineProperty(navigator, 'clipboard', { value: { write: vi.fn().mockResolvedValue(undefined) }, configurable: true })
-    renderModal({ copy: { caption: 'Feature videos: a clip per feature https://docs.example/x' } })
+    stubClipboard({ write: vi.fn().mockResolvedValue(undefined) })
+    await renderModal({ copy: { caption: 'Feature videos: a clip per feature https://docs.example/x' } })
     const caption = screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement
     expect(caption.value).toBe('Feature videos: a clip per feature https://docs.example/x')
     expect(caption.value).not.toMatch(/just did this for me/)
-    fireEvent.click(screen.getByTestId('share-x'))
+    fireEvent.click(await screen.findByTestId('share-x'))
     await waitFor(() => expect(tab.location.href).toBe(
       `https://x.com/intent/post?text=${encodeURIComponent('Feature videos: a clip per feature https://docs.example/x')}`,
     ))
   })
 
-  it('pairs the question by default and drops it when unchecked', () => {
-    renderModal({ prevUserText: 'How did tonight go?' })
+  it('pairs the question by default and drops it when unchecked', async () => {
+    await renderModal({ prevUserText: 'How did tonight go?' })
     expect(screen.getByTestId('share-card')).toHaveTextContent('How did tonight go?')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include my question' }))
     expect(screen.getByTestId('share-card')).not.toHaveTextContent('How did tonight go?')
   })
 
-  it('shows no question toggle without a preceding user message', () => {
-    renderModal()
+  it('shows no question toggle without a preceding user message', async () => {
+    await renderModal()
     expect(screen.queryByRole('checkbox', { name: 'Include my question' })).toBeNull()
   })
 
-  it('warns with CARD location when the shared message looks sensitive', () => {
-    renderModal({ messageText: 'set AWS_KEY=AKIAIOSFODNN7EXAMPLE' })
+  it('warns with CARD location when the shared message looks sensitive', async () => {
+    await renderModal({ messageText: 'set AWS_KEY=AKIAIOSFODNN7EXAMPLE' })
     const alert = screen.getByRole('alert')
     expect(alert).toHaveTextContent('the card contains: an AWS access key')
     expect(alert).not.toHaveTextContent('post text')
   })
 
-  it('warns with POST-TEXT location when a sensitive value is typed into the caption', () => {
-    renderModal()
+  it('warns with POST-TEXT location when a sensitive value is typed into the caption', async () => {
+    await renderModal()
     expect(screen.queryByRole('alert')).toBeNull()
     fireEvent.change(screen.getByRole('textbox', { name: 'Post text' }), {
       target: { value: 'token ghp_abcdefghijklmnopqrstu0123456789' },
@@ -129,35 +154,35 @@ describe('ShareMessageModal', () => {
   it('pre-opens the composer tab synchronously, copies the card, then navigates it', async () => {
     vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
     const write = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(navigator, 'clipboard', { value: { write }, configurable: true })
+    stubClipboard({ write })
     // The tab is opened blank inside the click's own call stack (what popup
     // blockers judge), with its opener severed, and pointed at the composer
     // only after the export has settled.
     const tab = { opener: {} as unknown, location: { href: '' } }
     const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window)
-    renderModal()
+    await renderModal()
     fireEvent.change(screen.getByRole('textbox', { name: 'Post text' }), { target: { value: 'wow' } })
-    fireEvent.click(screen.getByTestId('share-x'))
+    fireEvent.click(await screen.findByTestId('share-x'))
     expect(open).toHaveBeenCalledWith('', '_blank')
     expect(tab.opener).toBeNull()
     await waitFor(() => expect(tab.location.href).toBe('https://x.com/intent/post?text=wow'))
     expect(write).toHaveBeenCalled()
-    fireEvent.click(screen.getByTestId('share-linkedin'))
+    fireEvent.click(await screen.findByTestId('share-linkedin'))
     await waitFor(() => expect(tab.location.href).toBe('https://www.linkedin.com/feed/?shareActive=true&text=wow'))
   })
 
   it('falls back to a direct open when the blocker refused the pre-opened tab', async () => {
     vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
-    Object.defineProperty(navigator, 'clipboard', { value: { write: vi.fn().mockResolvedValue(undefined) }, configurable: true })
+    stubClipboard({ write: vi.fn().mockResolvedValue(undefined) })
     const open = vi.spyOn(window, 'open').mockReturnValue(null)
-    renderModal()
+    await renderModal()
     fireEvent.change(screen.getByRole('textbox', { name: 'Post text' }), { target: { value: 'wow' } })
-    fireEvent.click(screen.getByTestId('share-x'))
+    fireEvent.click(await screen.findByTestId('share-x'))
     await waitFor(() => expect(open).toHaveBeenCalledWith('https://x.com/intent/post?text=wow', '_blank', 'noopener,noreferrer'))
   })
 
-  it('shows a focus ring on the editable card text and mirrors edits into the scan', () => {
-    renderModal()
+  it('shows a focus ring on the editable card text and mirrors edits into the scan', async () => {
+    await renderModal()
     const excerptBox = screen.getAllByRole('textbox', { name: /card text/i })[0]
     fireEvent.focus(excerptBox)
     expect(excerptBox.style.boxShadow).toContain('rgba(255,255,255')
@@ -170,8 +195,8 @@ describe('ShareMessageModal', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('an AWS access key')
   })
 
-  it('scans edits made to the question bubble and clears them when unchecked', () => {
-    renderModal({ prevUserText: 'How did tonight go?' })
+  it('scans edits made to the question bubble and clears them when unchecked', async () => {
+    await renderModal({ prevUserText: 'How did tonight go?' })
     const questionBox = screen.getAllByRole('textbox', { name: /card text/i })[0]
     Object.defineProperty(questionBox, 'innerText', { value: 'psst ghp_abcdefghijklmnopqrstu0123456789', configurable: true })
     fireEvent.input(questionBox)
@@ -195,7 +220,7 @@ describe('ShareMessageModal', () => {
       disconnect() {}
     }
     try {
-      renderModal()
+      await renderModal()
       const card = screen.getByTestId('share-card')
       const scaleWrap = card.parentElement as HTMLElement
       const fitEl = scaleWrap.parentElement as HTMLElement
@@ -213,15 +238,15 @@ describe('ShareMessageModal', () => {
     }
   })
 
-  it('flags the caption count once it passes the X limit', () => {
-    renderModal()
+  it('flags the caption count once it passes the X limit', async () => {
+    await renderModal()
     fireEvent.change(screen.getByRole('textbox', { name: 'Post text' }), { target: { value: 'x'.repeat(300) } })
     const counter = screen.getByText(/300 \/ 280/)
     expect(counter.className).toContain('text-danger')
   })
 
   it('exports at 2x and downloads on the download action', async () => {
-    renderModal()
+    await renderModal()
     fireEvent.click(screen.getByTestId('share-download'))
     await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalled())
     expect(toBlobMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ pixelRatio: 2 }))
@@ -230,8 +255,8 @@ describe('ShareMessageModal', () => {
   it('reports success when the clipboard write goes through', async () => {
     vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
     const write = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(navigator, 'clipboard', { value: { write }, configurable: true })
-    renderModal()
+    stubClipboard({ write })
+    await renderModal()
     fireEvent.click(screen.getByTestId('share-copy'))
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/paste the image/i))
     expect(write).toHaveBeenCalled()
@@ -243,12 +268,14 @@ describe('ShareMessageModal', () => {
     // image must still reach the user as a file, never a dead button.
     vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
     const write = vi.fn().mockRejectedValue(new Error('NotAllowedError'))
-    Object.defineProperty(navigator, 'clipboard', { value: { write }, configurable: true })
-    renderModal()
+    stubClipboard({ write })
+    await renderModal()
     fireEvent.click(screen.getByTestId('share-copy'))
-    await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalled())
+    // The download runs BEFORE setFeedback, whose render is a separate React
+    // task: wait for the status it renders, not for the download.
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/downloaded/i))
+    expect(URL.createObjectURL).toHaveBeenCalled()
     expect(write).toHaveBeenCalledTimes(2) // multi-type item, then image-only retry
-    expect(screen.getByRole('status')).toHaveTextContent(/downloaded/i)
   })
 
   it('keeps the compose and its edits when policy withdraws sharing mid-dialog, and says why', async () => {
@@ -268,7 +295,7 @@ describe('ShareMessageModal', () => {
     Object.defineProperty(excerptBox, 'innerText', { value: 'my edited card excerpt', configurable: true })
     fireEvent.input(excerptBox)
     expect(screen.queryByTestId('share-withdrawn')).toBeNull()
-    expect(screen.getByTestId('share-x')).not.toBeDisabled()
+    expect(await screen.findByTestId('share-x')).not.toBeDisabled()
 
     view.rerender(
       <ShareMessageModal onClose={onClose} messageText="Triaged 47 issues overnight." shareEnabled={false} />,
@@ -284,7 +311,7 @@ describe('ShareMessageModal', () => {
     // could have edited (no image, no third-party site), so Close never means
     // silent loss.
     const writeText = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    stubClipboard({ writeText })
     fireEvent.click(screen.getByTestId('share-copy-text'))
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('my carefully edited caption\n\nmy edited card excerpt'))
     // The user still decides when to leave.
@@ -296,20 +323,24 @@ describe('ShareMessageModal', () => {
     // clipboard refuses (plain HTTP) it must not look like success or sit
     // inert — it reports the failure and leaves the text selected so a
     // keyboard copy is the next keystroke.
-    renderModal({ shareEnabled: false })
+    await renderModal({ shareEnabled: false })
     const caption = screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement
     fireEvent.change(caption, { target: { value: 'keep this' } })
     // No async Clipboard API, and the legacy fallback reports failure.
-    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true })
+    stubClipboard(undefined)
     const execBefore = Object.getOwnPropertyDescriptor(document, 'execCommand')
     const execCommand = vi.fn(() => false)
     Object.defineProperty(document, 'execCommand', { value: execCommand, configurable: true })
     const select = vi.spyOn(caption, 'select')
     try {
       fireEvent.click(screen.getByTestId('share-copy-text'))
-      await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+      // execCommand runs synchronously inside the click; the "failed" outcome
+      // renders from setTextCopy after the awaited copy, in a separate React
+      // task. Wait for what only that render produces.
+      const unavailable = await screen.findByTestId('share-copy-text-unavailable')
+      expect(execCommand).toHaveBeenCalledWith('copy')
       expect(screen.getByTestId('share-copy-text')).toHaveTextContent(/failed/i)
-      expect(screen.getByTestId('share-copy-text-unavailable')).toHaveTextContent(/clipboard is blocked.*Ctrl\+C/i)
+      expect(unavailable).toHaveTextContent(/clipboard is blocked.*Ctrl\+C/i)
       expect(select).toHaveBeenCalled()
       expect(caption.value).toBe('keep this')
     } finally {
@@ -323,7 +354,7 @@ describe('ShareMessageModal', () => {
     // permission flips during that await, the navigation that carries the
     // caption off the machine must not happen, and the blank tab is closed.
     vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
-    Object.defineProperty(navigator, 'clipboard', { value: { write: vi.fn().mockResolvedValue(undefined) }, configurable: true })
+    stubClipboard({ write: vi.fn().mockResolvedValue(undefined) })
     let releaseExport!: (b: Blob) => void
     toBlobMock.mockImplementationOnce(() => new Promise<Blob>(res => { releaseExport = res }))
     const tab = { opener: {} as unknown, location: { href: '' }, close: vi.fn() }
@@ -331,7 +362,7 @@ describe('ShareMessageModal', () => {
     const view = render(
       <ShareMessageModal onClose={() => {}} messageText="Triaged 47 issues overnight." shareEnabled />,
     )
-    fireEvent.click(screen.getByTestId('share-x'))
+    fireEvent.click(await screen.findByTestId('share-x'))
     // html-to-image is imported on demand, so the rasterizer is reached a tick
     // after the click; wait for the export to actually be in flight.
     await waitFor(() => expect(toBlobMock).toHaveBeenCalled())
@@ -343,5 +374,46 @@ describe('ShareMessageModal', () => {
     await waitFor(() => expect(tab.close).toHaveBeenCalledTimes(1))
     // …so the pre-opened tab never receives the intent URL.
     expect(tab.location.href).toBe('')
+  })
+
+  it('draws only the sites the policy list permits', async () => {
+    dashCfgMock.mockResolvedValue({ social_share_sites: ['linkedin'] })
+    await renderModal()
+    expect(await screen.findByTestId('share-linkedin')).toBeInTheDocument()
+    expect(screen.queryByTestId('share-x')).toBeNull()
+  })
+
+  it('draws both site buttons disabled until the site list is read', async () => {
+    let answer!: (cfg: Record<string, unknown>) => void
+    dashCfgMock.mockReturnValue(new Promise((res) => { answer = res }))
+    render(<ShareMessageModal onClose={() => {}} messageText="Triaged 47 issues." shareEnabled />)
+    expect(screen.getByTestId('share-x')).toBeDisabled()
+    expect(screen.getByTestId('share-linkedin')).toBeDisabled()
+    await act(async () => { answer({ social_share_sites: ['x', 'linkedin'] }) })
+    expect(screen.getByTestId('share-x')).not.toBeDisabled()
+  })
+
+  it('offers no site when the config read fails, and says why', async () => {
+    dashCfgMock.mockRejectedValue(new Error('offline'))
+    await renderModal()
+    expect(await screen.findByTestId('share-sites-error')).toHaveTextContent(/sites you may share to/i)
+    expect(screen.queryByTestId('share-x')).toBeNull()
+    expect(screen.queryByTestId('share-linkedin')).toBeNull()
+    // The local actions do not depend on the site list.
+    expect(screen.getByTestId('share-download')).not.toBeDisabled()
+  })
+
+  it('re-reads the site list before navigating and stops when the site was withdrawn', async () => {
+    vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
+    stubClipboard({ write: vi.fn().mockResolvedValue(undefined) })
+    const tab = { opener: {} as unknown, location: { href: '' }, close: vi.fn() }
+    vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window)
+    await renderModal()
+    const x = await screen.findByTestId('share-x')
+    dashCfgMock.mockResolvedValue({ social_share_sites: ['linkedin'] })
+    fireEvent.click(x)
+    await waitFor(() => expect(tab.close).toHaveBeenCalledTimes(1))
+    expect(tab.location.href).toBe('')
+    await waitFor(() => expect(screen.queryByTestId('share-x')).toBeNull())
   })
 })

@@ -6,7 +6,8 @@ builds them and an adjustment is a single-file edit.
 
 1. ``session/update`` display/telemetry frames, whose discriminant blob arrives
    in a different shape than ``kiro-cli``'s. The handlers that act on a parsed
-   frame live in :mod:`kiro_crew.acp.session_handle`.
+   frame live in :mod:`kiro_crew.acp.session_handle_kas` (sub-agent frames in
+   :mod:`kiro_crew.acp.session_handle_native_children`).
 2. The **hooks** surface: the backend can delegate hook extraction AND
    execution to its ACP client, asking ``_kiro/hooks/list`` for the hooks
    matching a trigger, ``_kiro/hooks/sessionStart`` for results computed before
@@ -75,6 +76,8 @@ KIND_STEERING_QUEUED = "steering_queued"
 KIND_STEERING_INJECTED = "steering_injected"
 KIND_STEERING_CLEARED = "steering_cleared"
 KIND_AGENT_SUBTASK = "agent-subtask"  # hyphenated, not underscored
+# Sent once per prompt, right after KAS stores the user row: names that row's id.
+KIND_USER_MESSAGE_ID_ASSIGNED = "user_message_id_assigned"
 
 # Summarization maps to Crew's compaction status; steering to mid-turn steer.
 SUMMARIZATION_KINDS = frozenset(
@@ -95,7 +98,11 @@ FIELD_PIPELINE = "pipeline"
 FIELD_STAGES = "stages"
 FIELD_UNIT = "unit"
 FIELD_USAGE = "usage"
+FIELD_USER_MESSAGE_ID = "userMessageId"
 UNIT_CREDIT = "credit"
+# ``initialize``'s ``agentCapabilities._meta.kiro`` flag that announces the
+# ``_kiro/checkpoint/*`` verbs (``METHOD_KAS_CHECKPOINT_REVERT``).
+CAPABILITY_CHECKPOINTS = "checkpoints"
 
 
 def kiro_meta(update: dict) -> dict[str, Any] | None:
@@ -816,7 +823,8 @@ async def hooks_execute(
        an unowned session has no surface to resolve;
     2. the id was listed for that session and still resolves to an enabled hook;
     3. the command clears the tool gate (:func:`_gate_hook_command`);
-    4. ``capabilities.script_hooks`` permits it on that session's key.
+    4. ``capabilities.script_hooks`` permits it on that session's key, for the
+       stored hook's event (``hook_event_governance.event_refusal``).
 
     The spawn itself is ``run_script_hook`` on the same snapshot the gates judged:
     the same sandbox, environment allowlist, output cap, redaction and timeout a
@@ -836,6 +844,11 @@ async def hooks_execute(
         refusal = await asyncio.to_thread(
             _gate_hook_command, hook.command, session_key=session_key, agent=agent
         )
+        if refusal is None:
+            from kiro_crew.hook_event_governance import event_refusal
+
+            # The policy's ``events`` list, asked for the stored hook's event.
+            refusal = await asyncio.to_thread(event_refusal, session_key, hook.event)
         if refusal is not None:
             raise HookExecuteRefused(refusal)
         prompt = sanitize_string(_str_param(params, "userPrompt"))

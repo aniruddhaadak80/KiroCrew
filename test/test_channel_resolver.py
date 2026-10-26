@@ -6,6 +6,7 @@ import json
 import time
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 
 from kiro_crew.slack.channel_resolver import (
@@ -13,6 +14,7 @@ from kiro_crew.slack.channel_resolver import (
     _CACHE_TTL_SECS,
     ChannelNameResolver,
 )
+from kiro_crew.slack.client import RealSlackClient
 
 
 def _make_slack(channels: list[dict] | Exception | None = None) -> AsyncMock:
@@ -87,6 +89,94 @@ class TestResolveMany:
         # Failed refresh — falls through to id fallback
         assert result == {"C111": "C111"}
 
+    @pytest.mark.asyncio
+    async def test_successful_empty_refresh_is_cached(self, tmp_path):
+        resolver = ChannelNameResolver(cache_path=tmp_path / _CACHE_FILENAME)
+        slack = _make_slack([])
+
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+
+        slack.conversations_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_real_client_first_page_failure_stays_retryable(self, tmp_path):
+        resolver = ChannelNameResolver(cache_path=tmp_path / _CACHE_FILENAME)
+        web = AsyncMock()
+        web.conversations_list = AsyncMock(
+            side_effect=[
+                aiohttp.ClientError("temporary Slack failure"),
+                {"channels": [], "response_metadata": {}},
+            ]
+        )
+        slack = RealSlackClient.__new__(RealSlackClient)
+        slack._web = web
+
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+
+        assert web.conversations_list.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_real_client_keeps_channels_when_a_later_page_fails(self):
+        channel = {"id": "C111", "name": "engineering"}
+        web = AsyncMock()
+        web.conversations_list = AsyncMock(
+            side_effect=[
+                {
+                    "channels": [channel],
+                    "response_metadata": {"next_cursor": "next"},
+                },
+                aiohttp.ClientError("second page failed"),
+            ]
+        )
+        slack = RealSlackClient.__new__(RealSlackClient)
+        slack._web = web
+
+        assert await slack.conversations_list() == [channel]
+
+    @pytest.mark.asyncio
+    async def test_real_client_empty_first_page_then_failure_raises(self):
+        # An empty first page that carries a next_cursor, followed by a
+        # failing later page, has collected nothing: the result must stay a
+        # failure (raise) rather than returning [] — otherwise the resolver
+        # caches an empty "successful" refresh and suppresses retries for the
+        # full TTL. Keeping-the-partial only applies once channels exist.
+        web = AsyncMock()
+        web.conversations_list = AsyncMock(
+            side_effect=[
+                {"channels": [], "response_metadata": {"next_cursor": "next"}},
+                aiohttp.ClientError("second page failed"),
+            ]
+        )
+        slack = RealSlackClient.__new__(RealSlackClient)
+        slack._web = web
+
+        with pytest.raises(aiohttp.ClientError):
+            await slack.conversations_list()
+
+    @pytest.mark.asyncio
+    async def test_real_client_empty_first_page_failure_stays_retryable(self, tmp_path):
+        # End-to-end through the resolver: the above all-empty page failure
+        # must NOT be cached, so a later resolve re-hits the API.
+        resolver = ChannelNameResolver(cache_path=tmp_path / _CACHE_FILENAME)
+        web = AsyncMock()
+        web.conversations_list = AsyncMock(
+            side_effect=[
+                {"channels": [], "response_metadata": {"next_cursor": "next"}},
+                aiohttp.ClientError("second page failed"),
+                {"channels": [], "response_metadata": {}},
+            ]
+        )
+        slack = RealSlackClient.__new__(RealSlackClient)
+        slack._web = web
+
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "C111"}
+
+        assert web.conversations_list.await_count == 3
+
 
 class TestDiskCache:
     @pytest.mark.asyncio
@@ -113,6 +203,35 @@ class TestDiskCache:
         result = await resolver.resolve_many(slack, ["C111"])
         assert result == {"C111": "preloaded"}
         slack.conversations_list.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refresh_persists_cache_off_loop(self, tmp_path, monkeypatch):
+        """``_save_to_disk`` serializes the whole channel map and atomic-writes
+        it while ``_refresh`` holds the resolver lock, so it must not run on
+        the event loop thread. The file it writes is still the merged map."""
+        import threading
+
+        import kiro_crew.slack.channel_resolver as resolver_mod
+
+        cache_path = tmp_path / _CACHE_FILENAME
+        resolver = ChannelNameResolver(cache_path=cache_path)
+        loop_thread = threading.get_ident()
+        threads = []
+        real_atomic_write = resolver_mod.atomic_write
+
+        def recording_atomic_write(path, payload):
+            threads.append(threading.get_ident())
+            real_atomic_write(path, payload)
+
+        monkeypatch.setattr(resolver_mod, "atomic_write", recording_atomic_write)
+        slack = _make_slack([{"id": "C111", "name": "engineering"}])
+
+        assert await resolver.resolve_many(slack, ["C111"]) == {"C111": "engineering"}
+
+        assert len(threads) == 1
+        assert threads[0] != loop_thread
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        assert data["names"] == {"C111": "engineering"}
 
     def test_corrupt_disk_cache_starts_fresh(self, tmp_path):
         cache_path = tmp_path / _CACHE_FILENAME

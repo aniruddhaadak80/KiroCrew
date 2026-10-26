@@ -30,6 +30,7 @@ from kiro_crew.config.loader import (
     SttConfig,
     _validated_stt_provider,
 )
+from kiro_crew.testing.wait import await_until, finished
 
 _IS_MACOS = platform.system() == "Darwin"
 
@@ -385,7 +386,7 @@ class TestHelperBuild:
         binary = cache / apple_speech._HELPER_NAME
         binary.write_text("#!/bin/sh\ntrue\n")
         # Owner-only is correct for an executable; semgrep's 0o644 suggestion would
-        # strip the execute bit. Same rationale as `sandbox.py::_ensure_run_dir`.
+        # strip the execute bit. Same rationale as `sandbox_argv.py::_ensure_run_dir`.
         os.chmod(binary, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
         stamp = cache / f"{apple_speech._HELPER_NAME}.stamp"
         stamp.write_text(
@@ -733,6 +734,30 @@ class TestTranscribePlumbing:
             text, meta = await apple_speech.transcribe("/tmp/x.wav")
         assert text is None
         assert "no output" in meta["error"]
+
+    @pytest.mark.asyncio
+    async def test_empty_text_payload_is_an_empty_transcript_not_a_failure(self):
+        """A helper that exits cleanly with ``"text": ""`` heard silence. That is
+        a transcript of nothing, not a failure: ``""`` with no ``error`` key, so
+        the batch seam (and the endpoint's 200/500 split behind it) can tell a
+        quiet recording from a broken helper."""
+        payload = {"text": "", "locale": "en-US", "audio_secs": 2.0, "transcribe_secs": 0.1}
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(json.dumps(payload).encode(), b""))
+        proc.returncode = 0
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            _passthrough_sandbox(),
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav")
+        assert text == ""
+        assert text is not None
+        assert "error" not in meta
+        assert meta["audio_secs"] == 2.0
 
     @pytest.mark.asyncio
     async def test_successful_payload_returns_text_and_metrics(self):
@@ -1106,10 +1131,50 @@ class TestStreamingSession:
         assert session._final_text == "hello world"
 
     @pytest.mark.asyncio
-    async def test_close_is_idempotent(self):
+    async def test_close_is_idempotent(self, tmp_path):
+        launcher = tmp_path / "launcher.sh"
+        launcher.write_text("#!/bin/sh\n", "utf-8")
+        proc = Mock(returncode=None, kill=Mock(), wait=AsyncMock())
+        pump = Mock()
         session = apple_speech.StreamingSession()
+        session._proc = proc  # type: ignore[assignment]
+        session._pump = pump  # type: ignore[assignment]
+        session._sb_cleanup = str(launcher)
         await session.close()
         await session.close()
+
+        assert proc.kill.call_count == 1
+        assert proc.wait.await_count == 1
+        assert pump.cancel.call_count == 1
+        assert not launcher.exists()
+        assert (session._proc, session._pump, session._sb_cleanup) == (None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_a_helper_line_that_is_not_an_object_is_skipped_mid_utterance(self):
+        """``RecursionError`` (a line nested past the decoder) and the plain
+        ``ValueError`` of an over-long integer are not ``JSONDecodeError``s:
+        unlisted, either ended the reader and dictation with it."""
+        from types import SimpleNamespace
+
+        from stray_line_helpers import STRAY_LINES
+
+        stdout = asyncio.StreamReader(limit=1 << 20)
+        for line in (
+            b'{"type": "partial", "text": "hel"}\n',
+            *(make() for make in STRAY_LINES.values()),
+            b'{"type": "final", "text": "hello"}\n',
+        ):
+            stdout.feed_data(line)
+        stdout.feed_eof()
+        session = apple_speech.StreamingSession()
+        session._proc = SimpleNamespace(stdout=stdout)  # type: ignore[assignment]
+
+        await finished(session._read_events(), "reader drains stdout to EOF")
+
+        kinds = []
+        while (event := session._queue.get_nowait()) is not None:
+            kinds.append(event["type"])
+        assert kinds == ["partial", "final"]
 
 
 class TestHelperArgvPinsFast:
@@ -1708,16 +1773,21 @@ class TestNoBlockingCallOnEventLoop:
         assert STT_PROVIDER_LOCAL in offered
         assert "transcribe" in offered
 
-    def test_fast_swiftc_resolver_never_spawns(self):
+    def test_fast_swiftc_resolver_never_spawns(self, tmp_path):
         def boom(*args, **kwargs):
             raise AssertionError("the loop-safe resolver spawned a subprocess")
 
+        swiftc = tmp_path / "swiftc"
+        swiftc.write_text("", "utf-8")
+        fixed = (str(tmp_path / "missing"), str(swiftc))
         with (
             patch("subprocess.run", boom),
             patch("subprocess.Popen", boom),
             patch("subprocess.check_output", boom),
+            patch.object(apple_speech, "_SWIFTC_FIXED_PATHS", fixed),
+            patch.object(apple_speech, "_is_trusted_toolchain", lambda p: p == str(swiftc)),
         ):
-            apple_speech._swiftc_fast()
+            assert apple_speech._swiftc_fast() == str(swiftc)
 
     def test_blocking_resolver_is_only_reached_from_the_build_path(self):
         """`_swiftc` MAY spawn (`xcrun`), so it must not appear in a loop-safe
@@ -1728,6 +1798,70 @@ class TestNoBlockingCallOnEventLoop:
             src = inspect.getsource(fn)
             assert "_swiftc()" not in src, f"{fn.__name__} reaches the spawning resolver"
         assert "_swiftc()" in inspect.getsource(apple_speech._build_helper)
+
+
+_PREFERRED_SAY_VOICE = "Samantha"
+
+
+def _en_us_say_voice(listing: str) -> str | None:
+    """Pick an installed en_US voice from ``say -v '?'`` output.
+
+    Each line reads ``<name>  <locale>  # <sample>``. A name can hold spaces and
+    parentheses, so the locale is the last field before the ``#``. Samantha wins
+    when present; otherwise the first en_US voice listed is used.
+    """
+    voices = []
+    for line in listing.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 2 and fields[-1] == "en_US":
+            voices.append(" ".join(fields[:-1]))
+    if _PREFERRED_SAY_VOICE in voices:
+        return _PREFERRED_SAY_VOICE
+    return voices[0] if voices else None
+
+
+async def _say_voice_args() -> list[str]:
+    """``say`` flags that pin an installed en_US voice, or none at all.
+
+    With no en_US voice installed the fixture uses the host's default voice.
+    """
+    import asyncio
+
+    proc = await asyncio.create_subprocess_exec("say", "-v", "?", stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    voice = _en_us_say_voice(out.decode("utf-8", "replace"))
+    return ["-v", voice] if voice else []
+
+
+class TestEnUsSayVoice:
+    """The e2e fixtures synthesize English, so the voice must speak en_US.
+
+    The host's default voice can be non-English or mis-speak the phrase, while
+    the recognizer is pinned to en-US.
+    """
+
+    LISTING = (
+        "Albert              en_US    # Hello! My name is Albert.\n"
+        "Anna                de_DE    # Hallo! Ich heiße Anna.\n"
+        "Eddy (English (US)) en_US    # Hello! My name is Eddy.\n"
+        "Samantha            en_US    # Hello! My name is Samantha.\n"
+    )
+
+    def test_prefers_samantha(self):
+        assert _en_us_say_voice(self.LISTING) == "Samantha"
+
+    def test_falls_back_to_first_en_us_voice(self):
+        listing = self.LISTING.replace("Samantha ", "Zoe      ")
+        assert _en_us_say_voice(listing) == "Albert"
+
+    def test_keeps_a_name_with_spaces(self):
+        listing = "Anna   de_DE  # Hallo\nEddy (English (US)) en_US # Hi\n"
+        assert _en_us_say_voice(listing) == "Eddy (English (US))"
+
+    def test_none_when_no_en_us_voice(self):
+        listing = "Anna   de_DE  # Hallo\nDaniel en_GB # Hello\n"
+        assert _en_us_say_voice(listing) is None
+        assert _en_us_say_voice("") is None
 
 
 @pytest.mark.skipif(
@@ -1752,14 +1886,17 @@ class TestEndToEndMacOS:
             pytest.skip("no Swift toolchain on this host")
         if not shutil.which("say"):
             pytest.skip("no `say` to synthesize a fixture")
+        voice_args = await _say_voice_args()
 
         audio = tmp_path / "sample.aiff"
+        # ``-v`` pins an en_US voice, when one is installed, to match the en-US
+        # recognizer below.
         # ``-o`` makes ``say`` write the AIFF instead of playing it through the
         # sound output, so the fixture is silent on the developer's machine. The
         # child runs from tmp_path so any file it creates lands there, not in
         # the checkout it would otherwise inherit as CWD.
         proc = await asyncio.create_subprocess_exec(
-            "say", "-o", str(audio), "the build is green", cwd=tmp_path
+            "say", *voice_args, "-o", str(audio), "the build is green", cwd=tmp_path
         )
         await proc.wait()
         assert audio.is_file()
@@ -1789,12 +1926,14 @@ class TestEndToEndMacOS:
         for tool in ("say", "afconvert"):
             if not shutil.which(tool):
                 pytest.skip(f"no `{tool}` to build a 16 kHz fixture")
+        voice_args = await _say_voice_args()
 
         aiff = tmp_path / "s.aiff"
         # ``-o`` writes the AIFF instead of playing it; cwd=tmp_path keeps any
         # stray output out of the checkout (see test_round_trip).
         proc = await asyncio.create_subprocess_exec(
             "say",
+            *voice_args,
             "-o",
             str(aiff),
             "the continuous integration build is green and the tests all pass",
@@ -1847,7 +1986,7 @@ class TestEndToEndMacOS:
                     await asyncio.sleep(target - now)
             last_audio_at = time.perf_counter()
             text = await session.finish()
-            await asyncio.wait_for(reader, timeout=5)
+            await await_until(reader, what="partial-result reader")
         finally:
             await session.close()
 

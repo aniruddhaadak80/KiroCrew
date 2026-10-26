@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew.mcp_shared import DeferredTool
 from kiro_crew.validation import SPAWN_RUN_SCHEMA, ValidationError, validate_tool_args
 
 
@@ -53,7 +54,12 @@ def _posted(args: dict[str, Any], tool: str = "spawn_run") -> list[dict]:
         patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:chat-1"),
         patch.object(mcp_core, "sel", MagicMock()),
     ):
-        mcp_core._call_tool_inner(tool, _through_solo_gate(args, tool))
+        result = mcp_core._call_tool_inner(tool, _through_solo_gate(args, tool))
+        # spawn_sub_agents parks and posts one member per step; drive the
+        # submission here so the bodies are observable.
+        if isinstance(result, DeferredTool):
+            while getattr(result, "phase", None) == "submit":
+                result.step()
     return bodies
 
 
@@ -110,20 +116,23 @@ class TestSpawnSubAgentsToolForwarding:
 class TestSchemaCoercion:
     """A group must never be withheld by a value the caller did not mean."""
 
-    def test_explicit_null_resolves_to_kept_not_withheld(self):
-        """JSON null means "unset"; it must not read as a withheld group."""
-        cleaned = validate_tool_args({"task": "x", "include_memory": None}, SPAWN_RUN_SCHEMA)
-        assert cleaned["include_memory"] is True
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            # JSON null means "unset"; it must not read as a withheld group.
+            pytest.param(None, True, id="test_explicit_null_resolves_to_kept_not_withheld"),
+            pytest.param(False, False, id="test_explicit_false_survives"),
+        ],
+    )
+    def test_explicit_value_cleans_to(self, value, expected):
+        cleaned = validate_tool_args({"task": "x", "include_memory": value}, SPAWN_RUN_SCHEMA)
+        assert cleaned["include_memory"] is expected
 
     def test_absent_field_cleans_to_true(self):
         cleaned = validate_tool_args({"task": "x"}, SPAWN_RUN_SCHEMA)
         assert cleaned["include_memory"] is True
         assert cleaned["include_lessons"] is True
         assert cleaned["include_project"] is True
-
-    def test_explicit_false_survives(self):
-        cleaned = validate_tool_args({"task": "x", "include_memory": False}, SPAWN_RUN_SCHEMA)
-        assert cleaned["include_memory"] is False
 
     @pytest.mark.parametrize("bad", ["false", "true", "", 0, 1, 2.5, [], {}])
     def test_non_bool_is_rejected_rather_than_coerced(self, bad):

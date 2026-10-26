@@ -2,9 +2,6 @@
 
 Focus areas (the largest coverage gaps):
 
-* the browser-snapshot compressors (``_compress_snapshot_to_outline`` /
-  ``_search_snapshot``) and the ``browse_outline`` / ``browse_search`` tools
-  that wrap them,
 * the loopback HTTP verb helpers (``_get`` / ``_patch`` / ``_put`` /
   ``_delete``) plus ``_http_error_body`` error decoding + redaction,
 * the chat-history snippet helpers and ``_format_anchor``,
@@ -36,17 +33,16 @@ from kiro_crew.history import INCOGNITO_MEMORY_MODES
 from kiro_crew.mcp_core import (
     _call_tool,
     _casefold_match_span,
-    _compress_snapshot_to_outline,
     _do_select_crew,
     _extract_history_snippet,
     _format_anchor,
     _history_is_incognito,
     _http_error_body,
     _parse_iso_date_epoch,
-    _search_snapshot,
     _validate_args,
     _ws_bucket,
 )
+from kiro_crew.skill_runtime.search import SkillSearchReport
 
 
 class _FakeResponse:
@@ -85,75 +81,6 @@ def _no_session_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat-1")
     monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
     monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s3cr3t")
-
-
-# ── snapshot compression helpers ──────────────────────────────────────────
-
-
-class TestCompressSnapshotToOutline:
-    def test_empty_snapshot_is_reported_not_crashed(self):
-        assert "Empty snapshot" in _compress_snapshot_to_outline("")
-
-    def test_keeps_interactive_lines_and_drops_noise(self):
-        snapshot = "\n".join(
-            [
-                "- generic",
-                "",
-                "-",
-                '    - button "Save" [ref=e7]',
-                '  - heading "Title"',
-                "  - decorative-thing",
-            ]
-        )
-        out = _compress_snapshot_to_outline(snapshot)
-        assert "Page outline (2 elements)" in out
-        assert 'button "Save" [ref=e7]' in out
-        assert "decorative-thing" not in out
-
-    def test_indent_is_compacted_and_capped(self):
-        deep = " " * 40 + '- button "Deep" [ref=e1]'
-        out = _compress_snapshot_to_outline(deep)
-        body = out.split("\n")[1]
-        # min(indent // 2, 4) levels of two spaces → 8 leading spaces max.
-        assert body.startswith(" " * 8)
-        assert not body.startswith(" " * 10)
-
-    def test_truncates_at_max_lines(self):
-        snapshot = "\n".join(f'- button "b{i}" [ref=e{i}]' for i in range(20))
-        out = _compress_snapshot_to_outline(snapshot, max_lines=5)
-        assert "... (truncated at 5 lines)" in out
-        assert 'button "b19"' not in out
-
-    def test_no_interactive_elements_reports_total_lines(self):
-        out = _compress_snapshot_to_outline("- plain\n- text\n\n- words")
-        assert "No interactive elements found in snapshot (3 total lines)" in out
-
-
-class TestSearchSnapshot:
-    def test_empty_snapshot_and_empty_query_are_distinct_errors(self):
-        assert _search_snapshot("", "x") == "Empty snapshot."
-        assert _search_snapshot("some page", "") == "Error: query is required"
-
-    def test_matches_are_numbered_from_one(self):
-        out = _search_snapshot("alpha\nbeta\nBETA again", "beta")
-        assert "Found 2 matches" in out
-        assert "L2: beta" in out
-        assert "L3: BETA again" in out
-
-    def test_invalid_regex_falls_back_to_literal_search(self):
-        out = _search_snapshot("cost is 5 (approx)", "(approx")
-        assert "L1: cost is 5 (approx)" in out
-
-    def test_no_match_reports_line_count(self):
-        out = _search_snapshot("a\nb", "zzz")
-        assert "No matches for 'zzz' in snapshot (2 lines)." == out
-
-    def test_max_results_caps_output(self):
-        out = _search_snapshot("\n".join(["hit"] * 10), "hit", max_results=3)
-        assert "Found 3 matches" in out
-
-
-# ── loopback HTTP verb helpers ────────────────────────────────────────────
 
 
 class TestHttpErrorBody:
@@ -626,10 +553,18 @@ class TestSpawnLifecycleTools:
         assert body["max_turns"] == 3
         assert "run9" in out and "END YOUR TURN" in out
 
-    def test_continue_propagates_backend_error(self):
-        with patch.object(mcp_core, "_post", return_value={"error": "conversation_gone"}):
-            out = _call_tool("spawn_continue", {"conversation": "c", "task": "t"})
-        assert out == "Error: conversation_gone"
+    @pytest.mark.parametrize(
+        "tool,args,error",
+        [
+            ("spawn_continue", {"conversation": "c", "task": "t"}, "conversation_gone"),
+            ("spawn_steer", {"agent_id": "a1", "message": "m"}, "session_starting"),
+        ],
+        ids=["continue", "steer"],
+    )
+    def test_propagates_backend_error(self, tool, args, error):
+        with patch.object(mcp_core, "_post", return_value={"error": error}):
+            out = _call_tool(tool, args)
+        assert out == f"Error: {error}"
 
     def test_steer_posts_the_message_and_confirms(self):
         with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
@@ -639,11 +574,6 @@ class TestSpawnLifecycleTools:
         # "follow_up" queues for delivery after the run's turn completes.
         assert m.call_args[0][1] == {"message": "stop that", "mode": "interrupt"}
         assert "Steered run a1" in out
-
-    def test_steer_propagates_backend_error(self):
-        with patch.object(mcp_core, "_post", return_value={"error": "session_starting"}):
-            out = _call_tool("spawn_steer", {"agent_id": "a1", "message": "m"})
-        assert out == "Error: session_starting"
 
     def test_release_confirms_and_propagates_error(self):
         with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
@@ -771,10 +701,15 @@ class TestWorkflowRun:
         assert "Started workflow run `r1`" in out
         assert "authoring the workflow" in out
 
-    def test_intent_path_propagates_error(self):
-        with patch.object(mcp_core, "_post", return_value={"error": "no model"}):
-            out = _call_tool("workflow_run", {"intent": "ship it"})
-        assert out == "workflow_run failed: no model"
+    @pytest.mark.parametrize(
+        "args,error",
+        [({"intent": "ship it"}, "no model"), ({"source": "ctx.agent('x')"}, "sandbox denied")],
+        ids=["intent-path", "source-path"],
+    )
+    def test_propagates_error(self, args, error):
+        with patch.object(mcp_core, "_post", return_value={"error": error}):
+            out = _call_tool("workflow_run", args)
+        assert out == f"workflow_run failed: {error}"
 
     def test_source_path_posts_to_run_and_reports_name(self):
         resp = {"run_id": "r2", "name": "nightly"}
@@ -788,11 +723,6 @@ class TestWorkflowRun:
         with patch.object(mcp_core, "_post", return_value={"run_id": "r3"}):
             out = _call_tool("workflow_run", {"source": "ctx.agent('x')"})
         assert "(name: —)" in out
-
-    def test_source_path_propagates_error(self):
-        with patch.object(mcp_core, "_post", return_value={"error": "sandbox denied"}):
-            out = _call_tool("workflow_run", {"source": "ctx.agent('x')"})
-        assert out == "workflow_run failed: sandbox denied"
 
     def test_source_wins_over_intent(self):
         with patch.object(mcp_core, "_post", return_value={"run_id": "r4"}) as m:
@@ -1034,12 +964,14 @@ class TestSkillSearch:
         assert seen[0][2] == "dashboard:signed"
 
     @staticmethod
-    def _gateway(monkeypatch: pytest.MonkeyPatch, matches: list[dict]) -> list[str]:
+    def _gateway(
+        monkeypatch: pytest.MonkeyPatch, matches: list[dict], **extra: object
+    ) -> list[str]:
         seen: list[str] = []
 
         def _get(path: str, **_kw: object) -> dict:
             seen.append(path)
-            return {"matches": matches}
+            return {"matches": matches, **extra}
 
         monkeypatch.setattr(mcp_core, "_get", _get)
         monkeypatch.setattr(
@@ -1101,6 +1033,12 @@ class TestSkillSearch:
         out = _call_tool("skill_search", {"query": "zzz"})
         assert "No skills matched 'zzz'" in out
 
+    def test_no_matches_in_a_mapped_scope_names_the_scope(self, monkeypatch: pytest.MonkeyPatch):
+        self._gateway(monkeypatch, [], scoped=True)
+        out = _call_tool("skill_search", {"query": "babysit"})
+        assert "No skills matched 'babysit'. Search covers only this agent's skill://" in out
+        assert "not found" in out
+
     def test_pid_walked_identity_never_selects_a_project(self, monkeypatch: pytest.MonkeyPatch):
         """A tokenless spawn child resolves leniently to its PARENT slot. The
         gateway route returns that project's confined skill bodies, so only a
@@ -1117,9 +1055,17 @@ class TestSkillSearch:
             mcp_core,
             "SkillsLoader",
             lambda **_kw: SimpleNamespace(
-                search_skills=lambda q, limit, **kwargs: [
-                    {"name": "global-only", "key": "g/global-only", "description": q, "path": "/g"}
-                ],
+                search_skills_report=lambda q, limit, **kwargs: SkillSearchReport(
+                    [
+                        {
+                            "name": "global-only",
+                            "key": "g/global-only",
+                            "description": q,
+                            "path": "/g",
+                        }
+                    ],
+                    False,
+                ),
                 close=lambda: closed.append(True),
             ),
         )
@@ -1155,11 +1101,13 @@ class TestSkillSearch:
         closed: list[bool] = []
 
         def _loader(**_kw: object) -> SimpleNamespace:
-            def _search(_q: str, limit: int, **kwargs) -> list[dict]:
+            def _search(_q: str, limit: int, **kwargs) -> SkillSearchReport:
                 seen.append(limit)
-                return [{"name": "s", "key": "s", "description": "d", "path": "/p"}]
+                return SkillSearchReport(
+                    [{"name": "s", "key": "s", "description": "d", "path": "/p"}], False
+                )
 
-            return SimpleNamespace(search_skills=_search, close=lambda: closed.append(True))
+            return SimpleNamespace(search_skills_report=_search, close=lambda: closed.append(True))
 
         monkeypatch.setattr(mcp_core, "SkillsLoader", _loader)
         out = _call_tool("skill_search", {"query": "x", "limit": 7})

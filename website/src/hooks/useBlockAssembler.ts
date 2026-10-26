@@ -11,7 +11,7 @@ import type { ContentBlock } from '../types'
 // whose label was truncated to the first `\w+` run, followed by a phantom empty
 // "code" block that ran to the end of the message. Group 2 is the tag; the
 // rest of the info string is accepted and ignored, including leading whitespace
-// before the tag. Same rule fixCodeFences and the code-block label regex apply.
+// before the tag. Same tag rule fixCodeFences and the code-block label regex apply.
 const FENCE_OPEN = /^(`{3,})\s*([^`\s]*)[^`]*$/
 // Escape ALL regex metacharacters before interpolating a captured fence run
 // into a dynamic RegExp. The capture is currently backtick-only, but a
@@ -28,6 +28,39 @@ const FENCE_CLOSE_RE = (() => {
     return re
   }
 })()
+// A closing fence the model glued to the prose that follows it
+// (```**Summary**). CommonMark has no such closer, so the strict rule above
+// keeps the whole rest of the reply inside the fence; on a diff that tail is
+// then folded away behind a collapsed chip. Group 1 is the backtick run, group
+// 2 the glued text. The recovery is deliberately narrow: see isGluedProse.
+const GLUED_CLOSE = /^(`{3,})([^`].*)$/
+// The shape of an info string: a tag (```python, ```js:app.js), optionally
+// followed by whitespace and attributes (```python title="app.py"), or an
+// attribute block on its own (```{r}). A glued remainder of this shape may be
+// a nested opener or literal content, so it is never read as a close. A tag
+// starts with a letter or `_` and runs to the first space, backtick or `{`,
+// so ```rust,ignore and ```js= stay openers. A digit-first remainder such as
+// ```358KB is glued text.
+const INFO_STRING_SHAPE = /^(?:[A-Za-z_][^\s`{]*(?:\s.*|\{.*)?|\{.*)$/
+// Glued prose starts the way a line of reply text does: markdown emphasis or
+// a heading (`*`, `_`, `#`), a tag or quote marker (`<`, `>`), an image `!`,
+// a strike `~`, a digit, or a non-ASCII letter. A remainder that starts with a
+// quote, bracket or other code punctuation (```""" in a Python string that
+// builds markdown) is literal code, so it never closes the fence.
+const PROSE_START = /^[\d*_#<>!~\p{L}]/u
+
+/** True when the text after a backtick run is prose glued to a closing fence
+ * rather than an info string or code. It must contain no backtick (code such
+ * as a template literal keeps its run), must start like prose (see
+ * PROSE_START; this also rules out a leading space, as in the spaced-tag
+ * opener ``` foo), and must not have the shape of an info string. parseBlocks
+ * uses it inside a fence and inside a widget's fence. fixCodeFences in
+ * MarkdownRenderer keeps its own, wider split rule for markdown blocks. */
+export function isGluedProse(rest: string): boolean {
+  if (rest.includes('`') || !PROSE_START.test(rest)) return false
+  return !INFO_STRING_SHAPE.test(rest)
+}
+
 const DIFF_LINE = /^@@|^[+-]\d+:|^[+-][^+-\s]/
 // Outer fence languages where nested code fence examples are expected.
 // Only these languages trigger inner-fence depth tracking. Code languages
@@ -160,6 +193,7 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
   let widgetTitle = ''
   let widgetSlug = ''
   let widgetFenceTick = ''
+  let widgetFenceLen = 0  // raw backtick count of the widget's inner fence
   let mdStart = 1
   let codeStart = 1
   let widgetStart = 1
@@ -171,7 +205,7 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
     mdBuf = []
   }
 
-  const flushCode = (complete: boolean) => {
+  const flushCode = (complete: boolean, closed = true) => {
     const code = codeBuf.join('\n')
     const lang = fenceLang || undefined
     let type: ContentBlock['type'] = 'code'
@@ -180,7 +214,12 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
     // but an explicit language must never lose to content sniffing.
     else if (lang === 'excalidraw') type = 'excalidraw'
     else if (lang === 'diff' || isDiffContent(code, lang)) type = 'diff'
-    blocks.push({ type, content: code, language: lang, complete, startLine: codeStart })
+    const block: ContentBlock = { type, content: code, language: lang, complete, startLine: codeStart }
+    // Finished streaming is not the same as an observed closer: a finalized
+    // fence that never closed may hold the rest of the reply, so the renderer
+    // must not fold it away like a normal patch.
+    if (complete && !closed) block.unclosed = true
+    blocks.push(block)
     codeBuf = []
     fenceTick = ''
     fenceLang = ''
@@ -202,6 +241,7 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
     widgetTitle = ''
     widgetSlug = ''
     widgetFenceTick = ''
+    widgetFenceLen = 0
   }
 
   const pushMd = (text: string, lineIdx: number) => {
@@ -275,20 +315,36 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
             flushCode(true)
             state = 'outside'
           }
-        } else {
-          // Check if this line opens a nested fence inside our code block.
-          // Scoped to markup/doc outer languages where embedded code examples
-          // are common. For code languages (python, js, bash, etc.) a line
-          // like ```python is almost certainly literal content, not a nested
-          // structural fence — so we skip depth tracking entirely.
-          if (fenceNestable) {
-            const innerMatch = FENCE_OPEN.exec(line)
-            if (innerMatch && innerMatch[1].length === fenceLen && innerMatch[2]) {
-              innerFenceDepth++
-            }
-          }
-          codeBuf.push(line)
+          break
         }
+        // Check if this line opens a nested fence inside our code block.
+        // Scoped to markup/doc outer languages where embedded code examples
+        // are common. For code languages (python, js, bash, etc.) a line
+        // like ```python is almost certainly literal content, not a nested
+        // structural fence — so we skip depth tracking entirely. Runs before
+        // the glued-close check, so a markup example keeps its pre-existing
+        // nesting and an attributed inner opener never closes it.
+        if (fenceNestable) {
+          const innerMatch = FENCE_OPEN.exec(line)
+          if (innerMatch && innerMatch[1].length === fenceLen && innerMatch[2]) {
+            innerFenceDepth++
+            codeBuf.push(line)
+            break
+          }
+        }
+        // A closing run glued to prose: close here and re-read the glued
+        // text as an ordinary outside line, so a summary or widget tag after
+        // it gets its own block. Only a run at least as long as the opener
+        // can close it (CommonMark), and never while a nested example is open.
+        const glued = GLUED_CLOSE.exec(line)
+        if (glued && innerFenceDepth === 0 && glued[1].length >= fenceLen && isGluedProse(glued[2])) {
+          flushCode(true)
+          state = 'outside'
+          lines[i] = glued[2]
+          i--
+          break
+        }
+        codeBuf.push(line)
         break
       }
 
@@ -308,6 +364,7 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
         if (fenceMatch) {
           widgetBuf.push(line)
           widgetFenceTick = escapeRegExp(fenceMatch[1])
+          widgetFenceLen = fenceMatch[1].length
           state = 'widget-fence'
           break
         }
@@ -316,10 +373,23 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
       }
 
       case 'widget-fence': {
-        widgetBuf.push(line)
         if (FENCE_CLOSE_RE(widgetFenceTick).test(line)) {
+          widgetBuf.push(line)
           state = 'widget'
+          break
         }
+        // The same glued-closer recovery as the 'fence' state: close the
+        // inner fence and re-read the glued text as a widget line, so a
+        // </mcwidget> glued after it still ends the widget.
+        const glued = GLUED_CLOSE.exec(line)
+        if (glued && glued[1].length >= widgetFenceLen && isGluedProse(glued[2])) {
+          widgetBuf.push(glued[1])
+          state = 'widget'
+          lines[i] = glued[2]
+          i--
+          break
+        }
+        widgetBuf.push(line)
         break
       }
     }
@@ -327,7 +397,7 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
 
   // End of input: flush any open state.
   if (state === 'fence') {
-    flushCode(!streaming)
+    flushCode(!streaming, false)
   } else if (state === 'widget' || state === 'widget-fence') {
     flushWidget(!streaming)
   }
@@ -336,7 +406,8 @@ export function parseBlocks(raw: string, streaming: boolean): ContentBlock[] {
   return blocks
 }
 
-const THROTTLE_MS = 100
+/** How often the streaming structural parse runs. Exported so tests advance fake timers by it. */
+export const THROTTLE_MS = 100
 
 /** Shared empty result so the streaming path allocates nothing per render. */
 const NO_BLOCKS: ContentBlock[] = []
@@ -362,6 +433,128 @@ function nextLineOf(text: string): number {
  *  with their text goes through here so `nextLine` can never drift from `text`. */
 function snapOf(blocks: ContentBlock[], text: string): ParseSnap {
   return { blocks, text, nextLine: nextLineOf(text) }
+}
+
+// A list item opener at column 0: bullet, or ordered `1.` / `1)`.
+const LIST_ITEM_START = /^(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/
+// A top-level list item opener, which may sit up to three spaces in.
+const LIST_ITEM_OPEN = /^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/
+// Lines from which nothing later may be split off: a fence delimiter anywhere
+// on the line (fixCodeFences can turn a glued run into a fence the line
+// scanner here never sees), a display-math delimiter (`$$`, and the `\[` and
+// `\begin{` forms remarkLatexDelimiters reads), or any `<` that does not open
+// an autolink. Raw HTML of every kind (tags, comments, CDATA, declarations,
+// processing instructions) starts with `<`, and rehype-raw can nest later
+// paragraphs inside it, so matching the character rather than each construct
+// keeps the rule closed: a `<` in prose only costs the split.
+const SPLIT_STOP = /`{3}|~{3}|\$\$|\\\[|\\begin\{|<(?![A-Za-z][\w+.-]*:[^\s<>]*>)/
+/** True when `text` may hold a link reference or footnote definition, or a
+ *  footnote reference. Each binds text across blank lines, so such a block is
+ *  never split. Every definition, at any indent, inside any container and with
+ *  a label that spans lines or escapes a bracket, contains `]:`, so two
+ *  substring searches find them all in linear time; prose that merely contains
+ *  `]:` only loses the split. */
+function hasCrossBlockRef(text: string): boolean {
+  return text.includes(']:') || text.includes('[^')
+}
+
+/**
+ * Split one markdown block at blank-line boundaries that no later text can
+ * reach back across. Returns the block alone when nothing can be split.
+ *
+ * A boundary is a run of blank lines followed by a line with no leading
+ * whitespace (an indented line may continue a list item or an indented code
+ * block). It is skipped between two list items, which may form one loose
+ * list even when an item has lazy continuation lines, and before a bordered
+ * table row. Scanning stops at the first line holding a fence or display-math
+ * delimiter, or a `<` that does not open an autolink, and a block holding a
+ * reference or footnote definition anywhere is left whole. Every
+ * remaining construct ends at a blank line, so each piece parses to the same
+ * tree it has inside the whole block.
+ *
+ * A reference or footnote definition can arrive after the paragraphs that use
+ * it, and the pieces then merge back into one block, remounting them. The
+ * merge is what makes the link resolve, so correctness wins over keeping the
+ * pieces mounted.
+ */
+function splitParagraphs(last: ContentBlock): ContentBlock[] {
+  if (last.startLine == null) return [last]
+  const text = last.content
+  if (!text.includes('\n\n') || hasCrossBlockRef(text)) return [last]
+  const lines = text.split('\n')
+  const from = last.startLine
+  const pieces: ContentBlock[] = []
+  let start = 0 // first line of the current piece
+  // Inside a list that a later item may still join. An item line indented up
+  // to three spaces opens it. Only an unindented non-item line ends it, and
+  // only when it starts a new paragraph after a blank line; directly under an
+  // item it is a lazy continuation of that item, so the list goes on.
+  let inList = false
+  let afterBlank = true
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (SPLIT_STOP.test(line)) break
+    if (line.trim() !== '') {
+      if (LIST_ITEM_OPEN.test(line)) inList = true
+      else if (afterBlank && line[0] !== ' ' && line[0] !== '\t') inList = false
+      afterBlank = false
+      continue
+    }
+    afterBlank = true
+    let j = i
+    while (j < lines.length && lines[j].trim() === '') j++
+    // The blank run reaches the end: the paragraph after it has not started.
+    if (j >= lines.length) break
+    const next = lines[j]
+    const nextIsItem = LIST_ITEM_START.test(next)
+    // A bordered table row stays with the paragraph above it: the live tail
+    // holds back an incomplete table (deferIncompleteStreamingTable), and a
+    // piece holding only that table would render nothing and drop the caret.
+    if (next[0] !== ' ' && next[0] !== '\t' && next[0] !== '|' && !(inList && nextIsItem) && i > start) {
+      pieces.push({
+        type: 'markdown',
+        content: lines.slice(start, i).join('\n'),
+        complete: true,
+        startLine: from + start,
+        split: { from, part: pieces.length },
+      })
+      start = j
+    }
+    i = j - 1
+  }
+  if (pieces.length === 0) return [last]
+  pieces.push({
+    ...last,
+    content: lines.slice(start).join('\n'),
+    startLine: from + start,
+    split: { from, part: pieces.length },
+  })
+  return pieces
+}
+
+/** The no-split counterpart of splitMarkdownBlocks. */
+const keepBlocks = (blocks: ContentBlock[]): ContentBlock[] => blocks
+
+/**
+ * Split every markdown block of a parse into paragraph pieces (splitParagraphs),
+ * so settled paragraphs render as separate memoized blocks and only the last
+ * piece of the open tail re-parses on each animation frame. Without this the
+ * whole prose tail re-parses every frame: per-frame cost grows with answer
+ * length and the stream as a whole costs O(n^2).
+ *
+ * Every markdown block is split, not only the open tail: the tail stops being
+ * last the moment a fence opens after it, and splitting it only while last
+ * would merge its pieces back into one block and remount them, dropping state
+ * such as an image the reader allowed to load. Splitting the same text gives
+ * the same pieces, so a piece keeps its key from the parse where it settled.
+ *
+ * Applied to the streaming snapshot, and to the finished parse of a message
+ * that streamed in the same mount (see useBlockAssembler). A message mounted
+ * already finished renders from one unsplit parse.
+ */
+export function splitMarkdownBlocks(blocks: ContentBlock[]): ContentBlock[] {
+  if (!blocks.some((b) => b.type === 'markdown')) return blocks
+  return blocks.flatMap((b) => (b.type === 'markdown' ? splitParagraphs(b) : [b]))
 }
 
 /**
@@ -426,18 +619,30 @@ function extendTail(snap: ParseSnap, rawText: string): ContentBlock[] {
  * lurch in ~10Hz chunks and only animate smoothly during the post-stream
  * drain, after the completion sound.
  */
-export function useBlockAssembler(rawText: string, streaming: boolean): ContentBlock[] {
+export function useBlockAssembler(rawText: string, streaming: boolean, splitPieces = true): ContentBlock[] {
+  // `splitPieces` false keeps every markdown block whole, streaming or not.
+  const split = splitPieces ? splitMarkdownBlocks : keepBlocks
+  // Latched once this instance has streamed. Its finished render then keeps the
+  // paragraph pieces it streamed with, so the pieces after the first keep
+  // their React keys when the stream ends instead of remounting, and state in
+  // them (an image the reader allowed to load, a selection) survives. A
+  // message first mounted already finished renders from one unsplit parse.
+  // Set during render, which React allows for a component's own state.
+  const [streamedHere, setStreamedHere] = useState(streaming)
+  if (streaming && !streamedHere) setStreamedHere(true)
+
   // Gated on !streaming: during a stream this must not parse, or the throttle
   // below would only be deferring work the render had already paid for.
-  const immediateBlocks = useMemo(
-    () => (streaming ? NO_BLOCKS : parseBlocks(rawText, false)),
-    [rawText, streaming],
-  )
+  const immediateBlocks = useMemo(() => {
+    if (streaming) return NO_BLOCKS
+    const parsed = parseBlocks(rawText, false)
+    return streamedHere ? split(parsed) : parsed
+  }, [rawText, streaming, streamedHere, split])
 
   // Gated too: the early return below never reads this when !streaming, so a
   // completed message would otherwise pay a second full parse for nothing.
   const [throttledSnap, setThrottledSnap] = useState<ParseSnap>(() =>
-    streaming ? snapOf(parseBlocks(rawText, true), rawText) : EMPTY_SNAP,
+    streaming ? snapOf(split(parseBlocks(rawText, true)), rawText) : EMPTY_SNAP,
   )
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const latestTextRef = useRef(rawText)
@@ -462,10 +667,10 @@ export function useBlockAssembler(rawText: string, streaming: boolean): ContentB
       timerRef.current = setTimeout(() => {
         timerRef.current = null
         const text = latestTextRef.current
-        setThrottledSnap(snapOf(parseBlocks(text, true), text))
+        setThrottledSnap(snapOf(split(parseBlocks(text, true)), text))
       }, THROTTLE_MS)
     }
-  }, [rawText, streaming, immediateBlocks])
+  }, [rawText, streaming, immediateBlocks, split])
 
   useEffect(() => {
     return () => {

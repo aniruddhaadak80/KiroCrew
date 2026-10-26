@@ -199,6 +199,7 @@ class TestLegacyMachineryPreviewIsCorrectedOnRead:
             agents={CREW: KiroCrewAgentConfig(kiro_agent="kirocrew")},
             default_agent="kirocrew",
             memory_stores={},
+            degraded_sections=frozenset(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)
@@ -239,6 +240,7 @@ class TestLegacyMachineryPreviewIsCorrectedOnRead:
             agents={CREW: KiroCrewAgentConfig(kiro_agent="kirocrew")},
             default_agent="kirocrew",
             memory_stores={},
+            degraded_sections=frozenset(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)
@@ -274,6 +276,7 @@ class TestLegacyMachineryPreviewIsCorrectedOnRead:
             agents={CREW: KiroCrewAgentConfig(kiro_agent="kirocrew")},
             default_agent="kirocrew",
             memory_stores={},
+            degraded_sections=frozenset(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)
@@ -367,8 +370,8 @@ def _redaction_chain(text: str) -> str:
 
 
 class TestLivePreviewEqualsTheRosterRead:
-    """The live `member/message` payload (state.py, via `member_message_payload`)
-    and the cold roster read (`last_speech_info`) build the
+    """The live `member/message` payload (state_parts/slot_directory.py, via
+    `member_message_payload`) and the cold roster read (`last_speech_info`) build the
     preview through ONE function, `speech_preview`; a formatted or long message
     must fold to exactly the string the read returns, or the read would append a
     correction after every such message."""
@@ -486,6 +489,7 @@ class TestAnEmptyReadThatRanOutOfWindowIsNotAuthority:
             agents={CREW: KiroCrewAgentConfig(kiro_agent="kirocrew")},
             default_agent="kirocrew",
             memory_stores={},
+            degraded_sections=frozenset(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)
@@ -545,7 +549,8 @@ class TestEnvelopeClassifiersFollowTheRealWriters:
 
     def test_subagent_completion_meta_stamp_as_written_is_not_speech(self) -> None:
         # The gateway stamps SUBAGENT_COMPLETION_META_KEY with these fields
-        # (slack/gateway.py, "Structured header facts for the dashboard card");
+        # (slack/gateway_runtime/subagent_report.py, "Structured header facts for
+        # the dashboard card");
         # the classifier keys on the stamp before any header regex.
         from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY, SUBAGENT_COMPLETION_PREFIX
 
@@ -559,7 +564,7 @@ class TestEnvelopeClassifiersFollowTheRealWriters:
 
 class TestAnUnflushedSlotIsNotCorrectedFromDisk:
     """Live speech reaches the member log at in-memory append time (the emit in
-    state.py) while the transcript copy lands at slot flush. A roster read in
+    state_parts/slot_directory.py) while the transcript copy lands at slot flush. A roster read in
     between sees the NEW quote on the roster and the OLD speech on disk; with the
     roster observed before the read, the compare-and-append would accept the
     stale correction. `_slot_has_unflushed_rows` refuses it."""
@@ -601,6 +606,7 @@ class TestAnUnflushedSlotIsNotCorrectedFromDisk:
             agents={CREW: KiroCrewAgentConfig(kiro_agent="kirocrew")},
             default_agent="kirocrew",
             memory_stores={},
+            degraded_sections=frozenset(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)
@@ -666,6 +672,7 @@ class TestAnUnflushedSlotIsNotCorrectedFromDisk:
             agents={CREW: KiroCrewAgentConfig(kiro_agent="kirocrew")},
             default_agent="kirocrew",
             memory_stores={},
+            degraded_sections=frozenset(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)

@@ -14,6 +14,13 @@ from kiro_crew.skills import SkillsLoader
 env = _member_env
 
 
+@pytest.fixture(autouse=True)
+def _close_skills_loaders(close_skills_loaders):
+    """Every test here builds a ``ContextBuilder`` (``env`` included): close its
+    ``SkillsLoader`` (rootdir conftest) -- the skill search index is a SQLite
+    connection nothing else closes."""
+
+
 def test_v2_prompt_lifecycles_leave_retrieval_to_the_tool(env, monkeypatch):
     memory = env.memory
     memory.write_preferences("Use a concise reply.")
@@ -67,6 +74,7 @@ def test_v1_new_session_reads_activity_once_and_follow_ups_never(tmp_path):
         get_preferences_context=preferences,
         has_any_lesson=lambda: True,
         get_lessons_context=lessons,
+        startup_lesson_query=lambda query_text: None,
     )
     builder = ContextBuilder(
         memory=memory,
@@ -122,14 +130,14 @@ def test_withheld_memory_does_not_advertise_automatic_recall(tmp_path, options):
     assert "Facts and past experiences are not searched automatically" not in message
 
 
-def test_v1_new_session_bounds_pref_rows_at_the_startup_cap(tmp_path):
+def test_v1_new_session_bounds_pref_rows_at_the_startup_cap(tmp_path, opened):
     """The cap must reach the store through the real plumbing
     (context._ResolvedCaps -> memory.get_context -> get_preferences_context).
     Mocks cannot see a dropped keyword argument; a real store over the cap can."""
     from kiro_crew.context import _PREFS_STARTUP_CAP
     from kiro_crew.vector_memory import VectorMemoryStore
 
-    vectors = VectorMemoryStore(db_path=tmp_path / "mem.db")
+    vectors = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
     vectors.init()
     for i in range(60):
         vectors.set_semantic(f"pref.rule_{i:02d}", f"standing rule {i} " * 25, 0.9, "user_explicit")
@@ -147,3 +155,34 @@ def test_v1_new_session_bounds_pref_rows_at_the_startup_cap(tmp_path):
     assert "preference facts above the" in block
     assert f"{_PREFS_STARTUP_CAP}-character startup budget" in block
     assert 0 < block.count("\npref.rule_") < 60
+
+
+def test_v1_new_session_records_the_pref_cut_beside_its_notice(tmp_path, opened):
+    """The usage record states the same cut the startup notice states, gathered
+    through the real build rather than recomputed."""
+    import re
+
+    from kiro_crew import context_omissions
+    from kiro_crew.vector_memory import VectorMemoryStore
+
+    vectors = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
+    vectors.init()
+    for i in range(60):
+        vectors.set_semantic(f"pref.rule_{i:02d}", f"standing rule {i} " * 25, 0.9, "user_explicit")
+    memory = MemoryStore(workspace=tmp_path / "workspace", vector_store=vectors)
+    builder = ContextBuilder(
+        memory=memory,
+        skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        lessons=LessonStore(base_dir=tmp_path),
+    )
+    with context_omissions.collect() as cut:
+        first, _ = builder.build_message("plan the deploy", True, "session")
+    stated = re.search(r"omitted (\d+) of (\d+) preference facts above the (\d+)-character", first)
+    assert stated
+    omitted, total, limit = (int(g) for g in stated.groups())
+    assert cut[context_omissions.PREFERENCE_FACTS] == {
+        "reason": "budget",
+        "omitted": omitted,
+        "total": total,
+        "budget_chars": limit,
+    }

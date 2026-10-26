@@ -46,7 +46,11 @@ from kiro_crew.apps.builtins.mochi.pinned_files_service import (
     read_pins_for_update,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
-from kiro_crew.validation import ValidationError, validate_mcp_tool_arguments
+from kiro_crew.validation import (
+    ValidationError,
+    coerce_mcp_tool_args_json_schema,
+    validate_mcp_tool_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +490,10 @@ def _tool_perform_pet_action(args: dict[str, Any]) -> str:
             cached = json.loads((_data_dir() / "mochi-displays.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
+        # A file that parses but is not an object (a hand edit) is as unusable
+        # as malformed JSON: answer "no data yet" rather than fail the query.
+        if not isinstance(cached, dict):
+            cached = {}
         displays = cached.get("displays", [])
         active_id = cached.get("activeId")
         current = next(
@@ -703,8 +711,14 @@ def _validate_args(name: str, raw_args: dict[str, Any]) -> dict[str, Any]:
     names.
     """
     args = raw_args or {}
+    schema = _INPUT_SCHEMAS.get(name)
     try:
-        validate_mcp_tool_arguments(args, _INPUT_SCHEMAS.get(name))
+        # Repair an int an upstream deferred-schema runtime re-typed from a
+        # numeric-looking string ("42" -> 42) back to its string form on a
+        # string-typed property, BEFORE validation — this entry point is where
+        # that re-typing lands (see coerce_mcp_tool_args_json_schema).
+        args = coerce_mcp_tool_args_json_schema(args, schema)
+        validate_mcp_tool_arguments(args, schema)
     except ValidationError as exc:
         # Re-raise naming the tool. The shared helper renders a ValidationError as
         # `Error: <message>`, and a bare `arguments.which: not in enum` does not say

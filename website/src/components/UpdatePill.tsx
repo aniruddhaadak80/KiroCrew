@@ -6,6 +6,8 @@ import { useAppSelector } from '../store'
 import { i18nT } from '../i18n/t'
 import { settingsPath } from './settingsPath'
 import type { UpdateState } from '../hooks/useUpdateSubscription'
+import { DropdownMenuItem } from './ui/dropdown-menu'
+import { useGuardedLeave } from './NavigationLeaveGuard'
 
 /**
  * Top-bar update pill: the persistent, passive home for update state.
@@ -25,15 +27,33 @@ import type { UpdateState } from '../hooks/useUpdateSubscription'
  * interruption, and a user who skipped a version still deserves a quiet,
  * visible way back in.
  */
-export default function UpdatePill() {
+/**
+ * `variant="menu-item"`: the same update lifecycle (available → downloading N%
+ * → ready) as a row inside a DropdownMenu, for a bar that has no room for the
+ * pill — the phone chat page's single top bar holds two controls on its right
+ * and the update lands as the first item of its overflow menu. Same label
+ * source, same destination (Settings › About), so the two forms cannot drift.
+ */
+/**
+ * `showLabel`: keep the text at every width. The phone Crewmates bar sets it:
+ * there the pill sits alone beside the bell, and a bare download glyph did not
+ * say it was an update.
+ */
+export default function UpdatePill({ variant = 'pill', showLabel = false }: { variant?: 'pill' | 'menu-item'; showLabel?: boolean } = {}) {
   const navigate = useNavigate()
+  // Settings › About unmounts the page on screen, so ask it first: a tap on
+  // the pill must not drop an unsaved draft (a New crewmate card, a Schedules
+  // form) without the same confirm every other leave gets.
+  const guardedLeave = useGuardedLeave()
+  const target = settingsPath({ tab: 'about' })
+  const openAbout = () => guardedLeave(() => navigate(target), target)
   const updateAvailable = useAppSelector(
     s => s.dashboard.status?.update_available === true || s.dashboard.desktopUpdateAvailable
   )
   const { data: desktop } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
-    enabled: false, // populated by useUpdateSubscription (App.tsx)
+    enabled: false, // populated by useUpdateSubscription (shell/appShell.tsx)
     staleTime: Infinity,
   })
 
@@ -55,20 +75,48 @@ export default function UpdatePill() {
     Icon = RefreshCw
   }
 
+  if (variant === 'menu-item') {
+    // A menu row reads as an ACTION, and "Update available" alone promised a
+    // download or a restart mid-conversation to first-time readers. The row
+    // only navigates, so it names that outcome after the status, in the
+    // pill's own hover/aria wording -- one key, two forms.
+    return (
+      <DropdownMenuItem
+        data-testid="update-menu-item"
+        className="[@media(hover:none)]:min-h-10"
+        onSelect={openAbout}
+      >
+        {/* Accent on the row's own content, not on the DropdownMenuItem
+            primitive (restyle ratchet): the primitive keeps its palette. */}
+        <span className="flex items-center gap-2 text-accent">
+          <Icon size={14} className="shrink-0" />
+          <span>{label}</span>
+          <span aria-hidden="true" className="text-muted">—</span>
+          <span className="text-muted">{i18nT('components.updatePill.open_update_settings')}</span>
+        </span>
+      </DropdownMenuItem>
+    )
+  }
+
   return (
     <button
       type="button"
       data-testid="update-pill"
-      className="flex items-center gap-1.5 h-7 px-2.5 rounded-xl shrink-0 cursor-pointer text-[12px] whitespace-nowrap border border-accent/30 bg-accent-subtle text-accent hover:opacity-90 transition-opacity"
-      onClick={() => navigate(settingsPath({ tab: 'about' }))}
-      title={i18nT('components.updatePill.open_update_settings')}
+      // `showLabel` caps the pill at 88px (icon plus about one word) so a
+      // long label or locale truncates instead of taking the room the phone
+      // Crewmates header needs beside it, even on a 320px bar.
+      className={`flex items-center gap-1.5 h-7 px-2.5 rounded-xl shrink-0 cursor-pointer text-[12px] whitespace-nowrap border border-accent/30 bg-accent-subtle text-accent hover:opacity-90 transition-opacity${showLabel ? ' min-w-0 max-w-[88px]' : ''}`}
+      onClick={openAbout}
+      title={showLabel ? label : i18nT('components.updatePill.open_update_settings')}
       aria-label={i18nT('components.updatePill.open_update_settings')}
     >
-      <Icon size={13} className="lucide-inline" />
+      <Icon size={13} className="lucide-inline shrink-0" />
       {/* The text label yields at narrow widths (the icon + aria-label carry
           the meaning) so the pill cannot push the notification control out of
-          a 320px top bar. */}
-      <span className="hidden sm:inline">{label}</span>
+          a 320px top bar. On desktop the actions group's last collapse rung
+          hides it for the same reason (`tb-drop-update-label`, index.css).
+          With `showLabel` it stays, truncated to the capped pill. */}
+      <span className={showLabel ? 'min-w-0 truncate' : 'tb-drop-update-label hidden sm:inline'}>{label}</span>
     </button>
   )
 }

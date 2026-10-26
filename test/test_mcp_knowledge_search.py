@@ -29,17 +29,12 @@ class TestKnowledgeSearchDBMissing:
 
 
 class TestKnowledgeSearchValidation:
-    def test_empty_query_raises_validation_error(self):
+    @pytest.mark.parametrize("query", ["", "   "], ids=["empty", "whitespace"])
+    def test_blank_query_raises_validation_error(self, query):
         from kiro_crew.mcp_core import _call_tool_inner
 
         with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": ""})
-
-    def test_whitespace_query_raises_validation_error(self):
-        from kiro_crew.mcp_core import _call_tool_inner
-
-        with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "   "})
+            _call_tool_inner("local_knowledge_search", {"query": query})
 
     def test_limit_over_max_raises_validation_error(self):
         from kiro_crew.mcp_core import _call_tool_inner
@@ -127,10 +122,11 @@ class TestKnowledgeSearchResults:
 
         from kiro_crew.mcp_core import _call_tool_inner
 
-        _call_tool_inner("local_knowledge_search", {"query": "test"})
+        result = _call_tool_inner("local_knowledge_search", {"query": "test"})
         mock_retriever_cls.return_value.search.assert_called_once_with(
             "test", limit=3, source_id=None, namespace=None
         )
+        assert "No relevant knowledge found" in result
 
     @patch("kiro_crew.mcp_core.config_dir")
     @patch("kiro_crew.mcp_core.HybridRetriever")
@@ -238,12 +234,11 @@ class TestKnowledgeSearchResults:
 
 
 class TestKnowledgeSearchToolDefinition:
-    def test_tool_listed(self):
+    @pytest.mark.parametrize("name", ["local_knowledge_search", "knowledge_list_sources"])
+    def test_tool_listed(self, name):
         from kiro_crew.mcp_core import _list_tools
 
-        tools = _list_tools()
-        names = [t["name"] for t in tools]
-        assert "local_knowledge_search" in names
+        assert name in [t["name"] for t in _list_tools()]
 
     def test_tool_has_required_query(self):
         from kiro_crew.mcp_core import _list_tools
@@ -252,93 +247,63 @@ class TestKnowledgeSearchToolDefinition:
         tool = next(t for t in tools if t["name"] == "local_knowledge_search")
         assert "query" in tool["inputSchema"]["required"]
 
-    def test_source_id_is_optional(self):
+    @pytest.mark.parametrize("field", ["source_id", "namespace"])
+    def test_filter_field_is_optional(self, field):
         from kiro_crew.mcp_core import _list_tools
 
         tools = _list_tools()
         tool = next(t for t in tools if t["name"] == "local_knowledge_search")
-        assert "source_id" in tool["inputSchema"]["properties"]
-        assert "source_id" not in tool["inputSchema"]["required"]
-
-    def test_namespace_is_optional(self):
-        from kiro_crew.mcp_core import _list_tools
-
-        tools = _list_tools()
-        tool = next(t for t in tools if t["name"] == "local_knowledge_search")
-        assert "namespace" in tool["inputSchema"]["properties"]
-        assert "namespace" not in tool["inputSchema"]["required"]
-
-    def test_list_sources_tool_listed(self):
-        from kiro_crew.mcp_core import _list_tools
-
-        tools = _list_tools()
-        names = [t["name"] for t in tools]
-        assert "knowledge_list_sources" in names
+        assert field in tool["inputSchema"]["properties"]
+        assert field not in tool["inputSchema"]["required"]
 
 
 class TestKnowledgeSearchSourceFilter:
-    def test_source_id_rejects_non_string(self):
+    @pytest.mark.parametrize("field", ["source_id", "namespace"])
+    def test_filter_rejects_non_string(self, field):
+        from kiro_crew.mcp_core import _validate_args
+
+        # At the MCP entry point: a genuinely wrong type (list) on a string
+        # field is still rejected, while a number is defensively converted to
+        # its string form (the re-typed-numeric-string repair).
+        with pytest.raises(ValidationError):
+            _validate_args("local_knowledge_search", {"query": "q", field: [7]})
+        coerced = _validate_args("local_knowledge_search", {"query": "q", field: 7})
+        assert coerced[field] == "7"
+
+    @pytest.mark.parametrize("field", ["source_id", "namespace"])
+    def test_filter_rejects_overlong_value(self, field):
         from kiro_crew.mcp_core import _call_tool_inner
 
         with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "source_id": 7})
+            _call_tool_inner("local_knowledge_search", {"query": "q", field: "x" * 65})
 
-    def test_source_id_rejects_overlong_value(self):
-        from kiro_crew.mcp_core import _call_tool_inner
-
-        with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "source_id": "x" * 65})
-
+    # The store mock answers the source_id existence probe; a namespace needs no
+    # such probe (it does not have to exist as a source) and flows straight through.
+    @pytest.mark.parametrize(
+        "extra,expected",
+        [
+            ({"source_id": "src-1"}, {"source_id": "src-1", "namespace": None}),
+            ({"namespace": "client-a"}, {"source_id": None, "namespace": "client-a"}),
+        ],
+        ids=["source_id", "namespace"],
+    )
     @patch("kiro_crew.mcp_core.config_dir")
     @patch("kiro_crew.mcp_core.HybridRetriever")
     @patch("kiro_crew.mcp_core._get_knowledge_search")
-    def test_source_id_passed_through_to_retriever(
-        self, mock_get_search, mock_retriever_cls, mock_config_dir, mock_db_exists
+    def test_filter_passed_through_to_retriever(
+        self, mock_get_search, mock_retriever_cls, mock_config_dir, mock_db_exists, extra, expected
     ):
         mock_config_dir.return_value = mock_db_exists
         mock_store = MagicMock()
-        mock_store.db.execute.return_value.fetchone.return_value = (1,)  # source exists
+        mock_store.db.execute.return_value.fetchone.return_value = (1,)
         mock_get_search.return_value = (mock_store, None)
         mock_retriever_cls.return_value.search.return_value = []
 
         from kiro_crew.mcp_core import _call_tool_inner
 
-        _call_tool_inner("local_knowledge_search", {"query": "auth", "source_id": "src-1"})
-        mock_retriever_cls.return_value.search.assert_called_once_with(
-            "auth", limit=3, source_id="src-1", namespace=None
-        )
-
-    def test_namespace_rejects_non_string(self):
-        from kiro_crew.mcp_core import _call_tool_inner
-
-        with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "namespace": 7})
-
-    def test_namespace_rejects_overlong_value(self):
-        from kiro_crew.mcp_core import _call_tool_inner
-
-        with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "namespace": "x" * 65})
-
-    @patch("kiro_crew.mcp_core.config_dir")
-    @patch("kiro_crew.mcp_core.HybridRetriever")
-    @patch("kiro_crew.mcp_core._get_knowledge_search")
-    def test_namespace_passed_through_to_retriever(
-        self, mock_get_search, mock_retriever_cls, mock_config_dir, mock_db_exists
-    ):
-        # A namespace does not need to exist as a source, so no sources probe
-        # is required (unlike source_id): it flows straight to the retriever.
-        mock_config_dir.return_value = mock_db_exists
-        mock_store = MagicMock()
-        mock_get_search.return_value = (mock_store, None)
-        mock_retriever_cls.return_value.search.return_value = []
-
-        from kiro_crew.mcp_core import _call_tool_inner
-
-        _call_tool_inner("local_knowledge_search", {"query": "auth", "namespace": "client-a"})
-        mock_retriever_cls.return_value.search.assert_called_once_with(
-            "auth", limit=3, source_id=None, namespace="client-a"
-        )
+        result = _call_tool_inner("local_knowledge_search", {"query": "auth", **extra})
+        mock_retriever_cls.return_value.search.assert_called_once_with("auth", limit=3, **expected)
+        assert "No relevant knowledge found" in result
 
     @patch("kiro_crew.mcp_core.config_dir")
     @patch("kiro_crew.mcp_core._get_knowledge_search")
@@ -440,3 +405,86 @@ class TestKnowledgeListSources:
 
         with pytest.raises(ValidationError):
             _call_tool_inner("knowledge_list_sources", {"filter": "x"})
+
+
+# The correlated reference shape: IN (SELECT ...) inside the JOIN. It is the
+# answer the linear query must agree with, and the shape the plan guard must
+# recognise.
+_CORRELATED_COUNTS_SQL = (
+    "SELECT s.id, s.name, COUNT(DISTINCT i.id) AS item_count "
+    "FROM sources s LEFT JOIN items i ON i.status = 'active' AND ("
+    "  i.source_id = s.id"
+    "  OR i.id IN (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = s.id)"
+    ") GROUP BY s.id, s.name ORDER BY s.name"
+)
+
+
+class TestKnowledgeListSourcesCountQuery:
+    """The per-source count is linear and matches the correlated answer."""
+
+    @staticmethod
+    def _seed(path, seed: int):
+        import random
+
+        from kiro_crew.knowledge.store import KnowledgeStore
+
+        rng = random.Random(seed)
+        store = KnowledgeStore(str(path))
+        sources = [
+            store.add_source(f"S{n}", "local_folder", f"/tmp/s{seed}-{n}")
+            for n in range(rng.randint(1, 5))
+        ]
+        items = []
+        for n in range(rng.randint(0, 25)):
+            owner = rng.choice(sources + [None])
+            items.append(store.add_item(f"I{n}", f"body {seed} {n}", "note", source_id=owner))
+        for item in items:
+            if rng.random() < 0.3:
+                store.db.execute("UPDATE items SET status = 'deleted' WHERE id = ?", (item,))
+            for src in sources:
+                if rng.random() < 0.3:
+                    store.add_source_location(item, src)
+        store.db.commit()
+        return store
+
+    def test_item_owned_and_located_in_same_source_counts_once(self, tmp_path):
+        from kiro_crew.knowledge.store import KnowledgeStore
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = KnowledgeStore(str(tmp_path / "k.db"))
+        try:
+            src = store.add_source("Only", "local_folder", "/tmp/only")
+            item = store.add_item("Doc", "content", "note", source_id=src)
+            store.add_source_location(item, src)
+            rows = [tuple(r) for r in store.db.execute(_SOURCE_COUNTS_SQL)]
+        finally:
+            store.close()
+        assert rows == [(src, "Only", 1)]
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_matches_correlated_query_on_random_libraries(self, tmp_path, seed):
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = self._seed(tmp_path / "k.db", seed)
+        try:
+            new = [tuple(r) for r in store.db.execute(_SOURCE_COUNTS_SQL)]
+            old = [tuple(r) for r in store.db.execute(_CORRELATED_COUNTS_SQL)]
+        finally:
+            store.close()
+        assert new == old
+
+    def test_query_plan_has_no_correlated_subquery(self, tmp_path):
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = self._seed(tmp_path / "k.db", 0)
+        try:
+
+            def plan(sql: str) -> str:
+                return " | ".join(str(r[-1]) for r in store.db.execute(f"EXPLAIN QUERY PLAN {sql}"))
+
+            # Probe: this SQLite reports the old shape as correlated, so the
+            # guard below can see the regression it is meant to catch.
+            assert "CORRELATED" in plan(_CORRELATED_COUNTS_SQL)
+            assert "CORRELATED" not in plan(_SOURCE_COUNTS_SQL)
+        finally:
+            store.close()

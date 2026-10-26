@@ -37,6 +37,8 @@ from pathlib import Path
 
 from kiro_crew import platform_compat, sandbox
 from kiro_crew.config.loader import config_dir
+from kiro_crew.json_line import parse_json_object_line
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +115,7 @@ def _sdk_path() -> str | None:
         out = subprocess.run(
             ["/usr/bin/xcrun", "--show-sdk-path"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=10,
             env=_build_env(),
         )
@@ -272,7 +274,7 @@ def _swiftc() -> str | None:
         out = subprocess.run(
             ["/usr/bin/xcrun", "--find", "swiftc"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=10,
             env=_build_env(),
         )
@@ -462,7 +464,7 @@ def _build_helper(name: str, source: str, *, build: bool = True) -> str | None:
         return None
 
     cache = _cache_dir()
-    # 0o700, matching the other two `run/` writers (`sandbox.py::_ensure_run_dir`).
+    # 0o700, matching the other two `run/` writers (`sandbox_argv.py::_ensure_run_dir`).
     # BEFORE the cache-hit early return on purpose: placed after it, the repair
     # would never run in the steady state — the directory holding an executable
     # the gateway runs would stay at whatever the umask gave it. `exist_ok` does
@@ -516,7 +518,7 @@ def _build_helper(name: str, source: str, *, build: bool = True) -> str | None:
             # the SDK implicitly and nothing may redirect the toolchain.
             [swiftc, "-O", "-parse-as-library", "-sdk", sdk, str(src), "-o", tmp_out],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=180,
             env=_build_env(),
         )
@@ -783,6 +785,8 @@ async def transcribe(
 ) -> tuple[str | None, dict]:
     """Transcribe *audio_path* on device. Returns ``(text_or_None, metrics)``.
 
+    ``text`` is None only when the run FAILED (and ``metrics`` then carries an
+    ``error`` key); a recording the framework heard no speech in is ``""``.
     ``metrics`` always carries what the run reported (``transcribe_secs``,
     ``audio_secs``, resolved ``locale``) or an ``error`` key — callers surface it in
     diagnostics rather than re-deriving timings.
@@ -860,8 +864,11 @@ async def transcribe(
     if proc.returncode != 0 or "error" in payload:
         return None, payload if "error" in payload else {"error": "speech helper failed"}
 
-    text = str(payload.get("text", "")).strip()
-    return (text or None), payload
+    # A helper that exited cleanly with no ``error`` and an empty ``text`` heard
+    # nothing: that is a transcript of silence, not a failure, so it stays ``""``.
+    # None is reserved for the error returns above, every one of which also
+    # carries an ``error`` key in the metrics.
+    return str(payload.get("text", "")).strip(), payload
 
 
 async def inventory() -> dict:
@@ -1037,13 +1044,11 @@ class StreamingSession:
                 text = line.decode(errors="replace").strip()
                 if not text:
                     continue
-                try:
-                    event = json.loads(text)
-                except json.JSONDecodeError:
+                event = parse_json_object_line(text)
+                if event is None:
                     logger.debug("apple_speech: unparseable helper line: %s", text[:120])
                     continue
-                if isinstance(event, dict):
-                    await self._queue.put(event)
+                await self._queue.put(event)
         except (OSError, asyncio.CancelledError):
             pass
         finally:

@@ -67,27 +67,6 @@ def _tokens(root: Path, check: str, *, strict: bool = False) -> set[str]:
 
 
 class TestInvariantIds:
-    def test_autopilot_source_comment_ids_must_exist_in_the_invariant_table(
-        self, tree: Path
-    ) -> None:
-        _write(
-            tree,
-            "docs/system-specs/modules/autopilot.md",
-            "| ID | Rule |\n|---|---|\n| S1 | First |\n| S2 | Second |\n",
-        )
-        _write(
-            tree,
-            "src/kiro_crew/worker.py",
-            "# S1: valid citation\n"
-            "def run():\n"
-            '    """Valid citation (S2)."""\n'
-            "    return 'S3 service'  # S3 is a service, not an invariant citation\n"
-            "# noqa: S608\n"
-            "# S9: missing invariant\n",
-        )
-
-        assert gate.run(tree).unknown_autopilot_invariants == ["src/kiro_crew/worker.py:6 -> S9"]
-
     def test_harness_source_comment_ids_must_exist_in_the_invariant_table(self, tree: Path) -> None:
         _write(
             tree,
@@ -414,6 +393,26 @@ class TestDeadIdentifier:
         # first-party tree is searched so "dead" means dead repo-wide.
         _write(tree, "test/test_thing.py", "def test_all_exports_exact():\n    pass\n")
         _write(tree, "docs/ok.md", "# Ok\n\nPinned by `test_all_exports_exact`.\n")
+        assert not _tokens(tree, gate.CHECK_DEAD_IDENTIFIER)
+
+    def test_silent_for_a_frontend_integration_test_file(self, tree: Path) -> None:
+        # website/integration/ is the vitest integration suite; a doc citing one
+        # of its files by name names a live test, not a renamed symbol.
+        _write(
+            tree, "website/integration/WidgetButtons.integration.test.tsx", "it('x', () => {})\n"
+        )
+        _write(
+            tree,
+            "docs/ok.md",
+            "# Ok\n\nCovered by `integration/WidgetButtons.integration.test.tsx`.\n",
+        )
+        assert not _tokens(tree, gate.CHECK_DEAD_IDENTIFIER)
+
+    def test_silent_for_a_desktop_shell_symbol(self, tree: Path) -> None:
+        # website/electron/ is the desktop shell; a doc naming one of its symbols
+        # cites something real, not a renamed symbol.
+        _write(tree, "website/electron/auto-update.js", "function checkForUpdates() {}\n")
+        _write(tree, "docs/ok.md", "# Ok\n\nIt drives `checkForUpdates`.\n")
         assert not _tokens(tree, gate.CHECK_DEAD_IDENTIFIER)
 
     @pytest.mark.parametrize("prefix", sorted(gate._IDENT_PLACEHOLDER_PREFIXES))

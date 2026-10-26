@@ -18,8 +18,10 @@ the expensive kind of green.
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -38,9 +40,12 @@ from kiro_crew.testing.harness import (
     GatewayHandle,
     GatewaySpawnError,
     _drain_stderr,
+    _end_escaped_descendants,
     _resolve_workspace_src,
+    _StdoutPump,
     _terminate_process_group,
     _wait_for_ready_line,
+    crash_dump_diagnostic,
     harness_environment,
     parse_ready_line,
     spawn_feature_gateway,
@@ -208,6 +213,132 @@ def test_ready_line_raises_on_malformed_payload(bad_payload: str) -> None:
 
     msg = str(exc.value)
     assert "malformed" in msg or "expected dict" in msg or "missing required key" in msg
+
+
+# ── _wait_for_ready_line — improved timeout diagnostics ──────────────────
+
+
+def test_ready_line_no_output_timeout_includes_cold_import_hint() -> None:
+    """Timeout with zero stdout/stderr output includes a cold-import hint."""
+    fake = FakePopen([])
+    fake.returncode = None
+
+    with pytest.raises(GatewaySpawnError) as exc:
+        _wait_for_ready_line(
+            fake,  # type: ignore[arg-type]
+            timeout=0.05,
+            stderr_buffer=[],
+        )
+
+    msg = str(exc.value)
+    assert "cold import phase" in msg
+    assert "KIROCREW_HARNESS_READY_TIMEOUT" in msg
+
+
+def test_ready_line_timeout_message_includes_stdout_and_process_state() -> None:
+    """Exit error carries stdout content.
+
+    Deterministic (D7/D8): ``_MockPump`` sets ``fake.returncode`` after
+    all chunks are delivered; the harness exit check fires immediately on
+    the next iteration — no wall-clock dependence.  ``timeout=30`` is only
+    a safety net.
+    """
+    fake = FakePopen([])  # stdout pipe not used; mock_pump owns delivery
+    fake.returncode = None
+    chunks: list = [b"Starting up...\n", b"still going\n"]
+    mock_pump = _MockPump(chunks, proc=fake, exit_code=1)
+
+    with pytest.raises(GatewaySpawnError) as exc:
+        _wait_for_ready_line(
+            fake,  # type: ignore[arg-type]
+            timeout=30,  # safety net — process exit fires the error
+            stderr_buffer=[b"WARNING: config missing\n"],
+            pump=mock_pump,  # type: ignore[arg-type]
+        )
+
+    msg = str(exc.value)
+    assert "before emitting" in msg
+    # Stdout content in the early-exit error message.
+    assert "Starting up" in msg
+    # Stderr still present.
+    assert "WARNING: config missing" in msg
+
+
+class _MockPump:
+    """Pump stand-in that yields one chunk per get() call, without read1 batching.
+
+    FakePopen-based tests cannot overflow the deque reliably because
+    ``_StdoutPump._run`` calls ``read1(4096)`` which batches small chunks
+    into a single queue entry.  This mock feeds entries one at a time, giving
+    exact control over how many queue items ``_wait_for_ready_line`` processes.
+
+    If ``proc`` is supplied, its ``returncode`` is set to ``exit_code`` once
+    all items have been delivered.  The harness ``proc.poll()`` check then
+    returns non-None on the next iteration, triggering the exit path
+    deterministically — no wall-clock dependence (D7/D8).
+    """
+
+    def __init__(self, items: list, proc: object = None, exit_code: int = 1) -> None:
+        self._items = list(items)
+        self._i = 0
+        self._proc = proc
+        self._exit_code = exit_code
+
+    def start(self) -> None:
+        pass  # no background thread needed
+
+    def get(self, timeout: float) -> object:
+        if self._i < len(self._items):
+            item = self._items[self._i]
+            self._i += 1
+            if self._i >= len(self._items) and self._proc is not None:
+                # All items delivered — signal process exit so the harness
+                # exit check fires on the next loop iteration.
+                self._proc.returncode = self._exit_code
+            return item
+        raise queue.Empty
+
+    def drain_until_eof(self, timeout: float) -> bytes:
+        return b""
+
+    def handoff(self) -> None:
+        pass
+
+
+def test_ready_line_stdout_received_is_bounded() -> None:
+    """stdout_received uses a bounded deque; exit error still shows the tail.
+
+    The GPT BLOCK (a-bound-bounds-every-field-it-retains) pinned that
+    ``stdout_received.append(chunk)`` with an unbounded list let >4 MiB of
+    startup stdout accumulate before the timeout, all retained for a join+decode
+    that only displays 2 000 characters.  The fix uses
+    ``deque(maxlen=_StdoutPump.TAIL_CHUNKS)`` with a count of dropped entries.
+
+    Deterministic (D7/D8): ``_MockPump`` sets ``fake.returncode`` after
+    TAIL_CHUNKS + 1 entries are delivered; the harness exit check fires on
+    the next iteration — no wall-clock dependence.  ``timeout=30`` is a safety net.
+    """
+    cap = _StdoutPump.TAIL_CHUNKS
+    fake = FakePopen([])  # stdout pipe not used; mock_pump owns delivery
+    fake.returncode = None
+    chunks: list = [f"line-{i}\n".encode() for i in range(cap + 1)]
+    mock_pump = _MockPump(chunks, proc=fake, exit_code=1)
+
+    with pytest.raises(GatewaySpawnError) as exc:
+        _wait_for_ready_line(
+            fake,  # type: ignore[arg-type]
+            timeout=30,  # safety net — process exit fires the error
+            stderr_buffer=[],
+            pump=mock_pump,  # type: ignore[arg-type]
+        )
+
+    msg = str(exc.value)
+    assert "before emitting" in msg
+    # The truncation note must appear (the 257th chunk evicted the first).
+    assert "chunk(s) dropped" in msg, "expected truncation note in error message"
+    # The LAST line must still be present in the tail (deque retains the tail).
+    last_line = f"line-{cap}"
+    assert last_line in msg, f"expected last line {last_line!r} in stdout tail"
 
 
 # ── parse_ready_line ────────────────────────────────────────────────────
@@ -728,6 +859,116 @@ def test_drain_stderr_accumulates() -> None:
     _drain_stderr(stream, buffer)
 
     assert b"".join(buffer) == b"first chunk\nsecond chunk\n"
+
+
+# ── crash_dump_diagnostic: the loop-stall stack reaches the failure text ──
+
+_DUMP_HEADER = (
+    "# loop-stall crash dump — opened 20261010T034911Z\n"
+    "# PID: 2407 @ runner/pid:[1] start=1\n"
+    "# If thread stacks appear below, the event loop wedged and faulthandler fired.\n"
+    "\n"
+)
+
+
+def _write_dump(home: Path, name: str, body: str) -> Path:
+    dumps = home / "logs" / "crash-dumps"
+    dumps.mkdir(parents=True, exist_ok=True)
+    path = dumps / name
+    path.write_text(_DUMP_HEADER + body, encoding="utf-8")
+    return path
+
+
+def test_crash_dump_diagnostic_is_empty_without_a_stalled_gateway(tmp_path: Path) -> None:
+    """No dump directory, and the header-only sentinel every boot opens, both say
+    nothing: the diagnostic must not invent a stall."""
+    assert crash_dump_diagnostic(tmp_path) == ""
+    _write_dump(tmp_path, "loopstall-20261010T034911Z.txt", "")
+    assert crash_dump_diagnostic(tmp_path) == ""
+
+
+def test_crash_dump_diagnostic_carries_the_newest_stack(tmp_path: Path) -> None:
+    """A dump with thread stacks is folded in whole, newest first, under a header
+    that names the file -- the frame the alarm caught is what a reader needs."""
+    _write_dump(
+        tmp_path,
+        "loopstall-20261010T030000Z.txt",
+        'Thread 0x01 (most recent call first):\n  File "old.py", line 1 in older\n',
+    )
+    older = tmp_path / "logs" / "crash-dumps" / "loopstall-20261010T030000Z.txt"
+    os.utime(older, (1_000_000, 1_000_000))
+    _write_dump(
+        tmp_path,
+        "loopstall-20261010T034911Z.txt",
+        "Thread 0x7f (most recent call first):\n" '  File "memory.py", line 42 in wedged_frame\n',
+    )
+    text = crash_dump_diagnostic(tmp_path)
+    assert text.startswith("\n--- loop-stall crash dump (loopstall-20261010T034911Z.txt) ---\n")
+    assert "wedged_frame" in text
+    assert "older" not in text
+
+
+def test_crash_dump_diagnostic_replays_every_thread_uncapped(tmp_path: Path) -> None:
+    """``faulthandler`` writes threads newest-first, so hundreds of idle workers
+    sit between the top of the file and the one thread that matters. The
+    diagnostic replays the wedged thread first and then EVERY other thread with
+    the journal's 120-line / 8 KiB cap lifted: a loop thread caught at a syscall
+    boundary is waiting for the GIL some OTHER thread holds, and that thread can
+    be anywhere in the file."""
+    workers = "".join(
+        f"Thread 0x{n:04x} (most recent call first):\n"
+        '  File "/usr/lib/python3.12/queue.py", line 171 in get\n'
+        '  File "/usr/lib/python3.12/concurrent/futures/thread.py", line 90 in _worker\n'
+        '  File "/usr/lib/python3.12/threading.py", line 1032 in _bootstrap\n'
+        for n in range(400)
+    )
+    body = (
+        "Timeout (0:00:25)!\n"
+        + workers[: len(workers) // 2]
+        + "Thread 0xbeef (most recent call first):\n"
+        '  File "/usr/lib/python3.12/ctypes/__init__.py", line 379 in __init__\n'
+        '  File "/home/u/src/kiro_crew/embeddings.py", line 700 in gil_holder\n'
+        + workers[len(workers) // 2 :]
+        + "Current thread 0xffff (most recent call first):\n"
+        '  File "/usr/lib/python3.12/selectors.py", line 468 in select\n'
+        '  File "/usr/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once\n'
+    )
+    _write_dump(tmp_path, "loopstall-20261010T034911Z.txt", body)
+    text = crash_dump_diagnostic(tmp_path)
+    assert "truncated" not in text
+    # Wedged thread first, and the holder buried mid-file is still there.
+    assert text.index("in select") < text.index("gil_holder")
+    # Nothing is dropped: 400 workers + the holder + the wedged thread.
+    assert text.count("(most recent call first)") == 402
+    assert len(text) > 8192 + 120
+
+
+def test_gateway_diagnostics_include_the_crash_dump() -> None:
+    """``GatewayHandle.diagnostics()`` on a spawned gateway reports the dump its
+    watchdog left behind, next to the stderr and stdout tails."""
+    fake_proc = _make_fake_proc_with_ready(
+        '{"port": 51234, "token": "t-abc", "pid": 9876, "home": "/tmp/x"}'
+    )
+    with (
+        patch("kiro_crew.testing.harness.subprocess.Popen", return_value=fake_proc),
+        patch("kiro_crew.testing.harness._terminate_process_group", return_value=True),
+        patch(
+            "kiro_crew.testing.harness.platform_compat.process_descendants",
+            return_value=[],
+        ),
+    ):
+        with spawn_feature_gateway(fixture="empty") as handle:
+            assert "loop-stall crash dump" not in handle.diagnostics()
+            _write_dump(
+                handle.home,
+                "loopstall-20261010T034911Z.txt",
+                "Thread 0x7f (most recent call first):\n"
+                '  File "memory.py", line 42 in wedged_frame\n',
+            )
+            text = handle.diagnostics()
+    assert "--- stderr (last) ---" in text
+    assert "--- loop-stall crash dump (loopstall-20261010T034911Z.txt) ---" in text
+    assert "wedged_frame" in text
 
 
 # ── spawn_feature_gateway: orchestration with mocked Popen ──────────────
@@ -1332,6 +1573,96 @@ class TestTeardownDoesNotTrustTheRootsExit:
             "and must name it rather than leave it to be looked up"
         )
 
+    @pytest.mark.parametrize("escaped_ended", [True, False])
+    def test_a_live_roots_verdict_waits_on_its_escaped_descendants(
+        self, monkeypatch, escaped_ended: bool
+    ) -> None:
+        """With the group gone, a saved child outside it still decides the verdict.
+
+        A descendant in another process group is out of the group kill's reach, so
+        after the group is gone it is handed to ``_end_escaped_descendants`` with its
+        recorded token. One still alive there keeps the HOME, because it can still be
+        writing into it.
+        """
+        from kiro_crew.testing import harness as h
+
+        ended: list[dict[int, str]] = []
+        monkeypatch.setattr(h.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(h.platform_compat, "process_descendants", lambda pid: [])
+        monkeypatch.setattr(h.platform_compat, "pgroup_of", lambda pid: 7)
+        monkeypatch.setattr(h, "terminate_pgid", lambda pid, grace=None, pgid=None, wait=None: True)
+        monkeypatch.setattr(h, "_await_group_gone", lambda pgid: True)
+        monkeypatch.setattr(
+            h,
+            "_end_escaped_descendants",
+            lambda escaped: (ended.append(dict(escaped)), escaped_ended)[1],
+        )
+
+        verdict = h._terminate_process_group(self._LiveProc(), {5151: "token"})
+
+        assert ended == [{5151: "token"}], (
+            "the saved child in group 7 must be handed to _end_escaped_descendants "
+            "with its recorded token"
+        )
+        assert verdict is escaped_ended
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("pidfd", [True, False], ids=["pidfd", "no-pidfd"])
+def test_escaped_descendant_with_a_different_identity_is_not_killed(
+    pidfd: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved pid now held by another process is left running.
+
+    The snapshot's token stands in for a descendant that exited and whose pid
+    was reissued: the live process at that pid has a different creation time.
+    """
+    if not pidfd:
+        monkeypatch.delattr(os, "pidfd_open", raising=False)
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert platform_compat.process_start_time(stranger.pid) not in (None, "not-its-token")
+        assert _end_escaped_descendants({stranger.pid: "not-its-token"}) is True
+        assert stranger.poll() is None, "teardown killed a process it could not identify"
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=10)
+
+
+@_POSIX_ONLY
+def test_a_refused_pidfd_still_kills_a_matching_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host whose kernel refuses pidfd_open falls back to the re-checked kill."""
+
+    def refused(_pid: int) -> int:
+        raise OSError(errno.ENOSYS, "pidfd_open not implemented")
+
+    monkeypatch.setattr(os, "pidfd_open", refused, raising=False)
+    # A grandchild, so its parent exits and init reaps it: no zombie of ours
+    # keeps its identity readable after the kill.
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys\n"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "print(c.pid, flush=True)\n",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert parent.stdout is not None
+    grandchild = int(parent.stdout.readline().strip())
+    parent.wait(timeout=10)
+    token = platform_compat.process_start_time(grandchild)
+    assert token is not None
+    try:
+        assert _end_escaped_descendants({grandchild: token}) is True
+        assert not platform_compat.pid_exists(grandchild), "a refused pidfd skipped the kill"
+    finally:
+        _end_descendant_pinned(grandchild, token)
+
 
 @_POSIX_ONLY
 def test_dead_root_ends_saved_in_group_child() -> None:
@@ -1525,8 +1856,12 @@ def test_gateway_launcher_fixed_command_and_restart_seed(
 
 def test_harness_environment_skips_the_model_download_by_default(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("KIROCREW_SKIP_MODEL_DOWNLOAD", raising=False)
+    monkeypatch.delenv("KIROCREW_SKIP_APP_STORE_FETCH", raising=False)
     env = harness_environment(tmp_path, tmp_path / "src")
     assert env["KIROCREW_SKIP_MODEL_DOWNLOAD"] == "1"
+    # The app store stays off the network: the browser specs' Discover page
+    # must not wait on the live CDN.
+    assert env["KIROCREW_SKIP_APP_STORE_FETCH"] == "1"
     assert env["KIROCREW_HOME"] == str(tmp_path)
     assert env["KIRO_HOME"] == str(tmp_path / "kiro")
     assert env["PYTHONUNBUFFERED"] == "1"
@@ -1546,6 +1881,7 @@ def test_harness_environment_can_arm_the_download_path_for_one_gateway(
     # The isolation the harness exists for is not negotiable through the switch.
     assert env["KIROCREW_HOME"] == str(tmp_path)
     assert env["KIRO_HOME"] == str(tmp_path / "kiro")
+    assert env["KIROCREW_SKIP_APP_STORE_FETCH"] == "1"
 
 
 def test_harness_environment_pins_home_over_an_inherited_one(tmp_path, monkeypatch) -> None:

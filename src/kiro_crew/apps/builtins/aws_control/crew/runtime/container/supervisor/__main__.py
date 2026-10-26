@@ -4,25 +4,31 @@ Run as ``python -m container.supervisor``. This is the task's init process. It
 does not serve anything itself; it enforces the startup order the contract makes
 a correctness requirement and then supervises the children.
 
-The order (``docs/system-specs/modules/aws-control.md``, "Three processes, one task"):
+The order (``docs/system-specs/modules/aws-control.md``, "Four processes, one task"):
 
 1. Gate the environment (layout, model credential, sandbox) and install the crew
    bundle. Nothing has started.
-2. The backend starts and ``wait_until_ready`` returns (port answers AND the
+2. Claim writer ownership in the bucket (``generation.claim_ownership``), so a
+   predecessor's later commit is fenced from this instant. A task that aborts
+   before it is serving releases the claim.
+3. The authority files are restored to completion. This is before the backend on
+   purpose: the backend flushes the slot table from its own memory, so a backend
+   that starts first persists an empty one over the restored files.
+4. The backend starts and ``wait_until_ready`` returns (port answers AND the
    boot secret exists).
-3. The front process starts.
+5. The front process starts, and then the sidecar, whose first cycle copies what
+   the backend has written.
 
-There is no restore phase and no sidecar: the backup subsystem was extracted from
-this PR (durability is tracked separately). When it returns it must reinstate the
-rule that made it correct -- restore to completion before the backend starts, or
-the backend's periodic flush persists an empty slot table over the gap.
+A task with no bucket configured has no durability: steps 2, 3 and the sidecar are
+all no-ops, the front says so once at startup, and the task serves turns.
 
 Shutdown drains process groups, not pids (see ``process.py``): a ``kiro-cli``
 worker is a two-process tree and signalling only the launcher orphans a child
-that finishes its turn. Teardown order is front, then backend: stop new turns
-arriving first, then let the backend drain in-flight work and flush to disk.
-Anything still alive after the backend is gone is an escaped worker it could not
-reap, so the teardown sweeps orphaned process groups directly.
+that finishes its turn. Teardown order is front, then backend, then sidecar: stop
+new turns arriving first, then let the backend drain in-flight work and flush to
+disk, and the sidecar LAST because its final cycle has to see the bytes that
+flush produced. Anything still alive after the backend is gone is an escaped
+worker it could not reap, so the teardown sweeps orphaned process groups directly.
 
 Track boundaries: the front ``__main__`` seam is imported by its documented path,
 lazily, so this module stays importable and testable and never reimplements the
@@ -31,6 +37,7 @@ other track's work.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
 import logging
@@ -44,8 +51,13 @@ from pathlib import Path
 
 from .. import common
 from ..common import Settings
+from ..common.config import BACKEND_DRAIN_SECS, FRONT_DRAIN_SECS, SIDECAR_DRAIN_SECS
+from ..sidecar import generation as generation_mod
+from ..sidecar import restore as restore_mod
+from ..sidecar.store import S3ObjectStore
 from . import backend as backend_mod
 from . import bundle as bundle_mod
+from . import kiro_login as kiro_login_mod
 from .process import ProcessGroup, spawn_process_group
 
 log = logging.getLogger("container.supervisor")
@@ -58,8 +70,11 @@ log = logging.getLogger("container.supervisor")
 # shutdown reaps it. Too short a drain here would SIGKILL the backend before it
 # finishes reaping, orphaning workers that go on to finish their turn. Verified
 # confirmed by reading the real source and booting the real backend.
-FRONT_DRAIN_SECS: float = 5.0
-BACKEND_DRAIN_SECS: float = 25.0
+#
+# The three windows and their sum live in ``common/config.py``, because the sum is a
+# contract this process shares with the task definition the control plane registers:
+# the task's stop timeout has to cover it or the platform SIGKILLs this process
+# mid-drain, and a number duplicated in two subsystems is one that drifts.
 # How many discover-kill rounds the orphan sweep makes at teardown. Each round
 # reaps a layer, and a killed process's own children reparent to PID 1 and surface in the
 # NEXT round, so more than one is required to reach a worker's grandchildren. Bounded so a
@@ -75,6 +90,162 @@ def _start_front(settings: Settings) -> ProcessGroup:
 
 #: The shutdown reason a spent lifetime produces.
 _LIFETIME_REASON: str = "lifetime"
+
+
+def _start_sidecar(settings: Settings) -> ProcessGroup | None:
+    """Launch the backup process, or ``None`` when there is nowhere to write.
+
+    A crew with no bucket has no durability, which the front already says once at
+    startup. Starting a writer with no destination would be worse than not starting one:
+    a process that runs and writes nothing looks exactly like a working backup.
+    """
+    if not settings.backup_bucket:
+        log.warning(
+            "sidecar: no bucket configured, so this task's state is not backed up and "
+            "does not survive replacement. Set SMC_BACKUP_BUCKET to make it durable."
+        )
+        return None
+    child = spawn_process_group("sidecar", [sys.executable, "-m", "container.sidecar"])
+    log.info("sidecar: started")
+    return child
+
+
+def restore_authority(settings: Settings) -> bool:
+    """Bring the authority files back before the backend can flush over them.
+
+    Called from :func:`run` at the point where "before the backend starts" is enforced.
+    A failure RAISES, so the task does not start: booting without the slot table lets
+    the backend persist an empty one, and then the transcripts are still in the bucket
+    while the conversation list is gone.
+
+    With no bucket there is nothing to restore and this is a no-op, which is the same
+    call :func:`_start_sidecar` makes about the writer.
+
+    Returns whether this boot restored its authority from a remote snapshot. When it
+    did, the slot table is on disk but the transcripts are NOT -- they are fetched
+    lazily, per turn -- so the backend must keep a listed slot whose transcript is
+    absent locally as a reopen seed rather than pruning it as a dead tab (the signal
+    is carried to the backend through :data:`backend.ENV_AUTHORITY_RESTORED`).
+    """
+    if not settings.backup_bucket:
+        return False
+    result = restore_mod.restore_authority(settings, S3ObjectStore(settings.backup_bucket))
+    log.info("restore: %s", result.summary())
+    return True
+
+
+class _StartupInterrupted(BaseException):
+    """A stop signal (SIGTERM/SIGINT) arrived DURING startup, before the supervise phase.
+
+    A :class:`BaseException` rather than an ``Exception`` so a stray ``except Exception`` in
+    the startup path cannot swallow it: a shutdown signal must reach the ownership-release
+    abort path, never be absorbed as an ordinary failure. It names the signal so the abort log
+    says a stop ended startup rather than an unexplained error.
+    """
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"startup interrupted by signal {signum}")
+        self.signum = signum
+
+
+class _StartupSignalGuard:
+    """Controller for the startup signal guard: raises on a stop, or DEFERS one on request.
+
+    In its default mode a SIGTERM/SIGINT raises :class:`_StartupInterrupted` at once, so a stop
+    during restore, readiness, or the child spawns aborts promptly into the release path. But
+    the claim acquisition itself must not be interrupted part-way: a stop between the claim's
+    committed PUT and the moment the returned claim is bound would strand the claim (the release
+    path has no claim object to release). So the claim call runs inside :meth:`deferring`, where
+    a stop is RECORDED rather than raised; once the claim is bound inside the release scope,
+    :meth:`raise_pending` re-raises it so the ordinary release-and-teardown handles it.
+    """
+
+    def __init__(self) -> None:
+        self._deferring = False
+        self._pending: int | None = None
+
+    def _on_signal(self, signum, _frame) -> None:
+        if self._deferring:
+            # Hold it: raising here, mid-claim, would escape before the claim is recorded.
+            self._pending = signum
+            return
+        raise _StartupInterrupted(signum)
+
+    @contextlib.contextmanager
+    def deferring(self):
+        """Within this scope a stop is recorded, not raised -- for the claim acquisition."""
+        self._deferring = True
+        try:
+            yield
+        finally:
+            self._deferring = False
+
+    def raise_pending(self) -> None:
+        """Raise a stop that arrived while deferring, now that it is safe to abort."""
+        if self._pending is not None:
+            signum, self._pending = self._pending, None
+            raise _StartupInterrupted(signum)
+
+
+@contextlib.contextmanager
+def _startup_signal_guard():
+    """Make SIGTERM/SIGINT during startup raise rather than kill or escape uncaught.
+
+    From the moment ownership is claimed, the committed incarnation is bumped and a predecessor
+    is fenced; the claim is released only on the abort paths, which are reached by an exception.
+    But the supervise-phase handlers are not installed until after readiness, so until then a
+    SIGTERM takes the process down by its default disposition and a SIGINT raises
+    :class:`KeyboardInterrupt` -- in both cases the release never runs and the predecessor stays
+    fenced into silent loss of its later turns. This guard installs handlers BEFORE the claim
+    that raise :class:`_StartupInterrupted` (or, inside :meth:`_StartupSignalGuard.deferring`,
+    hold it until the claim is recorded), so a stop during the claim, restore, backend readiness,
+    or the child spawns is routed through the same release-and-teardown abort path as any other
+    startup failure. The previous handlers are restored on exit, so the supervise phase installs
+    its own cleanly once startup has succeeded. Yields the :class:`_StartupSignalGuard` so the
+    claim acquisition can defer a mid-claim stop.
+    """
+    guard = _StartupSignalGuard()
+    previous = {
+        signal.SIGTERM: signal.signal(signal.SIGTERM, guard._on_signal),
+        signal.SIGINT: signal.signal(signal.SIGINT, guard._on_signal),
+    }
+    try:
+        yield guard
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _claim_writer_ownership(settings: Settings) -> "generation_mod.ClaimedOwnership":
+    """Claim writer ownership in shared storage BEFORE restoration, so the handoff is one step.
+
+    Calls :func:`generation.claim_ownership`, which bumps the committed pointer's incarnation
+    under a compare-and-swap so a predecessor's later commit is fenced from this instant --
+    closing the window in which an overlapping predecessor adds a slot after this task
+    restores but before its sidecar mints an incarnation. The claimed token is exported in the
+    environment the sidecar inherits (:data:`generation.ENV_CLAIMED_INCARNATION`), so the
+    writer ADOPTS it rather than minting a second one that would leave the committed pointer
+    naming a token no live task holds.
+
+    With no bucket there is nothing to claim and this is a no-op, the same tolerance
+    :func:`restore_authority` and :func:`_start_sidecar` apply. A failure RAISES, like the
+    restore's: a task that cannot establish ownership must not start and silently race a
+    predecessor. Generation 0 (no committed pointer) writes nothing, so there is nothing to
+    release, but it still mints the base token and exports it for the sidecar to adopt.
+
+    Returns the :class:`generation.ClaimedOwnership` the claim produced (an empty one when
+    there was no bucket), so an aborted startup can hand it to :func:`generation.release_ownership`
+    and undo the bump -- otherwise a replacement whose backend never becomes ready would leave
+    the committed incarnation raised and permanently fence a still-healthy predecessor.
+    """
+    if not settings.backup_bucket:
+        return generation_mod.ClaimedOwnership(token="")
+    claim = generation_mod.claim_ownership(settings, S3ObjectStore(settings.backup_bucket))
+    if claim.token:
+        os.environ[generation_mod.ENV_CLAIMED_INCARNATION] = claim.token
+        log.info("ownership: claimed before restore; the sidecar adopts the claimed incarnation")
+    return claim
+
 
 #: Shutdown reasons that mean the task did what was asked of it, so the process
 #: exits zero. Both members are produced by ``_wait_for_shutdown`` a few lines
@@ -142,6 +313,21 @@ def _our_live_children(exclude: set[int]) -> list[int]:
     backend spawns its workers and tells nobody. Linux-only, which ``crew/runtime/**`` already
     is; a missing ``/proc`` yields an empty list rather than an error, so a host without it
     degrades to the previous behaviour instead of failing the shutdown.
+
+    A child in OUR OWN process group is NOT one of these, and is excluded here rather than in
+    the caller. The subject is a process whose REAPER is gone; a process sharing our group
+    still has us, and the caller's remedy is a group signal, which on our own group SIGKILLs
+    this process -- so the sweep's remaining rounds never run and every real orphan is left
+    alive. One such child is enough, and it is a reachable shape rather than a theoretical
+    one: a library this process uses can hold a pool of helper children (the sensitive-path
+    resolver keeps several), and those sit in our group. Nothing the sweep exists to reach is
+    lost, because every one of those is in a group of its own -- an escaped worker by
+    ``start_new_session``, the front and backend by being spawned into theirs -- and a
+    same-group child dies with us when this process exits, which is the next thing to happen.
+
+    The group comes from the SAME ``/proc`` line the parent does (``pgrp`` is the field after
+    ``ppid``), so it is one read rather than a second syscall on a pid that may already be
+    gone, and this function keeps its one source of truth about a candidate.
     """
     mine = os.getpid()
     found: list[int] = []
@@ -149,6 +335,7 @@ def _our_live_children(exclude: set[int]) -> list[int]:
         entries = os.listdir("/proc")
     except OSError:
         return found
+    my_group = _own_process_group()
     for name in entries:
         if not name.isdigit():
             continue
@@ -165,19 +352,43 @@ def _our_live_children(exclude: set[int]) -> list[int]:
             # pid exiting mid-scan. Failing the whole teardown over one alien pid would be
             # worse than missing it.
             continue
-        # After the ')' closing comm: state, ppid. Split this way because comm can contain
-        # spaces and parentheses, which is why the naive field index is wrong.
-        if len(fields) < 2:
+        # After the ')' closing comm: state, ppid, pgrp. Split this way because comm can
+        # contain spaces and parentheses, which is why the naive field index is wrong.
+        if len(fields) < 3:
             continue
         if fields[0] == "Z":
             # Already dead and waiting to be reaped; the wait below collects it.
             continue
         try:
-            if int(fields[1]) == mine:
-                found.append(pid)
+            if int(fields[1]) != mine:
+                continue
+            if my_group is not None and int(fields[2]) == my_group:
+                continue
         except ValueError:
             continue
+        found.append(pid)
     return found
+
+
+def _own_process_group() -> int | None:
+    """This process's group, from ``/proc/self/stat``, or ``None`` when unreadable.
+
+    Read the same way and from the same field as every candidate's, so the comparison in
+    :func:`_our_live_children` is between two values of one kind. ``None`` means the question
+    could not be answered, and the caller then excludes nothing -- the previous behaviour,
+    rather than a guess that could either skip a real orphan or keep a self-kill.
+    """
+    try:
+        with open("/proc/self/stat", encoding="utf-8", errors="replace") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+    except OSError:
+        return None
+    if len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
 
 
 def _sweep_orphans_the_backend_cannot_reap(exclude: set[int]) -> None:
@@ -219,7 +430,10 @@ def _sweep_orphans_the_backend_cannot_reap(exclude: set[int]) -> None:
             break
         for pid in live:
             # Group first: reaches the worker's whole session in one signal. A pid whose
-            # group cannot be resolved (already gone) falls back to a direct kill.
+            # group cannot be resolved (already gone) falls back to a direct kill. Safe on
+            # every pid that reaches here because ``_our_live_children`` has already
+            # withheld anything in THIS process's group -- see its docstring for why a
+            # group signal there is a self-kill.
             try:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -240,23 +454,45 @@ def _sweep_orphans_the_backend_cannot_reap(exclude: set[int]) -> None:
 
 
 def _teardown(
-    front: ProcessGroup,
+    front: ProcessGroup | None,
     backend: ProcessGroup,
-) -> None:
-    """Drain the children in order: front, then backend, then sweep orphans.
+    sidecar: ProcessGroup | None = None,
+) -> int | None:
+    """Drain the children in order: front, backend, sidecar, then sweep orphans.
 
-    The backend gets the longer drain so an in-flight turn can finish. Once it is gone,
-    anything of ours still running is a process it could not reap -- an escaped worker in its
-    own process group, which no group signal reached -- so we discover and kill those directly.
+    The backend gets the longer drain so an in-flight turn can finish. The sidecar goes
+    LAST and not first, because its final cycle is what makes an orderly replacement
+    lossless: the front stops new turns arriving, the backend flushes the turns it holds,
+    and only then does the writer get to upload what that flush produced.
+
+    Once the backend is gone, anything of ours still running is a process it could not
+    reap -- an escaped worker in its own process group, which no group signal reached --
+    so we discover and kill those directly.
+
+    Returns the SIDECAR's exit status, because that status is the only evidence that the
+    final cycle actually committed: the writer exits non-zero when its post-shutdown
+    cycle is incomplete, and is killed with a negative status when the drain window
+    elapses mid-upload. ``None`` means there was no sidecar, or that its status could not
+    be read; the caller decides what each of those is worth. The front's and backend's
+    statuses are not returned: they are draining on our own signal, so a non-zero status
+    there is the signal, not a fault.
     """
-    log.info("draining front (%.0fs)", FRONT_DRAIN_SECS)
-    front.terminate(FRONT_DRAIN_SECS)
+    known = {backend.pid}
+    if front is not None:
+        log.info("draining front (%.0fs)", FRONT_DRAIN_SECS)
+        front.terminate(FRONT_DRAIN_SECS)
+        known.add(front.pid)
     log.info("draining backend (%.0fs)", BACKEND_DRAIN_SECS)
     backend.terminate(BACKEND_DRAIN_SECS)
+    sidecar_status: int | None = None
+    if sidecar is not None:
+        log.info("draining sidecar (%.0fs)", SIDECAR_DRAIN_SECS)
+        sidecar_status = sidecar.terminate(SIDECAR_DRAIN_SECS)
+        known.add(sidecar.pid)
     # The backend is gone. Anything of ours still running is a process it cannot reap --
     # an escaped worker in its own process group, which no group signal could reach.
-    known = {front.pid, backend.pid}
     _sweep_orphans_the_backend_cannot_reap(known)
+    return sidecar_status
 
 
 def verify_layout(settings: Settings) -> None:
@@ -323,6 +559,112 @@ def verify_layout(settings: Settings) -> None:
             "Container path layout disagrees with Kiro Crew's resolved paths; "
             "refusing to start rather than silently lose state:\n  - " + "\n  - ".join(problems)
         )
+
+
+def export_kiro_home(settings: Settings) -> Path:
+    """Point this task's kiro home at ``<data home>/kiro``. Returns the agents dir.
+
+    Exported into THIS process's environment, not just handed to the backend, because
+    the bundle installer resolves the agents directory from ``os.environ``
+    (``bundle.default_kiro_agents_dir``, which mirrors kiro-cli's own
+    ``$KIRO_HOME``-or-``~/.kiro`` rule and imports no ``kiro_crew``). One export is
+    therefore what makes the installer and the backend agree on one directory; the
+    backend additionally gets the value from ``settings`` (``build_backend_env``), so
+    neither side depends on the other having run first.
+
+    WHY the default is wrong here, which is the whole reason this exists. With no
+    ``KIRO_HOME`` the agents directory is the process HOME's ``~/.kiro/agents``, which
+    every instance under that ``$HOME`` shares. The backend runs on a non-default data
+    home (``KIROCREW_HOME=<data home>``) and Kiro Crew REFUSES to rewrite a shared
+    agents dir from one: the specs it writes pin the writer's data home into every
+    managed MCP server entry, which fails strict session identity for a default-home
+    gateway (kirodotdev/KiroCrew#9690). Measured consequence in the container: the
+    supervisor's crew spec landed in the shared dir with no ownership provenance, the
+    backend read it as another home's, declined to write, and every turn died with
+    ``DerivedSpecStale: the default agent spec .../kirocrew.json is missing``.
+
+    ``<data home>/kiro`` is that guard's own documented private-target case (see
+    ``Settings.kiro_home``), so this fixes the refusal by giving the task a directory
+    it owns -- NOT by relaxing the guard, which protects a real poisoning bug.
+
+    Fails CLOSED on four things, because every one of them is silent otherwise:
+
+    * A SYMLINK at either path this function owns. The privacy exemption is decided on
+      RESOLVED paths on both sides, so a link at ``<data home>/kiro`` or at its
+      ``agents`` child pointing into the shared tree makes the shared directory itself
+      test as "provably private" -- and the backend then rewrites the specs the guard
+      exists to protect, which is worse than the failure this function fixes. The
+      reachable planter is a previous task's model worker: it runs unsandboxed under
+      this uid with the volume writable, so a link it leaves behind survives into the
+      next boot. Refused with ``is_symlink``, which does NOT follow, and refused BEFORE
+      the export so a poisoned layout never reaches the backend's environment.
+    * A path that resolves outside ``<data home>/kiro/agents``. The check above reads the
+      path and the ``mkdir`` below uses it, so a link appearing in that window is
+      followed rather than refused; this closes the window by stating the guard's own
+      equation on what actually landed. The guard compares
+      ``resolve(<kiro home>/agents)`` against ``resolve(<data home>)/kiro/agents``, so an
+      equality here means the exemption the backend will take is genuine rather than
+      forged. Cheap, and it needs no assumption about where a link could be planted.
+    * A directory that cannot be created. The backend would then decline for a second
+      reason and the turn would die the same way, several minutes later and with the
+      refusal attributed to the guard instead of to the filesystem.
+    * The two resolvers disagreeing. This asserts that the installer's own resolver,
+      read back after the export, answers ``<kiro home>/agents``. That is the single
+      invariant the fix rests on, and a future change to either spelling breaks it
+      quietly -- the deployment would boot, install the crew in one directory and
+      serve agents out of another. It is checked SEPARATELY from the resolved-location
+      check above because the installer's resolver deliberately does not resolve, so a
+      symlinked home passes it while pointing somewhere else entirely.
+    """
+    agents = settings.kiro_home / "agents"
+    for path, what in ((settings.kiro_home, "kiro home"), (agents, "agent-spec directory")):
+        if path.is_symlink():
+            raise common.ConfigError(
+                f"the task's {what} {path} is a symlink, and the container refuses to "
+                f"start on it. Whether this directory is private is decided on the "
+                f"RESOLVED path, so a link pointing into a shared agents tree would make "
+                f"that tree test as this task's own and let the backend rewrite specs "
+                f"belonging to another data home. Remove it, or start on a clean data "
+                f"home."
+            )
+    try:
+        agents.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        raise common.ConfigError(
+            f"the task's agent-spec directory cannot be created: {agents} exists and is "
+            f"not a directory. The container refuses to start rather than crash on it "
+            f"every time the task restarts. Remove it, or start on a clean data home."
+        ) from exc
+    except OSError as exc:
+        raise common.ConfigError(
+            f"could not create the task's agent-spec directory {agents} ({exc}). This is "
+            f"where both the crew's spec and Kiro Crew's own default spec must live; "
+            f"refusing to start rather than letting the backend fall back to the shared "
+            f"agents directory under the process home, which it is not allowed to rewrite "
+            f"from a non-default data home and which would kill every turn at "
+            f"DerivedSpecStale."
+        ) from exc
+    expected = settings.data_home.resolve() / "kiro" / "agents"
+    landed = agents.resolve()
+    if landed != expected:
+        raise common.ConfigError(
+            f"the task's agent-spec directory {agents} resolves to {landed}, not to "
+            f"{expected}. Something along that path redirects it out of the data home, "
+            f"and the privacy the backend's write depends on is decided on the resolved "
+            f"path -- so this would hand it a directory it must not rewrite. Refusing to "
+            f"start."
+        )
+    os.environ[backend_mod.ENV_KIRO_HOME] = str(settings.kiro_home)
+    resolved = bundle_mod.default_kiro_agents_dir()
+    if resolved != agents:
+        raise common.ConfigError(
+            f"the crew installer resolves the agents directory as {resolved}, but this "
+            f"task owns {agents}. The installer reads $KIRO_HOME the way kiro-cli does "
+            f"and the backend reads it through Kiro Crew's own resolver; if the two "
+            f"disagree the crew is installed where nothing serves it. Refusing to start."
+        )
+    log.info("kiro home: %s (agent specs in %s)", settings.kiro_home, agents)
+    return agents
 
 
 #: The three things the sandbox probe can conclude. A verdict is a string rather
@@ -451,12 +793,13 @@ def make_non_dumpable(*, clear=_clear_dumpable) -> None:
 def verify_sandbox(
     settings: Settings, *, env: Mapping[str, str], probe=_user_namespaces_available
 ) -> None:
-    """Refuse to start unless the model subprocess can run sandboxed.
+    """Refuse to start unless the model subprocess can run sandboxed, or the
+    deployment declares the internal-only trust boundary.
 
     kiro-cli runs the model subprocess inside a sandbox. On Linux that needs an
     unprivileged user namespace; without one, ``wrap_argv`` fails CLOSED. This
-    container is sandboxed-only, so a host that cannot provide one is refused here,
-    loudly, rather than left to fail every turn.
+    container is sandboxed-only by default, so a host that cannot provide one is
+    refused here, loudly, rather than left to fail every turn.
 
     **Why taking the credential out of the worker's environment does not earn an
     unsandboxed posture.** The worker auto-approves every tool it calls on untrusted
@@ -466,20 +809,34 @@ def verify_sandbox(
     is the vault: the backend answers the engine's token request from it, so the
     backend's uid must be able to decrypt it, and the worker is a child of the backend
     under that same uid. Measured -- a uid-1000 process reads and decrypts that vault
-    directly. An auto-approved unsandboxed worker therefore still has a route, which is
-    why ``sandbox_allow_unsandboxed_exec`` stays false and why this refusal has no
-    credential-shaped escape hatch.
+    directly. So no clean environment can be traded for this refusal, and the
+    assertion below is a tripwire on that invariant rather than a posture.
 
-    Closing the remaining route is not something this file can do: it needs a user
-    namespace, or a worker under a different uid from the BACKEND (the gateway's own
-    spawn path), or a credential not worth stealing.
+    **What CAN lift it is a trust boundary, not a credential claim.** With
+    ``settings.internal_only`` the deployment states that this task runs the operator's
+    OWN crews and that the operator bears the risk of what those crews read. The
+    exposure is then ACCEPTED, and it is worth being exact about its size: it is NOT
+    only a prompt an outsider types. An internal crew consumes untrusted CONTENT as a
+    matter of course -- tool output, fetched web pages, connector and API payloads,
+    repository and ticket text -- any of which can carry an injection, and all of which
+    reach the worker whoever sent the prompt. So with this set, a worker injected
+    through any of those routes can read the vault. What the claim buys is not "no
+    injection can happen" but "the credential at risk and the account it belongs to are
+    the operator's own". That is why the switch names the boundary and not the
+    consequence -- an operator cannot set "allow unsandboxed" without saying whose crews
+    these are and therefore who bears it. Closing the route properly still needs a user
+    namespace, a worker under a different uid from the BACKEND (the gateway's own spawn
+    path), or a credential not worth stealing; a Firecracker-based runtime is the answer
+    for multi-tenant or external callers.
 
-    **Only ``SANDBOX_AVAILABLE`` proceeds.** Undetermined refuses, and so does any
+    **Only ``SANDBOX_AVAILABLE`` proceeds unconditionally, and only ``SANDBOX_DENIED``
+    is lift-able.** Undetermined refuses whatever the boundary says, and so does any
     verdict this function does not recognise. Reading a probe that cannot reach an
     answer as permission to continue is the same defect as reading the environment
     through a denylist: it holds for the hosts someone already thought of and fails
-    open on the next one. The refusal repeats the verdict verbatim so an operator
-    learns what could not be determined rather than only that something could not be.
+    open on the next one. A boundary can accept a KNOWN exposure and cannot accept an
+    unknown one. The refusal repeats the verdict verbatim so an operator learns what
+    could not be determined rather than only that something could not be.
     """
     # The environment route, asserted rather than decided -- and checked before the
     # probe, because it is broken whatever the host can provide. `build_backend_env`
@@ -504,28 +861,68 @@ def verify_sandbox(
     if verdict == SANDBOX_AVAILABLE:
         return
     if verdict == SANDBOX_DENIED:
+        # The internal-only branch. A DENIED verdict is a definite, informative answer
+        # about the host -- "no unprivileged user namespace here" -- and the internal-only
+        # boundary is the deployment stating that this consequence is accepted, so there
+        # IS something for it to accept. That is why the branch sits under DENIED and not
+        # under the undetermined verdict below, which carries no answer at all: a boundary
+        # can accept a known exposure and cannot accept an unknown one.
+        #
+        # Deliberately no second condition about the environment: the credential assertion
+        # above already refused on every verdict, so reaching here means the environment
+        # route is closed whatever this branch decides.
+        if settings.internal_only:
+            log.warning(
+                "no user-namespace sandbox on this host; starting UNSANDBOXED because "
+                "SMC_INTERNAL_ONLY is set. The model subprocess runs without a sandbox "
+                "and can reach the crew's vault under the backend's uid, so any "
+                "untrusted content it reads -- tool output, a fetched page, a connector "
+                "payload -- can inject a worker that reads the model credential. "
+                "Accepted because the deployment declares these are the operator's own "
+                "crews and the operator bears that risk."
+            )
+            return
         raise common.ConfigError(
             "No user-namespace sandbox is available on this host, so kiro-cli cannot "
-            "spawn the model subprocess sandboxed. This container runs sandboxed-only. "
-            "Taking the model credential out of the worker's environment is not enough "
-            "to offer an unsandboxed posture instead: the backend answers the engine's "
-            "token request from the crew's vault, so the backend's uid must be able to "
-            "decrypt it, and the worker runs as a child of the backend under that same "
-            "uid. Run where unprivileged user namespaces are permitted."
+            "spawn the model subprocess sandboxed. This container runs sandboxed-only "
+            "unless the deployment declares the internal-only trust boundary by setting "
+            "SMC_INTERNAL_ONLY=1. Accepting that boundary means: these are the "
+            "operator's OWN crews and the operator bears the risk of what they read. Be "
+            "clear about that risk before setting it -- it is NOT only about who sends "
+            "the prompt. The worker auto-approves every tool it calls; the backend "
+            "answers the engine's token request from the crew's vault so the backend's "
+            "uid must be able to decrypt it, and the worker runs as a child of the "
+            "backend under that same uid. So untrusted CONTENT the crew reads in the "
+            "ordinary course of its work -- tool output, a fetched web page, a connector "
+            "or API payload, text someone else wrote -- can inject that worker into "
+            "reading the model credential, whoever sent the prompt. Taking the "
+            "credential out of the worker's environment does not change that and is not "
+            "a substitute for the declaration. Do NOT set it where the credential at "
+            "risk is not the operator's own to lose: a user namespace is the real "
+            "containment, and a Firecracker-based runtime is the answer for multi-tenant "
+            "callers. Otherwise, run where unprivileged user namespaces are permitted."
         )
     raise common.ConfigError(
         f"Whether this host permits an unprivileged user-namespace sandbox could not be "
         f"determined: {verdict}. This container runs sandboxed-only, so an undetermined "
         "answer refuses exactly as a denial does: continuing would run a model "
         "subprocess that auto-approves every tool, with no evidence that a sandbox is "
-        "in place. Run this image on Linux where unprivileged user namespaces are "
-        "permitted, and fix what stopped the probe rather than reading its silence as "
-        "consent."
+        "in place. SMC_INTERNAL_ONLY does not cover this case and is not the fix for it: "
+        "that setting accepts a KNOWN absence of isolation, and this verdict says the "
+        "probe reached no answer at all, so there is nothing for a boundary to accept. "
+        "Run this image on Linux where unprivileged user namespaces are permitted, and "
+        "fix what stopped the probe rather than reading its silence as consent."
     )
 
 
 def run(settings: Settings, *, wait_for_shutdown=None) -> int:
     """Order, supervise and drain the task. Return a process exit code.
+
+    The code is 0 only when BOTH halves of an orderly stop held: the task was asked to
+    go rather than losing a child, and the writer's final backup cycle committed. The
+    second half matters because that cycle runs after the backend's flush and is the
+    only copy of the turns in it, so a task that exits 0 having failed it reports a
+    lossless replacement for a lossy one.
 
     ``wait_for_shutdown`` is injected so tests can drive the supervise phase
     without signals or real processes. It takes the watched children and returns a
@@ -541,6 +938,12 @@ def run(settings: Settings, *, wait_for_shutdown=None) -> int:
     #    turn: bad path layout, no model identity, a sandbox absent where one is
     #    required, or a bundle that is absent or names a different crew.
     verify_layout(settings)
+    # Before anything reads or writes an agent spec: give this task its OWN kiro home,
+    # so the crew's spec and Kiro Crew's default spec share one directory that the
+    # backend is allowed to write. Ahead of `build_backend_env` only for readability --
+    # that function takes the value from the settings, not from this export -- but it
+    # MUST precede `install_bundle`, which resolves its destination from the environment.
+    export_kiro_home(settings)
     env = backend_mod.build_backend_env(settings)
     # The identity is delivered in the SUPERVISOR's environment and moved into the
     # vault here, which is where the backend's auth callback reads it.
@@ -594,37 +997,203 @@ def run(settings: Settings, *, wait_for_shutdown=None) -> int:
     # bundle may ship config, and this has to win on the keys it sets) and before the
     # backend, which reads this file at boot: a transport it starts there is already
     # connected by the time anything else could object.
-    backend_mod.write_backend_config(settings)
-
-    # 1. Backend, then readiness. Nothing else has started yet.
+    config_path = backend_mod.write_backend_config(settings)
+    # Then satisfy the SIGN-IN PROGRAM's own check, which is a separate question
+    # from whether this task has an identity, and which program that is depends on
+    # the config just written -- hence after it, not after the vault check.
     #
-    # There is no restore phase: the backup subsystem was extracted from this PR (its
-    # durability design is tracked separately), so the container boots straight into the
-    # backend on a fresh data home. Cross-task-replacement persistence is a capability the
-    # container does not yet have, not a regression -- there is no crew container on main.
-    backend = backend_mod.start_backend(settings, env=env)
-    try:
-        backend_mod.wait_until_ready(
-            settings, backend_mod.DEFAULT_READY_TIMEOUT_SECS, process=backend
+    # On the KAS bundle route (`agent.acp_backend` kas AND `agent.kas_bundle` on) the
+    # backend spawns the installed engine directly: there is no kiro-cli, no login
+    # check in front of the engine's credential request, and nothing to seed. Whether
+    # the engine is installed is the gateway's own readiness gate's question
+    # (`kiro_prerequisite_service`), which names a missing engine on every turn.
+    #
+    # Everywhere else `kiro-cli acp` validates its own credential store before it
+    # offers an ACP handshake, so on a store it has never signed into it exits rc=1
+    # "You are not logged in" and the `_kiro/auth/getAccessToken` request the vault
+    # answers is never reached: the container serves /health 200 and answers every
+    # dashboard turn with a 503. The row written here is a NON-SECRET sentinel, not a
+    # copy of the credential -- Crew is the auth owner and the engine asks the host
+    # for the token it uses, so what the store needs is the answer to "has this been
+    # signed into", which carries nothing worth reading.
+    #
+    # AFTER the vault check, because the order is what makes each refusal say the
+    # right thing: no identity is that check's verdict, and this one's is that the
+    # sign-in program would refuse to start. All are startup refusals, because the
+    # thing they prevent is a container that starts and then 503s every turn.
+    #
+    # Handed `env`, NOT this process's own environment. The kiro-cli step spawns
+    # kiro-cli to ask its login check a question; `env` is the dictionary
+    # `build_backend_env` scrubbed of both credential shapes, and it carries the same
+    # HOME, so the store resolves to the same path either way. (This process's own
+    # environment has been scrubbed too by now, above; handing the backend's copy
+    # keeps the seam the same whatever runs before it.)
+    if kiro_login_mod.kas_bundle_route(config_path):
+        log.info(
+            "KAS bundle route: kiro-cli's login store is not seeded (no kiro-cli on this route)"
         )
-    except Exception:
-        # Readiness failed or the backend exited: tear the backend down and
-        # abort. The front was never started.
-        log.error("backend did not become ready; aborting")
-        backend.terminate(BACKEND_DRAIN_SECS)
-        raise
-    log.info("backend: ready on %s", settings.backend_base_url)
+    else:
+        kiro_login_mod.seed_kiro_cli_login(env=env)
 
-    # 2. Front. There is no sidecar: backup was extracted from this PR.
-    front = _start_front(settings)
-    log.info("front: started")
+    # 1. Claim writer ownership in shared storage, THEN restore, THEN the backend. The
+    #    claim is first because restoration takes the authority pair before any writer
+    #    ownership exists: without it an overlapping predecessor can add a slot after this
+    #    task restores but before its sidecar starts, and the sidecar would then capture
+    #    that stale pair and commit it under a newer incarnation, deleting the predecessor's
+    #    slot from committed history. `claim_ownership` bumps the committed pointer's
+    #    incarnation in place (same generation) under a compare-and-swap, so from this
+    #    instant a predecessor's later commit is fenced -- the handoff is one storage-backed
+    #    step BEFORE restoration rather than the sidecar's own mint after it. The claimed
+    #    token is handed to the sidecar through the environment it inherits, so the writer
+    #    adopts it rather than minting a second one. Generation 0 returns "" and claims
+    #    nothing: there is no committed generation to roll back to.
+    #
+    #    The ORDER of restore-before-backend is itself the correctness rule rather than an
+    #    optimisation: the backend flushes the slot table from its own memory, so a backend
+    #    that starts first persists an empty one over the restored files and the conversation
+    #    list comes up blank with nothing to say so. Transcripts are not restored here -- the
+    #    front fetches the one a turn continues, on that turn.
+    # Signal guard spans the whole startup phase: see _startup_signal_guard. From the
+    # claim's incarnation bump until the supervise phase installs its own handlers, a
+    # SIGTERM/SIGINT is raised as _StartupInterrupted so it reaches the release-and-teardown
+    # abort paths rather than killing the process (SIGTERM) or escaping uncaught (SIGINT)
+    # with the claim still raised against a live predecessor.
+    with _startup_signal_guard() as _signal_guard:
+        # The claim acquisition DEFERS a stop: a SIGTERM/SIGINT between the claim's committed
+        # PUT and the moment the returned claim is bound would otherwise escape before the
+        # release scope exists, stranding the claim (there is no claim object to release yet).
+        # With it deferred, the claim is bound first; the pending stop is then raised INSIDE the
+        # release try below, where the ordinary release-and-teardown handles it.
+        with _signal_guard.deferring():
+            claim = _claim_writer_ownership(settings)
+        # Restoration and backend start-up run INSIDE the ownership-release scope. A successful
+        # claim bumped the committed incarnation before this point, so ANY failure between the
+        # claim and readiness -- an authority GET that times out, a backend spawn that fails, or
+        # readiness itself not arriving -- must release the claim, or the bump outlives this
+        # aborting task and permanently fences a still-healthy predecessor. The backend is created
+        # as None and torn down only if it actually started, so a spawn failure does not call
+        # terminate on a backend that never existed. front and sidecar are declared here too,
+        # BEFORE the first try, so no interruptible statement sits between the two cleanup
+        # scopes: a stop at the readiness boundary is caught by one scope or the other rather
+        # than escaping both with the claim unreleased.
+        backend = None
+        front: ProcessGroup | None = None
+        sidecar: ProcessGroup | None = None
+        try:
+            # A stop that arrived DURING the claim was deferred; now that the claim is bound and
+            # the release scope is active, raise it so the release path runs rather than leaving
+            # the claim stranded.
+            _signal_guard.raise_pending()
+            if restore_authority(settings):
+                # The slot table came back from a remote snapshot but the transcripts
+                # did not (they load lazily, per turn), so tell the backend to keep a
+                # listed slot whose transcript is not yet on local disk as a reopen
+                # seed instead of pruning it as a dead tab -- see
+                # chat_persistence._transcripts_may_be_remote_only.
+                env[backend_mod.ENV_AUTHORITY_RESTORED] = "1"
+            backend = backend_mod.start_backend(settings, env=env)
+            backend_mod.wait_until_ready(
+                settings, backend_mod.DEFAULT_READY_TIMEOUT_SECS, process=backend
+            )
+        except (Exception, _StartupInterrupted):
+            # Restore, spawn, or readiness failed -- or a stop signal arrived mid-startup (routed
+            # here as _StartupInterrupted by the signal guard below). Release the ownership claim
+            # and abort. The front was never started. The claim bumped the committed incarnation
+            # BEFORE restoration so a predecessor was fenced from that instant; a task that aborts
+            # here never commits anything, so leaving the bump raised would permanently fence a
+            # still-healthy predecessor into silent loss of every later turn. The release restores
+            # the predecessor's own committed pointer under a CAS and is a no-op if a newer
+            # successor has since claimed on top. Best-effort: a release that cannot run must not
+            # mask the original failure, which still propagates.
+            log.error("startup failed before readiness; releasing ownership claim and aborting")
+            if settings.backup_bucket:
+                try:
+                    generation_mod.release_ownership(
+                        settings, S3ObjectStore(settings.backup_bucket), claim
+                    )
+                except Exception:  # noqa: BLE001 - best-effort; the real failure must propagate
+                    log.exception("ownership: release failed during abort; continuing to abort")
+            if backend is not None:
+                backend.terminate(BACKEND_DRAIN_SECS)
+            raise
 
-    watched = [backend, front]
-    try:
-        why = wait_for_shutdown(watched)
-        log.info("shutdown: %s", why)
-    finally:
-        _teardown(front, backend)
+        # 2. Front, then the sidecar. The sidecar is started last because its first cycle
+        #    reads what the backend has written, and it is absent entirely when no bucket is
+        #    configured: that is a crew running without durability, not a fault.
+        #
+        #    The spawns run INSIDE a cleanup scope that already owns the running backend, so
+        #    a spawn that raises partway through -- a fork/PID failure between these two
+        #    statements, after the front is up -- tears down every child started so far
+        #    rather than leaking it. Without this scope a `_start_sidecar` failure returned
+        #    from `run` with the front and backend still running, orphaned under a PID 1 that
+        #    had not yet exited, and the backend's turns never drained. front and sidecar were
+        #    declared None before the first scope so `_teardown` only drains what started, and
+        #    so no interruptible statement sits between the two scopes.
+        try:
+            # The readiness boundary is INSIDE this cleanup scope (not between the scopes): a
+            # stop here still routes to the release-and-teardown below rather than escaping with
+            # the claim unreleased and the backend undrained.
+            log.info("backend: ready on %s", settings.backend_base_url)
+            front = _start_front(settings)
+            log.info("front: started")
+            sidecar = _start_sidecar(settings)
+        except (Exception, _StartupInterrupted):
+            # A child failed to start -- or a stop signal arrived mid-spawn (routed here as
+            # _StartupInterrupted) -- AFTER readiness, so the task is aborting without ever
+            # serving: tear down every child started so far AND release the ownership claim. The
+            # claim bumped the committed incarnation before restoration, so an abort here that did
+            # not release it would leave the bump raised and permanently fence a still-healthy
+            # predecessor into silent loss of every later turn -- the same hazard the
+            # restore/readiness abort path above guards. Best-effort and the same CAS-protected
+            # release: a release that cannot run must not mask the spawn failure, which propagates.
+            log.error("a child failed to start; tearing down what started and releasing ownership")
+            _teardown(front, backend, sidecar)
+            if settings.backup_bucket:
+                try:
+                    generation_mod.release_ownership(
+                        settings, S3ObjectStore(settings.backup_bucket), claim
+                    )
+                except Exception:  # noqa: BLE001 - best-effort; the real failure must propagate
+                    log.exception("ownership: release failed during spawn abort; continuing")
+            raise
+
+        # The handoff from the startup guard to the supervise-phase handlers happens INSIDE
+        # the guard scope, not after it. If the `watched` list build and the
+        # supervise `try` ran after `with _startup_signal_guard()` exited, its finally would
+        # have already restored the default dispositions -- a SIGTERM in that span would then
+        # kill the process and a SIGINT escape as KeyboardInterrupt, in both cases BEFORE
+        # `wait_for_shutdown` installs its own handlers, so the ownership claim stays raised
+        # against a live predecessor and the children are never drained. Built here, a stop in
+        # the span is still the guard's `_StartupInterrupted`, caught below and routed through
+        # the same release-and-teardown abort path. `wait_for_shutdown` installs its own
+        # handlers as its first action, so by the time the guard's finally restores the
+        # defaults on block exit the supervise handlers already own the signals -- no instant
+        # is left unguarded.
+        watched = [child for child in (backend, front, sidecar) if child is not None]
+        sidecar_status: int | None = None
+        try:
+            # A stop that lands between here and wait_for_shutdown taking over its handlers is
+            # raised as _StartupInterrupted (the guard is still active); tear down the children
+            # and release the claim rather than escaping with the bump raised and nothing drained.
+            _signal_guard.raise_pending()
+            why = wait_for_shutdown(watched)
+            log.info("shutdown: %s", why)
+        except (Exception, _StartupInterrupted):
+            # The `finally` below tears the children down on every exit, so release only the
+            # ownership claim here: a stop in the handoff span would otherwise leave the
+            # incarnation bump raised against a live predecessor. Best-effort and CAS-protected,
+            # the same as the startup abort paths; the original stop still propagates.
+            log.error("stop during the supervise handoff; releasing ownership before teardown")
+            if settings.backup_bucket:
+                try:
+                    generation_mod.release_ownership(
+                        settings, S3ObjectStore(settings.backup_bucket), claim
+                    )
+                except Exception:  # noqa: BLE001 - best-effort; the real failure must propagate
+                    log.exception("ownership: release failed during handoff abort; continuing")
+            raise
+        finally:
+            sidecar_status = _teardown(front, backend, sidecar)
     # The exit code has to distinguish the two reasons, because it is the only one
     # the platform reads. `_wait_for_shutdown` returns "signal" for an orderly stop
     # (ECS asked the task to go) and "<name> exited (code N)" when a child died
@@ -640,10 +1209,25 @@ def run(settings: Settings, *, wait_for_shutdown=None) -> int:
     # Anything outside `_ORDERLY_REASONS`, including an empty reason, is reported as
     # a failure: a reason this code cannot account for is not evidence that things
     # went well.
-    if why in _ORDERLY_REASONS:
-        return 0
-    log.error("exiting non-zero: %s", why or "shutdown reason unknown")
-    return 1
+    if why not in _ORDERLY_REASONS:
+        log.error("exiting non-zero: %s", why or "shutdown reason unknown")
+        return 1
+    # An orderly stop is only a SUCCESSFUL stop if the writer's final cycle committed.
+    # That cycle runs after the backend's flush and carries the turns nothing else has
+    # copied, so its failure -- a refused upload, or a kill when the drain window
+    # elapses mid-upload -- is state this task produced and lost. Reporting 0 for it
+    # would hand the platform a clean shutdown for a lossy one, which is the same
+    # mistake as reporting 0 for a crash loop. This applies to a spent lifetime as much
+    # as to a signal: both stop a task that was serving turns a moment earlier.
+    if sidecar is not None and sidecar_status != 0:
+        log.error(
+            "exiting non-zero: the sidecar's final backup cycle did not complete "
+            "(status %s), so state written after the backend's flush is not in the "
+            "bucket",
+            "unknown" if sidecar_status is None else sidecar_status,
+        )
+        return 1
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -19,6 +19,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from dashboard_owner_helpers import owner_claims
 
 import kiro_crew.apps.teardown as teardown
 
@@ -86,7 +87,9 @@ class TestForgetAppHooks:
 
     def test_it_is_safe_when_nothing_is_registered(self):
         """Uninstall runs for apps that never registered anything."""
+        _install_hooks([])
         teardown.forget_app_hooks("never-registered-app")
+        assert _registered() == {"disable": True, "close": True, "undo": True}
 
 
 @pytest.mark.asyncio
@@ -108,7 +111,9 @@ class TestUninstallDropsTheHooks:
         # cleanup raises is refused before anything destructive runs.
         state = MagicMock()
         state.crons = None
+        state.owner_id = ""
         request.app = {"state": state}
+        owner_claims(request)
         request.json = AsyncMock(return_value={})
 
         with (

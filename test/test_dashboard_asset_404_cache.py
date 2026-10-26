@@ -2,9 +2,11 @@
 
 The unit tests in ``test_dashboard_security_headers.py`` feed
 ``_apply_security_headers`` a ``web.Response`` whose status is already final,
-so they cannot see this bug: aiohttp's ``FileResponse`` (what ``add_static``
-returns) is constructed with status 200 and only discovers the file is missing
-inside ``prepare()`` -- AFTER every middleware has run. The middleware therefore
+so they cannot see this bug: aiohttp's ``FileResponse`` is constructed with
+status 200 and only discovers the file is missing inside ``prepare()`` -- AFTER
+every middleware has run. The dist routes check the file before returning one,
+but a file removed between that check and ``prepare()`` (a stage sweeping the
+tree it was in) still takes this path. The middleware therefore
 stamps ``public, max-age=31536000, immutable`` on what becomes a 404, and
 Chromium stores that 404 for a year under the request URL. Because lucide icon
 chunks keep the same content hash across releases, a 404 cached while a gateway
@@ -13,18 +15,22 @@ that imports the same chunk: the ``<script type=module>`` fails silently and the
 pane never boots. Observed on the desktop app's remote-crew panes (one origin
 stuck for days while its siblings on other ports loaded fine).
 
-These tests drive a real ``add_static`` mount through the real middleware and a
-real ``TestClient`` so the headers asserted are the ones that went on the wire.
+These tests drive the real dist routes through the real middleware and a real
+``TestClient`` so the headers asserted are the ones that went on the wire.
 """
 
 from __future__ import annotations
 
+import errno
+import logging
+import os
 from pathlib import Path
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.dashboard import dist_file_response
 from kiro_crew.dashboard import server as srv
 
 
@@ -32,6 +38,9 @@ def _dist(tmp_path: Path) -> Path:
     dist = tmp_path / "dist"
     (dist / "assets").mkdir(parents=True)
     (dist / "assets" / "main-krfrL6rl.js").write_text("export const x = 1\n", encoding="utf-8")
+    (dist / "assets" / "diffWorker-DcdnVVDz.js").write_text(
+        "self.onmessage = () => {}\n", encoding="utf-8"
+    )
     return dist
 
 
@@ -63,6 +72,18 @@ async def test_missing_hashed_asset_is_not_cached(tmp_path: Path) -> None:
         assert "no-store" in cc, cc
         assert resp.headers.get("Pragma") == "no-cache"
         assert resp.headers.get("Expires") == "0"
+
+
+@pytest.mark.asyncio
+async def test_an_asset_swept_after_it_was_found_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the finalizer still covers: found, then removed before prepare()."""
+    monkeypatch.setattr(srv, "_resolve_dist_file", lambda *_a: tmp_path / "swept.js")
+    async with TestClient(TestServer(_make_app(_dist(tmp_path)))) as client:
+        resp = await client.get("/assets/check-BiXj6uGO.js")
+        assert resp.status == 404
+        assert "immutable" not in resp.headers["Cache-Control"]
 
 
 @pytest.mark.asyncio
@@ -105,11 +126,50 @@ async def test_finalizer_leaves_non_asset_paths_alone(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_without_finalizer_the_404_is_immutable(tmp_path: Path) -> None:
-    """Pins the mechanism this file exists for: with only the middleware, the
-    missing-file 404 really does leave with ``immutable``. If aiohttp ever
-    moves the existence check back before the handler returns, this test
-    fails and the finalizer can be retired."""
+async def test_present_worker_asset_uses_short_lived_policy(tmp_path: Path) -> None:
+    """A worker chunk on the wire carries the short-lived policy, not immutable:
+    a worker's CSP lives in its own cached response header, so a small
+    ``max-age`` re-fetches it within a minute of a header-only build while
+    keeping the bytes cache-servable across a brief gateway-down window. It must
+    NOT carry ``no-cache``/``must-revalidate`` — those forbid the cache reuse
+    the gateway-down survival depends on."""
+    async with TestClient(TestServer(_make_app(_dist(tmp_path)))) as client:
+        resp = await client.get("/assets/diffWorker-DcdnVVDz.js")
+        assert resp.status == 200
+        cc = resp.headers["Cache-Control"]
+        assert "immutable" not in cc, cc
+        assert "no-store" not in cc, cc
+        assert "max-age=60" in cc, cc
+        assert "no-cache" not in cc, cc
+        assert "must-revalidate" not in cc, cc
+
+
+@pytest.mark.asyncio
+async def test_missing_worker_asset_is_downgraded_to_no_store(tmp_path: Path) -> None:
+    """A worker 404 must not keep the worker's cacheable policy: its ``max-age``
+    would let a browser cache the error and its ``stale-if-error`` would let an
+    intermediary serve the stale bytes of an orphaned worker. The finalizer
+    downgrades it to no-store just as it does an immutable 404."""
+    async with TestClient(TestServer(_make_app(_dist(tmp_path)))) as client:
+        resp = await client.get("/assets/goneWorker-ZZZ99999.js")
+        assert resp.status == 404
+        cc = resp.headers["Cache-Control"]
+        assert "stale-if-error" not in cc, cc
+        assert "max-age=60" not in cc, cc
+        assert "no-store" in cc, cc
+        assert resp.headers.get("Pragma") == "no-cache"
+        assert resp.headers.get("Expires") == "0"
+
+
+@pytest.mark.asyncio
+async def test_without_finalizer_the_404_is_immutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the mechanism this file exists for: with only the middleware, a
+    file that vanishes after the route found it really does leave as a 404
+    with ``immutable``. If aiohttp ever moves the existence check back before
+    the handler returns, this test fails and the finalizer can be retired."""
+    monkeypatch.setattr(srv, "_resolve_dist_file", lambda *_a: tmp_path / "swept.js")
     app = web.Application()
     srv._register_dist_static_routes(app, _dist(tmp_path))
 
@@ -124,3 +184,96 @@ async def test_without_finalizer_the_404_is_immutable(tmp_path: Path) -> None:
         resp = await client.get("/assets/check-BiXj6uGO.js")
         assert resp.status == 404
         assert "immutable" in resp.headers["Cache-Control"]
+
+
+def _fail_open_for(monkeypatch: pytest.MonkeyPatch, target: Path, err: int) -> None:
+    """Make the build response's open of ``target`` fail with ``err``, as a
+    process denied file opens sees it while ``stat`` still works."""
+    real_open = open
+
+    def _open(file: object, *args: object, **kwargs: object) -> object:
+        if Path(str(file)) == target:
+            if err in (errno.EACCES, errno.EPERM):
+                raise PermissionError(err, os.strerror(err), str(file))
+            raise OSError(err, os.strerror(err), str(file))
+        return real_open(file, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(dist_file_response, "open", _open, raising=False)
+
+
+def _unopenable_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == dist_file_response.logger.name
+        and r.levelno == logging.WARNING
+        and "cannot be read" in r.getMessage()
+    ]
+
+
+@pytest.fixture
+def _fresh_open_log(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.setattr(dist_file_response, "_UNOPENABLE_LAST_LOGGED", {})
+    caplog.set_level(logging.WARNING, logger=dist_file_response.logger.name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_open_log")
+@pytest.mark.parametrize(
+    ("err", "status"), [(errno.ENOSYS, 404), (errno.EIO, 404), (errno.EACCES, 403)]
+)
+async def test_an_asset_that_cannot_be_opened_logs_once_and_keeps_its_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    err: int,
+    status: int,
+) -> None:
+    dist = _dist(tmp_path)
+    target = (dist / "assets" / "main-krfrL6rl.js").resolve()
+    _fail_open_for(monkeypatch, target, err)
+    async with TestClient(TestServer(_make_app(dist))) as client:
+        first = await client.get("/assets/main-krfrL6rl.js")
+        second = await client.get("/assets/main-krfrL6rl.js")
+        assert first.status == second.status == status
+        assert "no-store" in first.headers["Cache-Control"]
+    warnings = _unopenable_warnings(caplog)
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    message = warnings[0].getMessage()
+    assert repr(str(target)) in message
+    assert f"[Errno {err}]" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_open_log")
+async def test_an_unopenable_precompressed_sibling_falls_back_without_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The response falls back to the plain file, so nothing failed to serve."""
+    dist = _dist(tmp_path)
+    sibling = (dist / "assets" / "main-krfrL6rl.js.gz").resolve()
+    sibling.write_bytes(b"gz")
+    _fail_open_for(monkeypatch, sibling, errno.ENOSYS)
+    async with TestClient(TestServer(_make_app(dist))) as client:
+        resp = await client.get("/assets/main-krfrL6rl.js", headers={"Accept-Encoding": "gzip"})
+        assert resp.status == 200
+        assert "Content-Encoding" not in resp.headers
+    assert _unopenable_warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_open_log")
+async def test_a_served_or_missing_asset_logs_no_open_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    dist = _dist(tmp_path)
+    async with TestClient(TestServer(_make_app(dist))) as client:
+        served = await client.get("/assets/main-krfrL6rl.js")
+        never_built = await client.get("/fonts/absent.woff2")
+        assert served.status == 200
+        assert never_built.status == 404
+    monkeypatch.setattr(srv, "_resolve_dist_file", lambda *_a: tmp_path / "swept.js")
+    async with TestClient(TestServer(_make_app(dist))) as client:
+        swept = await client.get("/assets/check-BiXj6uGO.js")
+        assert swept.status == 404
+    assert _unopenable_warnings(caplog) == []

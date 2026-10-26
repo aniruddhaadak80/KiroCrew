@@ -29,6 +29,7 @@ import pytest
 from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 from kiro_crew.subagent_persistence import create_agent_folder
+from kiro_crew.testing.wait import await_until
 
 _DEATH_TEXT = (
     "Runtime process died during prompt — killed (provider shutdown) "
@@ -108,7 +109,7 @@ async def test_a_user_stop_is_reported_as_a_stop_not_a_runtime_death(agent_root,
         run_task = asyncio.create_task(manager._run(info))
         await asyncio.sleep(0)
         assert await manager.cancel("stopecho1") is True
-        await asyncio.wait_for(run_task, timeout=10)
+        await await_until(run_task)
 
     # Neutral record: the death was our own doing.
     assert info.outcome == "stopped"
@@ -141,7 +142,7 @@ async def test_a_parent_end_names_the_verb_that_ended_the_run(agent_root, caplog
             verb="retire_kiro_identity_sessions",
         )
         assert stopped == 1
-        await asyncio.wait_for(run_task, timeout=10)
+        await await_until(run_task)
 
     assert info.outcome == "stopped"
     assert not info.error
@@ -170,7 +171,7 @@ async def test_a_deadline_reap_names_the_deadline_not_the_death(agent_root, capl
         run_task = asyncio.create_task(manager._run(info))
         await asyncio.sleep(0)
         await manager._force_reap("stopecho3", info, elapsed=900.0, reason="reaped")
-        await asyncio.wait_for(run_task, timeout=10)
+        await await_until(run_task)
 
     # A deadline reap IS a failure, but its own one: the error names the reap.
     assert info.outcome == "failed"
@@ -223,7 +224,7 @@ async def test_an_unrelated_exception_under_a_reap_is_still_the_runs_own_failure
         run_task = asyncio.create_task(manager._run(info))
         await asyncio.sleep(0)
         await manager._force_reap("stopecho4", info, elapsed=5.0, reason="reaped")
-        await asyncio.wait_for(run_task, timeout=10)
+        await await_until(run_task)
 
     assert info.outcome == "failed"
     assert info.error == "RuntimeError: a bug of the run's own"
@@ -249,31 +250,15 @@ async def test_a_childless_parent_end_is_not_a_warning(caplog):
     ]
 
 
-def test_a_stage_cancel_names_itself_before_the_reap():
-    """A stage-boundary cancel is neither a user Stop nor a parent end."""
-    manager = _manager()
-    info = SubagentInfo(id="stage0001", task="t", parent_session_key="dashboard:p")
-    info._stage_boundary_owner = "owner-7"
-    manager._agents["stage0001"] = info
-    revoked = manager._cancellation._revoke_boundary_owners_impl("dashboard:p", "owner-7")
-    assert [i.id for i in revoked] == ["stage0001"]
-    assert info.user_stopped is True
-    assert info._reap_reason == "stage_cancel"
-    assert info._stop_origin == "stage cancelled (owner-7)"
-
-
 @pytest.mark.asyncio
 async def test_the_first_stopper_keeps_the_attribution():
-    """A later parent end or stage cancel must not rewrite who stopped the run."""
+    """A later parent end must not rewrite who stopped the run."""
     manager = _manager()
     info = SubagentInfo(id="first0001", task="t", parent_session_key="dashboard:p")
-    info._stage_boundary_owner = "owner-9"
     manager._agents["first0001"] = info
     # The user's Stop has begun and named itself; the reap is still in flight.
     info._reap_reason = "user_stop"
     info._stop_origin = "stopped by user"
-    manager._cancellation._revoke_boundary_owners_impl("dashboard:p", "owner-9")
-    assert (info._reap_reason, info._stop_origin) == ("user_stop", "stopped by user")
     with patch.object(manager, "cancel", new_callable=AsyncMock, return_value=True):
         await manager.cancel_for_teardown(
             ["first0001"], parent_session_key="dashboard:p", verb="destroy"
@@ -310,7 +295,7 @@ async def test_a_late_stop_does_not_turn_a_deadline_reap_neutral(agent_root, cap
 
         manager._sessions.reset = _reset_then_late_stop
         await manager._force_reap("stopecho5", info, elapsed=900.0, reason="reaped")
-        await asyncio.wait_for(run_task, timeout=10)
+        await await_until(run_task)
 
     assert info.outcome == "failed"
     assert info.error and "reaped" in info.error

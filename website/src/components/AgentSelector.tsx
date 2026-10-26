@@ -8,8 +8,12 @@ import { isTouchDevice } from '../utils/isTouchDevice'
 import { Input, Btn } from './ui'
 import { SourceBadge } from './SourceBadge'
 import ErrorNotice from './ErrorNotice'
+import { MarkdownOnlyBadge } from './MarkdownOnlyBadge'
 
 import { i18nT } from '../i18n/t'
+import { isAssistantMember } from '../lib/assistantMember'
+import type { MarkdownBlock } from '../lib/markdownAgents'
+import { useInsideDialog } from './overlayRoot'
 export interface KiroCrewAgent {
   name: string
   kiro_agent: string
@@ -44,15 +48,20 @@ export interface KiroCrewAgent {
   selection_kind?: 'member' | 'template'
   /** `global` or `project`; only catalog rows carry it. */
   scope?: string
+  /** Catalog rows only: defined in markdown, with no JSON spec for its name. */
+  markdown_only?: boolean
+  /** Set by `useAgents` when this chat's harness cannot load the markdown spec. */
+  markdown_block?: MarkdownBlock
 }
 
 /** The label a roster surface shows for a crew: its display name when one is
  *  set, otherwise its name. One helper rather than `a.display_name || a.name`
  *  at each site, so every surface applies the same fallback (and the same
  *  trim — a stored label arrives trimmed, but an in-flight edit draft may
- *  not be). */
-export function crewDisplayName(a: Pick<KiroCrewAgent, 'name' | 'display_name'>): string {
-  return a.display_name?.trim() || a.name
+ *  not be). The built-in Assistant (see `isAssistantMember`) with no label of
+ *  its own reads as its localized name rather than its config key. */
+export function crewDisplayName(a: Pick<KiroCrewAgent, 'name' | 'display_name'> & { kiro_agent?: unknown }): string {
+  return a.display_name?.trim() || (isAssistantMember(a) ? i18nT('components.assistantWelcome.default_name') : a.name)
 }
 
 interface Props {
@@ -72,7 +81,7 @@ interface Props {
    * there is no host dialog to coexist with. The transfer has a transient
    * cost in modal mode: while the popup is open, the wheel lock belongs to
    * the popup, so the dialog body itself does not wheel-scroll until the
-   * popup closes.
+   * popup closes. Outside a dialog the shared Popover ignores it.
    */
   modal?: boolean
   /**
@@ -113,7 +122,11 @@ interface Props {
  * Popover has no option semantics of its own, so the listbox ARIA and roving
  * focus come from `useListboxKeyboard`, unchanged.
  */
-export default function AgentSelector({ agents, defaultAgent, value, onChange, modal = false, rosterFailure }: Props) {
+export default function AgentSelector({ agents, defaultAgent, value, onChange, modal: modalProp = false, rosterFailure }: Props) {
+  // The shared Popover is modal only inside a Radix dialog, so focus handling
+  // follows the modality it actually gets (components/overlayRoot).
+  const insideDialog = useInsideDialog()
+  const modal = modalProp && insideDialog
   const provider = useProvider()
   const [open, setOpen] = useState(false)
   const [filter, setFilter] = useState('')
@@ -232,6 +245,43 @@ export default function AgentSelector({ agents, defaultAgent, value, onChange, m
     closeToTrigger,
   })
 
+  // One option row. The roster
+  // `useAgents` hands this picker is folded to one row per name (a member wins
+  // over a same-named template), so the name is the key and the default badge
+  // marks the row named as the default — a template-only default carries it
+  // truthfully.
+  const renderRow = (a: KiroCrewAgent) => {
+    const isCurrent = active === a.name
+    const isDefault = a.name === defaultAgent
+    return (
+      <Btn
+        key={a.name}
+        role="option"
+        aria-selected={isCurrent}
+        tabIndex={-1}
+        className={`w-full text-left px-3 py-2 flex items-center gap-2 min-w-0 border-0 rounded-none cursor-pointer
+          ${isCurrent ? 'bg-accent-subtle hover:bg-accent-subtle' : 'hover:bg-bg-hover'}
+        `}
+        onClick={() => handleSelect(a)}
+      >
+        <div className="flex flex-col min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className={`text-[13px] font-mono font-semibold truncate ${isCurrent ? 'text-accent' : 'text-text'}`}>{crewDisplayName(a)}</span>
+            {isDefault && <span className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent-subtle text-accent border border-accent/30 shrink-0">{i18nT('components.agentSelector.default')}</span>}
+            {a.source && (
+              <SourceBadge source={a.source} className="shrink-0">
+                {a.source}
+              </SourceBadge>
+            )}
+            <MarkdownOnlyBadge block={a.markdown_block} />
+          </div>
+          <span className="text-[11px] text-muted truncate">{a.description || provider.resolveAgentTemplate(a)}</span>
+        </div>
+        {isCurrent && <span className="text-accent text-[11px] ml-auto shrink-0"><Check className="lucide-inline" /></span>}
+      </Btn>
+    )
+  }
+
   return (
     <Popover open={open} onOpenChange={setOpen} modal={modal}>
       <PopoverTrigger
@@ -312,42 +362,7 @@ export default function AgentSelector({ agents, defaultAgent, value, onChange, m
           </div>
         )}
         <div role="listbox" aria-label={i18nT('components.agentSelector.agent_list')} className="flex-1 min-h-0 overflow-y-auto divide-y divide-border">
-          {filtered.map(a => {
-            const isCurrent = active === a.name
-            const isDefault = a.name === defaultAgent
-            return (
-              <Btn
-                key={a.name}
-                role="option"
-                aria-selected={isCurrent}
-                tabIndex={-1}
-                className={`w-full text-left px-3 py-2 flex items-center gap-2 min-w-0 border-0 rounded-none cursor-pointer
-                  ${isCurrent ? 'bg-accent-subtle hover:bg-accent-subtle' : 'hover:bg-bg-hover'}
-                `}
-                onClick={() => handleSelect(a)}
-              >
-                <div className="flex flex-col min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <span className={`text-[13px] font-mono font-semibold truncate ${isCurrent ? 'text-accent' : 'text-text'}`}>{crewDisplayName(a)}</span>
-                    {/* The ID stays visible when a label covers it: `agent=` in
-                        spawn params, crons and the CLI all address the ID, so a
-                        picker that hid it would strand anyone wiring those up. */}
-                    {crewDisplayName(a) !== a.name && (
-                      <span className="text-[11px] font-mono text-muted truncate max-w-[9rem]" title={i18nT('components.agentSelector.agent_id_tooltip', { name: a.name })}>{a.name}</span>
-                    )}
-                    {isDefault && <span className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent-subtle text-accent border border-accent/30 shrink-0">{i18nT('components.agentSelector.default')}</span>}
-                    {a.source && (
-                      <SourceBadge source={a.source} className="shrink-0">
-                        {a.source}
-                      </SourceBadge>
-                    )}
-                  </div>
-                  <span className="text-[11px] text-muted truncate">{a.description || provider.resolveAgentTemplate(a)}</span>
-                </div>
-                {isCurrent && <span className="text-accent text-[11px] ml-auto shrink-0"><Check className="lucide-inline" /></span>}
-              </Btn>
-            )
-          })}
+          {filtered.map(renderRow)}
           {filtered.length === 0 && !rosterFailed && <div className="px-3 py-2 text-[13px] text-muted italic">{i18nT('components.agentSelector.no_matches')}</div>}
         </div>
         {/* Outside the listbox, not another childless row inside it: the retry is

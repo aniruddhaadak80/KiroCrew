@@ -83,7 +83,9 @@ def _install_policy(monkeypatch, doc: dict | None) -> None:
 #: filtering to one scope would discard the property that makes them a ratchet — a
 #: third probe added to this read without an audit row must fail here, and it cannot
 #: if the helper drops every row it does not recognise.
-_ENDPOINT_SCOPES = (_SCOPE, "capabilities.decisions")
+# Both decisions rows, every read: the card is drawn while either permits, and each
+# row's evaluation is audited whatever the other answered.
+_ENDPOINT_SCOPES = (_SCOPE, "capabilities.decisions", "capabilities.decisions_local")
 
 
 def _governance_rows(fake: MagicMock) -> list[dict]:
@@ -284,11 +286,17 @@ class TestDashboardConfigEndpoint:
             assert (await (await client.get("/api/dashboard/config")).json())[
                 "social_share_enabled"
             ] is True
-            assert len(_governance_rows(fake_sel)) == 3 * len(_ENDPOINT_SCOPES)
-            assert [r["outcome"] for r in _rows_for(fake_sel, _SCOPE)] == [
-                "denied",
-                "denied",
-                "allowed",
+            # A permitted entry also asks each site of the ``sites`` list (one row
+            # each); a withdrawn entry asks none, so the two pinned reads had none.
+            assert len(_governance_rows(fake_sel)) == 3 * len(_ENDPOINT_SCOPES) + len(
+                social_share.SHARE_SITES
+            )
+            share_rows = _rows_for(fake_sel, _SCOPE)
+            assert [r["outcome"] for r in share_rows] == ["denied", "denied", "allowed"] + [
+                "allowed"
+            ] * len(social_share.SHARE_SITES)
+            assert [r["item"] for r in share_rows[3:]] == [
+                f"sites:{s}" for s in social_share.SHARE_SITES
             ]
 
     @pytest.mark.asyncio

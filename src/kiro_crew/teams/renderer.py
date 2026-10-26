@@ -88,7 +88,7 @@ _PROGRESS_THROTTLE_S = 3.0
 
 #: How often the typing indicator is re-posted while a turn runs. A Teams typing
 #: activity expires after a few seconds; the reference middleware refreshes every
-#: 2 s. Teams' per-thread budget is 7 requests/second, so this spends ~1% of it.
+#: 2 s. Teams' per-thread budget is 7 requests/second, so this spends about 4% of it.
 _TYPING_REFRESH_S = 4.0
 
 _ERROR_TEXT = "⚠️ Something went wrong — please try again."
@@ -228,6 +228,8 @@ class TeamsRenderer(Renderer):
         # directory. Absolute or nothing -- a relative root is no boundary at all.
         self._upload_root = upload_root if os.path.isabs(upload_root) else ""
         self._upload_root_resolved = bool(self._upload_root)
+        # The session's own scratch directory (``authorize_scratch_root``).
+        self._scratch_root = ""
 
     def authorize_upload_root(self, root: str) -> None:
         """Authorize the provider's resolved cwd as the extraction boundary.
@@ -238,6 +240,16 @@ class TeamsRenderer(Renderer):
         """
         self._upload_root = root if os.path.isabs(root) else ""
         self._upload_root_resolved = True
+
+    def authorize_scratch_root(self, scratch_root: str) -> None:
+        """Record the session's own ``$KIROCREW_SCRATCH`` directory.
+
+        Set by the dispatcher once the provider exists. It only ever counts beside
+        an approved cwd (extraction never runs without one), and extraction
+        re-checks that it is one allocation under the managed scratch root
+        (``outbound_files.session_scratch_root``) before it counts.
+        """
+        self._scratch_root = scratch_root if os.path.isabs(scratch_root) else ""
 
     # -- lifecycle ----------------------------------------------------------
     async def on_turn_start(self) -> None:
@@ -650,7 +662,10 @@ class TeamsRenderer(Renderer):
             return text, []
         try:
             result = await extract_local_refs_off_loop(
-                text, within_root=root, limits=TEAMS_UPLOAD_LIMITS
+                text,
+                within_root=root,
+                limits=TEAMS_UPLOAD_LIMITS,
+                scratch_root=self._scratch_root,
             )
         except Exception:
             logger.warning("Teams: outbound file extraction failed", exc_info=True)

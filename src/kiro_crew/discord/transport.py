@@ -26,6 +26,7 @@ from kiro_crew.discord.client import (
     DISCORD_CHUNK_LIMIT,
     DiscordClient,
     DiscordInbound,
+    SendPermission,
 )
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.outbound_files import OutboundFile
@@ -370,14 +371,31 @@ class DiscordTransport(MessagingTransport):
         recipient is exactly the case that must not be waved through: this is a
         network egress boundary, and the caller audits the refusal.
 
-        The one route that reaches that refusal is a ``unified`` DM bucket, whose
-        key names no peer by design. Refusing costs an unattended notice there and
-        is the correct trade: that bucket deliberately collapses SEVERAL peers into
-        one session, so nothing available to this seam establishes which of them the
-        link currently points at. Sessions under the default ``per-channel-peer``
-        scope carry their peer in the key and are unaffected. Serving it needs a
-        ``dm_channel_id -> user_id`` pairing persisted when the DM is opened, which
-        is a Discord-owned schema change.
+        Two routes name no peer in their session KEY. A dashboard-born session
+        mirrored into a DM is served anyway, from the record the GATEWAY wrote when
+        it admitted the mirror: the link carries the peer (``ChannelLink.principal``)
+        under a MAC the gateway alone can mint (``mirror_admission``, keyed from the
+        sandbox-masked token signing key over the session key and the whole
+        location), and the ladder hands that peer in here as *principal* only when
+        the MAC verifies. The session map is writable by in-sandbox code, so an
+        unsigned or rewritten row -- one pointed at another user's DM, or given
+        another user's name -- fails verification and is refused, and a key rotation
+        refuses every such mirror until it is re-linked. This transport's own pairing
+        (:meth:`direct_peer_of`) is read as well, as defense in depth: when the client
+        knows which user a channel belongs to and that disagrees with the record, the
+        record loses; when it knows nothing (a DM this process has not opened or seen,
+        the ordinary state right after a restart) the verified record stands, which is
+        what keeps this check admitting the mirror across a restart with no inbound
+        message. One residual is the REST ladder's own mid-send re-check
+        (:meth:`_still_may_send_to`), which reads the pairing alone: a send that hits
+        one of the ladder's waits before the pairing is re-learned is still refused
+        there, while a send that never waits is delivered. The
+        route that stays refused is a ``unified`` DM bucket bound from inside the
+        channel, whose link records no peer. Refusing costs an unattended notice
+        there and is the correct trade: that bucket deliberately collapses SEVERAL
+        peers into one session, so nothing available to this seam establishes which
+        of them the link currently points at. Sessions under the default
+        ``per-channel-peer`` scope carry their peer in the key and are unaffected.
         """
         if not conversation_id:
             return False
@@ -385,7 +403,7 @@ class DiscordTransport(MessagingTransport):
             return True
         return bool(principal) and principal in self._allowed
 
-    def _still_may_send_to(self, channel_id: str) -> bool:
+    def _still_may_send_to(self, channel_id: str) -> SendPermission:
         """May a channel the REST ladder already started sending to still be
         written to? Fails closed. Installed on the client as
         ``still_permitted``.
@@ -424,17 +442,57 @@ class DiscordTransport(MessagingTransport):
         delivering to a peer whose authorization may already be gone, which is the
         thing this exists to stop. A caller that needs the send to survive can re-open
         the DM through ``create_dm_channel``, which establishes the pairing.
+
+        Each refusal names its OWN ground, because only here can the two be told
+        apart: a peer the roster refuses is a withdrawal, while an id nothing
+        can place is a destination this process cannot attribute. The caller reports
+        whichever it is, so an operator reading a dropped notification is not told a
+        policy changed when none did.
         """
         if not channel_id:
-            return False
+            return SendPermission.unattributable()
         if channel_id in self._allowed_threads:
-            return True
+            return SendPermission.allow()
         if channel_id in self._allowed_channels:
-            return True
+            return SendPermission.allow()
         peer = self._client.cached_dm_recipient(channel_id)
         if peer is not None:
-            return peer in self._allowed
-        return False
+            if peer in self._allowed:
+                return SendPermission.allow()
+            return SendPermission.revoked()
+        return SendPermission.unattributable()
+
+    def direct_peer_of(self, conversation_id: str) -> str:
+        """The user this DM channel belongs to, from the client's own pairing alone.
+
+        A Discord DM link persists the channel id ``create_dm_channel`` returned,
+        which is unrelated to the user snowflake, so the peer has to come from the
+        record that call (and an authorized inbound DM or button press) leaves --
+        ``cached_dm_recipient``, the same pairing :meth:`_still_may_send_to`
+        decides on. Every writer of that pairing is DM-gated, so an answer is also
+        the statement that the id is a DM channel and not a guild one; a guild
+        channel or thread id is never paired and reads ``""``.
+
+        This is what the per-send recipient leg reads as defense in depth for a
+        dashboard-born session's mirror: the gateway-signed record on the link names
+        the peer, and when this pairing knows the channel too the two must agree --
+        a disagreement refuses the send, whatever the record says.
+
+        Session control's owner-DM predicate (``owner_dm_refusal``) reads the same
+        answer to place a dashboard tab's mirror as the owner's own DM, and refuses
+        on ``""``: a DM opened before a restart stays refused THERE until the
+        pairing is learned again, while the recipient leg below admits it.
+
+        In-process only, by the pairing's own contract: a DM opened before a
+        restart names nobody until the bot re-opens it or the peer writes into it,
+        and the reader treats ``""`` as "not on record" rather than as a
+        contradiction -- the verified record stands at the recipient leg, so a
+        restart costs no admission there (the mid-send re-check, which reads this
+        pairing alone, can still refuse a send that waits before it is re-learned).
+        """
+        if not conversation_id:
+            return ""
+        return self._client.cached_dm_recipient(conversation_id) or ""
 
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
@@ -591,4 +649,6 @@ class DiscordTransport(MessagingTransport):
             )
             return
         if self._dispatch is not None:
+            # Received from a person: its start is FOREGROUND (kiro_crew.start_priority).
+            msg.person_origin = True
             await self._dispatch(msg)

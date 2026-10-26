@@ -30,13 +30,16 @@ long-lived conversation's accumulated context on every sync.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import pathlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from dashboard_owner_helpers import owner_claims
 
+from kiro_crew import platform_compat
 from kiro_crew.apps import bridges, routes
 from kiro_crew.gateway_lock import GatewayLock
 from kiro_crew.history import transcript_stem
@@ -225,6 +228,57 @@ def test_the_cli_path_declines_while_a_gateway_owns_the_map(tmp_path, monkeypatc
     assert _stored_sid(tmp_path, OWNED) == "sid-app"
 
 
+def test_an_unusable_lock_path_fails_with_its_remedy_instead_of_declining(
+    tmp_path, monkeypatch, caplog
+):
+    """No gateway owns the map when the lock PATH is the problem.
+
+    A directory at ``gateway.lock`` is refused by the lock itself, and "stop the
+    gateway and run again" would repeat that refusal forever. So it is a
+    ``failed`` clear, and the log line names the path and what to do about it.
+    """
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    SessionMap().set(OWNED, "sid-app", provider="acp")
+    _seed_transcript(tmp_path, OWNED, app=APP)
+    (tmp_path / "gateway.lock").mkdir()
+
+    with caplog.at_level(logging.WARNING, logger=bridges.logger.name):
+        cleanup = bridges.discard_app_session_pointers(APP)
+
+    assert cleanup == bridges.SessionPointerCleanup(failed=True)
+    assert "is not a regular file" in caplog.text and "remove it" in caplog.text
+    assert _stored_sid(tmp_path, OWNED) == "sid-app"
+
+
+def test_an_unopenable_lock_file_fails_instead_of_declining(tmp_path, monkeypatch, caplog):
+    """A lock file this process cannot open says nothing about a running gateway.
+
+    The shape of a ``gateway.lock`` left root-owned by a ``sudo`` run, or on a
+    read-only home: no gateway owns the map, so "stop the gateway and run
+    again" would send the operator in circles. It is a ``failed`` clear, and the
+    log line carries the cause.
+    """
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    SessionMap().set(OWNED, "sid-app", provider="acp")
+    _seed_transcript(tmp_path, OWNED, app=APP)
+    lock_file = tmp_path / "gateway.lock"
+    lock_file.write_text("", encoding="utf-8")
+    real_open = platform_compat.open_create_no_reparse
+
+    def denied(path, *args, **kwargs):
+        if pathlib.Path(path) == lock_file:
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_compat, "open_create_no_reparse", denied)
+    with caplog.at_level(logging.WARNING, logger=bridges.logger.name):
+        cleanup = bridges.discard_app_session_pointers(APP)
+
+    assert cleanup == bridges.SessionPointerCleanup(failed=True)
+    assert "could not open" in caplog.text and "Permission denied" in caplog.text
+    assert _stored_sid(tmp_path, OWNED) == "sid-app"
+
+
 def test_the_cleared_pointer_stays_diagnosable(tmp_path, monkeypatch):
     """``clear_sid``, not ``delete``: the entry (and its Slack linkage) survives and
     the dropped value is stashed, so this is reversible by hand."""
@@ -269,9 +323,13 @@ def test_the_in_gateway_path_clears_inside_the_lock_via_the_live_map(tmp_path):
     is the NEW installation's.
     """
     src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "apps" / "routes.py"
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "kiro_crew"
+        / "apps"
+        / "routes_uninstall.py"
     ).read_text(encoding="utf-8")
-    handler = src.split("async def handle_uninstall_app", 1)[1].split("\nasync def ", 1)[0]
+    handler = src.split("async def _run_uninstall", 1)[1].split("\nasync def ", 1)[0]
 
     assert "discard_conversation(" in handler, "the in-gateway path must use the live map"
     assert "discard_app_session_pointers" not in handler, (
@@ -336,9 +394,13 @@ def test_the_in_gateway_path_enumerates_through_the_live_manager(tmp_path):
     clear, which goes through the live map, then leaves it for a reinstall.
     """
     src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "apps" / "routes.py"
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "kiro_crew"
+        / "apps"
+        / "routes_uninstall.py"
     ).read_text(encoding="utf-8")
-    handler = src.split("async def handle_uninstall_app", 1)[1].split("\nasync def ", 1)[0]
+    handler = src.split("async def _run_uninstall", 1)[1].split("\nasync def ", 1)[0]
 
     assert "mapped_keys=" in handler, (
         "the in-gateway path must hand its own live key set to the enumeration; "
@@ -497,9 +559,13 @@ def test_the_in_gateway_path_suppresses_replay_and_finishes_durable(tmp_path):
     the same invariant as ``flush()`` before releasing the lock.
     """
     src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "apps" / "routes.py"
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "kiro_crew"
+        / "apps"
+        / "routes_uninstall.py"
     ).read_text(encoding="utf-8")
-    handler = src.split("async def handle_uninstall_app", 1)[1].split("\nasync def ", 1)[0]
+    handler = src.split("async def _run_uninstall", 1)[1].split("\nasync def ", 1)[0]
 
     assert "discard_conversation(key, replay=False)" in handler, (
         "the default replay=True discards standing suppression, so the removed "
@@ -524,7 +590,11 @@ def test_the_cold_start_chokepoint_consumes_the_persisted_flag():
     persisted half cannot be honoured on one path and ignored on the other.
     """
     src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "session.py"
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "kiro_crew"
+        / "session_parts"
+        / "turn_context.py"
     ).read_text(encoding="utf-8")
     consume = src.split("def consume_replay_suppression", 1)[1].split("\n    def ", 1)[0]
 
@@ -596,7 +666,11 @@ def test_both_suppression_markers_are_consumed_together():
     a fix for stale history turned into amnesia about live history.
     """
     src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "session.py"
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "kiro_crew"
+        / "session_parts"
+        / "turn_context.py"
     ).read_text(encoding="utf-8")
     consume = src.split("def consume_replay_suppression", 1)[1].split("\n    def ", 1)[0]
 
@@ -695,6 +769,7 @@ async def test_a_flush_that_fails_does_not_abandon_the_rest_of_the_uninstall(
     sessions = _DurableWriteFails()
     state = MagicMock()
     state.sessions = sessions
+    state.owner_id = ""
     # No cron service, so the handler's cron step is skipped and this test is
     # scoped to the step it is about. A bare MagicMock here is not inert: the
     # handler would drive a fake CronSDK whose removal raises, and an uninstall
@@ -704,6 +779,7 @@ async def test_a_flush_that_fails_does_not_abandon_the_rest_of_the_uninstall(
     request = MagicMock()
     request.match_info = {"name": APP}
     request.app = {"state": state}
+    owner_claims(request)
     request.json = AsyncMock(return_value={})
 
     fake_app = {
@@ -782,7 +858,7 @@ async def test_a_teardown_that_raises_still_leaves_the_suppression_durable(tmp_p
     ``discard_conversation`` clears the sid and sets the in-memory suppression INSIDE
     its registry lock, and only then awaits ``provider.shutdown()`` — whose own
     ``finally`` deliberately lets an exception propagate rather than carry it past the
-    child cancel (``session_lifecycle.py``). So by the time this can raise, the pointer
+    child cancel (``session_lifecycle_parts/teardown.py``). So by the time this can raise, the pointer
     is already gone and the ONLY thing standing between the user and the bug this step
     exists to prevent is the suppression flag.
 
@@ -822,6 +898,7 @@ async def test_a_teardown_that_raises_still_leaves_the_suppression_durable(tmp_p
     sessions = _ShutdownRaisesAfterTheClear()
     state = MagicMock()
     state.sessions = sessions
+    state.owner_id = ""
     # No cron service, so the handler's cron step is skipped and this test is
     # scoped to the step it is about. A bare MagicMock here is not inert: the
     # handler would drive a fake CronSDK whose removal raises, and an uninstall
@@ -831,6 +908,7 @@ async def test_a_teardown_that_raises_still_leaves_the_suppression_durable(tmp_p
     request = MagicMock()
     request.match_info = {"name": APP}
     request.app = {"state": state}
+    owner_claims(request)
     request.json = AsyncMock(return_value={})
 
     fake_app = {

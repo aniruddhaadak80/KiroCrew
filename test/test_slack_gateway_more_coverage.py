@@ -39,13 +39,20 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.autonudge import APPROVAL_STALL_REASON, NudgeLoop
+from kiro_crew.acp.types import AcpEvent
+from kiro_crew.autonudge import (
+    APPROVAL_STALL_REASON,
+    CONSECUTIVE_FAILURE_REASON,
+    MODEL_REFUSED_REASON,
+    NudgeLoop,
+)
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_CADENCE_SECS,
@@ -57,6 +64,7 @@ from kiro_crew.monitoring.models import (
     MonitorState,
 )
 from kiro_crew.slack import gateway as gw
+from kiro_crew.testing.wait import await_until, finished
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
@@ -115,17 +123,16 @@ def _slack_default_deliver() -> Any:
 
 
 class TestHeartbeatSafeToolNormalisation:
-    """A malformed ``mcp__`` title yields no server-qualified identity."""
+    """The title is never parsed: a malformed or a well-formed ``mcp__`` / ``@server``
+    title with no trusted identity behind it is refused the same way."""
 
-    def test_mcp_prefix_without_tool_segment_is_refused(self):
-        # "mcp__foo".split("__", 2) is only 2 parts, so neither the qualified
-        # form nor the bare-name strip applies: the title stays "mcp__foo",
-        # misses HEARTBEAT_SAFE_TOOLS, and (qualified == "") can never match an
-        # edition entry -> deny-by-default.
-        assert gw._is_heartbeat_safe_tool("mcp__foo") is False
-
-    def test_at_prefix_without_slash_is_refused(self):
-        assert gw._is_heartbeat_safe_tool("@server-only") is False
+    @pytest.mark.parametrize(
+        "title", ["mcp__foo", "@server-only", "mcp__kirocrew-core__learn_list", ""]
+    )
+    def test_a_title_alone_is_refused(self, title: str):
+        event = AcpEvent(kind="permission_request", title=title, tool_kind="mcp")
+        assert event.mcp_identity_trusted is False
+        assert gw._is_heartbeat_safe_tool(event) is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -170,6 +177,24 @@ class TestWarnIfKiroCliOutdated:
         with patch("kiro_crew.kiro_cli.resolve_kiro_cli", return_value=None):
             with patch("asyncio.create_subprocess_exec") as spawn:
                 await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "outdated" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_the_kas_bundle_route_skips_the_probe(self, capsys):
+        """KAS selected and ``agent.kas_bundle`` on: the engine is Crew's own
+        install, so the resolved kiro-cli -- the fixture resolves one -- decides
+        nothing about this gateway's sessions and is neither pinned nor spawned.
+        The predicate is the shared ``agent_sdk.kas_bundle.kas_bundle_route``,
+        read through ``KiroCrewConfig.load``."""
+        orch = _make_orchestrator()
+        base = KiroCrewConfig()
+        cfg = replace(base, agent=replace(base.agent, acp_backend="kas", kas_bundle=True))
+        with patch.object(KiroCrewConfig, "load", classmethod(lambda cls: cfg)):
+            with patch.object(gw, "_pinned_kiro_cli", AsyncMock()) as pinned:
+                with patch("asyncio.create_subprocess_exec") as spawn:
+                    await orch._warn_if_kiro_cli_outdated()
+        pinned.assert_not_awaited()
         spawn.assert_not_called()
         assert "outdated" not in capsys.readouterr().out
 
@@ -320,27 +345,22 @@ class TestWarnIfKiroCliOutdated:
         assert "1.25 is outdated" in out
 
     @pytest.mark.asyncio
-    async def test_current_version_is_quiet(self, capsys):
+    @pytest.mark.parametrize(
+        "output",
+        [
+            pytest.param(b"kiro-cli 1.26.0\n", id="test_current_version_is_quiet"),
+            pytest.param(b"some-other-binary\n", id="test_unparseable_output_is_silent"),
+        ],
+    )
+    async def test_probe_output_without_a_warning(self, capsys, output: bytes):
         async def _communicate() -> tuple[bytes, bytes]:
-            return (b"kiro-cli 1.26.0\n", b"")
+            return (output, b"")
 
         orch = _make_orchestrator()
-        with patch(
-            "asyncio.create_subprocess_exec", AsyncMock(return_value=_probe_proc(_communicate))
-        ):
+        spawn = AsyncMock(return_value=_probe_proc(_communicate))
+        with patch("asyncio.create_subprocess_exec", spawn):
             await orch._warn_if_kiro_cli_outdated()
-        assert "outdated" not in capsys.readouterr().out
-
-    @pytest.mark.asyncio
-    async def test_unparseable_output_is_silent(self, capsys):
-        async def _communicate() -> tuple[bytes, bytes]:
-            return (b"some-other-binary\n", b"")
-
-        orch = _make_orchestrator()
-        with patch(
-            "asyncio.create_subprocess_exec", AsyncMock(return_value=_probe_proc(_communicate))
-        ):
-            await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_awaited_once()
         assert "outdated" not in capsys.readouterr().out
 
 
@@ -356,25 +376,33 @@ class TestDeliverResultRouting:
     async def test_default_deliver_lookup_failure_falls_through(self):
         orch = _make_orchestrator()
         orch.slack = None
-        orch.dashboard_state = None
-        with patch.object(gw.KiroCrewConfig, "load", side_effect=RuntimeError("no config")):
-            await orch._deliver_result("Title", "task", "result", "")  # must not raise
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        with patch.object(gw.KiroCrewConfig, "load", side_effect=RuntimeError("no config")) as load:
+            await orch._deliver_result("Title", "task", "result", "")
+            # A Slack-less, dashboard-less host takes the same arm and delivers nowhere.
+            orch.dashboard_state = None
+            await orch._deliver_result("Title", "task", "result", "")
+        assert load.call_count == 2
+        # The failed lookup keeps the tagless default arm: a bell, no new slot.
+        ds.notify.assert_called_once_with("heartbeat", "Title", "task\n\nresult")
+        ds.get_or_create_slot.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_dashboard_slot_arm_without_dashboard_state(self):
+    @pytest.mark.parametrize(
+        "deliver",
+        [
+            pytest.param("dashboard:s1", id="test_dashboard_slot_arm_without_dashboard_state"),
+            pytest.param("dashboard", id="test_new_slot_arm_without_dashboard_state"),
+        ],
+    )
+    async def test_dashboard_arm_without_dashboard_state(self, deliver: str):
         orch = _make_orchestrator()
         orch.dashboard_state = None
         orch.slack = _mock_slack()
-        await orch._deliver_result("Title", "task", "result", "dashboard:s1")
-        # The dashboard arm returns early; nothing leaks to Slack.
-        orch.slack.post_message.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_new_slot_arm_without_dashboard_state(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        orch.slack = _mock_slack()
-        await orch._deliver_result("Title", "task", "result", "dashboard")
+        await orch._deliver_result("Title", "task", "result", deliver)
+        # The dashboard arm returns early; the default Slack-DM arm never runs.
+        orch.slack.open_dm.assert_not_awaited()
         orch.slack.post_message.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -396,7 +424,8 @@ class TestDeliverResultRouting:
         orch.dashboard_state = None
         orch.slack = _mock_slack()
         orch.slack.open_dm = AsyncMock(side_effect=RuntimeError("slack down"))
-        await orch._deliver_result("Title", "task", "result", "slack")  # must not raise
+        await orch._deliver_result("Title", "task", "result", "slack")
+        orch.slack.open_dm.assert_awaited_once_with("U_OWNER")
         orch.slack.post_message.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -439,8 +468,9 @@ class TestDeliverResultRouting:
         orch.slack = _mock_slack(dm=None)
         with _slack_default_deliver():
             await orch._deliver_result("Title", "task", "result", "")
+        orch.slack.open_dm.assert_awaited_once_with("U_OWNER")
         orch.slack.post_message.assert_not_awaited()
-        ds.notify.assert_called_once()
+        ds.notify.assert_called_once_with("heartbeat", "Title", "task\n\nresult")
 
     @pytest.mark.asyncio
     async def test_default_arm_notifies_after_post_failure(self):
@@ -452,7 +482,9 @@ class TestDeliverResultRouting:
         with _slack_default_deliver():
             await orch._deliver_result("Title", "task", "result", "")
         # The Slack failure is swallowed; the bell still fires.
-        ds.notify.assert_called_once()
+        orch.slack.post_message.assert_awaited_once()
+        assert orch.slack.post_message.await_args.args[0] == "D1"
+        ds.notify.assert_called_once_with("heartbeat", "Title", "task\n\nresult")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -515,9 +547,45 @@ class TestShutdownExtras:
             "kiro_crew.dashboard.chat.save_all_slots_to_history",
             side_effect=RuntimeError("history lock"),
         ):
-            await orch._shutdown()  # must not raise
+            await orch._shutdown()
         # Teardown continued past the failed save.
-        ds.file_indexes.stop_all.assert_called_once()
+        ds.file_indexes.stop_all.assert_called_once_with()
+        orch._stop_mcp_broker.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_pending_eager_spawn_ends_inside_the_shutdown(self):
+        """A slot's speculative start is cancelled and awaited by the shutdown.
+
+        Left running, a start still debouncing wakes mid-teardown and spawns an
+        agent no session teardown can reach, and the task outlives the gateway.
+        """
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = None
+        orch._dashboard_runner = None
+        orch._stop_mcp_broker = AsyncMock()
+        ds = _mock_dashboard_state()
+        ds._loop_watchdog = None
+        ds._loop_heartbeat = None
+        orch.dashboard_state = ds
+        debouncing = asyncio.Event()
+
+        async def _debouncing_start() -> None:
+            debouncing.set()
+            await asyncio.Event().wait()
+
+        start = asyncio.create_task(_debouncing_start())
+        ds._slots = {"s1": SimpleNamespace(_eager_spawn_task=start)}
+        try:
+            await await_until(debouncing, what="the eager start's debounce")
+            with patch("kiro_crew.dashboard.chat.save_all_slots_to_history"):
+                await await_until(asyncio.ensure_future(orch._shutdown()), what="the shutdown")
+            assert start.cancelled()
+        finally:
+            start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_cancels_background_tasks_and_closes_socket(self):
@@ -545,6 +613,128 @@ class TestShutdownExtras:
             await orch._shutdown()
         orch._socket_client.close.assert_awaited_once()
         assert model.cancelled() and migrate.cancelled() and update.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_the_update_task_finishes_stopping_before_the_teardown(self):
+        """An installer's rollback finishes before services are torn down.
+
+        The update task's own cancel arm stops the installer with SIGTERM and a
+        grace. Shutdown cancels it first and waits for it before the teardown,
+        or its 10 s cap can exit the process with the installer orphaned
+        mid-write.
+        """
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = None
+        orch.dashboard_state = None
+        orch._dashboard_runner = None
+        stopped: list[str] = []
+        orch._stop_mcp_broker = AsyncMock(side_effect=lambda: stopped.append("teardown"))
+
+        async def _installer_running() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)  # the installer's own rollback
+                stopped.append("update")
+                raise
+
+        orch._update_check_task = asyncio.create_task(_installer_running())
+        await asyncio.sleep(0)
+        with patch.object(gw.registry, "shutdown_tasks", return_value=[]):
+            await finished(orch._shutdown(), "orchestrator shutdown")
+
+        assert stopped == ["update", "teardown"]
+
+    @pytest.mark.asyncio
+    async def test_a_dashboard_started_policy_apply_is_stopped_before_the_teardown(self):
+        """``POST /api/update`` with a policy provider runs the same installer shape.
+
+        Its handler is cancelled only by aiohttp's own teardown, which the
+        graceful cap exits ahead of. Shutdown stops it with the coordinator, up
+        front, and waits for its rollback before the teardown.
+        """
+        from kiro_crew.dashboard.handlers import updates
+
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = None
+        orch.dashboard_state = None
+        orch._dashboard_runner = None
+        stopped: list[tuple[str, bool]] = []
+        started = asyncio.Event()
+        hold = asyncio.Event()  # never set: only a cancel ends the apply
+
+        async def _installer_running() -> bool | None:
+            started.set()
+            try:
+                await hold.wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)  # the installer's own rollback step
+                stopped.append(("apply", True))
+                raise
+            return True
+
+        # The handler's own seam, standing in for the aiohttp request task.
+        handler = asyncio.create_task(updates._run_tracked_policy_apply(_installer_running))
+        await await_until(started, what="the apply to start")
+        apply_task = updates.policy_applies_in_flight()[0]
+        orch._stop_mcp_broker = AsyncMock(
+            side_effect=lambda: stopped.append(("teardown", apply_task.done()))
+        )
+        with patch.object(gw.registry, "shutdown_tasks", return_value=[]):
+            await await_until(asyncio.ensure_future(orch._shutdown()), what="the shutdown")
+
+        # The apply's cancel arm ran, and it had finished before the teardown.
+        assert stopped == [("apply", True), ("teardown", True)]
+        with pytest.raises(updates._PolicyApplyStopped):
+            await await_until(handler, what="the handler to unwind")
+        assert updates.policy_applies_in_flight() == []
+
+    @pytest.mark.asyncio
+    async def test_an_update_task_that_will_not_stop_does_not_hold_shutdown(self, monkeypatch):
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = None
+        orch.dashboard_state = None
+        orch._dashboard_runner = None
+        orch._stop_mcp_broker = AsyncMock()
+        monkeypatch.setattr(gw, "UPDATE_INSTALLER_STOP_SECS", 0.05)
+        release = asyncio.Event()
+
+        async def _wedged() -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        update = asyncio.create_task(_wedged(), name="update-coordinator")
+        orch._update_check_task = update
+        await asyncio.sleep(0)
+        try:
+            with (
+                patch.object(gw.registry, "shutdown_tasks", return_value=[]),
+                patch.object(gw.logger, "warning") as warning,
+            ):
+                await finished(orch._shutdown(), "orchestrator shutdown")
+            assert not update.done()
+            # The warning names the task that would not stop, so a reader chasing
+            # an orphaned install knows which installer it was.
+            stuck = [call for call in warning.call_args_list if "did not stop" in str(call.args[0])]
+            assert len(stuck) == 1
+            assert stuck[0].args[0] % stuck[0].args[1:] == (
+                "Update work did not stop within 0s (update-coordinator); continuing shutdown"
+            )
+        finally:
+            release.set()
+            await await_until(update, timeout=5, what="the released installer")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -750,10 +940,17 @@ class TestInitMcpDiscovery:
                 orch._init_mcp_discovery()
         assert "builder-mcp, playwright-mcp" in caplog.text
 
-    def test_listing_failure_is_swallowed(self):
+    def test_listing_failure_is_swallowed(self, caplog):
         orch = _make_orchestrator()
-        with patch("kiro_crew.mcp_discovery.list_servers", side_effect=RuntimeError("boom")):
-            orch._init_mcp_discovery()  # must not raise
+        with caplog.at_level("DEBUG", logger="kiro_crew.slack.gateway"):
+            with patch(
+                "kiro_crew.mcp_discovery.list_servers", side_effect=RuntimeError("boom")
+            ) as listing:
+                orch._init_mcp_discovery()
+        listing.assert_called_once_with()
+        messages = [r.getMessage() for r in caplog.records if r.name == "kiro_crew.slack.gateway"]
+        assert "MCP server listing failed" in messages
+        assert not any(m.startswith("Configured MCP servers") for m in messages)
 
 
 class TestSubagentCoalescer:
@@ -780,7 +977,8 @@ class TestChannelLoopStallWiring:
     """
 
     def test_the_nudge_fire_path_passes_its_binding_key(self) -> None:
-        src = inspect.getsource(gw.GatewayOrchestrator._fire_slack_nudge)
+        # The turn body; ``_fire_slack_nudge`` only holds its drain section.
+        src = inspect.getsource(gw.GatewayOrchestrator._fire_slack_inner_nudge)
         assert '_interactive_approval("autonudge", nudge_key=key)' in src, (
             "the Slack nudge turn does not identify its loop to the approval "
             "callback, so a stalled channel cycle records no evidence"
@@ -834,7 +1032,11 @@ class TestNotifyNudgeExpired:
         title = ds.notify.call_args.args[1]
         body = ds.notify.call_args.args[2]
         assert title == "Monitoring loop spent its time budget"
-        assert "60s wall-clock budget" in body
+        assert (
+            "60s runtime budget (awake time while the gateway runs; a restart counts "
+            "the time since created_ts on the wall clock)"
+        ) in body
+        assert "wall-clock budget" not in body
 
     @pytest.mark.parametrize(
         ("outcome", "title"),
@@ -1186,21 +1388,33 @@ class TestNotifyNudgeExpired:
         assert title == "Monitoring loop finished — it reported done"
 
     @pytest.mark.parametrize(
-        ("pending", "expected_title", "expected_body"),
+        ("pending", "delivered", "expected_title", "expected_body"),
         [
-            ("success", "Monitoring loop finished — what it was watching is done", "merged"),
-            ("blocked", "Monitoring loop stopped — its subject was closed unmerged", "WITHOUT"),
+            ("success", "", "Monitoring loop finished — what it was watching is done", "merged"),
+            ("", "success", "Monitoring loop finished — what it was watching is done", "merged"),
+            (
+                "blocked",
+                "",
+                "Monitoring loop stopped — its subject was closed unmerged",
+                "WITHOUT",
+            ),
+            (
+                "",
+                "blocked",
+                "Monitoring loop stopped — its subject was closed unmerged",
+                "WITHOUT",
+            ),
         ],
     )
     def test_an_owed_legacy_terminal_turn_outranks_the_cycle_cap(
-        self, pending, expected_title, expected_body
+        self, pending, delivered, expected_title, expected_body
     ):
         """A gated legacy loop keeps terminal truth even when its cap wins the race."""
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
         orch.dashboard_state = ds
         loop = NudgeLoop(
-            id=f"loop-owed-{pending}",
+            id=f"loop-owed-{pending or delivered}",
             slot_key="slack:C123:456.789",
             message="watch https://github.com/acme/widgets/pull/42 until green",
             max_cycles=4,
@@ -1213,6 +1427,7 @@ class TestNotifyNudgeExpired:
                 objective="watch until green",
                 created_ts=0.0,
                 terminal_pending=pending,
+                terminal_delivered=delivered,
             ),
         )
 
@@ -1277,6 +1492,58 @@ class TestNotifyNudgeExpired:
         assert "away" in body
         assert "restart the loop" in body
 
+    def test_consecutive_failure_names_its_own_remedy(self):
+        """Failing cycles must not be reported as a cap the loop never hit.
+
+        Before this branch the stop fell through to the final ``else`` ("hit its
+        cycle cap" / "raise the cap"), telling the operator to raise a bound that
+        was never the problem. The cause is the loop's own cycles dying, so the
+        remedy is to look at the error and restart.
+        """
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-cf",
+            slot_key="chat-5",
+            message="keep checking",
+            max_cycles=24,
+            cycle_count=5,
+            stopped_reason=CONSECUTIVE_FAILURE_REASON,
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        body = ds.notify.call_args.args[2]
+        assert title == "Monitoring loop stopped — its cycles kept failing"
+        assert "cycle cap" not in body
+        assert "restart the loop" in body
+
+    def test_model_refused_names_its_own_remedy(self):
+        """A refused cycle is reported as a refusal, with the refusal's remedies.
+
+        Falling through to the final ``else`` would tell the operator to raise a
+        cap the loop never hit. The cause is the model declining the prompt, so
+        the remedy is to reword, switch model or configure a fallback.
+        """
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-mr",
+            slot_key="chat-5",
+            message="patrol the ledger",
+            max_cycles=24,
+            cycle_count=3,
+            stopped_reason=MODEL_REFUSED_REASON,
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        body = ds.notify.call_args.args[2]
+        assert title == "Monitoring loop stopped — the model declined its last cycle"
+        assert "cycle cap" not in body
+        assert "agent.refusal_fallback_model" in body
+        assert "restart the loop" in body
+
     def test_cycle_cap_outranks_a_stall(self):
         """Ranked below the two bounds, matching _timer's evaluation order."""
         orch = _make_orchestrator()
@@ -1296,9 +1563,9 @@ class TestNotifyNudgeExpired:
     def test_no_dashboard_state_is_a_no_op(self):
         orch = _make_orchestrator()
         orch.dashboard_state = None
-        orch._notify_nudge_expired(
-            NudgeLoop(id="l", slot_key="chat-3", message="m")
-        )  # must not raise
+        assert (
+            orch._notify_nudge_expired(NudgeLoop(id="l", slot_key="chat-3", message="m")) is False
+        )
 
 
 class TestPersistSlotTitle:
@@ -1354,7 +1621,12 @@ class TestRememberOptions:
         with patch.object(gw, "remember_slack_options") as remember:
             orch._remember_options("cron:j1", "C1", "", ["A"], [{}], "Options")
             orch._remember_options("cron:j1", "C1", "111.1", [], [{}], "Options")
-        remember.assert_not_called()
+            remember.assert_not_called()
+            # The same call with both a ts and choices does record, so the
+            # absence above is the guard and not a missed patch.
+            orch._remember_options("cron:j1", "C1", "111.1", ["A"], [{}], "Options")
+        remember.assert_called_once()
+        assert remember.call_args.args[1] == "cron:j1"
 
 
 class TestDeliverCronResponse:

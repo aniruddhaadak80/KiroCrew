@@ -1,9 +1,10 @@
-"""The display redaction battery reads no mutable state beyond ``_exempt_exact_hosts``.
+"""The display redaction battery reads no mutable state beyond its two exempt sets.
 
 ``kiro_crew.dashboard.chat_utils._redact_for_display`` memoizes the output of
 ``redact_exfiltration_urls`` followed by ``redact_credentials``, keyed on the
-input text and the exempt-host set. That key is only sound while the battery's
-OUTPUT is a pure function of exactly those two inputs. Nothing on the
+input text, the exempt-host set and the pass-4 token-parameter prefix set. That
+key is only sound while the battery's OUTPUT is a pure function of exactly those
+inputs. Nothing on the
 ``security/`` side is told its output is memoized, so a battery change that
 starts reading a second mutable input -- an operator file, the clock, the
 environment, a memo that a later call can repopulate differently -- would make
@@ -13,7 +14,8 @@ This module pins that contract on the ``security/`` SOURCE: every function the
 battery reaches, statically, reads no mutable module global and performs no
 I/O or clock read, with two named carve-outs:
 
-* ``_exempt_exact_hosts`` -- the ONE mutable read the cache key covers.
+* ``_exempt_exact_hosts`` and ``_token_param_exempt_prefixes`` -- the two
+  mutable reads the cache key covers.
 * ``_slack_manifest_re_slot`` -- a write-once memo of a bundled package
   resource that is constant for the life of the process; a fresh process
   starts with an empty cache anyway.
@@ -27,12 +29,14 @@ one call that reads the operator file sits under that flag's guard.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 from collections import deque
 
 import pytest
 
 import kiro_crew.dashboard.chat_utils as chat_utils
+from kiro_crew import _facade_mirror
 from kiro_crew.security import exfil, redaction
 
 # The two battery entry points, as the display cache composes them.
@@ -41,8 +45,11 @@ BATTERY_ROOTS: tuple[tuple[object, str], ...] = (
     (redaction, "redact_credentials"),
 )
 
-# The one mutable read the cache key accounts for.
+# The mutable reads the cache key accounts for.
 ALLOWED_MUTABLE_READER = "_exempt_exact_hosts"
+ALLOWED_MUTABLE_READERS = frozenset(
+    {("exfil", ALLOWED_MUTABLE_READER), ("redaction", "_token_param_exempt_prefixes")}
+)
 
 # Module globals a reachable function may read although they are mutable
 # containers, each with the reason the cache key need not cover it.
@@ -118,7 +125,10 @@ MUTATOR_METHODS = frozenset(
 
 
 def _module_tree(module: object) -> ast.Module:
-    return ast.parse(inspect.getsource(module))
+    # A mirror facade and the owners it serves from are read as one module.
+    index = vars(module)[_facade_mirror.INDEX_ATTRIBUTE]
+    family = (module, *(importlib.import_module(owner) for owner in index.owners))
+    return ast.parse("\n".join(inspect.getsource(member) for member in family))
 
 
 def _function_defs(tree: ast.Module) -> dict[str, ast.FunctionDef]:
@@ -277,7 +287,7 @@ def test_battery_reaches_the_one_allowed_mutable_reader(graph: _Graph) -> None:
     """The guard measures a real graph: the allowed reader is in it, the file reader is not."""
     reached = graph.reachable()
     names = {name for _, name in reached}
-    assert ("exfil", ALLOWED_MUTABLE_READER) in reached
+    assert ALLOWED_MUTABLE_READERS <= reached, sorted(ALLOWED_MUTABLE_READERS - reached)
     assert ("exfil", GATED_CLASSIFIER) in reached
     assert ("redaction", "redact_credentials") in reached
     assert OAUTH_FILE_READER not in names
@@ -289,7 +299,7 @@ def test_battery_reads_no_mutable_state_beyond_the_exempt_hosts(graph: _Graph) -
     """No reachable function reads a mutable global, the clock, the environment or a file."""
     violations: list[str] = []
     for module, name in sorted(graph.reachable()):
-        if name == ALLOWED_MUTABLE_READER:
+        if (module, name) in ALLOWED_MUTABLE_READERS:
             continue
         fn = graph.defs[module][name]
         tokens = _tokens(fn)
@@ -376,8 +386,10 @@ def test_operator_file_read_sits_under_the_oauth_flag(graph: _Graph) -> None:
 
 
 def test_display_cache_memoizes_exactly_the_guarded_battery() -> None:
-    """The consumer composes exactly the two roots this guard walks, in order."""
-    fn = ast.parse(inspect.getsource(chat_utils._redact_for_display)).body[0]
+    """The consumer runs ``display_battery``, which composes exactly the guarded roots, in order."""
+    from kiro_crew.dashboard import display_battery
+
+    fn = ast.parse(inspect.getsource(display_battery.display_battery)).body[0]
     assert isinstance(fn, ast.FunctionDef)
     redactor_calls = [
         node.func.id
@@ -387,6 +399,14 @@ def test_display_cache_memoizes_exactly_the_guarded_battery() -> None:
         and node.func.id.startswith("redact_")
     ]
     assert redactor_calls == [root for _, root in BATTERY_ROOTS]
+    consumer = ast.parse(inspect.getsource(chat_utils._redact_for_display)).body[0]
+    calls = [
+        node.func.id
+        for node in ast.walk(consumer)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert calls.count("display_battery") == 1
+    assert not [c for c in calls if c.startswith("redact_")]
 
 
 def test_display_battery_never_touches_the_operator_file(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -410,6 +430,7 @@ def test_display_battery_never_touches_the_operator_file(monkeypatch: pytest.Mon
         return real()
 
     monkeypatch.setattr(exfil, ALLOWED_MUTABLE_READER, counted)
+    monkeypatch.setattr(chat_utils, ALLOWED_MUTABLE_READER, counted)
     chat_utils._clear_display_redaction_cache()
     consent = (
         "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state="
@@ -419,4 +440,4 @@ def test_display_battery_never_touches_the_operator_file(monkeypatch: pytest.Mon
     )
     for text in (consent, "key AKIAIOSFODNN7EXAMPLE here", "plain prose with no url"):
         chat_utils._redact_for_display(text)
-    assert seen["n"] >= 3, "the cache key and the battery both read the exempt set"
+    assert seen["n"] == 3, "one snapshot read per call feeds both the cache key and the battery"

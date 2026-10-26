@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -110,6 +111,31 @@ async def test_api_releases_returns_per_version_entries(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_api_changelog_does_not_freeze_the_event_loop(monkeypatch):
+    """The changelog read must run off the gateway's event-loop thread.
+
+    ``_read_changelog`` stats the file on every call and reads the whole file
+    on a cache miss, so on the loop thread a slow mount stalls every session.
+    The fake records the thread it ran on; no timing is involved.
+    """
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+
+    def recording_read() -> str:
+        read_threads.append(threading.get_ident())
+        return "# Changelog\n\nnotes\n"
+
+    monkeypatch.setattr(updates, "_read_changelog", recording_read)
+
+    resp = await updates.api_changelog(_request())
+
+    assert resp.status == 200
+    assert json.loads(resp.body)["content"] == "# Changelog\n\nnotes\n"
+    assert len(read_threads) == 1
+    assert read_threads[0] != loop_thread, "_read_changelog ran on the event-loop thread"
+
+
+@pytest.mark.asyncio
 async def test_api_releases_does_not_freeze_the_event_loop(monkeypatch):
     """The read and parse must be offloaded, not run on the gateway's loop.
 
@@ -130,7 +156,7 @@ async def test_api_releases_does_not_freeze_the_event_loop(monkeypatch):
     async def ticker() -> None:
         nonlocal ticks
         while True:
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.01)  # flake-ok: tick interval; the tick count is the measurement
             ticks += 1
 
     task = asyncio.create_task(ticker())

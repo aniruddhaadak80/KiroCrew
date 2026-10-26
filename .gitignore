@@ -61,11 +61,15 @@ frontend/tsconfig.app.tsbuildinfo
 frontend/tsconfig.node.tsbuildinfo
 src/kiro_crew/static/dist/
 src/kiro_crew/static/dist
-# Staging scratch + lock used to swap a built dist into static/dist atomically.
-# An untracked leftover here makes the checkout read as dirty, which
-# fail-closes Dev Fleet's "Prune merged".
-src/kiro_crew/static/.dist.staging.*
-src/kiro_crew/static/.dist.previous.*
+# Staged copies static/dist links to, the link being swapped in, and the
+# staging lock (src/kiro_crew/frontend.py). An untracked leftover here makes
+# the checkout read as dirty, which fail-closes Dev Fleet's "Prune merged".
+src/kiro_crew/static/.dist.*
+# find_ui's auto tier is a BUILD-TIME artifact (`npm run build` writes it into
+# website/dist, shipped as static/dist/ui-index.auto.json; both dirs are ignored
+# above). Wherever else a hand-run `gen:ui --auto-out` drops it, it is never
+# committed: every new static-label button changes it.
+ui-index.auto.json
 
 # Disposable scratch for Dev Fleet's Pull+Build installability probe
 # (npm_preflight). It lives in the checkout rather than TMPDIR so the rehearsal
@@ -120,7 +124,7 @@ kirocrew-data.tar.gz
 # ignore rule stays so that nobody else's capture run dirties `git status`.
 temp-screenshots/
 .github/screenshots/
-# Staged blind-review artifacts (prepare-pr review lanes point subagents at
+# Staged blind-review artifacts (kirocrew-prepare-pr review lanes point subagents at
 # .review-<n>.diff files) and the autofix work-dir heartbeat — scratch, never
 # a deliverable, and a `git add -A` would otherwise sweep them into the PR.
 .review-*.diff
@@ -150,6 +154,8 @@ website/electron/node_modules
 # Placed by packaging/build-desktop.sh from KIROCREW_MANAGED_INSTALL_MARKER so
 # electron-builder packs it into app.asar; a per-edition build input, not source.
 website/electron/EXTERNALLY-MANAGED
+# Placed by packaging/build-desktop.sh for an enterprise build (KIROCREW_BUILD_EDITION).
+website/electron/EDITION
 # Generated launcher icon (created from icon.png when making the desktop shortcut)
 website/electron/KiroCrew.ico
 tui/
@@ -189,5 +195,7 @@ src/kiro_crew/BUILD_VERSION
 # ~27MB build artifact sits in a tracked path waiting for a `git add -A`.
 src/kiro_crew/apps/builtins/aws_control/crew/runtime/vendor/*.whl
 
-# Cross-process lock for workspace Kiro CLI overlay writers.
+# Workspace Kiro CLI overlay and its cross-process lock. Crew writes both before
+# every session spawn, so they are local session state, not project config.
+/.kiro/settings/cli.json
 /.kiro/settings/.kirocrew-cli-settings.lock

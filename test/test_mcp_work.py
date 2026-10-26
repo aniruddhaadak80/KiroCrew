@@ -16,8 +16,16 @@ from typing import Any
 
 import pytest
 
-from kiro_crew import agent, mcp_cleanup, mcp_core, mcp_discovery, mcp_work
-from kiro_crew.validation import MCP_WORK_SCHEMAS
+from kiro_crew import agent, mcp_cleanup, mcp_core, mcp_discovery, mcp_work, validation
+from kiro_crew import work_ledger as wl
+from kiro_crew.validation import (
+    MCP_WORK_SCHEMAS,
+    WORK_REPORT_SCHEMA,
+    ValidationError,
+    clamp_report,
+    clamp_to_max_len,
+    validate_tool_args,
+)
 
 SERVER = "kirocrew-work"
 SUBCOMMAND = "mcp-work"
@@ -48,14 +56,127 @@ def test_every_tool_has_a_registered_schema():
         assert schema.tool_name == name
 
 
-def test_the_two_no_argument_tools_declare_an_empty_schema():
+def test_the_brief_tool_declares_an_empty_schema():
     """Registered-but-empty, not unregistered: an unregistered schema admits an
     unexpected argument, an empty registered one rejects it."""
-    for name in ("work_brief", "work_ledger_read"):
-        definition = next(t for t in mcp_work._list_tools() if t["name"] == name)
-        assert definition["inputSchema"]["properties"] == {}
-        assert "required" not in definition["inputSchema"]
-        assert MCP_WORK_SCHEMAS[name].fields == []
+    definition = next(t for t in mcp_work._list_tools() if t["name"] == "work_brief")
+    assert definition["inputSchema"]["properties"] == {}
+    assert "required" not in definition["inputSchema"]
+    assert MCP_WORK_SCHEMAS["work_brief"].fields == []
+
+
+def test_work_ledger_read_advertises_the_five_optional_filters():
+    """Every parameter narrows or shapes the read and none is required, so a
+    conductor that passes nothing still gets its whole board — and the advertised
+    schema, the validation schema and the forwarded fields name the same five."""
+    definition = next(t for t in mcp_work._list_tools() if t["name"] == "work_ledger_read")
+    props = definition["inputSchema"]["properties"]
+    assert set(props) == {"events", "item_id", "state", "since", "compact"}
+    assert "required" not in definition["inputSchema"]
+    assert {f.name for f in MCP_WORK_SCHEMAS["work_ledger_read"].fields} == set(props)
+    assert set(mcp_work._READ_FIELDS) == set(props)
+    assert all(not f.required for f in MCP_WORK_SCHEMAS["work_ledger_read"].fields)
+    # The advertised bounds are the validated bounds.
+    events = next(f for f in MCP_WORK_SCHEMAS["work_ledger_read"].fields if f.name == "events")
+    assert (props["events"]["minimum"], props["events"]["maximum"]) == (
+        events.min_val,
+        events.max_val,
+    )
+    state = next(f for f in MCP_WORK_SCHEMAS["work_ledger_read"].fields if f.name == "state")
+    assert set(props["state"]["enum"]) == state.allowed
+
+
+def test_work_ledger_read_description_states_the_shape_a_conductor_relies_on():
+    """What an argument-less read still is, how each argument narrows it, and the
+    truncation marker are what a conductor plans its patrol read around, so the
+    description must say them — and must not claim a changed default."""
+    definition = next(t for t in mcp_work._list_tools() if t["name"] == "work_ledger_read")
+    text = definition["description"]
+    assert "last 20 events" in text
+    assert "NARROWS" in text and "events=<n>" in text
+    assert "compact=true" in text
+    assert "truncated=true" in text
+    assert "closed first, then open oldest-created" in text
+    assert "NEWEST FIRST" not in text and "last 5 events" not in text
+    assert "Takes no arguments" not in text
+    events = definition["inputSchema"]["properties"]["events"]["description"]
+    assert "default and max 20" in events
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"events": 21},
+        {"events": -1},
+        {"events": True},
+        {"item_id": "it_zz"},
+        {"item_id": "../etc"},
+        {"state": "closed"},
+        {"since": "x" * 41},
+        {"compact": "yes"},
+        {"status": "done"},
+    ],
+)
+def test_work_ledger_read_refuses_an_out_of_shape_filter(args):
+    """Refused at the schema, before any identity is resolved or wire is touched."""
+    from kiro_crew.validation import ValidationError
+
+    with pytest.raises(ValidationError):
+        mcp_work._validate_args("work_ledger_read", args)
+
+
+def test_work_ledger_read_forwards_only_known_filters_as_query(monkeypatch):
+    """The filters travel as a query string on the same GET; an unknown key that
+    got past validation still never reaches the wire, and a bool is spelled the
+    way the route reads it back."""
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-x")
+    seen: dict[str, Any] = {}
+
+    def _fake_get(path: str, session_key: str | None = None, **k: Any) -> dict:
+        seen["path"] = path
+        seen["session_key"] = session_key
+        return {"conductor": {}, "items": []}
+
+    monkeypatch.setattr(mcp_work, "_get", _fake_get)
+    mcp_work._call_tool_inner(
+        "work_ledger_read",
+        {
+            "events": 3,
+            "item_id": "it_0000abcd",
+            "state": "open",
+            "since": "2026-01-02T03:04:05+00:00",
+            "compact": True,
+            "verdict": "pass",
+        },
+    )
+    from urllib.parse import parse_qs, urlsplit
+
+    split = urlsplit(seen["path"])
+    assert split.path == mcp_work._READ_PATH
+    assert parse_qs(split.query, keep_blank_values=True) == {
+        "events": ["3"],
+        "item_id": ["it_0000abcd"],
+        "state": ["open"],
+        "since": ["2026-01-02T03:04:05+00:00"],
+        "compact": ["true"],
+    }
+    assert seen["session_key"] == "chat-x"
+
+
+def test_work_ledger_read_with_no_filters_hits_the_bare_path(monkeypatch):
+    """No arguments is still the common call, and it must not grow a trailing ``?``."""
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-x")
+    seen: dict[str, Any] = {}
+
+    def _fake_get(path: str, session_key: str | None = None, **k: Any) -> dict:
+        seen["path"] = path
+        return {"conductor": {}, "items": []}
+
+    monkeypatch.setattr(mcp_work, "_get", _fake_get)
+    mcp_work._call_tool_inner("work_ledger_read", {})
+    assert seen["path"] == mcp_work._READ_PATH
+    mcp_work._call_tool_inner("work_ledger_read", {"compact": False})
+    assert seen["path"] == f"{mcp_work._READ_PATH}?compact=false"
 
 
 def test_the_worker_report_tool_advertises_no_conductor_field():
@@ -63,7 +184,7 @@ def test_the_worker_report_tool_advertises_no_conductor_field():
     a field added to the inputSchema alone would be a promise the store refuses."""
     definition = next(t for t in mcp_work._list_tools() if t["name"] == "work_report")
     props = definition["inputSchema"]["properties"]
-    assert set(props) == {"status", "summary", "artifacts", "pr"}
+    assert set(props) == {"status", "summary", "artifacts", "pr", "reason"}
     assert definition["inputSchema"]["required"] == ["status", "summary"]
 
 
@@ -423,6 +544,28 @@ def test_an_item_write_reports_the_committed_item(monkeypatch):
     assert out == "Recorded decide. item=it_00000002 state=closed verdict=pass"
 
 
+def test_a_close_reply_carries_the_routes_warning(monkeypatch):
+    """A close that cut a live worker's report channel says so in the reply."""
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-x")
+    monkeypatch.setattr(
+        mcp_work,
+        "_post",
+        lambda *a, **k: {
+            "ok": True,
+            "action": "close",
+            "item": {"item_id": "it_00000002", "state": "accepted", "verdict": "pass"},
+            "warning": "Worker session chat-w is still open.",
+        },
+    )
+    out = mcp_work._call_tool_inner(
+        "work_ledger_record", {"action": "close", "item_id": "it_00000002", "state": "accepted"}
+    )
+    assert out == (
+        "Recorded close. item=it_00000002 state=accepted verdict=pass\n"
+        "Warning: Worker session chat-w is still open."
+    )
+
+
 def test_an_item_write_with_unset_fields_says_so(monkeypatch):
     monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-x")
     monkeypatch.setattr(mcp_work, "_post", lambda *a, **k: {"ok": True, "item": {}})
@@ -480,3 +623,319 @@ def test_run_mcp_server_serves_this_module_and_advertises_identity(monkeypatch):
     assert seen["list_tools"] is mcp_work._list_tools
     assert seen["call_tool"] is mcp_work._call_tool
     assert seen["advertise_caller_identity"] is True
+
+
+# ── the read budget, measured on what the tool layer delivers ─────────────
+
+
+def _fat_board(n: int = 8, *, chars: int = 13_000) -> dict[str, Any]:
+    """A board of *n* open items whose events make the whole read ~``n * chars``."""
+    items = []
+    for i in range(n):
+        items.append(
+            {
+                "item_id": f"it_{i:08x}",
+                "state": "open",
+                "status": "progress",
+                "title": f"item {i}",
+                "created_at": f"2026-09-{i + 1:02d}T10:00:00+00:00",
+                "acceptance": {"kind": "pr_checks", "pr": 100 + i, "repo": "o/r"},
+                "events": [{"kind": "report", "summary": "x" * (chars // 20)} for _ in range(20)],
+            }
+        )
+    batch = {
+        "items": [
+            {"id": r["item_id"], "accept": r["acceptance"], "status": r["status"]} for r in items
+        ]
+    }
+    return {"conductor": {"goal": "g", "round": 1}, "items": items, "accept_batch": batch}
+
+
+def _delivered(monkeypatch: pytest.MonkeyPatch, board: dict[str, Any]) -> str:
+    """The text the model receives: the real tool call, then the real egress frame."""
+    from kiro_crew.validation import build_tool_response
+
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-x")
+    monkeypatch.setattr(mcp_work, "_get", lambda *a, **k: json.loads(json.dumps(board)))
+    out = mcp_work._call_tool("work_ledger_read", {})
+    return build_tool_response(out)["content"][0]["text"]
+
+
+def test_a_110kb_board_delivers_the_newest_item_as_valid_json(monkeypatch):
+    """The bug: ~110 KB came back whole, the runtime cut it at 100,000 chars, and the
+    newest item -- serialized last -- was lost inside torn JSON."""
+    from kiro_crew.validation import MAX_RESPONSE_LEN
+
+    board = _fat_board()
+    assert len(json.dumps(board, indent=2)) > 105_000
+    text = _delivered(monkeypatch, board)
+    assert len(text) <= mcp_work._READ_BUDGET_CHARS < MAX_RESPONSE_LEN
+    doc = json.loads(text)
+    assert doc["truncated"] is True
+    ids = [r["item_id"] for r in doc["items"]]
+    assert "it_00000007" in ids
+    assert {e["id"] for e in doc["accept_batch"]["items"]} >= {"it_00000007"}
+
+
+def test_an_under_budget_read_is_untouched(monkeypatch):
+    board = _fat_board(2, chars=1_000)
+    doc = json.loads(_delivered(monkeypatch, board))
+    assert doc == board
+
+
+def test_closed_rows_are_dropped_before_open_ones():
+    board = _fat_board(6, chars=1_000)
+    # The two OLDEST rows stay open; the newer ones close. Age alone would drop the
+    # open ones first.
+    for row in board["items"][2:5]:
+        row["state"] = "accepted"
+    for row in board["items"]:
+        row["title"] = "t" * 6_000
+    doc = json.loads(mcp_work._fit_ledger(board, budget=22_000))
+    assert len(json.dumps(doc, indent=2, ensure_ascii=False)) <= 22_000
+    kept = [r["item_id"] for r in doc["items"]]
+    assert set(doc["omitted_items"]) == {"it_00000002", "it_00000003", "it_00000004"}
+    assert kept == ["it_00000000", "it_00000001", "it_00000005"]
+
+
+def test_open_rows_go_oldest_created_first_and_the_newest_stays():
+    board = _fat_board(4, chars=1_000)
+    for row in board["items"]:
+        row["title"] = "t" * 8_000
+    board["items"].reverse()  # the store's order is not the drop order
+    doc = json.loads(mcp_work._fit_ledger(board, budget=12_000))
+    assert [r["item_id"] for r in doc["items"]] == ["it_00000003"]
+    assert doc["omitted_items"] == ["it_00000000", "it_00000001", "it_00000002"]
+
+
+def test_a_board_at_the_item_ceiling_trims_in_few_renders(monkeypatch):
+    """Dropping rows bisects the count: a 256-row board must not re-render once
+    per dropped row, each render running the whole egress scrub."""
+    board = _fat_board(256, chars=1_000)
+    for i, row in enumerate(board["items"]):
+        row["created_at"] = f"2026-09-01T{i // 60:02d}:{i % 60:02d}:00+00:00"
+    calls = 0
+    real = mcp_work._render
+
+    def _counting(doc: Any) -> str:
+        nonlocal calls
+        calls += 1
+        return real(doc)
+
+    monkeypatch.setattr(mcp_work, "_render", _counting)
+    doc = json.loads(mcp_work._fit_ledger(board, budget=20_000))
+    assert calls <= 16
+    assert doc["items"][-1]["item_id"] == "it_000000ff"
+    assert len(doc["items"]) + len(doc["omitted_items"]) == 256
+
+
+def test_one_oversized_acceptance_does_not_evict_the_other_rows():
+    """Elision runs before any row is dropped, so only the bloated bar pays."""
+    board = _fat_board(8, chars=1_000)
+    huge = {"kind": "pr_checks", "pr": 1, "repo": "o/r", "notes": "n" * 60_000}
+    board["items"][0]["acceptance"] = huge
+    board["accept_batch"]["items"][0]["accept"] = huge
+    doc = json.loads(mcp_work._fit_ledger(board, budget=30_000))
+    assert len(doc["items"]) == 8
+    assert "omitted_items" not in doc
+    assert doc["elided_acceptance_for"] == ["it_00000000"]
+    assert doc["items"][0]["acceptance"]["elided"] is True
+    assert doc["accept_batch"]["items"][0]["accept"]["elided"] is True
+    assert doc["items"][1]["acceptance"] == board["items"][1]["acceptance"]
+
+
+def test_the_measured_size_is_the_delivered_size(monkeypatch):
+    """The fitter measures with the same redact + sanitize the egress applies, so
+    what it counted is what the model gets -- byte for byte, not an estimate."""
+    board = _fat_board()
+    # Content that redaction and NFC normalization both change the length of.
+    board["items"][-1]["title"] = "token=ghp_" + "a" * 36 + " e\u0301"
+    fitted = mcp_work._fit_ledger(json.loads(json.dumps(board)))
+    assert _delivered(monkeypatch, board) == fitted
+    assert len(fitted) <= mcp_work._READ_BUDGET_CHARS
+
+
+def test_a_board_nothing_can_trim_falls_back_to_one_envelope():
+    board = _fat_board(1, chars=0)
+    board["conductor"]["goal"] = "g" * 50_000
+    doc = json.loads(mcp_work._fit_ledger(board, budget=10_000))
+    assert doc["unfittable"] is True
+    assert doc["item_count"] == 1
+    assert doc["omitted_items"] == ["it_00000000"]
+
+
+# ── work_report: an over-cap summary is clamped and reported, not refused ──
+#
+# A model cannot measure its prose before calling, so a refusal costs a whole
+# round-trip. ``clamp_to_max_len`` stamps the stored value and the reply reads the
+# stamp back with ``clamp_report``, the worker's only signal that its text was cut.
+# Only ``summary`` is clamped: a truncated pointer (``artifacts``, ``pr``) is broken.
+
+_CLAMP_WORKER = "chat-clamp-worker"
+
+#: The cap under test, read off the schema that enforces it.
+CAP: int = next(f.max_len for f in WORK_REPORT_SCHEMA.fields if f.name == "summary")
+
+
+# ── the cap still binds, and the boundary is untouched ────────────────────
+
+
+def test_a_summary_exactly_at_the_cap_is_stored_verbatim():
+    """The boundary value carries no stamp: only the overflow path clamps."""
+    exact = "s" * CAP
+    cleaned = validate_tool_args({"status": "progress", "summary": exact}, WORK_REPORT_SCHEMA)
+    assert cleaned["summary"] == exact
+    assert len(cleaned["summary"]) == CAP
+    assert clamp_report(cleaned["summary"]) is None
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [
+        # One char over is the common overshoot and must not cost a retry.
+        pytest.param(CAP + 1, id="test_a_summary_one_over_the_cap_is_clamped_rather_than_refused"),
+        CAP + 30,
+        CAP + 804,
+        CAP * 3,
+    ],
+)
+def test_every_overshoot_in_the_measured_range_is_accepted_and_bounded(sent: int):
+    """Real overshoots run from one char to several times the cap."""
+    cleaned = validate_tool_args({"status": "progress", "summary": "y" * sent}, WORK_REPORT_SCHEMA)
+    assert len(cleaned["summary"]) <= CAP
+    reported = clamp_report(cleaned["summary"])
+    assert reported is not None
+    before, kept = reported
+    assert before == sent
+    assert 0 < kept < CAP
+
+
+def test_a_required_empty_summary_is_still_refused():
+    """Clamping widens what is accepted at the TOP of the range only."""
+    with pytest.raises(ValidationError):
+        validate_tool_args({"status": "progress", "summary": ""}, WORK_REPORT_SCHEMA)
+
+
+# ── the stamp and its reader are one pair ─────────────────────────────────
+
+
+@pytest.mark.parametrize("sent", [CAP + 1, CAP + 7, CAP + 500])
+def test_clamp_report_reads_back_what_clamp_to_max_len_stamped(sent: int):
+    """The reader is built from the stamp constant, so the two cannot drift."""
+    stamped = clamp_to_max_len("z" * sent, CAP)
+    assert len(stamped) <= CAP
+    reported = clamp_report(stamped)
+    assert reported is not None
+    before, kept = reported
+    assert before == sent
+    # ``kept`` is the caller's own surviving text, so the stamp sits after it.
+    assert stamped.startswith("z" * kept)
+    assert kept + len(stamped[kept:]) == len(stamped)
+
+
+def test_clamp_report_answers_none_for_a_value_nothing_clamped():
+    """The common case: an in-budget summary is not described as truncated."""
+    assert clamp_report("a short honest summary") is None
+    assert clamp_report("") is None
+    assert clamp_report("x" * CAP) is None
+
+
+# ── the worker is told, which is what makes the cut honest ────────────────
+
+
+def _stub_transport(monkeypatch, captured: dict[str, Any]) -> None:
+    """Replace the loopback POST and the identity probe; the store has its own suite."""
+
+    def _fake_post(path: str, payload: dict[str, Any], *, session_key: str) -> dict[str, Any]:
+        captured.update(payload)
+        return {"status": payload["status"], "item_id": "it_abcd1234"}
+
+    monkeypatch.setattr(mcp_work, "_post", _fake_post)
+    monkeypatch.setattr(mcp_work, "_strict_caller", lambda: (_CLAMP_WORKER, ""))
+
+
+def test_the_work_report_reply_names_both_lengths_when_the_summary_was_cut(monkeypatch):
+    """The success frame carries no summary, so the reply is the worker's only signal."""
+    sent = CAP + 30
+    captured: dict[str, Any] = {}
+    _stub_transport(monkeypatch, captured)
+
+    cleaned = validate_tool_args({"status": "progress", "summary": "q" * sent}, WORK_REPORT_SCHEMA)
+    reply = mcp_work._call_tool_inner("work_report", cleaned)
+
+    assert "Recorded." in reply
+    assert str(sent) in reply, reply
+    assert str(CAP) in reply, reply
+    # What reached the store is the clamped value, stamp and all.
+    assert len(captured["summary"]) <= CAP
+    assert clamp_report(captured["summary"]) is not None
+
+
+def test_the_work_report_reply_stays_terse_when_nothing_was_cut(monkeypatch):
+    """An in-budget report keeps the terse reply, so the note means something."""
+    captured: dict[str, Any] = {}
+    _stub_transport(monkeypatch, captured)
+
+    cleaned = validate_tool_args({"status": "progress", "summary": "fits"}, WORK_REPORT_SCHEMA)
+    reply = mcp_work._call_tool_inner("work_report", cleaned)
+
+    assert reply == "Recorded. status=progress item=it_abcd1234"
+
+
+def test_the_reply_cap_is_read_off_the_schema_that_enforces_it():
+    """A second copy of the number could quote a cap the validator does not apply."""
+    assert mcp_work.SUMMARY_CAP == CAP == wl.MAX_SUMMARY_CHARS
+
+
+def test_the_published_description_promises_a_cut_rather_than_a_refusal():
+    """The schema text is the contract a worker reads before it writes a summary."""
+    spec = next(t for t in mcp_work._tool_definitions() if t["name"] == "work_report")
+    described = spec["inputSchema"]["properties"]["summary"]["description"]
+    assert "cut to the cap, not refused" in described
+    assert "how much was dropped" in described
+    assert str(CAP) in described
+
+
+# ── the scope guard: siblings still refuse ────────────────────────────────
+
+
+def test_summary_is_the_only_clamped_field_on_the_worker_schema():
+    """A truncated pointer is a broken pointer, so only prose is clamped."""
+    assert {f.name for f in WORK_REPORT_SCHEMA.fields if f.clamp_to_max} == {"summary"}
+
+
+def test_an_oversized_artifacts_value_is_still_refused():
+    """``artifacts`` carries pointers the conductor follows, so it keeps refusing."""
+    with pytest.raises(ValidationError):
+        validate_tool_args(
+            {
+                "status": "progress",
+                "summary": "ok",
+                "artifacts": {"k": "v" * (wl.MAX_ARTIFACT_VALUE_CHARS + 1)},
+            },
+            WORK_REPORT_SCHEMA,
+        )
+
+
+def test_the_conductor_side_caps_are_untouched():
+    """Only the worker's prose field changes; the conductor's fields still refuse."""
+    record = validation.WORK_LEDGER_RECORD_SCHEMA
+    assert not any(f.clamp_to_max for f in record.fields)
+    with pytest.raises(ValidationError):
+        validate_tool_args({"action": "create", "title": "t" * (wl.MAX_TITLE_CHARS + 1)}, record)
+
+
+def test_the_session_ledger_fields_still_refuse():
+    """``event``/``next`` share the cause and have a cap that refuses, not clamps."""
+    schema = validation.SESSION_LEDGER_RECORD_SCHEMA
+    for name in ("event", "next"):
+        spec = next(f for f in schema.fields if f.name == name)
+        assert spec.clamp_to_max is False, name
+        with pytest.raises(ValidationError):
+            validate_tool_args({name: "e" * (spec.max_len + 1)}, schema)
+
+
+def test_the_store_still_refuses_an_oversized_summary_of_its_own():
+    """The store's cap is a backstop for a caller that bypasses the schema."""
+    with pytest.raises(wl.WorkLedgerError):
+        wl._require_text("x" * (wl.MAX_SUMMARY_CHARS + 1), wl.MAX_SUMMARY_CHARS, "summary")

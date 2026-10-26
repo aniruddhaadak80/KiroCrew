@@ -26,6 +26,7 @@ from kiro_crew.config import live
 from kiro_crew.config.live import ConfigWatch
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.subagent import _STALL_IDLE_SECS, _TIMEOUT_SECS, SubagentInfo, SubagentManager
+from kiro_crew.testing.wait import await_until
 
 
 def _mgr(max_concurrent: int = 4) -> SubagentManager:
@@ -146,16 +147,32 @@ class TestReconfigureDerivesEveryField:
         mgr.reconfigure = AsyncMock()  # type: ignore[method-assign]
         await _dispatch(KiroCrewConfig(), "agent.model")
         mgr.reconfigure.assert_not_awaited()
+        # A watched path through the same dispatcher does reach the stub, so
+        # the absence above is the prefix filter and not a detached mock.
+        watched = KiroCrewConfig()
+        await _dispatch(watched, "agent.max_subagents")
+        mgr.reconfigure.assert_awaited_once_with(watched)
 
     @pytest.mark.asyncio
     async def test_pool_size_change_recomputes_the_cap(self) -> None:
-        """``session.pool_size`` is an input to the auto-sized cap."""
+        """``session.pool_size`` sizes the auto cap when the spawn floor is off, so a
+        change re-resolves it."""
         mgr = _mgr(max_concurrent=4)
         fresh = KiroCrewConfig()
         fresh.session.pool_size = 5
         with patch("kiro_crew.subagent.resolve_max_subagents", return_value=6):
             await _dispatch(fresh, "session.pool_size")
         assert mgr.max_concurrent == 6
+
+    @pytest.mark.asyncio
+    async def test_disabling_the_spawn_floor_recomputes_the_cap(self) -> None:
+        """A floor switched off live moves the auto cap onto host memory at once."""
+        mgr = _mgr(max_concurrent=4)
+        fresh = KiroCrewConfig()
+        fresh.agent.spawn_min_memory_gb = 0.0
+        with patch("kiro_crew.subagent.resolve_max_subagents", return_value=7):
+            await _dispatch(fresh, "agent.spawn_min_memory_gb")
+        assert mgr.max_concurrent == 7
 
     @pytest.mark.asyncio
     async def test_a_non_sizing_change_skips_the_resolve_thread_hop(self) -> None:
@@ -221,6 +238,14 @@ class TestCapChangesAndTheQueue:
         fresh.agent.max_subagents = 3
         mgr.apply_limits(fresh)
         mgr._drain_queue.assert_not_called()
+        assert mgr.max_concurrent == 3
+        assert mgr._queue == [{"task": "queued"}]
+        mgr.apply_limits(fresh)  # unchanged cap
+        mgr._drain_queue.assert_not_called()
+        # Raising past the old cap is what pumps the queue.
+        fresh.agent.max_subagents = 9
+        mgr.apply_limits(fresh)
+        mgr._drain_queue.assert_called_once_with()
 
     def test_lowered_cap_cancels_nothing_in_flight(self) -> None:
         mgr = _mgr(max_concurrent=8)
@@ -288,8 +313,11 @@ class TestCapChangeVersusAdaptiveClamp:
         mgr.spawn = MagicMock(return_value=None)  # type: ignore[method-assign]
         mgr._emit_queue_depth = MagicMock()  # type: ignore[method-assign]
         mgr._queue.append({"task": "queued work", "parent_session_key": "p", "batch_id": ""})
-        mgr.set_effective_cap(4)
+        assert mgr.set_effective_cap(4) == 4
+        assert mgr._queue == []
         mgr.spawn.assert_called_once()
+        assert mgr.spawn.call_args.kwargs["task"] == "queued work"
+        assert mgr.spawn.call_args.kwargs["_from_queue"] is True
 
     def test_adaptive_pause_admits_nothing_and_cancels_nothing(self) -> None:
         mgr = _mgr(max_concurrent=8)
@@ -354,7 +382,7 @@ class TestCapRaiseReachesTheRunnerLane:
 
         # No lane.release() and no lane.set_effective_cap(): the manager's raise
         # is the whole wake, and it is FIFO.
-        await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+        await await_until(asyncio.ensure_future(asyncio.gather(first, second)))
         assert granted == ["s1", "s2"]
         assert adm.lane.running == 2 and adm.lane.waiting == 0
 
@@ -378,7 +406,7 @@ class TestCapRaiseReachesTheRunnerLane:
         assert granted == [] and adm.lane.waiting == 1  # the one slot is taken
 
         held.release_slot()  # the ordinary wake, once the slot is actually free
-        await asyncio.wait_for(parked, timeout=5)
+        await await_until(parked)
         assert granted == ["b"]
 
     @pytest.mark.asyncio
@@ -397,7 +425,7 @@ class TestCapRaiseReachesTheRunnerLane:
         fresh.agent.max_subagents = 4
         mgr.apply_limits(fresh)
 
-        await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+        await await_until(asyncio.ensure_future(asyncio.gather(first, second)))
         assert granted == ["b", "c"]
         assert mgr.max_concurrent == 4 and adm.lane.running == 3
 
@@ -415,7 +443,7 @@ class TestCapRaiseReachesTheRunnerLane:
 
         assert mgr.set_effective_cap(None) == 3
 
-        await asyncio.wait_for(parked, timeout=5)
+        await await_until(parked)
         assert granted == ["b"]
 
     @pytest.mark.asyncio

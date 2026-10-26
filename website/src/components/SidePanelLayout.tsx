@@ -1,10 +1,12 @@
 import React from 'react'
 import { useSearchParams, useLocation, useNavigate } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
+import { MoreBelowCue } from './MoreBelowCue'
 import { NavBackBar } from './NavBackBar'
 import { useRegisterNavigationLeaveGuard, usePublishNavigationStake } from './NavigationLeaveGuard'
 import { hasSubSelection, deleteSubSelection, COARSE_TOUCH_TARGET, SUBNAV_PUSH_STATE, toPathSegment, parsePathSegments } from './subNavParams'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useScrollEdgesY } from '../hooks/useScrollEdges'
 import { useVisualViewport } from '../hooks/useVisualViewport'
 import { useBottomTerminalOpen, useTerminalPosition } from '../hooks/useBottomTerminal'
 import { useTerminalEnabled } from '../utils/terminalRegistry'
@@ -12,13 +14,24 @@ import { useTerminalPoppedOut } from '../utils/terminalPopout'
 import { safeGetSessionItem, safeSetSessionItem } from '../utils/safeStorage'
 
 import { i18nT } from '../i18n/t'
+import { Glass } from './Glass'
 export interface SidePanelTab {
   key: string
   label: string
   icon: React.ReactNode
+  /** Background of a coloured rounded tile drawn behind `icon` (a `--tile-*`
+   *  token), the way System Settings marks each section. Omitted: the bare icon
+   *  in `--muted`, as every other host of this layout renders it. */
+  tile?: string
   description?: string
   /** Presence dot after the label (e.g. About while an update is available). */
   dot?: boolean
+  /** Count pill after the label, for items waiting on the user inside this tab
+   *  (e.g. Skills while generated skill candidates wait for review). Nothing
+   *  renders at a count of 0. `label` names what is counted, count included,
+   *  and is the pill's accessible name: a bare number beside a tab label does
+   *  not say what it counts. */
+  badge?: { count: number; label: string }
   /** Optional group label. Desktop nav renders an uppercase header above the
    *  first tab of each new group; tabs without a group render header-less.
    *  Mobile ignores groups (flat pill row). */
@@ -124,10 +137,21 @@ const SidePanelLeaveGuardContext = React.createContext<
  * draft belongs next to the draft — the shell has no idea what is in it, and a
  * shell-owned string would have to be vague enough to cover every pane.
  *
- * One registration, several askers: this layout also forwards the guard to the
- * app shell (see NavigationLeaveGuard), so the same answer covers an in-app
- * route change that unmounts the layout itself. A pane declares dirtiness here
- * and nowhere else.
+ * One registration, several askers. Inside a layout the pane registers here and
+ * the layout forwards that same answer to the app shell (see
+ * NavigationLeaveGuard), so an in-app route change that unmounts the layout
+ * itself is covered too. A surface mounted OUTSIDE a layout has no pane to
+ * forward through; if it also needs the app shell to ask (a surface that can be
+ * mounted BOTH ways, like `NewCrewmateDialog` — the Crewmates page standalone
+ * and the crew manager's Crews tab inside a layout), pass `alsoGuardAppShell`
+ * and this hook registers with the shell itself when there is no pane context.
+ * Such a surface must NOT also call `useRegisterNavigationLeaveGuard` on its
+ * own, or inside a layout the shell would hold two entries resolving to the
+ * same guard and `ask()` would raise that surface's confirm TWICE for one
+ * navigation — the second "Cancel" vetoing a leave the user had already
+ * approved. A surface that only ever lives inside a layout leaves
+ * `alsoGuardAppShell` at its default and declares dirtiness HERE and nowhere
+ * else.
  *
  * `atStake` is that same dirtiness as a plain value, for the one asker that
  * cannot ask: the browser's Back button arrives with no component to intercept
@@ -137,7 +161,7 @@ const SidePanelLeaveGuardContext = React.createContext<
  * cannot drift. Omitting it leaves Back unguarded for that pane, which is where
  * every pane started.
  */
-export function useSidePanelLeaveGuard(guard: SidePanelLeaveGuard, atStake = false) {
+export function useSidePanelLeaveGuard(guard: SidePanelLeaveGuard, atStake = false, alsoGuardAppShell = false) {
   const register = React.useContext(SidePanelLeaveGuardContext)
   // Published from the PANE, not forwarded by the layout: the stake changes on
   // the keystroke that dirties the draft, and that keystroke re-renders the pane
@@ -151,6 +175,16 @@ export function useSidePanelLeaveGuard(guard: SidePanelLeaveGuard, atStake = fal
   // draft forever — losing exactly the text this exists to protect.
   const latest = React.useRef(guard)
   latest.current = guard
+  // The app shell, for a surface that OPTS IN (`alsoGuardAppShell`) and is
+  // mounted OUTSIDE any layout. Called UNCONDITIONALLY — hook rules — and
+  // answers a bare `true` unless BOTH hold: the caller opted in AND there is no
+  // pane context. Inside a layout the layout already forwards `mayLeavePane`
+  // into this same channel, so answering here too would put two entries in the
+  // shell's set resolving to one guard and `ask()` would raise its confirm
+  // TWICE for one navigation. A caller that does NOT opt in (every pane that
+  // only ever lives inside a layout, and MemoryTab, which deliberately did not
+  // reach the shell) keeps its prior behaviour: a no-op outside a layout.
+  useRegisterNavigationLeaveGuard(() => (alsoGuardAppShell && !register ? latest.current() : true))
   React.useEffect(() => {
     if (!register) return
     return register(() => latest.current())
@@ -159,11 +193,34 @@ export function useSidePanelLeaveGuard(guard: SidePanelLeaveGuard, atStake = fal
 
 const TAB_MEMORY_PREFIX = 'kirocrew:sidepanel-tab:'
 
+/** A tab's count pill (see `SidePanelTab.badge`). Same pill as the main rail's
+ *  expanded badge. `role="status"` carries the label as the accessible name, as
+ *  the presence dot does, so the row is announced with what the number counts. */
+function TabCountBadge({ badge, className = '' }: { badge?: SidePanelTab['badge']; className?: string }) {
+  if (!badge || badge.count <= 0) return null
+  return (
+    <span
+      className={`${className} shrink-0 bg-accent text-accent-fg text-[11px] font-bold px-1.5 py-[1px] rounded-full min-w-[18px] text-center leading-[14px]`}
+      role="status"
+      aria-label={badge.label}
+      title={badge.label}
+    >{badge.count}</span>
+  )
+}
+
 export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, footer, headerRight, headerRightDock = 'header', navTop, paneOwnsHeader = false, fixedContent, basePath, children }: SidePanelLayoutProps) {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
   const isMobile = useIsMobile()
+  // "More below" cue under the desktop tab list. Settings has twenty rows, so
+  // on a laptop-height window the last few (Developer, Releases, About) sit
+  // below the fold, and the overlay scrollbar stays hidden until hovered: the
+  // list read as complete and a first-time user could not find Developer. The
+  // cue says so while rows are hidden below, in its own strip outside every
+  // row. `attachContent` watches the rows themselves, so a tab appearing or a
+  // late font changing a row's height re-measures too.
+  const [attachTabList, tabListEdges, , attachTabListContent] = useScrollEdgesY<HTMLDivElement>()
   // Keyboard avoidance for the bottom-float dock. iOS Safari shrinks only the
   // VISUAL viewport when the keyboard opens (the layout viewport `fixed`
   // resolves against keeps its height — see CommandPalette.tsx), so a
@@ -448,7 +505,9 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
             * are not a selection — and a listbox may contain only options and
             * groups, which the separators and headers here are not. Groups
             * carry the header text as their accessible name; the visual header
-            * stays aria-hidden so it is not announced twice. */}
+            * stays aria-hidden so it is not announced twice. No row is
+            * `aria-current`: nothing is open at the root, and `tab` is only the
+            * default for the pane. */}
           <div role="list" aria-label={title} className="flex flex-col gap-0.5 pb-2">
             {groupedTabs.map(({ group, items }, gi) => {
               const rows = items.map(t => (
@@ -458,9 +517,12 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                     className={`flex items-center gap-2.5 w-full px-2.5 py-2.5 ${COARSE_TOUCH_TARGET} rounded-md text-[14px] text-left font-medium cursor-pointer border-none bg-transparent text-text transition-colors hover:bg-bg-hover`}
                     onClick={() => setTab(t.key)}
                   >
-                    <span className="w-5 h-5 shrink-0 flex items-center justify-center text-muted">{t.icon}</span>
+                    {t.tile
+                      ? <span className="w-[30px] h-[30px] shrink-0 flex items-center justify-center rounded-[8px] text-[color:var(--tile-fg)] [&_svg]:w-4 [&_svg]:h-4" style={{ background: t.tile }}>{t.icon}</span>
+                      : <span className="w-5 h-5 shrink-0 flex items-center justify-center text-muted">{t.icon}</span>}
                     <span className="flex-1 min-w-0 truncate">{t.label}</span>
                     {t.dot && <span className="w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={i18nT('components.sidePanelLayout.update_available')} />}
+                    <TabCountBadge badge={t.badge} />
                     <ChevronRight size={15} className="text-muted-strong shrink-0" />
                   </button>
                 </div>
@@ -493,11 +555,15 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
               // occludes the visual viewport.
               style={keyboardInset > 0 ? { transform: `translateY(-${keyboardInset}px)` } : undefined}
             >
-              <div className="pointer-events-auto mx-auto max-w-sm rounded-full border border-border focus-within:border-accent shadow-lg backdrop-blur-xl bg-[color-mix(in_srgb,var(--bg-elevated)_92%,transparent)]">
+              {/* Liquid Glass capsule: the shared recipe (components/Glass.tsx) with the
+                * neutral rest shadow. Nothing changes on focus: the material never
+                * lights up, steps or deepens (maintainer decision); the caret in the
+                * search field is the focus indicator. */}
+              <Glass radius={24} className="glass-shadow pointer-events-auto mx-auto max-w-sm">
                 <SidePanelDockContext.Provider value="bottom-float">
                   {headerRight}
                 </SidePanelDockContext.Provider>
-              </div>
+              </Glass>
             </div>
           )}
         </div>
@@ -523,7 +589,8 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
           )}
           {/* Only the tab list scrolls — the title and navTop above and the
             * footer below stay fixed. */}
-          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-overlay scrollbar-overlay-thin flex flex-col gap-0.5">
+          <div ref={attachTabList} data-testid="side-panel-tab-list" className="flex-1 min-h-0 overflow-y-auto">
+          <div ref={attachTabListContent} className="flex flex-col gap-0.5">
           {tabs.map((t, i) => (
             <React.Fragment key={t.key}>
               {t.dividerBefore && <div className="h-px bg-border mx-2.5 my-2" role="separator" />}
@@ -538,17 +605,31 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                     ? 'bg-accent-subtle text-accent'
                     : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover'
                 }`}
+                // The rows navigate, so the open tab is the current page. The class
+                // above paints it; this is the part a screen reader can read.
+                aria-current={tab === t.key ? 'page' : undefined}
                 onClick={() => setTab(t.key)}
               >
-                <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${tab === t.key ? 'text-accent' : 'text-muted'}`}>
-                  {t.icon}
-                </span>
+                {t.tile
+                  ? <span className="w-5 h-5 shrink-0 flex items-center justify-center rounded-[5px] text-[color:var(--tile-fg)] [&_svg]:w-3 [&_svg]:h-3" style={{ background: t.tile }}>{t.icon}</span>
+                  : <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${tab === t.key ? 'text-accent' : 'text-muted'}`}>
+                      {t.icon}
+                    </span>}
                 {t.label}
                 {t.dot && <span className="ml-auto w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={i18nT('components.sidePanelLayout.update_available')} />}
+                {/* The dot, when present, already holds the row's right edge. */}
+                <TabCountBadge badge={t.badge} className={t.dot ? '' : 'ml-auto'} />
               </button>
             </React.Fragment>
           ))}
           </div>
+          </div>
+          {/* Its own strip under the last row, so it reads as the list's edge
+            * rather than part of any row. The strip keeps its height for as
+            * long as the list overflows at all. */}
+          {(tabListEdges.top || tabListEdges.bottom) && (
+            <MoreBelowCue visible={tabListEdges.bottom} testId="side-panel-tab-list-more" />
+          )}
           {footer && <div className="shrink-0 pt-3 px-2.5">{footer}</div>}
         </nav>}
 

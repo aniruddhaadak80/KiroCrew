@@ -197,7 +197,7 @@ class TestScreenshotEvidence:
         part that is its own; the reason lives once, in rationale.md."""
         root = WORKFLOWS.parents[1]
         skills = root / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev"
-        rationale = (skills / "prepare-pr" / "references" / "rationale.md").read_text(
+        rationale = (skills / "kirocrew-prepare-pr" / "references" / "rationale.md").read_text(
             encoding="utf-8"
         )
         section = rationale.split("## Why screenshots are attachments, not commits", 1)[1]
@@ -232,9 +232,13 @@ class TestScreenshotEvidence:
         assert cost in template and "the blob stays" in template
         wf = _read("screenshot-evidence.yml")
         assert cost in wf and 'echo "blob stays."' in wf
-        prepare = (skills / "prepare-pr" / "SKILL.md").read_text(encoding="utf-8")
-        assert "never committed, bar one scoped exception" in prepare
-        assert "never committed. See below." not in prepare
+        prepare = (skills / "kirocrew-prepare-pr" / "SKILL.md").read_text(encoding="utf-8")
+        contract = (
+            skills / "kirocrew-prepare-pr" / "references" / "pr-description-contract.md"
+        ).read_text(encoding="utf-8")
+        assert "references/pr-description-contract.md" in prepare
+        assert "never committed, bar one scoped exception" in contract
+        assert "never committed. See below." not in prepare + contract
         assert "is in `main`'s history for good" in prepare
         assert "references/rationale.md" in prepare
 
@@ -247,7 +251,7 @@ class TestScreenshotEvidence:
         assert "references/rationale.md" in stt
         worktree = (skills / "kirocrew-worktree-dev" / "SKILL.md").read_text(encoding="utf-8")
         assert "never committed — with write access, which\nthis agent has" in worktree
-        assert "see prepare-pr's *Screenshots*" in worktree
+        assert "see kirocrew-prepare-pr's *Screenshots*" in worktree
 
     def test_the_ci_doc_describes_the_committed_read_as_the_script_performs_it(self):
         """The CI doc's Design-lane paragraph describes where committed media is
@@ -285,12 +289,12 @@ class TestScreenshotEvidence:
         ceiling beside it, and names where a bigger recording goes instead: the
         description via the web editor, which the attachment path reads at
         100 MB. The script's ceiling itself is pinned in
-        test_ai_review_workflows.py and is not this test's to move."""
+        test_ai_review_workflows_ux_committed_evidence.py and is not this test's to move."""
         root = WORKFLOWS.parents[1]
         skills = root / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev"
         template = (root / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8")
         wf = _read("screenshot-evidence.yml")
-        prepare = (skills / "prepare-pr" / "SKILL.md").read_text(encoding="utf-8")
+        prepare = (skills / "kirocrew-prepare-pr" / "SKILL.md").read_text(encoding="utf-8")
         # The attachment limits stay where they are, and the committed ceiling
         # is stated in the same block as the `git add -f` it applies to, after
         # the attachment limits and before the merge-time cost. Whitespace is
@@ -334,7 +338,7 @@ class TestScreenshotEvidence:
         the same thing as the script -- listing SVG as accepted while both
         evidence scripts drop it is the trap -- and the reason SVG is out is stated
         where an author reads it. Executed coverage of the script lives in
-        test_ai_review_workflows.py."""
+        test_ai_review_workflows_ux_committed_evidence.py."""
         root = WORKFLOWS.parents[1]
         script = (root / ".github" / "scripts" / "pr-committed-evidence.sh").read_text(
             encoding="utf-8"
@@ -345,7 +349,7 @@ class TestScreenshotEvidence:
             / "kiro_crew"
             / "builtin_skills"
             / "kirocrew-dev"
-            / "prepare-pr"
+            / "kirocrew-prepare-pr"
             / "SKILL.md"
         ).read_text(encoding="utf-8")
         media = "*.png|*.jpg|*.jpeg|*.webp|*.gif|*.webm|*.mp4|*.mov) ;;"
@@ -943,7 +947,8 @@ class TestDesignReviewBlocks:
         # including an errored or throttled run -- exits 0.
         wf = _read("design-review.yml")
         gate = wf.split("Design review status (gates on BLOCK)")[1]
-        assert "PASS|CONCERNS)" in gate
+        assert "PASS|CONCERNS)" not in gate
+        assert "PASS)" in gate
         assert "exit 1 ;;" in gate
         # The wildcard (errored / no verdict) branch must not fail.
         tail = gate.split("BLOCK)")[1]
@@ -1029,9 +1034,9 @@ class TestDecidableFindingsExitTheTieBreaker:
     @pytest.mark.parametrize("name", UX_LANES)
     def test_ux_tie_breaker_carries_a_closed_exception_list(self, name):
         wf = _flat(_read(name))
-        assert "Tie-breaker: when torn between BLOCK and CONCERNS" in wf
+        assert "Tie-breaker: when torn between BLOCK and PASS, choose PASS with a note" in wf
         # Five decidable exits: an evidence gap (a control no supplied
-        # screenshot shows -- the lane cannot evaluate it, so CONCERNS would
+        # screenshot shows -- the lane cannot evaluate it, so a pass would
         # misreport an unreached verdict as a mild one), the two notice rules,
         # a primary control the blind reader could not use and a hard element
         # swap. Each is read off the screenshot list, the blind-read report or
@@ -1058,7 +1063,7 @@ class TestDecidableFindingsExitTheTieBreaker:
 
     def test_first_principles_tie_breaker_exempts_the_rider_combination(self):
         contract = _flat(_read_prompt(FP_CONTRACT))
-        assert "Tie-breaker: when torn between BLOCK and CONCERNS" in contract
+        assert "Tie-breaker: when torn between BLOCK and PASS, choose PASS with a note" in contract
         # Three combinations are settled by reading, not by degree: (a) an
         # unverified premise on a core availability path, (b) the rider, (c) a
         # product-shape change with no non-draft RFC on the base and no
@@ -1107,10 +1112,11 @@ class TestMissingEvidenceIsABlockNotAConcern:
 
     def test_fork_ux_lane_keeps_its_own_limitation_out_of_the_block(self):
         # The fork lane has no blind reader. That is the LANE's limitation, not
-        # an evidence gap the author can close, so it must cap at CONCERNS
-        # rather than block a fork contributor for something they cannot fix.
+        # an evidence gap the author can close, so it must be a PASS that names
+        # the limitation rather than block a fork contributor for something they
+        # cannot fix.
         wf = _flat(_read("fork-ux-review.yml"))
-        assert "this lane's limitation, not the author's gap" in wf
+        assert "names this lane's limitation" in wf
         assert "The absent blind read is not this exit" in wf
 
     @pytest.mark.parametrize("name", DESIGN_LANES)
@@ -1156,7 +1162,7 @@ class TestMissingEvidenceIsABlockNotAConcern:
             i for i, s in enumerate(steps) if "configure-aws-credentials" in s.get("uses", "")
         )
         review_at = next(
-            i for i, s in enumerate(steps) if s.get("name") == "Design review (Fable 5)"
+            i for i, s in enumerate(steps) if s.get("name") == "Design review (Opus 5.5)"
         )
         assert evidence_at < creds_at < review_at
         if name == "fork-design-review.yml":
@@ -1185,7 +1191,7 @@ class TestMissingEvidenceIsABlockNotAConcern:
             # mime table with no size cap or skip counting. The reviewer is
             # told this list means the evidence rendered, so admission is the
             # script's byte typing and mode gate, exercised by execution in
-            # test_ai_review_workflows.py, not a name plus existence.
+            # test_ai_review_workflows_ux*.py, not a name plus existence.
             attach = '"$GITHUB_WORKSPACE/.github/scripts/pr-attachment-evidence.sh"'
             committed = '"$GITHUB_WORKSPACE/.github/scripts/pr-committed-evidence.sh"'
             assert attach in raw and committed in raw

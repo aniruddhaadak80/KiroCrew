@@ -44,7 +44,7 @@ import re
 import threading
 import time
 from hashlib import sha256
-from typing import Any
+from typing import Any, Sequence
 
 from kiro_crew import credential_patterns as _cred
 from kiro_crew.config.sections import (
@@ -54,7 +54,18 @@ from kiro_crew.config.sections import (
 )
 from kiro_crew.decisions import consent as _consent
 from kiro_crew.decisions import log as _log
-from kiro_crew.decisions.types import Answer, Answers, Question, is_model_id
+from kiro_crew.decisions.types import (
+    SCORE_MAX_LEVELS,
+    SCORE_MIN_LEVELS,
+    Answer,
+    Answers,
+    Choice,
+    Noul,
+    Question,
+    Score,
+    is_model_id,
+    question_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +179,9 @@ ERROR_INVALID_RESULT = "invalid-result"
 ERROR_SCRUBBED_CREDENTIAL = "scrubbed:credential"
 ERROR_SCRUBBED_URL = "scrubbed:exfiltration-url"
 ERROR_SCRUBBED_SCAN_FAILED = "scrubbed:scan-failed"
+#: The unclipped text was longer than :data:`MAX_UNCLIPPED_SCAN_CHARS`, so it was
+#: not scanned. Its own category so a long paste never reads as a scanner fault.
+ERROR_SCRUBBED_SCAN_BOUND = "scrubbed:scan-bound"
 #: ``provider.model`` is not a model id (``types.MODEL_ID_RE``). The field is in
 #: the agent-writable config and goes on the wire verbatim, so anything but a
 #: short identifier is refused as an egress channel, not sent as a model name.
@@ -179,8 +193,15 @@ SCRUB_ERRORS = (
     ERROR_SCRUBBED_CREDENTIAL,
     ERROR_SCRUBBED_URL,
     ERROR_SCRUBBED_SCAN_FAILED,
+    ERROR_SCRUBBED_SCAN_BOUND,
     ERROR_SCRUBBED_MODEL,
 )
+
+#: Longest *unclipped* text the scrub reads (see :func:`decide`). A point clips its
+#: excerpt at a few thousand characters; this leaves room past that clip for a
+#: credential that starts inside it, a PEM block included. Longer text refuses:
+#: any cut of the scan can leave a credential's anchor past the cut.
+MAX_UNCLIPPED_SCAN_CHARS = 8192
 
 #: Credential spellings refused locally, before the canonical scanner. Compiled
 #: here because ``credential_patterns`` exports pattern SOURCE strings. This is the
@@ -215,9 +236,31 @@ def _answers_are_valid(answers: Answers, questions: list[Question]) -> bool:
             return False
         if not _probability(answer.p):
             return False
-        if not isinstance(answer.value, str) or answer.value not in question.options:
+        if not _value_in_domain(answer.value, question):
             return False
     return True
+
+
+def _value_in_domain(value: object, question: object) -> bool:
+    """Whether *value* lies in *question*'s own domain, by question type.
+
+    One branch per type, so a type with no ``options`` never reaches the
+    ``Choice`` check, and a question of any other class is out of domain rather
+    than an exception: this runs outside ``decide``'s ``try``, so a raise here
+    would reach the caller instead of becoming the ``None`` a refusal is.
+    """
+    if isinstance(question, Choice):
+        return isinstance(value, str) and value in question.options
+    if isinstance(question, Noul):
+        return _probability(value)
+    if isinstance(question, Score):
+        levels = len(question.levels)
+        if not SCORE_MIN_LEVELS <= levels <= SCORE_MAX_LEVELS:
+            return False
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        return math.isfinite(value) and 0.0 <= value <= levels - 1
+    return False
 
 
 def _snapshot() -> Any:
@@ -253,6 +296,12 @@ def configured_endpoint(config: Any | None = None) -> str:
     return raw or DECISION_PROVIDER_ENDPOINT_DEFAULT
 
 
+def configured_provider_model(config: Any | None) -> str:
+    """The configured ``provider.model`` as written, for telling a local preset apart."""
+    provider = getattr(_decisions_config(config), "provider", None)
+    return str(getattr(provider, "model", "") or "")
+
+
 #: Endpoints already warned about, so a mismatch is said once, not once per message.
 _unconsented_warned: set[str] = set()
 
@@ -261,8 +310,12 @@ _unconsented_warned: set[str] = set()
 _capability_denied_warned = False
 
 
-def _capability_denied(session_key: str | None) -> bool:
-    """Whether the ``capabilities.decisions`` ceiling withdraws the seam. Filesystem IO.
+def _capability_denied(session_key: str | None, *, local: bool = False) -> bool:
+    """Whether the governance ceiling withdraws the seam. Filesystem IO.
+
+    *local* adds ``capabilities.decisions_local`` to ``capabilities.decisions``:
+    true when the configured provider is a local preset, so a fleet that permits
+    hosted Jev can still withdraw a model on this machine. A hosted deny covers it.
 
     *session_key* is the turn's own identity, which is what a profile binds on, so a
     profile bound to THIS surface is consulted rather than a dashboard one. It is
@@ -279,19 +332,53 @@ def _capability_denied(session_key: str | None) -> bool:
     global _capability_denied_warned
     from kiro_crew.decisions.capability import DASHBOARD_SURFACE_KEY, is_decisions_denied
 
-    if not is_decisions_denied(session_key or DASHBOARD_SURFACE_KEY):
+    if not is_decisions_denied(session_key or DASHBOARD_SURFACE_KEY, local=local):
         return False
     if not _capability_denied_warned:
         _capability_denied_warned = True
         logger.warning(
-            "decisions: the seam is withdrawn by governance "
-            "(capabilities.decisions); nothing is sent even though consent is on"
+            "decisions: the seam is withdrawn by governance (%s); nothing is sent "
+            "even though consent is on",
+            (
+                "capabilities.decisions or capabilities.decisions_local"
+                if local
+                else "capabilities.decisions"
+            ),
         )
     return True
 
 
+def _targets_denied(
+    config: Any | None, session_key: str | None, point: str, model: str, lane: str
+) -> bool:
+    """Whether the ceiling's ``points`` / ``models`` / ``endpoints`` lists refuse this
+    request. Filesystem IO; never raises (an error denies).
+
+    The ``models`` and ``endpoints`` lists bind the decision PROVIDER, which only
+    the Jev lane uses. The judge's LLM lane sends to the session's own model
+    provider through the session runner, which picks the served model itself, so
+    it is asked about its point only.
+    """
+    from kiro_crew.decisions.capability import DASHBOARD_SURFACE_KEY, targets_denied
+
+    try:
+        jev = lane == LANE_JEV
+        return targets_denied(
+            session_key or DASHBOARD_SURFACE_KEY,
+            point=point,
+            model=model if jev else None,
+            endpoint=configured_endpoint(config) if jev else None,
+        )
+    except Exception as exc:
+        logger.debug("decisions: %s target check failed (%s)", point, type(exc).__name__)
+        return True
+
+
 def _consented_for(
-    config: Any | None, session_key: str | None = None, point: str | None = None
+    config: Any | None,
+    session_key: str | None = None,
+    point: str | None = None,
+    scopes: Sequence[str] = (),
 ) -> bool:
     """Read the keystone and hold it against the configured endpoint. Filesystem IO.
 
@@ -319,13 +406,33 @@ def _consented_for(
     second keystone read, and because this is the documented chokepoint every
     ``decide`` and ``is_enabled`` path funnels through. ``None`` asks for no scope
     and is what a caller with no point of its own gets.
+
+    *scopes* names further keystone scopes ONE request needs beyond its point's
+    own (:data:`REQUEST_SCOPES`), held against this same keystone read -- so the
+    scope and the endpoint it authorizes come from one snapshot.
     """
     state = _consent.load_state()
     endpoint = configured_endpoint(config)
+    from kiro_crew.decisions.local_models import ENDPOINT_NONE
+
+    # "No decision model" chosen: nothing to send to, whatever the keystone says.
+    if endpoint == ENDPOINT_NONE:
+        return False
     if _consent.permits(endpoint, state):
         if not _scope_consented(point, state):
             return False
-        return not _capability_denied(session_key)
+        if not _request_scopes_consented(scopes, state):
+            return False
+        from kiro_crew.decisions.capability import is_local_preset, names_local_preset
+
+        model = configured_provider_model(config)
+        local = is_local_preset(endpoint, model)
+        # A preset's address is sent to only while the runtime attests the server on
+        # it. Until then -- the model downloading, starting, or a program that took
+        # the port -- whatever listens there is not known to be ours.
+        if not local and names_local_preset(endpoint, model):
+            return False
+        return not _capability_denied(session_key, local=local)
     if _consent.is_enabled(state) and endpoint not in _unconsented_warned:
         _unconsented_warned.add(endpoint)
         logger.warning(
@@ -418,6 +525,39 @@ def _scope_consented(point: str | None, state: dict) -> bool:
             category,
         )
     return False
+
+
+#: Scopes a caller may require for ONE request on top of its point's own
+#: (``decide(scopes=...)``), keyed by the keystone field the consent card writes,
+#: as ``field -> (keystone reader, the switch's own words)``. For a point whose
+#: requests mostly send what the main switch covers but sometimes carry a wider
+#: category: ``model.route`` classifies an owner-typed message on a chat turn and
+#: an agent-written tool argument on a sub-agent start.
+REQUEST_SCOPES: dict[str, tuple[str, str]] = {
+    _consent.STATE_KEY_TOOL_ARGS: ("consented_tool_args", "tool-call arguments"),
+}
+
+
+def _request_scopes_consented(scopes: Sequence[str], state: dict) -> bool:
+    """Whether every scope in *scopes* is consented in *state*. Never raises.
+
+    A scope this table does not know refuses, and so does an unreadable one: each
+    decides whether a category of content leaves the machine.
+    """
+    for scope in scopes:
+        entry = REQUEST_SCOPES.get(scope)
+        if entry is None:
+            logger.debug("decisions: unknown request scope %r; refusing", scope)
+            return False
+        reader_name, category = entry
+        try:
+            if not bool(getattr(_consent, reader_name)(state)):
+                logger.debug("decisions: request needs consent to send %s; refusing", category)
+                return False
+        except Exception:
+            logger.debug("decisions: %s scope unreadable; refusing", category)
+            return False
+    return True
 
 
 def in_bucket(session_key: str | None, bucket: object) -> bool:
@@ -725,6 +865,19 @@ def model_route_map(config: Any | None = None) -> dict[str, str]:
     }
 
 
+def model_route_derive(config: Any | None = None) -> bool:
+    """``decisions.model_route_derive``: whether empty tiers are derived. Never raises.
+
+    ``False`` for an absent, unreadable or non-bool value, so every failure keeps
+    the shipped behaviour where an unpinned tier applies nothing.
+    """
+    try:
+        raw = getattr(_decisions_config(config), "model_route_derive", False)
+    except Exception:
+        return False
+    return raw is True
+
+
 def _budget(name: str, default: int, config: Any | None = None) -> int:
     """One bounded integer knob off the decisions section, or *default*."""
     try:
@@ -755,13 +908,16 @@ def _scan_text(state: dict | str, questions: list[Question], model: str = "") ->
             rendered = repr(state)
     parts = [rendered, model]
     for question in questions:
-        parts.append(str(getattr(question, "prompt", "") or ""))
-        parts.extend(str(option) for option in getattr(question, "options", ()) or ())
+        parts.extend(question_texts(question))
     return "\n".join(parts)
 
 
 def scrub_reason(
-    state: dict | str, questions: list[Question], *, model: str = _DEFAULT_MODEL
+    state: dict | str,
+    questions: list[Question],
+    *,
+    model: str = _DEFAULT_MODEL,
+    unclipped: str = "",
 ) -> str | None:
     """A :data:`SCRUB_ERRORS` category, or ``None`` when the request may be sent.
 
@@ -773,10 +929,19 @@ def scrub_reason(
     external request cannot be cleared by a scan that did not complete. The reason
     is a category, never the matched text, which would put the credential into
     the log.
+
+    *unclipped* is scanned with them but never sent: the text a point clipped to
+    build *state*. A credential the clip cut in half is a fragment no pattern
+    matches in *state*, yet the fragment is what would go on the wire, so the
+    refusal has to read the text before the cut. Text longer than
+    :data:`MAX_UNCLIPPED_SCAN_CHARS` is not read at all and refuses, so the scan
+    stays bounded without a cut of its own.
     """
     if not is_model_id(model):
         return ERROR_SCRUBBED_MODEL
-    text = _scan_text(state, questions, model)
+    if len(unclipped) > MAX_UNCLIPPED_SCAN_CHARS:
+        return ERROR_SCRUBBED_SCAN_BOUND
+    text = _scan_text(state, questions, model) + "\n" + unclipped
     if _CREDENTIAL_RE.search(text) is not None:
         return ERROR_SCRUBBED_CREDENTIAL
     try:
@@ -859,6 +1024,8 @@ async def decide(
     config: Any | None = None,
     extra: dict[str, Any] | None = None,
     receipt: dict[str, Any] | None = None,
+    scopes: Sequence[str] = (),
+    unclipped: str = "",
 ) -> Answers | None:
     """Ask *questions* about *state* at *point*, or return ``None``.
 
@@ -887,9 +1054,20 @@ async def decide(
     append starts, the value resolves to true after append-line commitment or false
     after a definitive refusal, even when the post-append retention sweep outlives the
     write budget. If neither outcome arrives within the bounded grace, it remains
-    ``None`` rather than claiming a refusal while the append is still running. A caller
+    ``None`` rather than claiming a refusal while the append is still running, and the
+    gate logs one warning naming the point, the row and the time waited. A caller
     that supplies no receipt returns when the write budget expires and pays no grace.
     This additive signal does not change ``None`` as the only failure return.
+
+    *scopes* names keystone scopes THIS request needs beyond its point's own
+    (:data:`REQUEST_SCOPES`). They are checked against the same keystone read that
+    authorizes the endpoint, so a consent change between a caller's own check and
+    the send cannot let the request through under the wider category; a missing,
+    unknown or unreadable scope refuses with no row.
+
+    *unclipped* is the text a point clipped to build *state*, usually the new
+    message. It is scanned by :func:`scrub_reason` and never sent, so a credential
+    the clip halved still refuses the request.
     """
     if receipt is not None:
         receipt["row_written"] = False
@@ -909,7 +1087,7 @@ async def decide(
             return None
         # The keystone is a file read, so it leaves the event loop; everything
         # else `_sampled` checks is attribute reads on the snapshot.
-        consented = await asyncio.to_thread(_consented_for, cfg, session_key, point)
+        consented = await asyncio.to_thread(_consented_for, cfg, session_key, point, scopes)
         # Which provider answers, and on whose authority. Every point but the judge
         # has exactly one lane and exactly one authority -- the keystone -- so this
         # is inert for all of them. The judge's LLM lane runs on its provider key
@@ -930,13 +1108,26 @@ async def decide(
         logger.debug("decisions: %s config read failed (%s)", point, type(exc).__name__)
         return None
 
-    async def _write(*, latency_ms: int, answers: Answers | None, error: str | None) -> None:
+    async def _write(
+        *,
+        latency_ms: int,
+        answers: Answers | None,
+        error: str | None,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         # Guarded here as well as inside ``log.append``: ``append`` protects the
         # WRITE, this protects BUILDING the row, which renders values an
         # implementation supplied. The class only, never a message, for the same
         # reason.
         row_written: bool | None = False
         try:
+            # Provider-stamped metadata (model, usage, request id) is merged
+            # UNDER the caller's extra, so a point's own field always wins a name
+            # collision and the metadata only ever adds fields. Both are bounded
+            # again by the log's own ``extra`` handling.
+            row_extra = extra
+            if meta:
+                row_extra = {**meta, **(extra or {})}
             row = _log.build_row(
                 point=point,
                 session_key=session_key,
@@ -944,7 +1135,7 @@ async def decide(
                 answers=answers,
                 scrubbed=error in SCRUB_ERRORS,
                 error=error,
-                extra=extra,
+                extra=row_extra,
             )
             # A caller that asked for no receipt observes nothing about commitment, so
             # it gets the bare call this seam has always made: no event to set, no
@@ -952,6 +1143,7 @@ async def decide(
             # that needs a commit signal, so it is the only one that creates it.
             commit_event = threading.Event() if receipt is not None else None
             row_written = None
+            append_started = time.monotonic()
             append_task = asyncio.create_task(
                 asyncio.to_thread(_log.append, row)
                 if commit_event is None
@@ -975,6 +1167,17 @@ async def decide(
                     row_written = True
                 elif append_task.done():
                     row_written = append_task.result() is True
+                else:
+                    # Neither outcome arrived, so the receipt stays unknown and a
+                    # caller that scores only a confirmed row (the wake judge's join
+                    # key) loses this one. The worker may still commit it, so the
+                    # receipt is not turned into a refusal: the loss is logged.
+                    logger.warning(
+                        "decisions: %s row %s commit unconfirmed after %.3fs; receipt left unknown",
+                        point,
+                        row.get("verdict_id") or row.get("ts"),
+                        time.monotonic() - append_started,
+                    )
                 if not commit_wait.done():
                     commit_wait.cancel()
         except Exception as exc:
@@ -988,16 +1191,28 @@ async def decide(
     # For every lane but the judge's LLM one this is ``provider.model`` with the
     # same fallback ``JevOracle`` applies, unchanged.
     model = lane_model(cfg, lane=lane)
-    refusal = scrub_reason(state, questions, model=model)
+    # The scrub runs first: the list check below writes the model id to the SEL,
+    # so an id the scrub refuses (a pasted credential) never reaches that row.
+    refusal = scrub_reason(state, questions, model=model, unclipped=unclipped)
     if refusal is not None:
         await _write(latency_ms=0, answers=None, error=refusal)
         return None
+    # The fleet's lists: which points, models and endpoints the seam may use. Like
+    # the capability row in ``_consented_for``, a refusal here writes no decision
+    # row (its audit is the SEL ``governance_decision`` row) and costs nothing on
+    # an unconsented install, which never reaches this line.
+    if await asyncio.to_thread(_targets_denied, cfg, session_key, point, model, lane):
+        return None
 
     started = time.monotonic()
+    oracle: Any = None
     try:
-        answers = await asyncio.wait_for(
-            _oracle(lane, provider, model).ask(state, questions), timeout=budget
-        )
+        # Constructed inside the guard so a lane import or constructor failure is
+        # the same never-raise ERROR_PROVIDER as a call failure, not an exception
+        # out of ``decide``. Bound to a name so its response metadata can be read
+        # after a successful call.
+        oracle = _oracle(lane, provider, model)
+        answers = await asyncio.wait_for(oracle.ask(state, questions), timeout=budget)
     except asyncio.TimeoutError:
         # Named apart from the generic branch: "timeout" is the one failure an
         # operator can act on mechanically (raise timeout_ms, or accept the rate).
@@ -1024,7 +1239,12 @@ async def decide(
     # Written with the answers in hand, outside ``budget`` and under
     # ``_LOG_BUDGET_SECS``: the write cannot spend the provider deadline, cannot
     # hold the caller longer than that budget, and cannot cost it the result.
-    await _write(latency_ms=latency_ms, answers=answers, error=None)
+    # The lane's provider-stamped metadata (model, usage, request id) rides onto
+    # this row only -- an error row never carries it, because an oracle sets it
+    # only on a fully-valid response. A lane that stamps none (the LLM judge)
+    # leaves the attribute unset and the row simply has no metadata.
+    meta = getattr(oracle, "last_response_meta", None)
+    await _write(latency_ms=latency_ms, answers=answers, error=None, meta=meta)
     return answers
 
 

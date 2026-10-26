@@ -46,19 +46,46 @@ _FRAME_RE = re.compile(r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+) in (?P<f
 #: helper, so matching top-down on "slack/" would misname it.
 _SURFACE_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     # label, path fragments, function names -- either kind of hit qualifies
-    ("cron", ("/kiro_crew/cron.py",), ("_cron_callback", "_run_job_isolated")),
+    (
+        "cron",
+        ("/kiro_crew/cron.py", "/kiro_crew/cron_service/"),
+        ("_cron_callback", "_run_job_isolated"),
+    ),
     ("heartbeat", ("/kiro_crew/heartbeat.py",), ()),
     ("task runner", ("/kiro_crew/task_executor.py", "/kiro_crew/task_planner.py"), ()),
     ("subagent", ("/kiro_crew/subagent_manager/",), ()),
     ("workflow", ("/kiro_crew/workflows/",), ()),
-    ("dashboard chat", ("/kiro_crew/dashboard/chat_runner.py",), ()),
+    (
+        "dashboard chat",
+        ("/kiro_crew/dashboard/chat_runner.py", "/kiro_crew/dashboard/chat_turn/"),
+        (),
+    ),
     ("dashboard side panel", ("/kiro_crew/dashboard/handlers/side.py",), ()),
-    ("slack", ("/kiro_crew/slack/handler.py", "/kiro_crew/slack/transport_dispatch.py"), ()),
+    (
+        "slack",
+        (
+            "/kiro_crew/slack/handler.py",
+            "/kiro_crew/slack/handler_runtime/",
+            "/kiro_crew/slack/transport_dispatch.py",
+        ),
+        (),
+    ),
     ("discord", ("/kiro_crew/discord/",), ()),
     ("telegram", ("/kiro_crew/telegram/",), ()),
     ("teams", ("/kiro_crew/teams/",), ()),
     ("webex", ("/kiro_crew/webex/",), ()),
-    ("messaging", ("/kiro_crew/messaging/dispatch.py",), ()),
+    (
+        "messaging",
+        (
+            "/kiro_crew/messaging/dispatch.py",
+            "/kiro_crew/messaging/dispatch_contract.py",
+            "/kiro_crew/messaging/dispatch_tools.py",
+            "/kiro_crew/messaging/dispatch_admission.py",
+            "/kiro_crew/messaging/dispatch_crew_log.py",
+            "/kiro_crew/messaging/dispatch_recovery.py",
+        ),
+        (),
+    ),
     # Not an entry point but a loop: the per-turn event drain. Matched by
     # FUNCTION name alone -- a path fragment would label a stall in any other
     # function of those modules a queue drain, which is a worse answer than
@@ -74,7 +101,10 @@ _SURFACE_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
 #: Gate frames worth naming as "stuck in": the security gate and its callers.
 #: The security gate ships as a PACKAGE, so the entry is the directory prefix and
 #: every submodule of it counts; a bare module-file spelling would name only one.
-_GATE_FILES = ("/kiro_crew/security/", "/kiro_crew/hooks.py")
+#: The hook gate is a facade plus a package for the same reason: the frame a wedged
+#: path-safe read or deny resolution leaves names its owner file, not ``hooks.py``,
+#: so both spellings are entries or such a stall stops being named a gate stall.
+_GATE_FILES = ("/kiro_crew/security/", "/kiro_crew/hooks.py", "/kiro_crew/hook_runtime/")
 
 
 @dataclass(frozen=True)

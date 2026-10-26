@@ -1,7 +1,7 @@
 """Off-loop filesystem discipline for the auto_research backend.
 
 ``test_auto_research_onloop_db.py`` pins this module's *database* discipline
-with a static ratchet: no ``async def`` in ``handlers.py`` may reach
+with a static ratchet: no ``async def`` in the app package may reach
 ``_get_db`` on the event loop. This module is the same guard for its
 filesystem calls.
 
@@ -43,6 +43,8 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.apps.builtins.auto_research import handlers as h
+from kiro_crew.apps.builtins.auto_research.campaign import publication
+from kiro_crew.apps.builtins.auto_research.campaign import workflow_mode as wm
 
 BASE = "/api/apps/auto-research"
 
@@ -126,37 +128,63 @@ def _spy(monkeypatch: pytest.MonkeyPatch, method: str, target: Path, sink: list[
 # --- 1. static ratchet -------------------------------------------------------
 
 
-def _module_tree() -> ast.Module:
-    src = Path(inspect.getsourcefile(h)).read_text(encoding="utf-8")
-    return ast.parse(src)
+_PACKAGE = Path(inspect.getsourcefile(h)).resolve().parent
+
+
+def _package_trees() -> list[ast.Module]:
+    """Every module of the app package (its tests excluded), parsed."""
+    return [
+        ast.parse(p.read_text(encoding="utf-8"))
+        for p in sorted(_PACKAGE.rglob("*.py"))
+        if "tests" not in p.relative_to(_PACKAGE).parts and "__pycache__" not in p.parts
+    ]
+
+
+def _fs_violations(tree: ast.Module, scanned: set[str] | None = None) -> list[str]:
+    """Filesystem calls in the OWN body of each ``async def`` in *tree*.
+
+    A nested sync helper is fine -- it runs in the worker it is handed to --
+    so nested defs and lambdas are skipped; a nested ``async def`` is scanned
+    on its own.
+    """
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if scanned is not None:
+            scanned.add(node.name)
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.Lambda, ast.AsyncFunctionDef)):
+                continue  # body runs off-loop when offloaded
+            if isinstance(n, ast.Call):
+                fn = n.func
+                if isinstance(fn, ast.Attribute) and fn.attr in _FS_METHODS:
+                    violations.append(f"{node.name}:{n.lineno} calls .{fn.attr}()")
+                elif isinstance(fn, ast.Attribute) and fn.attr in _FS_FUNCS:
+                    violations.append(f"{node.name}:{n.lineno} calls {fn.attr}()")
+            stack.extend(ast.iter_child_nodes(n))
+    return violations
 
 
 class TestStaticRatchet:
     def test_no_async_def_touches_the_filesystem_directly(self):
-        """A nested sync helper is fine — it runs in the worker it is handed to.
-        What is flagged is a filesystem call in the ``async def``'s OWN body,
-        which is the shape that runs on the gateway loop.
-        """
-        violations: list[str] = []
-
-        def scan(node: ast.AsyncFunctionDef) -> None:
-            stack = list(ast.iter_child_nodes(node))
-            while stack:
-                n = stack.pop()
-                if isinstance(n, (ast.FunctionDef, ast.Lambda, ast.AsyncFunctionDef)):
-                    continue  # body runs off-loop when offloaded
-                if isinstance(n, ast.Call):
-                    fn = n.func
-                    if isinstance(fn, ast.Attribute) and fn.attr in _FS_METHODS:
-                        violations.append(f"{node.name}:{n.lineno} calls .{fn.attr}()")
-                    elif isinstance(fn, ast.Attribute) and fn.attr in _FS_FUNCS:
-                        violations.append(f"{node.name}:{n.lineno} calls {fn.attr}()")
-                stack.extend(ast.iter_child_nodes(n))
-
-        for node in ast.walk(_module_tree()):
-            if isinstance(node, ast.AsyncFunctionDef):
-                scan(node)
-
+        """A filesystem call in an ``async def``'s OWN body is the shape that
+        runs on the gateway loop; every module of the package is scanned."""
+        scanned: set[str] = set()
+        violations = [v for tree in _package_trees() for v in _fs_violations(tree, scanned)]
+        # The coroutines that do filesystem work must all be in view.
+        assert {
+            "_handle_to_knowledge",
+            "_handle_to_artifact",
+            "_handle_action",
+            "_handle_grill_tree",
+            "_poll_workflow_campaign",
+            "_watchdog_loop",
+            "_launch_loop",
+            "_write_knowledge_copy",
+        } <= scanned
         assert not violations, (
             "filesystem call(s) on the event loop (offload via asyncio.to_thread "
             "/ run_in_executor, or move them into a sync helper you hand to "
@@ -164,24 +192,18 @@ class TestStaticRatchet:
         )
 
     def test_the_ratchet_can_actually_fail(self):
-        """Guard against a scan that passes because it sees nothing: the same
-        walk must flag a known-bad snippet."""
+        """Guard against a scan that passes because it sees nothing: the real
+        scan must flag a known-bad snippet, and must skip a nested helper."""
         bad = ast.parse(
             "async def h(p):\n"
+            "    def _off():\n"
+            "        return p.stat()\n"
             "    if p.exists():\n"
             "        return p.read_text()\n"
             "    return None\n"
         )
-        found = [
-            n.func.attr
-            for node in ast.walk(bad)
-            for n in ast.walk(node)
-            if isinstance(node, ast.AsyncFunctionDef)
-            and isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr in _FS_METHODS
-        ]
-        assert set(found) == {"exists", "read_text"}
+        found = {v.rsplit(" ", 1)[-1] for v in _fs_violations(bad)}
+        assert found == {".exists()", ".read_text()"}
 
 
 # --- 2. behavioural proof ----------------------------------------------------
@@ -396,3 +418,105 @@ class TestCancellationSettlesWorker:
         )
         assert result == 42
         assert observed == [], "on_settled must not fire on the uncancelled path"
+
+
+class TestWorkflowRunFileOffLoop:
+    """The ``workflow_run.json`` helpers must run in a worker, not on the loop.
+
+    ``_read_workflow_run_id`` / ``_read_workflow_cycle_offset`` /
+    ``_write_workflow_run_id`` are sync helpers, so the static ratchet above
+    cannot see the ``exists()`` / read / ``write_text`` behind the call; this
+    records the thread each one actually ran on. The poll is the case that
+    matters most: the watchdog runs it for the life of a workflow campaign.
+    """
+
+    @staticmethod
+    def _record(monkeypatch: pytest.MonkeyPatch, sink: dict[str, list[int]]) -> None:
+        for name in (
+            "_read_workflow_run_id",
+            "_read_workflow_cycle_offset",
+            "_write_workflow_run_id",
+        ):
+            original = getattr(wm, name)
+
+            def _wrapper(*args: Any, _name: str = name, _orig: Any = original) -> Any:
+                sink.setdefault(_name, []).append(threading.get_ident())
+                return _orig(*args)
+
+            monkeypatch.setattr(wm, name, _wrapper)
+
+    @staticmethod
+    def _state(**svc: Any) -> MagicMock:
+        return MagicMock(workflow_service=MagicMock(**svc))
+
+    @pytest.mark.asyncio
+    async def test_poll_reads_the_run_file_off_the_event_loop(
+        self, _isolate: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cid = h.create_campaign({"question": "q?", "execution_mode": "workflow"})["id"]
+        h.update_campaign_status(cid, h.CampaignStatus.RUNNING)
+        h._write_workflow_run_id(cid, "run-1")
+        snap = {
+            "status": "running",
+            "events": [
+                {"type": "agent_started", "data": {"agent_id": "a", "label": "investigate: x"}},
+                {"type": "agent_finished", "data": {"agent_id": "a", "ok": True}},
+            ],
+        }
+        monkeypatch.setattr(h, "_emit_sse", lambda _e: None)
+        calls: dict[str, list[int]] = {}
+        self._record(monkeypatch, calls)
+        loop_thread = threading.get_ident()
+
+        await h._poll_workflow_campaign(
+            cid, self._state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"]
+        )
+
+        assert len(h._list_cycle_files(cid)) == 1, "the poll must still write the finding"
+        assert set(calls) == {"_read_workflow_run_id", "_read_workflow_cycle_offset"}
+        assert all(t != loop_thread for ts in calls.values() for t in ts), calls
+
+    @pytest.mark.asyncio
+    async def test_launch_and_stop_touch_the_run_file_off_the_event_loop(
+        self, _isolate: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cid = h.create_campaign({"question": "q?", "execution_mode": "workflow"})["id"]
+        cancel = AsyncMock()
+        state = self._state(start=AsyncMock(return_value={"run_id": "run-7"}), cancel=cancel)
+        req = _mk("x/action", app=_app(state=state), match={"id": cid})
+        calls: dict[str, list[int]] = {}
+        self._record(monkeypatch, calls)
+        loop_thread = threading.get_ident()
+
+        await h._launch_workflow(req, cid)
+        await h._stop_workflow(req, cid)
+
+        cancel.assert_awaited_once_with("run-7")  # the written id round-trips
+        assert set(calls) == {"_write_workflow_run_id", "_read_workflow_run_id"}
+        assert all(t != loop_thread for ts in calls.values() for t in ts), calls
+
+
+class TestKnowledgeCopyUriOffLoop:
+    """``_write_knowledge_copy`` must resolve the URI it returns in a worker.
+
+    The write already runs in a worker, but the ``Path.resolve()`` behind
+    ``_knowledge_uri`` sits in a sync helper, where the static ratchet above
+    cannot see it; this records the thread the resolve actually ran on.
+    """
+
+    @pytest.mark.asyncio
+    async def test_uri_resolve_runs_off_the_event_loop(
+        self, _isolate: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        d = h.RESEARCH_DIR / "aaaa0008"
+        d.mkdir(parents=True)
+        copy = publication._knowledge_copy(d)
+        expected = str(copy.resolve())
+        resolves: list[str] = []
+        _spy(monkeypatch, "resolve", copy, resolves)
+
+        uri = await publication._write_knowledge_copy(d, "# findings\n")
+
+        assert uri == expected, "the returned URI must be unchanged"
+        assert copy.read_text() == "# findings\n", "the scrubbed copy must still be written"
+        assert resolves and all(t != "MainThread" for t in resolves), resolves

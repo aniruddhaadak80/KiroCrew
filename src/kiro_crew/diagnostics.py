@@ -36,9 +36,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
-from kiro_crew import __version__, platform_compat, release_channel
+from kiro_crew import __version__, agent_scratch, platform_compat, release_channel
 from kiro_crew.config.loader import config_dir
 from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
+from kiro_crew.platform import PlatformCompositionError, current_context, safe_context_call
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -56,6 +57,9 @@ _ISSUE_NEW_URL = f"https://github.com/{_ISSUE_REPO}/issues/new"
 # the bundle (or, worse, the redaction pass).
 _MAX_CRASH_DUMPS = 5
 _MAX_IPS_REPORTS = 5
+# Same bound for the per-process kiro-cli chat logs read from agent scratch:
+# one per spawned process, so a host running many agents has many.
+_MAX_SCRATCH_CHAT_LOGS = 5
 # Keep only the newest N bundles in the output dir so a repeatedly-clicked
 # "Report a Problem" can't grow the diagnostics dir unbounded.
 _MAX_KEPT_BUNDLES = 10
@@ -117,8 +121,13 @@ class BundleResult:
     filename: str
     included: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
-    #: member name -> number of redactions applied (0 = clean)
+    #: member name -> number of secret redactions applied (0 = clean)
     redaction_summary: dict[str, int] = field(default_factory=dict)
+    #: Count of home/data-home path prefixes collapsed to ``~`` across all text
+    #: members. Tracked apart from :attr:`redaction_summary` because a path
+    #: collapse hides an OS login, not a secret -- folding it into the secret
+    #: tally would overstate "N secret(s) auto-redacted" in the issue body.
+    path_collapses: int = 0
     github_issue_url: str = ""
     #: The ONE release-provenance resolution this bundle was written from.
     #: :func:`collect_bundle` takes it before the first member and hands it to
@@ -176,6 +185,142 @@ def _scrub(text: str) -> tuple[str, int]:
     return text, count
 
 
+def _is_root_or_single_segment(path: str) -> bool:
+    """True when *path* is a filesystem root or a single top-level segment.
+
+    Collapsing such a prefix is both useless and dangerous: ``/`` or ``C:/``
+    carries no OS login to hide, and matching it would rewrite the leading
+    separator of every absolute path in the bundle. ``/home`` (one segment) is
+    likewise a shared parent, not a login. Only a prefix with a login segment
+    under a parent -- ``/home/alice``, ``C:/Users/alice`` -- is worth collapsing.
+    """
+    norm = path.replace("\\", "/").rstrip("/")
+    if not norm:
+        return True  # bare "/" or "\\"
+    body = norm[2:] if re.match(r"^[A-Za-z]:", norm) else norm
+    segments = [s for s in body.split("/") if s]
+    return len(segments) <= 1
+
+
+def _prefix_spellings(base: str) -> list[str]:
+    """Every on-disk/in-log spelling of a single home-ish *base* path.
+
+    A Windows path written with backslashes by the shell is normalised to the
+    forward-slash form by tools that rewrite separators (Git Bash, pathlib,
+    Node), and appears with doubled backslashes once a line is embedded in a
+    JSON string (kiro-chat.log, crash.log are JSON). All three spellings carry
+    the same login and must collapse, so each is matched.
+    """
+    out = [base]
+    if "\\" in base:
+        out.append(base.replace("\\", "/"))  # forward-slash spelling
+        out.append(base.replace("\\", "\\\\"))  # JSON-escaped backslashes
+    return out
+
+
+def _home_prefixes() -> list[str]:
+    """Home-directory prefixes to collapse to ``~`` in bundle text members.
+
+    Only the paths that embed the OS login: the user's home directory and the
+    data-home directory. Each is emitted in every spelling it can appear in (see
+    :func:`_prefix_spellings`): the native form, the forward-slash form, and the
+    JSON-escaped backslash form on Windows.
+
+    The data-home prefix is emitted on its own ONLY when it is not nested under
+    home. When it IS under home (the usual case -- ``<home>/.kiro/crew``),
+    collapsing the HOME prefix alone already rewrites ``<home>/.kiro/crew/x`` to
+    ``~/.kiro/crew/x``, keeping the relative tail the maintainer needs; adding
+    the data-home prefix as well would swallow that tail down to a bare ``~``.
+    Roots and single-segment candidates (``/``, ``/home``, ``C:/``) are dropped
+    -- they carry no login. Empty candidates (a monkeypatched ``home()``
+    returning ``""``) are dropped so they never match everywhere.
+    """
+    home = str(Path.home())
+    data_home = str(config_dir())
+    bases: list[str] = []
+    if home and not _is_root_or_single_segment(home):
+        bases.append(home)
+    if data_home and not _is_root_or_single_segment(data_home):
+        # Nested under home? Then the home collapse already covers it while
+        # preserving the ``.kiro/crew/...`` tail, so do not register it apart.
+        nested = bool(home) and (
+            data_home == home or data_home.startswith(home.rstrip("/\\") + os.sep)
+        )
+        if not nested:
+            bases.append(data_home)
+    raw: list[str] = []
+    for base in bases:
+        raw.extend(_prefix_spellings(base))
+    seen: set[str] = set()
+    prefixes: list[str] = []
+    for p in sorted(raw, key=len, reverse=True):
+        if p and p not in seen:
+            seen.add(p)
+            prefixes.append(p)
+    return prefixes
+
+
+# A home prefix only collapses when the login segment ENDS at the boundary --
+# i.e. the next character does not continue the segment. The guard is a
+# negative lookahead on segment-continuing characters (letters, digits,
+# underscore, hyphen), so only a LONGER login is protected from a shorter one
+# it is a strict prefix of. Every other following character ends the segment
+# and allows the collapse: a separator, a quote, whitespace, OR a delimiter
+# such as a PATH-list colon, a trailing comma, a closing paren or a
+# sentence-final dot.
+_PREFIX_BOUNDARY = r"(?![A-Za-z0-9_-])"
+
+
+def _collapse_home_prefixes(text: str) -> tuple[str, int]:
+    """Collapse home/data-home prefixes in *text* to ``~``, keeping the tail.
+
+    Narrow by design: it replaces only the leading home or data-home directory
+    with ``~`` and leaves the rest of each path intact, so a traceback frame
+    stays readable -- ``~/.kiro/crew/gateway.log`` -- and system (``/usr``,
+    ``/opt``) and repo-relative (``src/kiro_crew/...``) frames are untouched.
+
+    The match is segment-aware and case-insensitive: a prefix collapses when
+    the login segment ends -- i.e. the next character is not one that continues
+    the segment (a letter, digit, underscore or hyphen) -- so a login that is a
+    strict prefix of a longer one is not rewritten, while a delimiter such as a
+    separator, quote, whitespace, ``:``, ``,``, ``)`` or a trailing ``.`` all
+    allow the collapse. Case-insensitivity covers the Windows drive/user
+    spellings that differ only by case across tools.
+    """
+    count = 0
+    for prefix in _home_prefixes():
+        pattern = re.compile(re.escape(prefix) + _PREFIX_BOUNDARY, re.IGNORECASE)
+        text, n = pattern.subn("~", text)
+        count += n
+    return text, count
+
+
+def _scrub_bundle(text: str) -> tuple[str, int, int]:
+    """``_scrub`` plus a home-prefix collapse, for bundle text members only.
+
+    The bundle's stated destination is a public issue, so a text member must not
+    carry the OS login: on Windows the login is embedded in nearly every
+    path-bearing line, and ``versions.txt`` embeds the data-home path. The shared
+    :func:`_scrub` is deliberately left alone -- it also redacts the agent-facing
+    protocol-log reader, whose output goes to a model context, not a public
+    issue, so the extra pass is scoped to the bundle here.
+
+    The home collapse runs LAST, after ``_EXTRA_REDACTIONS``, so a credential
+    header sitting directly after a ``file:line:`` prefix is redacted by the
+    credential rules first and never swallowed. The collapse replaces only the
+    home and data-home PREFIX with ``~`` and keeps the rest of each path, so a
+    maintainer still sees the file location that makes a bundle useful; system
+    and repo-relative frames are left intact.
+
+    Returns ``(clean, secrets, path_collapses)``: the secret count and the
+    path-collapse count are kept apart so the issue body does not report a path
+    collapse as a "secret".
+    """
+    text, secrets = _scrub(text)
+    text, collapses = _collapse_home_prefixes(text)
+    return text, secrets, collapses
+
+
 def _kiro_log_dirs() -> list[Path]:
     """Candidate ``kiro-log`` parents, most explicit first.
 
@@ -206,7 +351,8 @@ def _kiro_log_dirs() -> list[Path]:
 
 
 def _usable_log(p: Path) -> bool:
-    return p.is_file() and not p.is_symlink()
+    # Link check first: `is_file()` follows a link (see `_usable_dir`).
+    return not p.is_symlink() and p.is_file()
 
 
 def _usable_dir(p: Path) -> bool:
@@ -225,8 +371,13 @@ def _usable_dir(p: Path) -> bool:
     ``SeCreateSymbolicLinkPrivilege``). A symlink-only guard is therefore open
     on exactly the platform where planting one is easiest, and what leaks
     through it is a bundle the user then attaches to a public issue.
+
+    The link check runs BEFORE ``is_dir()``, because ``is_dir()`` follows the
+    link to answer: on Windows, following a link whose target is a UNC share
+    opens an SMB connection that authenticates as this process, even when the
+    answer is then thrown away.
     """
-    return p.is_dir() and not platform_compat.is_link_or_junction(p)
+    return not platform_compat.is_link_or_junction(p) and p.is_dir()
 
 
 def _kiro_cli_chat_log() -> Path | None:
@@ -262,6 +413,38 @@ def _kiro_cli_extra_logs() -> list[Path]:
             # zip would carry two different `mcp.log` entries under one name.
             break
     return out
+
+
+def _scratch_kiro_chat_logs() -> list[Path]:
+    """Per-process kiro-cli chat logs under agent scratch, newest first.
+
+    On Linux and macOS ``agent_scratch.scratch_env`` pins the log of every
+    kiro-cli Kiro Crew spawns to ``<scratch root>/<dir>/kiro-log/kiro-chat.log``,
+    which none of :func:`_kiro_log_dirs`' shared candidates reach. Each directory
+    level must pass :func:`_usable_dir` and the log :func:`_usable_log`, so a
+    linked scratch dir or ``kiro-log`` is skipped rather than walked out of the
+    tree. Sorted by the log's mtime and capped at :data:`_MAX_SCRATCH_CHAT_LOGS`.
+    A dead process's directory is swept once it has been idle about an hour
+    (``agent_scratch.sweep_dead_scratch``), so its log is collectable until then.
+    """
+    root = agent_scratch.scratch_root()
+    if not _usable_dir(root):
+        return []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return []
+    found: list[tuple[float, Path]] = []
+    for child in children:
+        log_dir = child / agent_scratch.KIRO_CLI_LOG_SUBDIR
+        log = log_dir / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
+        try:
+            if _usable_dir(child) and _usable_dir(log_dir) and _usable_log(log):
+                found.append((log.lstat().st_mtime, log))
+        except OSError:
+            continue
+    found.sort(key=lambda entry: entry[0], reverse=True)
+    return [log for _, log in found[:_MAX_SCRATCH_CHAT_LOGS]]
 
 
 # ── Live log reader (kiro_cli_logs MCP tool) ─────────────────────────────────
@@ -826,11 +1009,21 @@ def _kiro_cli_version() -> str:
     Everything is contained: diagnostics must work precisely when the rest of
     the system is broken, so a raising lookup degrades like a failed spawn.
     """
+    # Deferred: the bundle module brings the agent-SDK pin with it, which this
+    # module -- imported on the dashboard's boot path -- does not need until a
+    # bundle is collected.
+    from kiro_crew.agent_sdk import kas_bundle
+
     try:
         binary, unpinned_exists = pin_kiro_cli()
         if binary is None:
             if unpinned_exists:
                 return f"not pinned ({PATH_ONLY_INSTALL_NOTE})"
+            if kas_bundle.kas_bundle_route():
+                # Absent AND not part of this installation: the selected harness
+                # runs Crew's own engine (``kas_engine:`` beside this line). A bare
+                # ``unavailable`` would read as the gap it is on the relay route.
+                return "unavailable (not used: KAS runs Kiro Crew's own engine bundle)"
             return "unavailable"
         out = subprocess.run(
             [binary, "--version"],
@@ -842,6 +1035,30 @@ def _kiro_cli_version() -> str:
         return (out.stdout or out.stderr).strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
         return "unavailable"
+
+
+def _kas_engine_version() -> str:
+    """The engine line for ``versions.txt``: what the KAS bundle route runs, if selected.
+
+    ``not selected`` when the installation is on the relay route (or another
+    harness), so the kiro-cli line above it is the one that matters; on the bundle
+    route the installed engine with the release pin beside it, or ``not installed``
+    with the command, because a maintainer reading a bundle from such a host wants
+    the engine version where they would otherwise look for kiro-cli's. Contained
+    like the kiro-cli probe: a raising config read degrades to ``unknown``.
+    """
+    from kiro_crew.agent_sdk import kas_bundle
+
+    try:
+        if not kas_bundle.kas_bundle_route():
+            return "not selected"
+        engine = kas_bundle.installed_engine_label()
+        pin = kas_bundle.KAS_PIN_VERSION
+        if engine is None:
+            return f"not installed (release pins KAS {pin}; kirocrew kas install)"
+        return f"{engine} (release pins KAS {pin})"
+    except Exception:  # noqa: BLE001 - diagnostics must survive a broken setup
+        return "unknown"
 
 
 #: PEP 440 prerelease segment — see
@@ -910,6 +1127,7 @@ def _versions_text(note: str, identity: release_channel.Provenance) -> str:
         f"channel: {identity.channel or 'unknown'}",
         f"channel_record: {identity.recorded or 'absent'}",
         f"kiro_cli_version: {_kiro_cli_version()}",
+        f"kas_engine: {_kas_engine_version()}",
         f"python: {platform.python_version()}",
         f"platform: {platform.platform()}",
         f"machine: {platform.machine()}",
@@ -982,9 +1200,19 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
             [
                 f"Diagnostics bundle: `{result.filename}`",
                 "",
-                f"Collected locally at `{result.zip_path}` — "
-                f"{result.total_redactions} secret(s) auto-redacted before "
-                "packaging.",
+                # No absolute path here: ``result.zip_path`` sits under the
+                # data-home directory, so printing it would leak the OS login
+                # into a public issue -- the very thing this collector scrubs
+                # out of the bundle members. The filename above is enough to
+                # match the attached .zip; the local path stays in the private
+                # terminal output of ``kirocrew doctor``.
+                f"{result.total_redactions} secret(s) auto-redacted"
+                + (
+                    f" and {result.path_collapses} path(s) collapsed to `~`"
+                    if result.path_collapses
+                    else ""
+                )
+                + " before packaging.",
                 "",
                 f"kiro-cli: `{_kiro_cli_version()}`",
                 f"Host: `{platform.platform()}`",
@@ -1015,6 +1243,42 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
     return f"{_ISSUE_NEW_URL}?" + urlencode(params, quote_via=quote)
 
 
+def _tracker_issue_url(result: BundleResult, note: str, *, prefill: bool) -> str:
+    """The new-issue link for *result*: the edition's tracker, else the public one.
+
+    Reads the ``feedback`` CPP seam (``FeedbackTrackerProvider.report_issue_url``).
+    ``None`` -- the public Default -- keeps :func:`_issue_url`'s pre-filled GitHub
+    link byte-for-byte. A supplied URL REPLACES it rather than decorating it: the
+    public query string is GitHub's bug-report form and means nothing appended to
+    another tracker.
+
+    Fail-closed per the CPP contract: a ``PlatformCompositionError`` (a
+    non-standalone host whose companion does not compose) logs a warning and
+    returns an empty link, keeping the diagnostic bundle usable without a
+    standalone fallback. Any other adapter error, a non-string or an empty
+    string degrades to the public link through the normal fallback path.
+    """
+    try:
+        url = safe_context_call(
+            lambda: current_context().feedback.report_issue_url(result, note, prefill=prefill),
+            fallback=None,
+            log_message="edition feedback tracker unavailable; using the public tracker",
+        )
+    except PlatformCompositionError:
+        logger.warning("platform companion does not compose; skipping issue link")
+        return ""
+    if url is None:
+        return _issue_url(result, note, prefill=prefill)
+    if not isinstance(url, str) or not url.strip():
+        logger.warning(
+            "FeedbackTrackerProvider.report_issue_url() returned %s, expected a URL; "
+            "using the public tracker",
+            type(url).__name__,
+        )
+        return _issue_url(result, note, prefill=prefill)
+    return url
+
+
 def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     """Issue link shaped for printing to a terminal rather than for a browser.
 
@@ -1023,9 +1287,10 @@ def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     to stdout has no such guarantee — it gets selected into chat, captured from a
     shell tool, or relayed by an agent, and on those paths the pre-filled variant
     is replaced wholesale by ``[REDACTED: suspicious URL to github.com]``. This
-    variant trades the pre-filled body for a link that arrives intact.
+    variant trades the pre-filled body for a link that arrives intact. An edition
+    tracker gets the same ``prefill=False`` signal and owns keeping its query short.
     """
-    return _issue_url(result, note, prefill=False)
+    return _tracker_issue_url(result, note, prefill=False)
 
 
 def _prune_old_bundles(out_dir: Path, keep: int) -> None:
@@ -1081,7 +1346,7 @@ def collect_bundle(
     # manifest.json, AND the pre-filled GitHub issue URL — a user may paste a
     # secret (bearer token, key) into "what happened?", so it needs the same
     # redaction the log members get below.
-    note, _ = _scrub(note or "")
+    note, _, _ = _scrub_bundle(note or "")
 
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     filename = f"kirocrew-diagnostics-{stamp}-{uuid.uuid4().hex[:8]}.zip"
@@ -1106,6 +1371,9 @@ def collect_bundle(
         chat = _kiro_cli_chat_log()
         if chat is not None:
             text_sources.append(("kiro-chat.log", chat, True))
+        for log in _scratch_kiro_chat_logs():
+            # Named for its scratch dir: every per-process log is `kiro-chat.log`.
+            text_sources.append((f"kiro-chat/{log.parent.parent.name}.log", log, True))
         for extra in _kiro_cli_extra_logs():
             text_sources.append((f"kiro-cli-{extra.name}", extra, True))
 
@@ -1140,9 +1408,15 @@ def collect_bundle(
     with os.fdopen(_fd, "wb") as _raw, zipfile.ZipFile(_raw, "w", zipfile.ZIP_DEFLATED) as zf:
         # Generated members first.
         versions = _versions_text(note, identity)
+        # ``versions.txt`` carries the absolute ``data_home`` path
+        # unconditionally, which embeds the OS login. Run it through the bundle
+        # scrub stack so the archive does not ship a local path in a file whose
+        # stated destination is a public issue.
+        versions, versions_secrets, versions_collapses = _scrub_bundle(versions)
         zf.writestr("versions.txt", versions)
         result.included.append("versions.txt")
-        result.redaction_summary["versions.txt"] = 0
+        result.redaction_summary["versions.txt"] = versions_secrets
+        result.path_collapses += versions_collapses
 
         for member, src, _gated in text_sources:
             try:
@@ -1163,10 +1437,11 @@ def collect_bundle(
             if text is None:
                 result.skipped.append(member)
                 continue
-            clean, n = _scrub(text)
+            clean, secrets, collapses = _scrub_bundle(text)
             zf.writestr(member, clean)
             result.included.append(member)
-            result.redaction_summary[member] = n
+            result.redaction_summary[member] = secrets
+            result.path_collapses += collapses
 
         # Manifest last so it reflects the final included/skipped/redaction state.
         # Its provenance keys are the machine-readable twin of ``versions.txt``,
@@ -1193,6 +1468,6 @@ def collect_bundle(
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         result.included.append("manifest.json")
 
-    result.github_issue_url = _issue_url(result, note)
+    result.github_issue_url = _tracker_issue_url(result, note, prefill=True)
     _prune_old_bundles(out_dir, _MAX_KEPT_BUNDLES)
     return result

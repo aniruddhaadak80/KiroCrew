@@ -9,6 +9,7 @@ import {
 } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { isLookPreviewFrame } from '../utils/lookPreview'
 // Leaf modules, deliberately not `../api/client`: that module is mocked with a
 // bare factory across most of the test corpus, and the replay path below must
 // not depend on exports those mocks never define.
@@ -71,6 +72,8 @@ export interface ThemeBranding {
   logo?: string
   favicon?: string
   wordmark?: string
+  /** Welcome-screen hero mark (`branding/welcome.*`), shown in place of the logo there. */
+  welcome?: string
 }
 
 /** Closed enum of overlay placements (mirrors backend `_THEME_OVERLAY_POSITIONS`). */
@@ -100,6 +103,8 @@ export interface ThemeOverlayDecl {
   position: ThemeOverlayPosition
   zIndex: number
   pointerEvents: boolean
+  /** `behind` paints under the nav/content (always click-through); `above` is the default. */
+  layer: 'above' | 'behind'
   animation: ThemeOverlayAnimation
   trigger: string
 }
@@ -323,6 +328,7 @@ function applyThemeOverrides(theme: CustomThemeData | undefined): Promise<Overri
 interface ResolvedThemeBranding {
   logo: string | null
   favicon: string | null
+  welcome: string | null
 }
 
 /** Apply/revert an installed theme's branding and return shell-safe asset URLs. */
@@ -332,7 +338,7 @@ function applyThemeBranding(theme: CustomThemeData | undefined): ResolvedThemeBr
   root.style.removeProperty('--theme-logo')
   const b = theme?.assets?.branding
   const slug = theme ? safeSlug(theme.slug) : ''
-  if (!b || !slug) return { logo: null, favicon: null }
+  if (!b || !slug) return { logo: null, favicon: null, welcome: null }
 
   const fav = b.favicon ? safeAssetPath(b.favicon) : ''
   const favicon = fav ? `${assetBase(slug)}/${fav}` : null
@@ -349,22 +355,31 @@ function applyThemeBranding(theme: CustomThemeData | undefined): ResolvedThemeBr
   if (logoPath) {
     root.style.setProperty('--theme-logo', assetUrlValue(slug, logoPath))
   }
-  return { logo, favicon }
+  const welcomePath = b.welcome ? safeAssetPath(b.welcome) : ''
+  const welcome = welcomePath ? `${assetBase(slug)}/${welcomePath}` : null
+  return { logo, favicon, welcome }
 }
 
 /**
- * Catalog KEY for each built-in theme whose display name is descriptive COPY
- * rather than a proper noun.
+ * Catalog KEY for each built-in theme whose display name resolves through the
+ * catalog rather than through a literal `label` in `THEMES`.
  *
  * Nearly every built-in is named after an upstream palette project (Monokai,
  * Solarized, Dracula, Nord, Rosé Pine, Catppuccin, Tokyo Night, Gruvbox,
- * Everforest), a product (Kiro, IntelliJ), or the display technology it is tuned
- * for (AMOLED). Those are proper nouns — translating one would sever the name
- * from the upstream project a user is looking for — so they stay verbatim as
- * `label` in `THEMES` below, exactly like the theme names an installed pack or a
- * `registerTheme()` caller supplies. `High Contrast` is the one that names a
- * rendering PROPERTY (the accessibility palette) rather than a palette identity,
- * so it is copy in the same sense as every other settings label.
+ * Everforest, Nu Disco), a product (Kiro, IntelliJ), or the display technology
+ * it is tuned for (AMOLED). Those are proper nouns — translating one would sever
+ * the name from the upstream project a user is looking for — so the older ones
+ * stay verbatim as `label` in `THEMES` below, exactly like the theme names an
+ * installed pack or a `registerTheme()` caller supplies.
+ *
+ * Two kinds of entry live here:
+ * - `High Contrast` names a rendering PROPERTY (the accessibility palette)
+ *   rather than a palette identity, so it is copy in the same sense as every
+ *   other settings label and each locale translates it.
+ * - A proper-noun theme added after the strict i18n gate (Nu Disco, Amethyst
+ *   OLED). The gate refuses a new literal display string, so the name goes
+ *   through the catalog and is pinned verbatim in every locale by its
+ *   `glossary.json` do-not-translate entry, which `glossary.test.ts` enforces.
  *
  * Keys, not strings: `THEMES` is evaluated at module load, so an `i18nT()` call
  * there would freeze whatever language was active at boot. The lookup happens in
@@ -374,6 +389,8 @@ function applyThemeBranding(theme: CustomThemeData | undefined): ResolvedThemeBr
  */
 export const THEME_LABEL_KEY: Record<string, string> = {
   highcontrast: 'hooks.theme.high_contrast',
+  'nu-disco': 'hooks.theme.nu_disco',
+  'amethyst-oled': 'hooks.theme.amethyst_oled',
 }
 
 export const THEMES: ThemeEntry[] = [
@@ -391,15 +408,20 @@ export const THEMES: ThemeEntry[] = [
   { value: 'amoled', label: '🖤 AMOLED' },
   { value: 'kiro', label: '👻 Kiro' },
   { value: 'intellij', label: '😶‍🌫️ IntelliJ' },
-  // The only descriptive name here, so the only one with a catalog key: `label`
-  // holds the glyph alone as the pre-resolution fallback and the full display
-  // string lives in `hooks.theme.high_contrast` (emoji included, as
+  // A catalog-keyed entry (see `THEME_LABEL_KEY`): `label` holds the glyph alone
+  // as the pre-resolution fallback and the full display string lives in
+  // `hooks.theme.high_contrast` (emoji included, as
   // `components.themeEditor.color_picker` already does). Nothing renders this
   // entry's `label` directly — `allThemes` goes through `builtinThemes()`.
   { value: 'highcontrast', label: '🔆' },
   { value: 'everforest', label: '🌲 Everforest' },
   { value: 'amoled-midnight', label: '🌌 AMOLED Midnight' },
   { value: 'amoled-grey-calm', label: '🌑 AMOLED Grey Calm' },
+  // Catalog-keyed like `highcontrast`: glyph-only fallback, full name in
+  // `hooks.theme.nu_disco`.
+  { value: 'nu-disco', label: '🪩' },
+  // Catalog-keyed: full name in `hooks.theme.amethyst_oled`.
+  { value: 'amethyst-oled', label: '💜' },
 ]
 
 /**
@@ -530,6 +552,8 @@ export interface ThemeContextValue {
   brandLogo: string | null
   /** Active installed theme's browser favicon URL, or null for built-ins / L0. */
   brandFavicon: string | null
+  /** Active installed theme's welcome-screen image URL, or null when it ships none. */
+  brandWelcome: string | null
   customThemes: ThemeEntry[]
   customThemeDataMap: Map<string, CustomThemeData>
   themeVersion: number
@@ -547,15 +571,10 @@ export interface ThemeContextValue {
    * chapter while the boot fetch is in flight.
    */
   privacyAcked: boolean
-  /** Has the first-run Meet CrewMates flow been finished or dismissed? Server-backed like the other first-run flags; localStorage is only the render cache. */
-  crewmatesOnboarded: boolean
   themeBootReady: boolean
   markOnboarded: () => void
   markImportOnboarded: () => void
   markPrivacyAcked: () => void
-  /** Resolves when the server has the flag; rejects on a failed PUT so the
-   *  caller can render the failure (the local mark is set either way). */
-  markCrewmatesOnboarded: () => Promise<void>
   addCustomTheme: (data: Omit<CustomThemeData, 'slug'> & { slug?: string }) => Promise<CustomThemeData>
   deleteCustomTheme: (slug: string) => Promise<void>
   /** Refetch the installed-theme catalog once; `true` when it now reflects the
@@ -727,7 +746,13 @@ async function fetchCatalog(hooks: CatalogFetchHooks, replayed = false): Promise
   try {
     res = await api.themes()
   } catch (e) {
-    if (replayed || !(e instanceof ApiError && e.authRequired)) throw e
+    // An interposed proxy's challenge sets `authRequired` too, but no refresh is
+    // ever started for it (`checkSessionExpired` needs the gateway's own
+    // `X-Auth-Required`), so `awaitRefreshOrThrow` would find nothing pending and
+    // the replay would re-fail — leaving the catalog settled in error with the
+    // notice suppressed and no retry left. Throw instead, so it reaches the notice.
+    const refreshable = e instanceof ApiError && e.authRequired && !e.edgeChallenge
+    if (replayed || !refreshable) throw e
     await awaitRefreshOrThrow(e)
     return fetchCatalog(hooks, true)
   }
@@ -759,7 +784,10 @@ async function fetchCatalog(hooks: CatalogFetchHooks, replayed = false): Promise
     (r): r is PromiseRejectedResult => r.status === 'rejected' && r.reason instanceof ApiError && r.reason.authRequired,
   )
   if (denied) {
-    if (replayed) throw denied.reason
+    // Same asymmetry as the listing above: a proxy challenge has no refresh to
+    // wait for, so replaying it only spends another round-trip on the same
+    // refusal. Throwing surfaces it through the Display panel's notice.
+    if (replayed || (denied.reason as ApiError).edgeChallenge) throw denied.reason
     await awaitRefreshOrThrow(denied.reason)
     return fetchCatalog(hooks, true)
   }
@@ -825,6 +853,7 @@ function useThemeState(): ThemeContextValue {
   const [brandName, setBrandName] = useState<string | null>(null)
   const [brandLogo, setBrandLogo] = useState<string | null>(null)
   const [brandFavicon, setBrandFavicon] = useState<string | null>(null)
+  const [brandWelcome, setBrandWelcome] = useState<string | null>(null)
   // Lightweight "Applying…" indicator: true only while an INSTALLED theme's
   // async assets settle after a switch (built-ins/editor-customs are instant).
   const [themeSwitching, setThemeSwitching] = useState(false)
@@ -845,20 +874,6 @@ function useThemeState(): ThemeContextValue {
   // to be shown it now.
   const [privacyAcked, setPrivacyAcked] = useState(
     () => !!localStorage.getItem('mc-privacy-acked') || !!localStorage.getItem('mc-onboarded'),
-  )
-  // Seeded from `mc-onboarded` as well as its own flag, like `privacyAcked`: a
-  // workspace that finished first run before this chapter existed is an
-  // EXISTING user, who reaches the flow from the Crew Members page instead of
-  // being interrupted by it. `mc-crewmates-pending` tells the two apart: the
-  // tour's own completion (`markOnboarded`) sets it on this browser, so a NEW
-  // user who reloads or restarts between the tour and this chapter is still
-  // due the chapter -- only a workspace onboarded with no such mark (before
-  // this shipped, or from another machine) counts as done. Cleared when the
-  // chapter is marked, so the mark cannot outlive its purpose.
-  const [crewmatesOnboarded, setCrewmatesOnboarded] = useState(
-    () =>
-      !!localStorage.getItem('mc-crewmates-onboarded') ||
-      (!!localStorage.getItem('mc-onboarded') && !localStorage.getItem('mc-crewmates-pending')),
   )
   const legacyOnboardedRef = useRef(
     !!localStorage.getItem('mc-onboarded') && !localStorage.getItem('mc-import-onboarded'),
@@ -941,6 +956,11 @@ function useThemeState(): ThemeContextValue {
     // is gone (a failed refetch keeps the styles it has), so a refetch that
     // fails falls back to the app-wide policy instead of retrying forever.
     retry: (failureCount, error) => {
+      // A proxy challenge is NOT exempted here, unlike the notice and the refresh
+      // replay: this arm is the one that already does the right thing for it. Adding
+      // `&& !edgeChallenge` would fall through to the line below, which retries
+      // forever while no catalog has loaded -- retrying the very refusal this change
+      // exists to stop retrying.
       if (error instanceof ApiError && error.authRequired) return false
       if (queryClient.getQueryData(CATALOG_QUERY_KEY) === undefined) return true
       return retryPolicy(failureCount, error)
@@ -955,8 +975,13 @@ function useThemeState(): ThemeContextValue {
   // once one has, only a settled refetch failure is (the list may be stale),
   // not the single app-policy retry in between.
   const catalogFailure = catalogQuery.error ?? (catalogQuery.data === undefined ? catalogQuery.failureReason : null)
+  // A gateway auth denial is withheld because the re-auth banner already owns that
+  // recovery and a second notice would duplicate it. A proxy challenge has no such
+  // owner -- no banner, no refresh, and `retry` refuses it -- so withholding it too
+  // would leave the dashboard unstyled with nothing on screen saying why.
   const customThemesLoadError =
-    catalogFailure instanceof Error && !(catalogFailure instanceof ApiError && catalogFailure.authRequired)
+    catalogFailure instanceof Error
+    && !(catalogFailure instanceof ApiError && catalogFailure.authRequired && !catalogFailure.edgeChallenge)
       ? catalogFailure
       : null
   const customThemes = catalogQuery.data?.themes ?? EMPTY_THEMES
@@ -1030,14 +1055,13 @@ function useThemeState(): ThemeContextValue {
       window.removeEventListener('mc-auth-recovered', onAuthRecovered)
     }
   }, [queryClient])
-  const { mutate: persistTheme, mutateAsync: persistThemeAsync } = useMutation({
+  const { mutate: persistTheme } = useMutation({
     mutationFn: (body: {
       mode?: string
       color?: string
       onboarded?: boolean
       import_onboarded?: boolean
       privacy_acked?: boolean
-      crewmates_onboarded?: boolean
     }) => api.updateThemeConfig(body),
   })
 
@@ -1111,20 +1135,6 @@ function useThemeState(): ThemeContextValue {
           } else {
             localStorage.removeItem('mc-import-onboarded')
           }
-        }
-        // Server value wins, set forward only: clearing it locally would re-open
-        // the Meet CrewMates flow mid-session on a stale read. A workspace the
-        // server already reports as onboarded is an existing one (same seed
-        // rule as the state initialiser, same `mc-crewmates-pending` exception
-        // for a first run this browser is mid-way through), so it counts as
-        // done locally too — without persisting, so the server flag keeps
-        // meaning "the flow ran".
-        if (
-          bootData.crewmates_onboarded === true ||
-          (bootData.onboarded === true && !localStorage.getItem('mc-crewmates-pending'))
-        ) {
-          setCrewmatesOnboarded(true)
-          if (bootData.crewmates_onboarded === true) safeSetItem('mc-crewmates-onboarded', '1')
         }
       }
     }
@@ -1200,6 +1210,26 @@ function useThemeState(): ThemeContextValue {
     }
     window.addEventListener(SYNC_EVENT, handler)
     return () => window.removeEventListener(SYNC_EVENT, handler)
+  }, [])
+
+  // The look-preview frame (utils/lookPreview.ts) mirrors the parent document's
+  // picks: the parent writes `mc-theme` / `mc-color-theme` as the user chooses,
+  // and `storage` delivers each write here. Only in that frame -- an ordinary
+  // tab keeps the gateway as its source of truth.
+  useEffect(() => {
+    if (!isLookPreviewFrame()) return
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'mc-theme' || e.key === null) {
+        const m = (localStorage.getItem('mc-theme') as ModePreference) || 'system'
+        setMode(m)
+        setResolved(resolveMode(m))
+      }
+      if (e.key === 'mc-color-theme' || e.key === null) {
+        setColorThemeState((localStorage.getItem('mc-color-theme') as ColorTheme) || DEFAULT_COLOR_THEME)
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
   }, [])
 
   useEffect(() => {
@@ -1286,12 +1316,14 @@ function useThemeState(): ThemeContextValue {
       setBrandName(active?.assets?.branding?.botName ?? null)
       setBrandLogo(appliedBranding.logo)
       setBrandFavicon(appliedBranding.favicon)
+      setBrandWelcome(appliedBranding.welcome)
     } catch {
       // A branding-application throw must not skip the overrides settle below,
       // which is what clears the "Applying…" indicator — otherwise it wedges.
       setBrandName(null)
       setBrandLogo(null)
       setBrandFavicon(null)
+      setBrandWelcome(null)
     }
     applyThemeOverrides(active)
       .then((report) => {
@@ -1432,15 +1464,10 @@ function useThemeState(): ThemeContextValue {
   ]
 
   const markOnboarded = useCallback(() => {
-    // Only a FIRST completion marks the Meet CrewMates chapter pending (so it
-    // survives a reload, see the `crewmatesOnboarded` seed): an existing user
-    // replaying the tour from Settings was already onboarded, and must not be
-    // handed the first-run chapter on their next reload.
-    if (!onboarded && !localStorage.getItem('mc-crewmates-onboarded')) safeSetItem('mc-crewmates-pending', '1')
     safeSetItem('mc-onboarded', '1')
     setOnboarded(true)
     persistTheme({ onboarded: true })
-  }, [onboarded, persistTheme])
+  }, [persistTheme])
 
   const markImportOnboarded = useCallback(() => {
     safeSetItem('mc-import-onboarded', '1')
@@ -1455,21 +1482,6 @@ function useThemeState(): ThemeContextValue {
     setPrivacyAcked(true)
     persistTheme({ privacy_acked: true })
   }, [persistTheme])
-
-  // Persisted server-side as well as locally so a second machine does not replay
-  // the Meet CrewMates flow this user already finished or dismissed.
-  const markCrewmatesOnboarded = useCallback(async () => {
-    // Awaited, unlike the sibling marks, and the local completion state is
-    // applied ONLY after the server accepted the write: a refused PUT leaves
-    // the render cache, the pending mark and the in-memory flag exactly as
-    // they were, so a reload re-offers the chapter instead of seeding "done"
-    // from a completion the server never recorded. The Meet CrewMates flow
-    // renders the refusal as an ErrorNotice (see useMeetCrewmatesGate).
-    await persistThemeAsync({ crewmates_onboarded: true })
-    safeSetItem('mc-crewmates-onboarded', '1')
-    localStorage.removeItem('mc-crewmates-pending')
-    setCrewmatesOnboarded(true)
-  }, [persistThemeAsync])
 
   return {
     theme: resolved,
@@ -1488,18 +1500,17 @@ function useThemeState(): ThemeContextValue {
     brandName,
     brandLogo,
     brandFavicon,
+    brandWelcome,
     customThemes,
     customThemeDataMap,
     themeVersion,
     onboarded,
     importOnboarded,
     privacyAcked,
-    crewmatesOnboarded,
     themeBootReady,
     markOnboarded,
     markImportOnboarded,
     markPrivacyAcked,
-    markCrewmatesOnboarded,
     addCustomTheme,
     deleteCustomTheme,
     loadCustomThemes,

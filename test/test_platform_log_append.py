@@ -15,6 +15,7 @@ import pytest
 from conftest import make_dir_link
 from kiro_crew import platform_log_append as pla
 from kiro_crew.decisions import log
+from kiro_crew.testing.wait import wait_until
 
 
 @pytest.fixture
@@ -188,7 +189,27 @@ def test_preexisting_tail_is_never_deleted(path):
     assert path.read_bytes() == b'{"keep":1}\npartial\n{}\n'
 
 
+#: Lost-run ceiling for :func:`test_concurrent_short_writers_serialize`'s appends,
+#: in place of the 0.5 s production budget. Measured: the whole test's call phase
+#: takes at most 0.078 s (median 0.034 s) over 35 ci.yml runs of Windows shard 3
+#: (``windows-pytest-progress-3``), and 0.72 s per run on Linux with 4 ms added to
+#: every write; 10 s is over 10x both. It sits under half the suite's
+#: ``--timeout=120``, so a lock that never frees still fails by name, with
+#: ``TimeoutError`` from ``append_line``, not a killed worker.
+SERIALIZE_APPEND_CEILING_SECS = 10.0
+
+
 def test_concurrent_short_writers_serialize(path, monkeypatch):
+    """Four writers forced into 3-byte writes still land four whole rows.
+
+    The last writer to get the lock waits out the other three's ~37 short writes
+    each and then makes its own, all inside ONE ``_APPEND_TIMEOUT_SECONDS``
+    budget. At 0.5s that is ~3.4ms per write, which a loaded Windows runner can
+    exceed, and losing it reads as a deadline failure in a test about
+    serialization. The deadline has its own test below, so it is raised here to
+    :data:`SERIALIZE_APPEND_CEILING_SECS`, not removed.
+    """
+    monkeypatch.setattr(pla, "_APPEND_TIMEOUT_SECONDS", SERIALIZE_APPEND_CEILING_SECS)
     original = os.write
     barrier = threading.Barrier(4, timeout=5)
 
@@ -203,7 +224,8 @@ def test_concurrent_short_writers_serialize(path, monkeypatch):
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = [executor.submit(writer, index) for index in range(4)]
         for result in results:
-            result.result(timeout=5)
+            wait_until(result.done)
+            result.result()
     assert sorted(json.loads(row)["index"] for row in path.read_bytes().splitlines()) == list(
         range(4)
     )
@@ -216,8 +238,9 @@ def test_contended_append_times_out_without_writing(path, monkeypatch):
         with pla.platform_compat.file_lock(held, exclusive=True):
             with ThreadPoolExecutor(max_workers=1) as executor:
                 pending = executor.submit(pla.append_line, path, b"{}\n")
+                wait_until(pending.done)
                 with pytest.raises(OSError):
-                    pending.result(timeout=5)
+                    pending.result()
     assert path.read_bytes() == b'{"keep":1}\n'
     pla.append_line(path, b"{}\n")
 
@@ -731,7 +754,8 @@ def test_native_concurrent_first_appends_keep_every_record(tmp_path, round_numbe
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(writer, index) for index in range(4)]
         for future in futures:
-            future.result(timeout=5)
+            wait_until(future.done)
+            future.result()
     assert sorted(json.loads(row)["index"] for row in path.read_bytes().splitlines()) == list(
         range(4)
     )

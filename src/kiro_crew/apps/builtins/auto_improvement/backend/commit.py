@@ -24,7 +24,7 @@ from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import _prefer_authenticated_remote
-from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
+from ..spine.git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 from ..spine.push_policy import (
     authorize_direct_push,
     describe_scan,
@@ -60,7 +60,7 @@ _BASE_REF = "refs/auto-improvement/commit-base"
 #: A module-level lock rather than one per clone: there is exactly one configured clone per
 #: install, and a per-path map would add eviction bookkeeping for no gain. `RLock` so a future
 #: caller that already holds it (e.g. commit calling into another guarded helper) cannot
-#: self-deadlock. Raised by the Opus 5 review of this branch.
+#: self-deadlock.
 _CLONE_LOCK = threading.RLock()
 
 
@@ -68,8 +68,7 @@ _CLONE_LOCK = threading.RLock()
 #: `_GIT_SAFE_CONFIG` in the driver. These commands run on the HOST as the gateway user against
 #: the tree the sandboxed agent edits, so a repo-written hook pointed at by `core.hooksPath`, or
 #: a `core.fsmonitor` program, would execute host-side (outside the sandbox) on the next
-#: add/commit/checkout. `-c` overrides on OUR argv beat the repo's own config. Raised by the GPT
-#: review.
+#: add/commit/checkout. `-c` overrides on OUR argv beat the repo's own config.
 _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 
 
@@ -83,7 +82,7 @@ def _git(
     # ``pr_watchers._git``. Scanning REPLACED text is still correct here: the replacement
     # only affects bytes that were never valid UTF-8, so no ASCII secret can hide behind it.
     return subprocess.run(
-        ["git", "-C", str(clone), *_GIT_SAFE_CONFIG, *args],
+        ["git", "-C", str(clone), *_GIT_SAFE_CONFIG, *hook_off_args(clone), *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -335,7 +334,7 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     # reached. The earlier failure points in this function already reset; these last two
     # returned with the commit intact. The durable queue copy is untouched, so a retry still
     # has everything it needs, and the message says "queued" rather than "committed locally"
-    # because after the reset that is what is true. Raised by the GPT review of this branch.
+    # because after the reset that is what is true.
     if not url:
         _git(clone, "reset", "--hard", base_ref_local)
         return {
@@ -387,7 +386,7 @@ def _commit_message(body_path: Path, fp: str) -> str:
     except Exception:  # noqa: BLE001 - a commit message is permanent, pushed git history
         # FAIL CLOSED: the message becomes unwipeable git history the moment it is pushed,
         # so an unscannable agent-authored subject must NOT be committed verbatim. Fall
-        # back to the fixed, prose-free subject. Raised by the GPT review of this branch.
+        # back to the fixed, prose-free subject.
         logger.warning("commit-message redaction failed; using the fixed subject", exc_info=True)
         return f"auto-improvement: apply verified change {fp[:12]}"
     return subject

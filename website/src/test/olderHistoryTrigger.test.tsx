@@ -13,15 +13,16 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, act, waitFor } from '@testing-library/react'
 import type { RefObject } from 'react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { createTestStore } from './helpers'
+import { landResume } from './resumeLanded'
 // The walk's page size is asserted through its CONSTANT, never a spelled-out
 // number: what these tests own is "the walk asks for a walk-sized page", and a
 // literal turns a deliberate retune of that size into two unrelated red tests.
-import { loadOlderMessages, resumeFromHistory, OLDER_WALK_PAGE_LIMIT } from '../store/chatSlice'
+import { loadOlderMessages, OLDER_WALK_PAGE_LIMIT } from '../store/chatSlice'
 import { shouldPaginateOlder } from '../pages/chat/pagination'
 import { shouldAutoFillOlder } from '../pages/ChatPage'
 import { api } from '../api/client'
@@ -229,11 +230,7 @@ describe('older-history trigger — fetch through the gate', () => {
   /** Seed a resumed session through the real reducer path that reads `has_more`. */
   function resumedStore(hasMore: boolean) {
     const store = createTestStore()
-    store.dispatch(resumeFromHistory.fulfilled(
-      { ok: true, key: 'slot-1', messages: [], hasMore, nextBefore: OLDEST, rawCount: RESUME_RAW, total: TOTAL },
-      'req-1',
-      { key: 'slot-1', title: 'slot-1' },
-    ))
+    landResume(store, { ok: true, key: 'slot-1', messages: [], hasMore, nextBefore: OLDEST, rawCount: RESUME_RAW, total: TOTAL }, 'req-1', { key: 'slot-1', title: 'slot-1' })
     return store
   }
 
@@ -325,7 +322,14 @@ describe('older-history trigger — fetch through the gate', () => {
 
 describe('older-history trigger — ChatPage wiring contract', () => {
   const here = dirname(fileURLToPath(import.meta.url))
-  const chatPageSrc = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+  // The page composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const pagesDir = resolve(here, '../pages')
+  const ownerDir = resolve(pagesDir, 'chat', 'page')
+  const chatPageSrc = [
+    readFileSync(resolve(pagesDir, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(resolve(ownerDir, f), 'utf8')),
+    ...readdirSync(pagesDir).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(resolve(pagesDir, f), 'utf8')),
+  ].join('\n')
 
   it('hands the virtualizer a top-reached callback', () => {
     expect(chatPageSrc).toMatch(/onTopReached:\s*handleTopReached/)

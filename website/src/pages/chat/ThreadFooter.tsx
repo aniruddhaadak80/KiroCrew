@@ -5,6 +5,7 @@
  * with none shows nothing here (its "Reply in thread" action lives in the hover
  * row, next to Copy).
  */
+import { useEffect, useReducer } from 'react'
 import { useTranslation } from 'react-i18next'
 import { UserRound } from 'lucide-react'
 import CrewAvatar from '../../components/CrewAvatar'
@@ -12,6 +13,13 @@ import { fmtRelative } from '../../i18n/format'
 import type { ThreadSummary } from '../../api/threads'
 
 const FACE_PX = 18
+
+/** How often "Last reply 2h ago" is drawn again. The footer keeps its own
+ *  clock: the transcript redraws a settled row only when its messages, its
+ *  neighbours or the host's props change, so without one the age would stay
+ *  what it was when the row last drew. Once a minute, like the pinned-messages
+ *  panel's relative times. */
+const LAST_REPLY_TICK_MS = 60_000
 
 /** The user's face beside a reply. The product has no user avatar, so this is a
  *  quiet glyph in a disc sized like the crewmate's. */
@@ -31,12 +39,27 @@ export default function ThreadFooter({ summary, crewmateName, onOpen, align = 's
   summary: ThreadSummary
   crewmateName: string
   onOpen: () => void
-  /** `end` under the user's right-aligned bubble. */
+  /** `end` under the user's right-aligned bubble. Rendered as `align-self`, so
+   *  a mode that re-aligns the ROW must re-state it here too: CLI mode moves
+   *  the user's bubble to the left and re-aligns this footer in
+   *  `styles/cli-mode.css`. Do not drop `self-start` from the `start` branch —
+   *  the assistant footer's column is `align-items: stretch`, and that class is
+   *  what keeps the button shrink-wrapped instead of full-width. */
   align?: 'start' | 'end'
 }) {
   const { t } = useTranslation()
   const count = summary.count
   const label = t('pages.chat.thread.replies_count', { count })
+  // A redraw is all a tick does: the age below still reads the clock when the
+  // footer draws, so a reply that lands between two ticks never reads as one
+  // from the future.
+  const [, redraw] = useReducer((n: number) => n + 1, 0)
+  const lastReplyTs = summary.last_reply_ts
+  useEffect(() => {
+    if (!lastReplyTs) return
+    const id = window.setInterval(redraw, LAST_REPLY_TICK_MS)
+    return () => window.clearInterval(id)
+  }, [lastReplyTs])
   return (
     <button
       type="button"

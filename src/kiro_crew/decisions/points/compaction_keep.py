@@ -447,6 +447,7 @@ def read_rows(session_key: str, before: str = "") -> list[dict[str, Any]]:
         # yields no rows -- a compaction that goes unmeasured -- while the same failure at
         # module scope would break importing the point on the compaction path.
         from kiro_crew.history import ConversationLog
+        from kiro_crew.warm_task_brief_contract import is_warm_task_brief_message
 
         rows = ConversationLog().read_messages(session_key)
     except Exception:
@@ -454,7 +455,7 @@ def read_rows(session_key: str, before: str = "") -> list[dict[str, Any]]:
         return []
     if not isinstance(rows, list):
         return []
-    usable = [row for row in rows if isinstance(row, dict)]
+    usable = [row for row in rows if isinstance(row, dict) and not is_warm_task_brief_message(row)]
     if before:
         usable = [row for row in usable if not _is_after(row, before)]
     return usable[-MAX_ROWS:]
@@ -912,8 +913,8 @@ def build_outcome(
 
 # ── The hand-off to the compaction card ──
 #
-# The record has to reach the notice row ``dashboard/state.py`` appends when the
-# compaction finishes. ``decisions.outcomes`` is the wrong vehicle: its one slot per
+# The record has to reach the notice row ``dashboard/state_parts/session_events.py`` appends when
+# the compaction finishes. ``decisions.outcomes`` is the wrong vehicle: its one slot per
 # session belongs to the next ASSISTANT reply, and claiming it here would take the
 # strip a ``skills.select`` turn had already published and attach it to a compaction
 # notice. So this module keeps its own store, on the same three bounds and for the

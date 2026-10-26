@@ -13,7 +13,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers
-from kiro_crew.dashboard.handlers import agent_templates
+from kiro_crew.dashboard.handlers import agent_templates, member_export
 from kiro_crew.dashboard.handlers.agent_catalog import api_agent_catalog
 
 
@@ -39,11 +39,20 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/agents/detail/{name}/fork", handlers.api_agent_fork)
     app.router.add_post("/api/agents/detail/{name}/publish", handlers.api_agent_publish)
     app.router.add_post("/api/agents/detail/{name}/reset", handlers.api_agent_reset)
-    from kiro_crew.dashboard.handlers.agent_capabilities import api_member_capabilities
+    from kiro_crew.dashboard.handlers.agent_capabilities import (
+        api_member_capabilities,
+        api_member_capabilities_detach,
+    )
 
     app.router.add_get("/api/agents/{name}/capabilities", api_member_capabilities)
     app.router.add_post("/api/agents/{name}/capabilities/preview", api_member_capabilities)
+    app.router.add_post("/api/agents/{name}/capabilities/detach", api_member_capabilities_detach)
     app.router.add_put("/api/agents/{name}/capabilities", api_member_capabilities)
+    from kiro_crew.dashboard.handlers.member_worker_kit import api_member_worker_kit
+
+    app.router.add_get("/api/agents/{name}/worker-kit", api_member_worker_kit)
+    app.router.add_post("/api/agents/{name}/worker-kit/preview", api_member_worker_kit)
+    app.router.add_put("/api/agents/{name}/worker-kit", api_member_worker_kit)
     # Kiro Crew Agent CRUD
     app.router.add_get("/api/agents", handlers.api_kirocrew_agents)
     app.router.add_get("/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model)
@@ -67,11 +76,19 @@ def register(app: web.Application) -> None:
     # Crew Members (roster + per-member pinned DM thread)
     app.router.add_get("/api/members", handlers.api_members)
     app.router.add_post("/api/members/{slug}/thread", handlers.api_member_thread)
+    app.router.add_post("/api/members/{slug}/greet", handlers.api_member_greet)
+    app.router.add_post("/api/members/{slug}/fresh-start", handlers.api_member_fresh_start)
     app.router.add_get("/api/members/{slug}/activity", handlers.api_member_activity)
     app.router.add_get("/api/members/{slug}/projections", handlers.api_member_projections)
     app.router.add_get("/api/members/{slug}/briefing", handlers.api_member_briefing)
+    app.router.add_get("/api/members/{slug}/recap", handlers.api_member_recap)
     app.router.add_get("/api/members/{slug}/rules", handlers.api_member_rules_get)
     app.router.add_put("/api/members/{slug}/rules", handlers.api_member_rules_put)
+    # Export one crewmate as a .crewmate file (rfc-crewmate-share.md §5.3): owner-only.
+    app.router.add_post("/api/members/{slug}/export", member_export.api_member_export)
+    app.router.add_post(
+        "/api/members/{slug}/export/lessons-draft", member_export.api_member_export_lessons_draft
+    )
     # Crewmate teams (a name + an ordered member list; the Crewmates page's
     # roster grouping and team view). Same dashboard-only posture as the
     # members routes; the writes are owner actions.

@@ -370,6 +370,105 @@ class TestApiSecretsList:
         ]
 
 
+_GERRIT_ONE = "gerrit.example.com:9080"
+_GERRIT_ONE_NAME = "GERRIT_HTTP_CREDENTIAL_6765727269742E6578616D706C652E636F6D3A39303830"
+_GERRIT_TWO = "gerritv.example.com:9081"
+_GERRIT_TWO_NAME = "GERRIT_HTTP_CREDENTIAL_676572726974762E6578616D706C652E636F6D3A39303831"
+
+
+class TestGerritManagedRows:
+    """``dashboard.gerrit_hosts`` publishes one labelled row per host.
+
+    The user fills the row by host and never derives the hex-suffixed vault
+    name, which the provider's credential lookup still reads.
+    """
+
+    def test_no_hosts_no_rows(self) -> None:
+        assert _managed_secret_catalog([], [], False, False, []) == []
+
+    def test_lone_host_offers_the_global_name(self) -> None:
+        catalog = _managed_secret_catalog([], [], False, False, [_GERRIT_ONE])
+        assert catalog == [
+            {
+                "name": "GERRIT_HTTP_CREDENTIAL",
+                "kind": "gerrit_http_credential",
+                "host": _GERRIT_ONE,
+            }
+        ]
+
+    def test_lone_host_with_stored_per_host_name_lists_that_name(self) -> None:
+        """The provider prefers the per-host entry, so the row must edit that one."""
+        catalog = _managed_secret_catalog([_GERRIT_ONE_NAME], [], False, False, [_GERRIT_ONE])
+        assert catalog == [
+            {"name": _GERRIT_ONE_NAME, "kind": "gerrit_http_credential", "host": _GERRIT_ONE}
+        ]
+
+    def test_two_hosts_get_per_host_rows_and_no_global_row(self) -> None:
+        catalog = _managed_secret_catalog(
+            ["GERRIT_HTTP_CREDENTIAL"], [], False, False, [_GERRIT_ONE, _GERRIT_TWO]
+        )
+        assert catalog == [
+            {"name": _GERRIT_ONE_NAME, "kind": "gerrit_http_credential", "host": _GERRIT_ONE},
+            {"name": _GERRIT_TWO_NAME, "kind": "gerrit_http_credential", "host": _GERRIT_TWO},
+        ]
+
+    def test_rows_follow_jira_rows_and_precede_connections(self) -> None:
+        catalog = _managed_secret_catalog([], ["jira.corp"], False, True, [_GERRIT_ONE])
+        assert [entry["kind"] for entry in catalog] == [
+            "wakatime_api_key",
+            "jira_host_token",
+            "gerrit_http_credential",
+        ]
+
+    def test_global_name_unused_reasons(self) -> None:
+        assert _unused_stored_secrets(
+            ["GERRIT_HTTP_CREDENTIAL"], [], False, False, [_GERRIT_ONE, _GERRIT_TWO]
+        ) == [{"name": "GERRIT_HTTP_CREDENTIAL", "reason": "gerrit_multi_host"}]
+        assert _unused_stored_secrets(
+            ["GERRIT_HTTP_CREDENTIAL", _GERRIT_ONE_NAME], [], False, False, [_GERRIT_ONE]
+        ) == [{"name": "GERRIT_HTTP_CREDENTIAL", "reason": "gerrit_host_precedence"}]
+        # A lone host served by the global name: nothing is unused.
+        assert (
+            _unused_stored_secrets(["GERRIT_HTTP_CREDENTIAL"], [], False, False, [_GERRIT_ONE])
+            == []
+        )
+        # No hosts listed: the stored name is an ordinary user secret, not flagged.
+        assert _unused_stored_secrets(["GERRIT_HTTP_CREDENTIAL"], [], False, False, []) == []
+
+    @pytest.mark.asyncio
+    async def test_list_reads_gerrit_hosts_from_config(self, tmp_path: Path) -> None:
+        """The endpoint threads ``dashboard.gerrit_hosts`` into rows and unused hints."""
+        vault = SecretVault(tmp_path)
+        vault._set_sync("GERRIT_HTTP_CREDENTIAL", "user:pw")
+        app = _app()
+        config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=False),
+            dashboard=SimpleNamespace(jira_auth=[], gerrit_hosts=[_GERRIT_TWO, _GERRIT_ONE]),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch("kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load", return_value=config),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                data = await (await client.get("/api/secrets")).json()
+
+        assert data["managed"] == [
+            {"name": _GERRIT_ONE_NAME, "kind": "gerrit_http_credential", "host": _GERRIT_ONE},
+            {"name": _GERRIT_TWO_NAME, "kind": "gerrit_http_credential", "host": _GERRIT_TWO},
+        ]
+        assert data["unused"] == [{"name": "GERRIT_HTTP_CREDENTIAL", "reason": "gerrit_multi_host"}]
+
+    def test_row_names_match_the_provider_lookup(self) -> None:
+        """The row's name is exactly the vault name the provider reads for the host."""
+        from kiro_crew.dashboard.source_providers import gerrit
+
+        assert gerrit.host_credential_name(_GERRIT_ONE) == _GERRIT_ONE_NAME
+        assert gerrit.GLOBAL_CREDENTIAL_NAME == "GERRIT_HTTP_CREDENTIAL"
+
+
 class TestApiSecretsSet:
     """Tests for POST /api/secrets."""
 
@@ -389,7 +488,6 @@ class TestApiSecretsSet:
                 data = await resp.json()
                 assert data["ok"] is True
 
-                # Verify stored
                 vault = SecretVault(tmp_path)
                 assert vault.get("NEW_KEY").reveal() == "new-value"
 
@@ -866,3 +964,130 @@ class TestSanitizeForLog:
         # A forged-line payload via U+2028 is neutralized.
         result = _sanitize_for_log("ok\u2028WARNING forged")
         assert "\u2028" not in result and "\\u2028" in result, repr(result)
+
+
+# A proxied request: loopback peer, but a forwarding header, so
+# ``is_direct_local_request`` reads it as a remote or tunnelled session.
+_REMOTE = {"X-Forwarded-For": "203.0.113.7"}
+
+
+class TestApiSecretsChannelCredentialRemote:
+    """A remote owner cannot set or delete a vault entry a channel token resolves from.
+
+    The channel settings panels accept a save only from the machine running the
+    gateway; the generic secrets route must not be a way around that gate.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_channel_env(self, _floor_monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.dashboard.handlers.secrets import _CHANNEL_ENV_KEYS
+
+        for key in _CHANNEL_ENV_KEYS:
+            _floor_monkeypatch.delenv(key, raising=False)
+
+    @staticmethod
+    async def _call(
+        home: Path, method: str, name: str, *, headers: dict[str, str] | None = None
+    ) -> tuple[int, dict]:
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(home)):
+            async with TestClient(TestServer(_app())) as client:
+                if method == "set":
+                    resp = await client.post(
+                        "/api/secrets",
+                        json={"name": name, "value": "planted"},
+                        headers=headers or {},
+                    )
+                else:
+                    resp = await client.delete(f"/api/secrets/{name}", headers=headers or {})
+                return resp.status, await resp.json()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["set", "delete"])
+    async def test_remote_write_to_channel_key_name_is_refused(
+        self, tmp_path: Path, method: str
+    ) -> None:
+        SecretVault(tmp_path)._set_sync("SLACK_BOT_TOKEN", "xoxb-original")
+
+        status, data = await self._call(tmp_path, method, "SLACK_BOT_TOKEN", headers=_REMOTE)
+
+        assert status == 409
+        assert data["code"] == "managed_by_channels"
+        assert "Channels" in data["error"]
+        assert SecretVault(tmp_path).get("SLACK_BOT_TOKEN").reveal() == "xoxb-original"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["set", "delete"])
+    async def test_remote_write_to_name_a_channel_env_line_references_is_refused(
+        self, tmp_path: Path, method: str
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            "# channel\nTELEGRAM_BOT_TOKEN = secret://MY_TG_TOKEN\n", encoding="utf-8"
+        )
+        SecretVault(tmp_path)._set_sync("MY_TG_TOKEN", "tg-original")
+
+        status, data = await self._call(tmp_path, method, "MY_TG_TOKEN", headers=_REMOTE)
+
+        assert status == 409
+        assert data["code"] == "managed_by_channels"
+        assert SecretVault(tmp_path).get("MY_TG_TOKEN").reveal() == "tg-original"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["set", "delete"])
+    async def test_remote_write_to_name_a_channel_env_var_references_is_refused(
+        self, tmp_path: Path, method: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "secret://MY_DC_TOKEN")
+        SecretVault(tmp_path)._set_sync("MY_DC_TOKEN", "dc-original")
+
+        status, data = await self._call(tmp_path, method, "MY_DC_TOKEN", headers=_REMOTE)
+
+        assert status == 409
+        assert SecretVault(tmp_path).get("MY_DC_TOKEN").reveal() == "dc-original"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_env_fails_closed_for_remote_write(self, tmp_path: Path) -> None:
+        (tmp_path / ".env").mkdir()
+
+        status, data = await self._call(tmp_path, "set", "ANY_NAME", headers=_REMOTE)
+
+        assert status == 409
+        assert data["code"] == "managed_by_channels"
+        assert SecretVault(tmp_path).get("ANY_NAME") is None
+
+    @pytest.mark.asyncio
+    async def test_direct_local_set_and_delete_of_channel_name_still_work(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            "SLACK_BOT_TOKEN=secret://SLACK_BOT_TOKEN\n", encoding="utf-8"
+        )
+
+        status, _ = await self._call(tmp_path, "set", "SLACK_BOT_TOKEN")
+        assert status == 200
+        assert SecretVault(tmp_path).get("SLACK_BOT_TOKEN").reveal() == "planted"
+
+        status, _ = await self._call(tmp_path, "delete", "SLACK_BOT_TOKEN")
+        assert status == 200
+        assert SecretVault(tmp_path).get("SLACK_BOT_TOKEN") is None
+
+    @pytest.mark.asyncio
+    async def test_remote_set_and_delete_of_non_channel_name_still_work(
+        self, tmp_path: Path
+    ) -> None:
+        # A non-channel credential's reference (the Jira token the Secrets panel
+        # manages) does not make its vault name channel-owned.
+        (tmp_path / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=secret://MY_TG_TOKEN\nJIRA_API_TOKEN=secret://MY_JIRA\n",
+            encoding="utf-8",
+        )
+
+        for name in ("MY_JIRA", "OTHER_KEY"):
+            status, _ = await self._call(tmp_path, "set", name, headers=_REMOTE)
+            assert status == 200, name
+            assert SecretVault(tmp_path).get(name).reveal() == "planted"
+
+            status, _ = await self._call(tmp_path, "delete", name, headers=_REMOTE)
+            assert status == 200, name
+            assert SecretVault(tmp_path).get(name) is None

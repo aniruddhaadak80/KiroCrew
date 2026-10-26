@@ -4,7 +4,7 @@
 session identity or make HTTP calls. Each VALIDATES its arguments and returns a
 DIRECTIVE string — a human-readable confirmation plus an opaque marker carrying
 the validated payload (and NO session key). The session-aware consumer
-(``dashboard.chat_runner._run_chat``'s ``EVENT_TOOL_RESULT`` handler) decodes the
+(``_on_tool_result`` in ``dashboard/chat_turn/tool_results.py``) decodes the
 marker and applies the effect against ITS OWN slot via
 ``dashboard.session_directive_apply.apply_session_directive``.
 
@@ -298,12 +298,14 @@ class _FakeMonitor:
     """The two monitor fields the paused-loop branch reads about a subject.
 
     ``terminal_pending`` is the owed final turn (``"success"``/``"blocked"``) a
-    channel loop records on observing a terminal subject; ``outcome`` is the
-    settled classification written once that turn lands.
+    channel loop records on observing a terminal subject, ``terminal_delivered``
+    the same outcome once that turn landed and only its settlement remains, and
+    ``outcome`` is the settled classification written once the settlement runs.
     """
 
-    def __init__(self, *, terminal_pending="", outcome=None):
+    def __init__(self, *, terminal_pending="", terminal_delivered="", outcome=None):
         self.terminal_pending = terminal_pending
+        self.terminal_delivered = terminal_delivered
         self.outcome = outcome
 
 
@@ -316,6 +318,7 @@ class _FakeSvc:
         self.get_by_slot_keys: list[str] = []
         self.removed: list[str] = []
         self.updated: list[tuple[str, dict]] = []
+        self.notes: list[tuple[str, str, str]] = []
 
     def get_by_slot(self, key):
         self.get_by_slot_keys.append(key)
@@ -324,10 +327,12 @@ class _FakeSvc:
     def list_all(self):
         return list(self._all)
 
-    async def remove(self, loop_id):
+    async def remove(self, loop_id, *, stop_reason="", stop_detail="", on_absent=None):
         self.removed.append(loop_id)
+        self.notes.append((loop_id, stop_reason, stop_detail))
+        return True
 
-    async def update(self, loop_id, **patch):
+    async def update(self, loop_id, on_absent=None, **patch):
         self.updated.append((loop_id, patch))
         return self._loop
 
@@ -410,7 +415,8 @@ def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
             {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
         )
     )
-    assert "only on a wake from it" in result, "the ack must state the gated cadence"
+    assert "only when the tick needs you" in result, "the ack must state the gated cadence"
+    assert "wake criteria" in result, "and say what decides a wake"
     assert "acme/widgets#42" in result, "and name the subject it is watching"
     assert "message re-injects every 300s" not in result, "not the plain promise"
 
@@ -433,7 +439,7 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
         )
     )
     assert "re-injects every 300s" in result
-    assert "only on a wake from it" not in result
+    assert "only when the tick needs you" not in result
 
 
 def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
@@ -702,7 +708,11 @@ def test_applier_monitor_update_budget_stopped_denial_names_the_budget(monkeypat
         )
     )
     assert not update_calls
-    assert "wall-clock" in result and "max_runtime_secs" in result
+    assert (
+        "runtime budget (awake time while the gateway runs; a restart counts the time "
+        "since created_ts on the wall clock)"
+    ) in result
+    assert "wall-clock" not in result and "max_runtime_secs" in result
     assert "max_cycles" not in result
 
 
@@ -728,7 +738,8 @@ def test_a_probe_state_double_is_a_legacy_loop_only_while_it_carries_the_gate():
     assert not is_structured_monitor_loop(plain_prompt_loop)
 
 
-def test_applier_owed_terminal_turn_is_not_reported_as_a_spent_cap(monkeypatch):
+@pytest.mark.parametrize(("pending", "delivered"), [("success", ""), ("", "success")])
+def test_applier_owed_terminal_turn_is_not_reported_as_a_spent_cap(monkeypatch, pending, delivered):
     """A channel loop whose subject MERGED must not be told it ran out of cycles.
 
     A channel-bound loop does not settle on observation: the probe records the owed
@@ -747,7 +758,7 @@ def test_applier_owed_terminal_turn_is_not_reported_as_a_spent_cap(monkeypatch):
         active=False,
         stopped_reason="cycle_cap",
         slot_key="slack:C123:170.5",
-        monitor=_FakeMonitor(terminal_pending="success"),
+        monitor=_FakeMonitor(terminal_pending=pending, terminal_delivered=delivered),
         gate=True,
     )
     svc = _FakeSvc(loop)
@@ -768,7 +779,8 @@ def test_applier_owed_terminal_turn_is_not_reported_as_a_spent_cap(monkeypatch):
     assert "monitor_start" in result
 
 
-def test_applier_owed_blocked_turn_is_not_reported_as_a_merge(monkeypatch):
+@pytest.mark.parametrize(("pending", "delivered"), [("blocked", ""), ("", "blocked")])
+def test_applier_owed_blocked_turn_is_not_reported_as_a_merge(monkeypatch, pending, delivered):
     """A subject closed WITHOUT merging is terminal but is not good news.
 
     It stopped on a question the operator has to answer — reopen, or abandon — so it
@@ -782,7 +794,7 @@ def test_applier_owed_blocked_turn_is_not_reported_as_a_merge(monkeypatch):
         active=False,
         stopped_reason="cycle_cap",
         slot_key="slack:C123:170.5",
-        monitor=_FakeMonitor(terminal_pending="blocked"),
+        monitor=_FakeMonitor(terminal_pending=pending, terminal_delivered=delivered),
         gate=True,
     )
     svc = _FakeSvc(loop)
@@ -947,6 +959,8 @@ def test_applier_autonudge_stop_removes_ordinary_monitor_loop(monkeypatch):
     assert svc.get_by_slot_keys == [binding_key_for(_SESSION)]
     assert svc.removed == ["loop-ordinary"]
     assert svc.updated == []
+    # The removal leaves no row, so the agent's reason must reach the stop record.
+    assert svc.notes == [("loop-ordinary", "autonudge_stop", "done")]
     assert "stopped" in result.lower()
 
 

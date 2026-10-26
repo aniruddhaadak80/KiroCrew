@@ -13,14 +13,15 @@
  * fallback component is a real surface here rather than a loading state.
  */
 import { Suspense, createContext, forwardRef, lazy, memo, type CSSProperties, useContext, useEffect, useMemo, useRef, useState } from 'react'
-import type { BaseCodeOptions, FileContents } from '@pierre/diffs'
+import type { BaseCodeOptions, FileContents, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
+import type { FileOptions } from '@pierre/diffs/react'
 import type { PierreDiffOptions } from './config'
 import type { EditorMarker, PierreEditorHandle } from './PierreEditorImpl'
 import { PlainCodeFallback, PlainFilePairFallback, PlainFilePairHeader } from './PlainCodeFallback'
 import { isPierreFilePairWithinBudget } from './renderBudget'
 import { computePairPatch } from './diffOffThread'
 import { countDiffStats } from '../utils/diffLineCounts'
-import { PierreFarmHoldContext } from '../components/pierreStaging'
+import { PierreFarmHoldContext, WarmSwapHeldContext } from '../components/pierreStaging'
 import { usePlainDiff } from '../hooks/usePlainDiff'
 
 const CodeImpl = lazy(() => import('./PierreImpl').then(m => ({ default: m.PierreCodeImpl })))
@@ -84,9 +85,15 @@ export const PierreEditor = memo(forwardRef<PierreEditorHandle, {
 /** A surface under this height is still Pierre's pre-highlight empty shell,
  *  not painted content: one rendered line inside body padding exceeds it. */
 const WARM_PAINT_MIN_PX = 24
-/** Fail-safe: swap even if the surface never crosses the threshold (a
- *  legitimately tiny surface, or a broken worker) so nothing wedges on the
- *  fallback forever. */
+/** Fail-safe for a surface that never crosses the threshold. At this deadline
+ *  a hold whose fallback is itself tiny (an empty file, a one-row stub) swaps,
+ *  so nothing wedges on a fallback that shows nothing either. A hold whose
+ *  fallback is readable text keeps it: revealing an impl that has still not
+ *  painted would trade that text for Pierre's empty shell, which is a code
+ *  block with a label and a blank body. Such a hold releases on the impl's
+ *  first rows, or on the plain text the pool hands the surface once its own
+ *  request watchdog gives up on the worker; past the deadline it drops the
+ *  pending cue, because the wait is no longer a short highlight pass. */
 const WARM_SWAP_DEADLINE_MS = 2500
 
 /** Painted height of surfaces that completed a swap this page load, keyed
@@ -153,23 +160,51 @@ function StagedSuspense({ fallback, children }: { fallback: React.ReactNode; chi
  * would collapse to Pierre's empty container until the highlight pool answers.
  * The inner wrapper has no height but the impl's, so it reads 0 until Pierre
  * has applied rows (or a failed pool has handed the surface plain text), and
- * the deadline below is what releases a surface that never paints at all.
+ * the deadline below is what releases a surface whose fallback is too small to
+ * be worth holding (see `WARM_SWAP_DEADLINE_MS`).
  *
  * `header` is a row the caller wants ABOVE the revealed content — it renders
  * outside the measured wrapper, and only once the hold has released. Inside
  * the wrapper its own height would pass for painted content and release the
  * hold before a single row exists; before release the caller's fallback
  * already carries the same row, so showing it early would double it.
+ *
+ * While the hold lasts, the fallback is rendered under `WarmSwapHeldContext`
+ * (`true` unless the caller passes `heldHint={false}`), and a fallback that
+ * has a header row carries the one-line "Highlighting code…" cue at that row's end
+ * (`PlainFallbackHeader`): the plain fallback is readable but uncoloured, and
+ * for the seconds a slow highlight pool takes, uncoloured text reads as a
+ * deliberate display mode rather than as a load in progress (#13937). The cue
+ * exists for exactly as long as the hold does — gone the moment `painted`
+ * flips true, whether on the first rows, on the plain text a failed pool hands
+ * the surface, or on the deadline fail-safe; a hold the deadline keeps for
+ * its readable text drops the cue at the deadline too. It lives in a row that exists in
+ * both states (the fallback's header while held, Pierre's own header with its
+ * metadata in the same place once painted), so it costs the hold no height and
+ * sits outside the measured wrapper. A hold whose fallback has no header row
+ * shows no cue at all: an in-flow line of its own would grow the box and
+ * shrink it back on the paint, and an overlay was ruled out (#13937), so the
+ * ruling's "no change to the hold's geometry" leaves those surfaces silent by
+ * design. A caller whose fallback already carries a pending cue of its own
+ * passes `heldHint={false}`, so one hold never shows two.
  */
-function WarmSwap({ fallback, header, children, warmKey, onVisible }: {
+function WarmSwap({ fallback, header, heldHint = true, children, warmKey, onVisible }: {
   fallback: React.ReactNode
   header?: React.ReactNode
+  heldHint?: boolean
   children: React.ReactNode
   warmKey?: string
   onVisible?: () => void
 }) {
   const implRef = useRef<HTMLDivElement | null>(null)
+  // The hold's outer box. While held, the impl sits in an absolute box out of
+  // its flow, so this box is as tall as the fallback on screen (or the frozen
+  // known height, which is only ever recorded above the paint threshold).
+  const holdRef = useRef<HTMLDivElement | null>(null)
   const [painted, setPainted] = useState(false)
+  // The deadline passed with readable fallback text still on screen and the
+  // impl still unpainted: keep the text, drop the pending cue.
+  const [overdue, setOverdue] = useState(false)
   // Measure-farm render: the fallback IS the measured geometry -- mounting the
   // impl invisibly would burn main thread for a surface that is never shown.
   const farm = useContext(PierreFarmHoldContext)
@@ -207,7 +242,19 @@ function WarmSwap({ fallback, header, children, warmKey, onVisible }: {
       }
     })
     ro.observe(el)
-    const deadline = setTimeout(() => setPainted(true), WARM_SWAP_DEADLINE_MS)
+    const deadline = setTimeout(() => {
+      if (el.scrollHeight > WARM_PAINT_MIN_PX) {
+        setPainted(true)
+        return
+      }
+      const fallbackH = holdRef.current ? holdRef.current.scrollHeight : 0
+      if (fallbackH > WARM_PAINT_MIN_PX) {
+        // Revealing now would blank readable text; the observer stays armed.
+        setOverdue(true)
+        return
+      }
+      setPainted(true)
+    }, WARM_SWAP_DEADLINE_MS)
     return () => {
       ro.disconnect()
       clearTimeout(deadline)
@@ -219,6 +266,7 @@ function WarmSwap({ fallback, header, children, warmKey, onVisible }: {
   if (farm) return <>{fallback}</>
   return (
     <div
+      ref={holdRef}
       className={painted ? undefined : 'relative'}
       // While warming, FREEZE the box at the height this surface painted at
       // last time (exact, overflow clipped): neither the fallback's own
@@ -239,14 +287,17 @@ function WarmSwap({ fallback, header, children, warmKey, onVisible }: {
           <WarmSwapRevealedContext.Provider value={painted}>{children}</WarmSwapRevealedContext.Provider>
         </div>
       </div>
-      {!painted && fallback}
+      {!painted && <WarmSwapHeldContext.Provider value={heldHint && !overdue}>{fallback}</WarmSwapHeldContext.Provider>}
     </div>
   )
 }
 
-export const PierreCode = memo(function PierreCode({ file, options, className, langHint, scrollClassName }: {
+export const PierreCode = memo(function PierreCode({ file, options, className, langHint, scrollClassName, lineAnnotations, selectedLines, renderAnnotation, renderGutterUtility }: {
   file: FileContents
-  options?: BaseCodeOptions
+  /** Accepts Pierre's full `FileOptions` surface (interaction callbacks like
+   *  `enableLineSelection` / `onLineSelected` / `enableGutterUtility`
+   *  included) — the impl merges it over the shared code-view defaults. */
+  options?: FileOptions<unknown>
   className?: string
   /** Markdown fence tag, resolved to a safe highlight language in the impl. */
   langHint?: string
@@ -254,13 +305,26 @@ export const PierreCode = memo(function PierreCode({ file, options, className, l
    *  renders a window of rows instead of one per line. The caller's own box
    *  must then NOT scroll. */
   scrollClassName?: string
+  /** Line-pinned annotation rows, rendered by Pierre inside its own surface
+   *  (virtualization-correct). Payload type is the caller's; `renderAnnotation`
+   *  narrows it back. Dashboard stylesheets do NOT reach Pierre's shadow DOM,
+   *  so render-prop content must style itself inline (theme custom properties
+   *  DO inherit through the boundary). */
+  lineAnnotations?: LineAnnotation<unknown>[]
+  /** Controlled line selection: set it (null clears) and Pierre shows exactly
+   *  this range; leave it undefined and Pierre keeps its own. */
+  selectedLines?: SelectedLineRange | null
+  renderAnnotation?: (annotation: LineAnnotation<unknown>) => React.ReactNode
+  /** Hover gutter slot (e.g. a comment button). Same inline-style rule as
+   *  `renderAnnotation`. */
+  renderGutterUtility?: (getHoveredLine: () => { lineNumber: number } | undefined) => React.ReactNode
 }) {
   // Whole-file surfaces own their scroll container and cannot be wrapped in
   // an invisible measurement box, so they retain a direct Suspense fallback.
   if (scrollClassName) {
     return (
       <Suspense fallback={<div className={scrollClassName}><PlainCodeFallback text={file.contents} /></div>}>
-        <CodeImpl file={file} options={options} className={className} langHint={langHint} scrollClassName={scrollClassName} />
+        <CodeImpl file={file} options={options} className={className} langHint={langHint} scrollClassName={scrollClassName} lineAnnotations={lineAnnotations} selectedLines={selectedLines} renderAnnotation={renderAnnotation} renderGutterUtility={renderGutterUtility} />
       </Suspense>
     )
   }
@@ -271,7 +335,7 @@ export const PierreCode = memo(function PierreCode({ file, options, className, l
   return (
     <WarmSwap warmKey={warmKeyOf(file.contents)} fallback={fallback}>
       <StagedSuspense fallback={fallback}>
-        <CodeImpl file={file} options={options} className={className} langHint={langHint} />
+        <CodeImpl file={file} options={options} className={className} langHint={langHint} lineAnnotations={lineAnnotations} selectedLines={selectedLines} renderAnnotation={renderAnnotation} renderGutterUtility={renderGutterUtility} />
       </StagedSuspense>
     </WarmSwap>
   )
@@ -483,9 +547,10 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
     // layout until the diff truly paints. The header goes to the hold as
     // `header`, NOT as a child, for the same reason: inside the wrapper its
     // own height would satisfy the paint measurement and release the hold
-    // before a single row exists.
+    // before a single row exists. No held hint either: the fallback's
+    // "computing" strip above is already this hold's pending cue.
     return (
-      <WarmSwap fallback={holdFallback} header={header} onVisible={onVisible}>
+      <WarmSwap fallback={holdFallback} header={header} heldHint={false} onVisible={onVisible}>
         <Suspense fallback={null}>
           <PairPatchImpl patch={active.patch} options={patchOptions} className={className} />
         </Suspense>
@@ -527,12 +592,16 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
   // A collapsed pair renders ONLY its header (~32px) — under the paint
   // threshold by design — so it must not warm-swap or it would sit on the
   // fallback until the deadline. Expanded pairs get the same treatment as
-  // Patch: readable text holds the layout until the diff paints.
+  // Patch: readable text holds the layout until the diff paints. The hold's
+  // pending cue rides in the fallback's header row (none when the caller
+  // disabled the header), and not in plain-diff mode, where the impl drops
+  // the colour and nothing is being highlighted.
   if (options?.collapsed) return impl
   return (
     <WarmSwap
       warmKey={warmKeyOf((newFile ?? oldFile)?.contents ?? '')}
       fallback={fallbackNode}
+      heldHint={!plain}
       onVisible={onVisible}
     >
       {impl}

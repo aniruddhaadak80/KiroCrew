@@ -95,7 +95,7 @@ def _fast_no_report_ceiling(monkeypatch):
 def _runtime(backend: str) -> AcpRuntime:
     """An initialized runtime on ``backend``, wired to a fake subprocess.
 
-    Mirrors ``test_acp_runtime._make_runtime`` but pins the backend so nothing
+    Mirrors ``acp_runtime_helpers._make_runtime`` but pins the backend so nothing
     reads the host filesystem.
     """
     rt = AcpRuntime(work_dir=_CWD, acp_backend=backend)
@@ -376,7 +376,7 @@ def test_handshake_params_come_from_the_shared_constants() -> None:
     assert isinstance(PROTOCOL_VERSION_KAS, int)
     assert KAS_CLIENT_CAPABILITIES == {
         **ACP_CLIENT_CAPABILITIES,
-        "_meta": {"kiro": {"settings": {}}},
+        "_meta": {"kiro": {"settings": {}, "openExternalUrl": True}},
     }
 
 

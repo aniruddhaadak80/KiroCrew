@@ -10,7 +10,7 @@ remaining seventeen had to follow it.
 The prose is kept and keeps its meaning — demoted to advisory, not removed — so
 a client that only reads ``error`` is unaffected. This is backend-only because
 all three frontend callers of ``forkChatSlot`` (``useSessionActions.ts``,
-``SessionGridView.tsx``, ``chatSlice.ts``) branch on ``ok``/``key`` and none
+``SessionGridView.tsx``, ``store/chat/lifecycle.ts``) branch on ``ok``/``key`` and none
 declares an ``onError`` or reads ``res.error`` at all.
 
 **The one refusal that must NOT become distinguishable.** ``api_chat_slot_fork``
@@ -26,10 +26,14 @@ is the assertion that keeps it that way.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
+
+from kiro_crew.dashboard import chat_fork
 
 _TARGET = "dashboard/chat_fork.py"
 
@@ -69,10 +73,16 @@ def test_the_ratchet_can_actually_fail() -> None:
     is no ``slot_not_persistent`` site: an incognito or temporary session forks
     and the child inherits its mode. The one memory-mode refusal in the module is
     ``fork_source_memory_mode_invalid``, for a parent whose persisted mode is
-    outside the allowlist.
+    outside the allowlist. The two app-isolation refusals answer through
+    `slot_ownership.deny_app_slot_access`, the shared per-slot decision, which
+    returns ``slot_not_found`` by construction, so the scan finds those two
+    sites in that module rather than here. The no-such-slot 404 answers through
+    `slot_ownership.slot_not_found`, the same response, so it is counted there
+    too. The over-capacity corpus refusal (``fork_corpus_too_large``) adds one
+    site, and so does the read-only remote-crew refusal (``relay_archive_read_only``).
     """
     coded = [f for f in _findings() if f.bucket == "compliant"]
-    assert len(coded) == 27, f"scanner reached {len(coded)} coded sites, expected 27"
+    assert len(coded) == 26, f"scanner reached {len(coded)} coded sites, expected 26"
     assert all(f.code_value for f in coded)
 
 
@@ -121,43 +131,56 @@ async def test_a_body_that_is_not_json(tmp_path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_body_that_is_json_but_not_an_object(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "payload,status,code",
+    [
+        pytest.param(
+            ["at_message_index"],
+            400,
+            "body_not_object",
+            id="test_a_body_that_is_json_but_not_an_object",
+        ),
+        pytest.param({"mode": "sideways"}, 400, "invalid_mode", id="test_an_unknown_mode"),
+        pytest.param(
+            {"direction": "sideways"}, 400, "invalid_direction", id="test_an_unknown_direction"
+        ),
+        pytest.param({"prompt": 7}, 400, "invalid_field_type", id="test_a_non_string_prompt"),
+        pytest.param(
+            {"prompt": "x" * 32_769}, 400, "prompt_too_long", id="test_an_over_long_prompt"
+        ),
+        # ``at_index < 0`` shares the branch with the type check, so it keeps that code.
+        pytest.param(
+            {"at_message_index": -1},
+            400,
+            "invalid_field_type",
+            id="test_a_negative_index_is_a_type_refusal_not_a_range_one",
+        ),
+        # ``isinstance(True, int)`` is True in Python; the handler rejects bools first.
+        pytest.param(
+            {"at_message_index": True},
+            400,
+            "invalid_field_type",
+            id="test_a_boolean_index_is_refused_as_a_type",
+        ),
+        pytest.param(
+            {"at_message_id": 7},
+            400,
+            "invalid_field_type",
+            id="test_a_non_string_message_id_is_refused",
+        ),
+        pytest.param(
+            {"at_message_id": "missing-row"},
+            409,
+            "fork_message_not_found",
+            id="test_an_unknown_message_id_is_a_stale_anchor",
+        ),
+    ],
+)
+async def test_a_refused_fork_names_its_code(tmp_path, monkeypatch, payload, status, code) -> None:
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", ["at_message_index"])
-    assert status == 400
-    assert body["code"] == "body_not_object"
-
-
-@pytest.mark.asyncio
-async def test_an_unknown_mode(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"mode": "sideways"})
-    assert status == 400
-    assert body["code"] == "invalid_mode"
-
-
-@pytest.mark.asyncio
-async def test_an_unknown_direction(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"direction": "sideways"})
-    assert status == 400
-    assert body["code"] == "invalid_direction"
-
-
-@pytest.mark.asyncio
-async def test_a_non_string_prompt(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"prompt": 7})
-    assert status == 400
-    assert body["code"] == "invalid_field_type"
-
-
-@pytest.mark.asyncio
-async def test_an_over_long_prompt(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"prompt": "x" * 32_769})
-    assert status == 400
-    assert body["code"] == "prompt_too_long"
+    got_status, body = await _fork(_seeded_state(tmp_path), "forkable", payload)
+    assert got_status == status
+    assert body["code"] == code
 
 
 @pytest.mark.asyncio
@@ -172,44 +195,6 @@ async def test_a_non_integer_index_and_an_out_of_range_one_differ(tmp_path, monk
     _, out_of_range = await _fork(_seeded_state(tmp_path), "forkable", {"at_message_index": 999})
     assert bad_type["code"] == "invalid_field_type"
     assert out_of_range["code"] == "value_out_of_range"
-
-
-@pytest.mark.asyncio
-async def test_a_negative_index_is_a_type_refusal_not_a_range_one(tmp_path, monkeypatch) -> None:
-    """``at_index < 0`` shares the branch with the type check, so it keeps that code."""
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"at_message_index": -1})
-    assert status == 400
-    assert body["code"] == "invalid_field_type"
-
-
-@pytest.mark.asyncio
-async def test_a_boolean_index_is_refused_as_a_type(tmp_path, monkeypatch) -> None:
-    """``isinstance(True, int)`` is True in Python; the handler rejects bools first."""
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"at_message_index": True})
-    assert status == 400
-    assert body["code"] == "invalid_field_type"
-
-
-@pytest.mark.asyncio
-async def test_a_non_string_message_id_is_refused(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(_seeded_state(tmp_path), "forkable", {"at_message_id": 7})
-    assert status == 400
-    assert body["code"] == "invalid_field_type"
-
-
-@pytest.mark.asyncio
-async def test_an_unknown_message_id_is_a_stale_anchor(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    status, body = await _fork(
-        _seeded_state(tmp_path),
-        "forkable",
-        {"at_message_id": "missing-row"},
-    )
-    assert status == 409
-    assert body["code"] == "fork_message_not_found"
 
 
 @pytest.mark.asyncio
@@ -367,7 +352,9 @@ def test_an_unreadable_mid_rotation_corpus_refuses_instead_of_approximating() ->
     """
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "src/kiro_crew" / _TARGET).read_text()
+    src = (Path(__file__).resolve().parents[1] / "src/kiro_crew" / _TARGET).read_text(
+        encoding="utf-8"
+    )
     head, _, tail = src.partition("chained-full fork corpus read failed")
     assert tail, "the full-read failure branch is gone -- re-point this guard"
     # Scope to the except block itself: the `if not _rebuilt:` prepend further
@@ -385,3 +372,77 @@ def test_an_unreadable_mid_rotation_corpus_refuses_instead_of_approximating() ->
     assert (
         "_rotated_head + all_messages" not in block
     ), "the flat prepend must not run after a failed full read"
+
+
+# ── an over-capacity corpus must refuse, never half-copy ──
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_over_slot_capacity_refuses(tmp_path, monkeypatch) -> None:
+    """A fork it cannot carry whole must refuse, not answer success minus the oldest rows.
+
+    The destination's append path trims from the FRONT once the slot exceeds
+    capacity, and during the copy loop nothing has reached disk yet, so
+    `persisted_trim` is 0 and the evicted rows are unrecoverable. Answering
+    success there loses the start of the conversation with no signal to the caller.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_fork._MAX_SLOT_MESSAGES", 5)
+    state = _seeded_state(tmp_path)
+    slot = state._slots["forkable"]
+    for n in range(4):
+        slot.append("user", f"q{n}", "msg msg-u")
+    status, body = await _fork(state, "forkable", {})
+    assert status == 400
+    assert body["code"] == "fork_corpus_too_large"
+
+
+@pytest.mark.asyncio
+async def test_the_over_capacity_refusal_names_no_numbers(tmp_path, monkeypatch) -> None:
+    """The body carries `error` + `code` only, and the prose carries no counts.
+
+    A row number is not an affordance in a transcript that numbers nothing, and the
+    client copy deliberately advises the ACTION instead, so a count in the wire text
+    is a bound no reader can act on and a second contract for the frontend to drift
+    against.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_fork._MAX_SLOT_MESSAGES", 5)
+    state = _seeded_state(tmp_path)
+    slot = state._slots["forkable"]
+    for n in range(4):
+        slot.append("user", f"q{n}", "msg msg-u")
+    status, body = await _fork(state, "forkable", {})
+    assert status == 400
+    assert body["code"] == "fork_corpus_too_large"
+    digits = [ch for ch in body["error"] if ch.isdigit()]
+    assert not digits, f"refusal leaks numbers {digits}: {body['error']!r}"
+    assert set(body) == {"error", "code"}, f"body grew beyond the contract: {sorted(body)}"
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_within_capacity_still_forks(tmp_path, monkeypatch) -> None:
+    """Negative control: the guard must fire on size alone, not on every fork."""
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_fork._MAX_SLOT_MESSAGES", 5)
+    state = _seeded_state(tmp_path)
+    status, body = await _fork(state, "forkable", {})
+    assert status == 200, body
+    assert body.get("code") != "fork_corpus_too_large"
+
+
+def test_the_over_capacity_refusal_carries_no_retry_parameter():
+    """The refusal is the 400 and its code; the fitting index defers to its own change.
+
+    Deliberate subtraction rather than an oversight, pinned so it is not reintroduced by
+    halves: the index had ONE consumer and cost a permanent field on a wire body plus two
+    keys across thirteen catalogs. What removes the data-loss harm is the REFUSAL, which
+    stays, together with the prose naming the parameters a caller can retry with.
+    """
+    source = pathlib.Path(chat_fork.__file__).read_text(encoding="utf-8")
+
+    assert "at_message_index_that_fits" not in source, "the retry field is back"
+    assert "_largest_fitting_index" not in source, "the fitting-index helper is back"
+    # The refusal itself, and the advice that replaces the index, both survive.
+    assert '"code": "fork_corpus_too_large"' in source, "the refusal lost its code"
+    assert "at_message_index or at_message_id" in source, "the prose advice was dropped"

@@ -4,13 +4,17 @@ import { ExternalLink } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsInput } from '../../components/settings'
 import { Badge, Btn, FormSkeleton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
+import { LockedByPolicyBadge } from '../../components/settingRef/LockedByPolicyBadge'
 import { api } from '../../api/client'
 import type { ComputerUseConfigData, ComputerUseConfigSave } from '../../api/client'
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
+import AgentSpecNotRewrittenNotice, { agentSpecNotRewritten } from '../../components/AgentSpecNotRewrittenNotice'
 
 const QK = ['computer-use-config']
+/** The locked-by-policy note under the enable, which the switch's description points at. */
+const LOCKED_NOTE_ID = 'computer-use-locked-note'
 
 /** macOS System Settings deep links for the two TCC grants (mirrors the
  *  backend's SETTINGS_URL_* constants). */
@@ -173,6 +177,8 @@ export function ComputerUsePanel() {
   const [draftWidth, setDraftWidth] = useState<string | null>(null)
   // Set when the server reports it restarted sessions to apply the enable.
   const [restarted, setRestarted] = useState(false)
+  // Set when the enable saved but the agent spec was not rewritten.
+  const [specNotRewritten, setSpecNotRewritten] = useState(false)
 
   // Mount time, for the poll's wall-clock bound. A ref (not state) so reading it
   // never re-renders and the deadline survives every refetch.
@@ -210,6 +216,9 @@ export function ComputerUsePanel() {
       // reads as a crash, and a user who is not told will still wonder why the
       // tools did not show up.
       if ((data?.sessions_reset ?? 0) > 0) setRestarted(true)
+      // Only a save that changed the enable carries the verdict; any other save
+      // leaves the last one standing, since the spec is still what it was.
+      if (data && 'agent_spec_rewritten' in data) setSpecNotRewritten(agentSpecNotRewritten(data))
     },
     onError: (_err, _vars, ctx) => {
       if (ctx?.prev) qc.setQueryData<ComputerUseConfigData>(QK, ctx.prev)
@@ -220,6 +229,8 @@ export function ComputerUsePanel() {
 
   const cfg = cfgQ.data
   const busy = saveMut.isPending
+  // An enterprise build ignores the local opt-in; the enable is shown greyed out.
+  const locked = cfg?.locked_by_policy === true
   const save = (patch: Partial<ComputerUseConfigSave>) => {
     setSaveError('')
     saveMut.mutate(patch)
@@ -330,8 +341,16 @@ export function ComputerUsePanel() {
             description={i18nT('pages.settings.computerUsePanel.let_the_agent_read_desktop_app_windows_through_a')}
             checked={cfg.enabled}
             onChange={v => save({ enabled: v })}
-            disabled={busy}
+            disabled={busy || locked}
+            describedBy={locked ? LOCKED_NOTE_ID : undefined}
           />
+          {/* Outside the toggle row, so it is not dimmed with the disabled switch. */}
+          {locked && (
+            <div id={LOCKED_NOTE_ID} className="flex items-center gap-2 text-[12px] text-muted" data-testid="computer-use-locked-note">
+              <LockedByPolicyBadge />
+              <span>{i18nT('components.lockedByPolicyBadge.tooltip')}</span>
+            </div>
+          )}
           <SettingsToggle
             label={i18nT('pages.settings.computerUsePanel.attach_screenshots')}
             description={i18nT('pages.settings.computerUsePanel.also_capture_the_target_window_and_pass_its_file')}
@@ -344,14 +363,24 @@ export function ComputerUsePanel() {
           {cfg.enabled && cfg.cursor_motion_supported && (
             <SettingsToggle
               label={i18nT('pages.settings.computerUsePanel.show_cursor_motion')}
-              description={i18nT('pages.settings.computerUsePanel.draw_a_cursor_that_glides_to_each_target_and_pul')}
+              hint={i18nT('pages.settings.computerUsePanel.draw_a_cursor_that_glides_to_each_target_and_pul')}
               checked={cfg.cursor_motion}
               onChange={v => save({ cursor_motion: v })}
               disabled={busy}
             />
           )}
+          {/* No hand-off: the hand-off navigates away, and this panel's numeric
+              fields hold drafts that only commit on blur. */}
+          {specNotRewritten && <AgentSpecNotRewrittenNotice className="pt-1" askAgent={false} />}
+          {/* Shown even beside the notice: the sessions really were restarted, and
+              hiding that would leave a torn-down chat unexplained. Beside the notice
+              it drops "so this takes effect", which the notice says is not true. */}
           {restarted && (
-            <div className="pt-1 text-[13px] text-muted animate-rise">{i18nT('pages.settings.computerUsePanel.your_chat_sessions_were_restarted_so_this_takes')}</div>
+            <div className="pt-1 text-[13px] text-muted animate-rise">
+              {specNotRewritten
+                ? i18nT('pages.settings.computerUsePanel.your_chat_sessions_were_restarted')
+                : i18nT('pages.settings.computerUsePanel.your_chat_sessions_were_restarted_so_this_takes')}
+            </div>
           )}
           {cfg.enabled && (
             <div className="pt-1 text-[13px] text-muted">{i18nT('pages.settings.computerUsePanel.computer_use_lets_the_agent_read_any_app_window')}</div>

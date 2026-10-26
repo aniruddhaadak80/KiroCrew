@@ -87,6 +87,8 @@ describe('SkillsTab pending updates', () => {
     expect(
       screen.getByText(/Adds new requirements to auto\/deploy-helper/),
     ).toBeTruthy()
+    // An update changes a skill that already exists, so it is not marked New.
+    expect(screen.queryByText('New')).toBeNull()
   })
 
   it('shows the server-computed diff with the version transition on Review', async () => {
@@ -94,7 +96,7 @@ describe('SkillsTab pending updates', () => {
     mockApi.skillPendingDetail.mockResolvedValue({
       name: 'auto/deploy-helper-update',
       content: '## Steps\nnew\n',
-      scripts: [],
+      scripts: [], content_sha256: 'c'.repeat(64),
       diff: DIFF,
       live_body: 'old',
       proposed_body: 'new',
@@ -114,7 +116,7 @@ describe('SkillsTab pending updates', () => {
     mockApi.skillPendingDetail.mockResolvedValue({
       name: 'auto/deploy-helper-update',
       content: '',
-      scripts: [],
+      scripts: [], content_sha256: 'c'.repeat(64),
       diff: DIFF,
       from_version: 5,
       to_version: 6,
@@ -134,7 +136,7 @@ describe('SkillsTab pending updates', () => {
     mockApi.skillPendingDetail.mockResolvedValue({
       name: 'auto/deploy-helper-update',
       content: '## Steps\nnew\n',
-      scripts: [],
+      scripts: [], content_sha256: 'c'.repeat(64),
       diff: null,
       live_body: null,
       stale_base: false,
@@ -149,14 +151,18 @@ describe('SkillsTab pending updates', () => {
     expect(screen.getByText('Approve').closest('button')!.disabled).toBe(true)
   })
 
-  it('still renders a plain new candidate as raw SKILL.md, with no badge', async () => {
+  it('marks a plain new candidate New and renders it as raw SKILL.md', async () => {
     mockApi.skillsPending.mockResolvedValue({ pending: [NEW_ROW] })
     mockApi.skillPendingDetail.mockResolvedValue({
       name: 'auto/fresh-skill',
       content: '## Steps\nrun it\n',
-      scripts: [],
+      scripts: [], content_sha256: 'c'.repeat(64),
     })
     renderWithQuery()
+    // The queue mounts only after the `skills` read settles, and then fetches
+    // `skills-pending` itself, so this waits on two chained queries: give it an
+    // explicit bound instead of findBy's 1 s default.
+    expect(await screen.findByText('New', undefined, { timeout: 5000 })).toBeTruthy()
     expect(screen.queryByText('Update')).toBeNull()
     fireEvent.click(await screen.findByText('Review'))
     await waitFor(() => expect(screen.getByText(/run it/)).toBeTruthy())
@@ -168,7 +174,7 @@ describe('SkillsTab pending updates', () => {
     mockApi.skillPendingDetail.mockResolvedValue({
       name: 'auto/deploy-helper-update',
       content: '',
-      scripts: [],
+      scripts: [], content_sha256: 'c'.repeat(64),
       diff: DIFF,
       from_version: 2,
       to_version: 3,
@@ -180,7 +186,7 @@ describe('SkillsTab pending updates', () => {
     await waitFor(() => expect(screen.getByTestId('diff')).toBeTruthy())
     fireEvent.click(screen.getByText('Approve'))
     await waitFor(() =>
-      expect(mockApi.approvePendingSkill).toHaveBeenCalledWith('deploy-helper-update'),
+      expect(mockApi.approvePendingSkill).toHaveBeenCalledWith('deploy-helper-update', 'c'.repeat(64)),
     )
   })
 })

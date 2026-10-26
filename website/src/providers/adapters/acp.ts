@@ -1,6 +1,7 @@
 import { api } from '../../api/client'
+import { apiErrorCode } from '../../api/apiError'
 import modelTokensRaw from '../../model_tokens.json'
-import { markModelsDegraded } from '../modelListHealth'
+import { markModelsDegraded, markModelsAuthRequired } from '../modelListHealth'
 import { isPricedMultiplier } from '../modelList'
 import { i18nT } from '../../i18n/t'
 import type {
@@ -10,6 +11,7 @@ import type {
   AgentBinding,
   NormalizedUsage,
   NormalizedProviderHook,
+  NormalizedUnsentHook,
   NormalizedPlugin,
   ModelInfo,
   PermissionMode,
@@ -141,6 +143,17 @@ interface RawHookEntry {
   source?: string
 }
 
+/** Raw `unsent` entry from /api/kiro-hooks: a validated `agent.kiro_hooks`
+ *  document left out of the kiro-cli spec. */
+interface RawUnsentHook {
+  name?: string
+  trigger?: string
+  matcher?: string
+  action_type?: string
+  command?: string
+  reason?: string
+}
+
 /** Raw plugin (agent/skill/mcp) entry from /api/capability/*. */
 interface RawPlugin {
   name: string
@@ -210,7 +223,6 @@ export class AcpAdapter implements ProviderAdapter {
 
   readonly labels: ProviderLabels = {
     sessionProcess: 'ACP subprocess',
-    agentTemplateField: 'Agent Template',
     processCountLabel: 'acp_cli',
     configFile: 'kirocrew.json',
     pluginRegistryName: 'Packages',
@@ -221,7 +233,7 @@ export class AcpAdapter implements ProviderAdapter {
     return agent.kiro_agent || agent.name
   }
 
-  async resolveModel(agentName: string): Promise<string> {
+  async resolveModel(agentName: string, app?: string): Promise<string> {
     // Ask the backend which model a new session on this agent would run on, so
     // the composer shows the real value before a session exists to report one.
     //
@@ -235,9 +247,10 @@ export class AcpAdapter implements ProviderAdapter {
     //
     // `agentName` is a KiroCrew agent name (a "crew"), not a kiro agent
     // template — the per-agent default is stored per crew, and several crews can
-    // share one template.
+    // share one template. `app` names the app that owns the session, so the
+    // answer includes that app's own model setting as the session start does.
     try {
-      const d = await api.agentResolvedModel(agentName)
+      const d = await (app ? api.agentResolvedModel(agentName, app) : api.agentResolvedModel(agentName))
       return d?.model || ''
     } catch {
       return ''
@@ -259,10 +272,12 @@ export class AcpAdapter implements ProviderAdapter {
 
   /** KiroCrew's configured default reasoning effort (Settings → Chat). '' means
    *  no default, i.e. the model picks its own. A per-slot override outranks it,
-   *  matching ConfigLoader._acp()'s `reasoning_effort_override or default`. */
-  async resolveDefaultEffort(): Promise<string> {
+   *  matching ConfigLoader._acp()'s `reasoning_effort_override or default`.
+   *  `readConfig` supplies the gateway config body from the caller's shared
+   *  `['kirocrewConfig']` query, avoiding a second GET at boot. */
+  async resolveDefaultEffort(readConfig: () => Promise<unknown>): Promise<string> {
     try {
-      const c = (await api.kirocrewConfig()) as KirocrewAgentConfig
+      const c = (await readConfig()) as KirocrewAgentConfig
       return c?.agent?.reasoning_effort || ''
     } catch {
       return ''
@@ -291,6 +306,7 @@ export class AcpAdapter implements ProviderAdapter {
     if (s?.error) throw new Error(String(s.error))
     const b = data.billing || {}
     return {
+      refreshing: data.refreshing === true,
       sessions: {
         total: s.total_sessions,
         today: { sessions: s.today.sessions, messages: s.today.messages, toolCalls: s.today.tool_calls },
@@ -330,6 +346,20 @@ export class AcpAdapter implements ProviderAdapter {
       }))
     }
     return result
+  }
+
+  async fetchUnsentProviderHooks(): Promise<NormalizedUnsentHook[]> {
+    const data = await api.kiroHooks()
+    // An older gateway sends no `unsent`; that reads as nothing left out.
+    const unsent: RawUnsentHook[] = Array.isArray(data.unsent) ? data.unsent : []
+    return unsent.map(u => ({
+      name: u.name || '',
+      trigger: u.trigger || '',
+      matcher: u.matcher || '',
+      actionType: u.action_type || '',
+      command: u.command || '',
+      reason: u.reason || '',
+    }))
   }
 
   async listPlugins(): Promise<NormalizedPlugin[]> {
@@ -399,11 +429,17 @@ export class AcpAdapter implements ProviderAdapter {
       writeCachedModels(result) // remember this good live list for next hiccup
       markModelsDegraded(this.id, false) // live success → self-heal can stop polling
       return result
-    } catch {
+    } catch (err) {
       // Transient backend failure (503 / network): NOT live — keep polling.
       // Serve the last-good live list if we have one, else auto-only. Never
       // surface canonical registry keys — the ACP CLI rejects them (-32603).
+      // Read the refusal code HERE, where the error is formed, so an expired /
+      // signed-out kiro-cli login (503 `kiro_prerequisite_required`) can raise
+      // the one actionable sign-in banner instead of the generic config-load
+      // failure. Any other cause clears the auth flag — only this code means a
+      // sign-in wall.
       markModelsDegraded(this.id, true)
+      markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
       return readCachedModels() ?? this._defaultModels()
     }
   }

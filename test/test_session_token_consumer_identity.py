@@ -5,7 +5,7 @@
 consumers resolved identity on their own and were left on the pre-token sources:
 
 * ``mcp_caller.CallerContext.from_env`` — the client-side resolver. Its real inbound
-  caller is ``mcp_gateway/stub.py``'s register/recaller caller block, so the key it
+  caller is ``mcp_gateway/stub_register.py``'s register/recaller caller block, so the key it
   answers with is what gatewayd stamps on every forwarded call for that connection.
 * ``mcp_shared._resolve_tool_policy`` — the managed-tool-policy lookup, whose
   resolved key becomes the ``X-Session-Key`` of the policy request AND the key its
@@ -243,6 +243,39 @@ class TestFromEnvReadsTheToken:
         assert ctx.session_key == protected
         assert ctx.session_type == "protected-pid"
 
+    def test_a_raising_protected_probe_refuses_and_never_reaches_the_env_key(
+        self, cfg, monkeypatch
+    ):
+        """A raising binding probe is a REFUSAL, not absence — the fence holds.
+
+        ``KIROCREW_SESSION_KEY``, the signed token and the pid file are all
+        writable by the same uid the member binding exists to fence, so a failed
+        binding read must never be re-read as identity from any of them:
+        ``chmod`` needs only ownership, so the fenced process could make its OWN
+        binding record unreadable and come back as the ambient session with that
+        session's tool-policy exclusions and ``spawn_run`` identity. The probe
+        therefore maps to ``""`` (hard deny) for EVERY exception class,
+        ``PermissionError`` included. A host override that can tell an expected
+        sandbox deny (Seatbelt) from an induced one returns ``None`` for it —
+        that is the layer the distinction lives in.
+        """
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", STALE_KEY)
+        monkeypatch.setattr(mcp_caller, "_FROM_ENV_CACHE", None)
+
+        for exc in (PermissionError("seatbelt deny"), OSError(5, "EIO"), RuntimeError("bug")):
+
+            def _boom(_pid, _exc=exc, **_kw):
+                raise _exc
+
+            monkeypatch.setattr(mcp_caller, "_FROM_ENV_CACHE", None)
+            with patch(
+                "kiro_crew.member_memory_auth.protected_member_session_for_pid",
+                _boom,
+            ):
+                ctx = CallerContext.from_env()
+            assert ctx.session_key == "", f"{type(exc).__name__} fell through to env"
+            assert ctx.session_type == "protected-pid"
+
 
 # ---------------------------------------------------------------------------
 # _resolve_excluded_tools — the managed-tool-policy lookup
@@ -440,6 +473,32 @@ class TestToolPolicyReadsTheToken:
                 == "resolution_failed"
             )
 
+    def test_an_eperm_probe_is_resolution_failed_not_env_fallthrough(
+        self, cfg, monkeypatch, policy
+    ):
+        """``PermissionError`` from the probe is no different from any other raise.
+
+        A sandbox deny and a deny the fenced process induced on its own binding
+        record are indistinguishable HERE (``chmod`` needs only ownership), so
+        treating EPERM as absence would let the second one walk the resolver down
+        to ``KIROCREW_SESSION_KEY`` and inherit the ambient session's exclusions.
+        The resolver refuses instead; a host override that CAN tell the two apart
+        returns ``None`` for the expected deny.
+        """
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", STALE_KEY)
+        policy.policies[STALE_KEY] = ["stale_tool"]
+
+        def _deny(_pid, **_kw):
+            raise PermissionError(1, "Operation not permitted")
+
+        with patch("kiro_crew.member_memory_auth.protected_member_session_for_pid", _deny):
+            assert policy.resolve() == set()
+            assert (
+                mcp_shared._resolve_tool_policy(ignore_negative_cache=True).unresolved
+                == "resolution_failed"
+            )
+        assert policy.asked_keys() == []
+
     def test_a_failed_fetch_is_attributed_to_the_resolved_session(self, cfg, monkeypatch, policy):
         """The audit trail names the session the request was made for.
 
@@ -507,3 +566,121 @@ class TestDispatchLoopAuditAttribution:
         assert mcp_shared._ambient_audit_session() == STALE_KEY
         monkeypatch.delenv("KIROCREW_SESSION_KEY")
         assert mcp_shared._ambient_audit_session() == "mcp"
+
+
+# ---------------------------------------------------------------------------
+# A locally resolved key with no attestation fails closed without a futile dial
+# ---------------------------------------------------------------------------
+#
+# With no gateway caller block and no signed token, the only key left is the
+# unsigned ``session_pid_<pid>.txt`` read. The gateway answers a request under it
+# with ``409 member_identity_unavailable``, so the resolver must not dial; it
+# returns ``identity_unattestable``, a reason in ``_UNRESOLVED_REFUSES_CALL``, so
+# ``tools/call`` refuses (an unread operator exclusion is an unknown deny).
+
+LENIENT_KEY = "dashboard:chat-9-current"
+
+
+class _Body:
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw
+
+    def read(self) -> bytes:
+        return self._raw
+
+    def close(self) -> None:
+        pass
+
+
+def _refuse_unattested(req, timeout=None):
+    raise urllib.error.HTTPError(
+        url="",
+        code=409,
+        msg="unattested",
+        hdrs=None,
+        fp=_Body(b'{"code": "member_identity_unavailable"}'),
+    )
+
+
+@pytest.fixture
+def dialled(monkeypatch, tmp_path):
+    """A resolver primed to dial, recording every request it puts on the wire."""
+    monkeypatch.delenv(STUB_SESSION_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(mcp_shared, "_last_failure_time", 0.0)
+    monkeypatch.setattr(mcp_shared, "_last_startup_race_time", 0.0)
+    monkeypatch.setattr(mcp_shared, "_last_startup_race_key", "")
+    monkeypatch.setattr(mcp_shared, "_failure_count", 0)
+    mcp_shared._excluded_tools_by_session.clear()
+    monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda _x: (5476, "test"))
+    monkeypatch.setattr(mcp_shared, "read_local_secret", lambda _port: "test-secret")
+    monkeypatch.setattr(mcp_shared, "current_caller", lambda: None)
+    audit = MagicMock()
+    monkeypatch.setattr(mcp_shared, "sel", lambda: audit)
+    sent: list[dict] = []
+
+    def record(req, timeout=None):
+        sent.append(dict(req.headers))
+        return _refuse_unattested(req, timeout)
+
+    monkeypatch.setattr(mcp_shared, "loopback_urlopen", record)
+    yield audit, sent
+    mcp_shared._excluded_tools_by_session.clear()
+
+
+def test_a_locally_resolved_key_with_no_token_is_not_sent(monkeypatch, dialled):
+    """A lenient key, no token, no gateway caller: the key never reaches the wire.
+
+    That request can only ever be refused, so the resolver returns the fail-closed
+    ``identity_unattestable`` reason instead of dialling.
+    """
+    audit, sent = dialled
+    monkeypatch.setattr(mcp_shared, "_policy_session_key", lambda: LENIENT_KEY)
+    policy = mcp_shared._resolve_tool_policy()
+    assert policy.unresolved == "identity_unattestable"
+    # Fail CLOSED: a key resolved, so an operator exclusion may exist, and the
+    # reason must make ``tools/call`` refuse rather than silently widen it.
+    assert policy.unresolved in mcp_shared._UNRESOLVED_REFUSES_CALL
+    assert sent == [], "an unattestable key was put on the wire"
+    ops = [c.kwargs.get("operation") for c in audit.log_api_access.call_args_list]
+    assert "tool_policy.unattestable_key" in ops
+
+
+def test_a_locally_resolved_key_with_a_token_is_still_sent(monkeypatch, dialled):
+    """A signed token on the element makes the key attestable, so it is sent."""
+    audit, sent = dialled
+    monkeypatch.setattr(mcp_shared, "_policy_session_key", lambda: LENIENT_KEY)
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, "f" * 64)
+    monkeypatch.setattr(
+        "kiro_crew.session_token_sig.session_token_header",
+        lambda token="": {"X-Session-Token": "f" * 64},
+    )
+
+    def ok(req, timeout=None):
+        sent.append(dict(req.headers))
+        body = MagicMock()
+        body.read.return_value = b'{"exclude": []}'
+        body.__enter__ = MagicMock(return_value=body)
+        body.__exit__ = MagicMock(return_value=False)
+        return body
+
+    monkeypatch.setattr(mcp_shared, "loopback_urlopen", ok)
+    policy = mcp_shared._resolve_tool_policy()
+    assert policy.unresolved == ""
+    assert len(sent) == 1
+    assert sent[0].get("X-session-key") == LENIENT_KEY
+    assert sent[0].get("X-session-token") == "f" * 64
+
+
+def test_a_gateway_stamped_caller_without_a_token_is_still_sent(monkeypatch, dialled):
+    """A gateway-named caller is vouched for even with no per-call token, so it dials.
+
+    ``caller_session`` is the gateway's own per-call identity; the gateway already
+    named this caller, so the key is legitimate and the resolver must still ask under
+    it. Only a LOCALLY resolved key with no token is withheld.
+    """
+    audit, sent = dialled
+    policy = mcp_shared._resolve_tool_policy("dashboard:from-gateway")
+    # It dialled (and got the 409 refusal), so the key reached the wire.
+    assert len(sent) == 1
+    assert sent[0].get("X-session-key") == "dashboard:from-gateway"
+    assert policy.unresolved == "identity_unattested"

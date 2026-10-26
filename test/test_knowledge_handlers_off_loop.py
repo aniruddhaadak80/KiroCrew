@@ -49,6 +49,7 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.dashboard.handlers import knowledge as kh
 from kiro_crew.knowledge.store import _ON_LOOP_DB_GUARD, KnowledgeStore
 from kiro_crew.on_loop_db import OnLoopStoreError
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 @pytest.fixture()
@@ -92,7 +93,7 @@ def _make_app(store, *, embedder=None, pipeline=None):
         app["knowledge_embedder"] = embedder
     if pipeline is not None:
         app["knowledge_pipeline"] = pipeline
-    app["knowledge_llm_pool"] = MagicMock(shutdown=AsyncMock())
+    app["knowledge_fetch_pool"] = MagicMock(shutdown=AsyncMock())
     # No connector for any type, so add_source takes its generic https branch.
     app["knowledge_sync"] = MagicMock(get_connector=MagicMock(return_value=None))
 
@@ -419,22 +420,34 @@ class TestAuditRidesWithTheWrite:
     async def test_cancelling_the_caller_cannot_drop_a_committed_audit(self, store, monkeypatch):
         """The window the fix closes: cancel while the worker is mid-write."""
         started = threading.Event()
+        release = threading.Event()
+        audit_written = threading.Event()
         audited: list[str] = []
-        monkeypatch.setattr(kh, "_sel_log", lambda tool, **kw: audited.append(tool))
+
+        def _record(tool, **kw):
+            audited.append(tool)
+            audit_written.set()
+
+        monkeypatch.setattr(kh, "_sel_log", _record)
 
         def _slow_write():
             started.set()
-            threading.Event().wait(0.2)
+            # Held until the caller is cancelled, so the cancel provably lands
+            # while the worker is mid-write rather than after it returned.
+            release.wait(10.0)
 
         task = asyncio.ensure_future(
             kh._audited_write(_slow_write, event="item.update", fields={"item_id": "x"})
         )
-        await asyncio.to_thread(started.wait, 2.0)
+        assert await asyncio.to_thread(started.wait, 10.0), "the worker never started"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        # The worker cannot be interrupted, so it finished and audited.
-        await asyncio.to_thread(threading.Event().wait, 0.4)
+        assert audited == [], "the audit landed before the write finished"
+        release.set()
+        # The worker cannot be interrupted, so it finishes and audits. Waited on
+        # the audit itself: a fixed sleep raced the worker thread on loaded runners.
+        assert await asyncio.to_thread(audit_written.wait, 10.0), "the committed audit was dropped"
         assert audited == ["item.update"]
 
 
@@ -627,10 +640,9 @@ class TestTheProgressStampCannotDiscardAnUpload:
             resp = await self._upload(client)
             assert resp.status == 200, await resp.text()
             assert (await resp.json())["status"] == "processing"
-            for _ in range(200):
-                if pipeline.ingest_file.await_args is not None:
-                    break
-                await asyncio.sleep(0.01)
+            await async_wait_until(
+                lambda: pipeline.ingest_file.await_args is not None,
+            )
 
         assert present == [True], "the ingest never ran, or ran after the unlink"
         assert "error" not in stamped, "a failed UI hint was turned into a failed ingest"
@@ -658,10 +670,9 @@ class TestTheProgressStampCannotDiscardAnUpload:
         )
         async with TestClient(TestServer(_make_app(store, pipeline=pipeline))) as client:
             assert (await self._upload(client)).status == 200
-            for _ in range(200):
-                if pipeline.ingest_file.await_args is not None:
-                    break
-                await asyncio.sleep(0.01)
+            await async_wait_until(
+                lambda: pipeline.ingest_file.await_args is not None,
+            )
 
         assert order == ["stamp:syncing", "ingest"]
 
@@ -1050,12 +1061,8 @@ class TestCancellationFinalizesSyncStatus:
     """
 
     @staticmethod
-    async def _wait_until(predicate, timeout: float = 5.0) -> None:
-        for _ in range(int(timeout / 0.01)):
-            if predicate():
-                return
-            await asyncio.sleep(0.01)
-        raise AssertionError("condition never became true")
+    async def _wait_until(predicate) -> None:
+        await async_wait_until(predicate)
 
     @pytest.mark.asyncio
     async def test_cancelled_local_file_ingest_lands_in_error(self, store, tmp_path):
@@ -1072,7 +1079,7 @@ class TestCancellationFinalizesSyncStatus:
         task = asyncio.ensure_future(
             kh._ingest_local_file_task(pipeline, store, str(doc), source_id)
         )
-        await asyncio.wait_for(started.wait(), 5.0)
+        await await_until(started)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1093,7 +1100,7 @@ class TestCancellationFinalizesSyncStatus:
                 source_id, "https://example.com/x", "x", store, MagicMock(), MagicMock()
             )
         )
-        await asyncio.wait_for(started.wait(), 5.0)
+        await await_until(started)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1120,7 +1127,7 @@ class TestCancellationFinalizesSyncStatus:
             resp = await client.post("/api/knowledge/ingest", data=form)
             assert resp.status == 200, await resp.text()
             source_id = (await resp.json())["source_id"]
-            await asyncio.wait_for(started.wait(), 5.0)
+            await await_until(started)
             task = next(t for t in app["_bg_tasks"] if not t.done())
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1223,7 +1230,7 @@ class TestCancellationFinalizesSyncStatus:
                 source_id, "https://example.com/x", "x", store, MagicMock(), MagicMock()
             )
         )
-        await asyncio.wait_for(started.wait(), 5.0)
+        await await_until(started)
         monkeypatch.setattr(kh, "_finalize_sync_status_write", _boom_write)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1418,3 +1425,130 @@ class TestCancellationFinalizesSyncStatus:
             store, source_id, "error", from_statuses=("syncing", "pending")
         )
         assert await asyncio.to_thread(_sync_status, store, source_id) == "synced"
+
+
+class TestAgentSyncStagesThePageOffTheLoop:
+    """``_background_agent_sync`` stages the fetched page in a temp file for
+    ``ingest_file``. A page has no size bound here, so its create, write and
+    unlink run in a worker thread, and the file is named before the worker
+    starts so a cancel during the write cannot leave it behind.
+
+    Each test hooks ``os.open`` for the staged name only, so it observes the
+    create wherever it runs."""
+
+    @staticmethod
+    def _wire(monkeypatch, tmp_path, page: str, on_open) -> None:
+        import os
+
+        real_open = os.open
+
+        def _open(path, flags, *args, **kwargs):
+            if os.path.basename(os.fspath(path)).startswith("agent_sync_"):
+                return on_open(real_open, path, flags, *args, **kwargs)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        monkeypatch.setattr(os, "open", _open)
+        monkeypatch.setattr(kh, "fetch_url_content", AsyncMock(return_value=page))
+
+    @staticmethod
+    def _staged(tmp_path) -> list[str]:
+        return sorted(p.name for p in tmp_path.glob("agent_sync_*"))
+
+    @pytest.mark.asyncio
+    async def test_the_page_is_written_and_removed_off_the_loop(self, store, monkeypatch, tmp_path):
+        import os
+
+        source_id = await asyncio.to_thread(_seed_source, store)
+        loop_thread = threading.get_ident()
+        opens: list[int] = []
+        unlinks: list[int] = []
+        real_unlink = pathlib.Path.unlink
+
+        def _on_open(real_open, *args, **kwargs):
+            opens.append(threading.get_ident())
+            return real_open(*args, **kwargs)
+
+        def _unlink(self, *args, **kwargs):
+            if self.name.startswith("agent_sync_"):
+                unlinks.append(threading.get_ident())
+            return real_unlink(self, *args, **kwargs)
+
+        self._wire(monkeypatch, tmp_path, "# hello agent\n", _on_open)
+        monkeypatch.setattr(pathlib.Path, "unlink", _unlink)
+        seen: dict = {}
+
+        async def _ingest(path, **_kw):
+            staged = pathlib.Path(path)
+            seen["parent"] = staged.parent
+            seen["text"] = await asyncio.to_thread(staged.read_text)
+            seen["mode"] = (await asyncio.to_thread(staged.stat)).st_mode & 0o777
+
+        pipeline = MagicMock(ingest_file=AsyncMock(side_effect=_ingest))
+
+        await kh._background_agent_sync(
+            source_id, "https://example.com/x", "x", store, pipeline, MagicMock()
+        )
+
+        assert seen["text"] == "# hello agent\n"
+        assert seen["parent"] == tmp_path
+        if os.name == "posix":
+            assert seen["mode"] == 0o600, "the staged page must stay owner-only"
+        assert len(opens) == 1 and loop_thread not in opens, "the create ran on the loop"
+        assert len(unlinks) == 1 and loop_thread not in unlinks, "the unlink ran on the loop"
+        assert self._staged(tmp_path) == []
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "synced"
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_during_the_write_leaves_no_file(self, store, monkeypatch, tmp_path):
+        """The worker outlives the cancel and still creates the file, so the
+        finally drains it before the unlink; the row still lands in 'error'."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _slow_open(real_open, *args, **kwargs):
+            entered.set()
+            release.wait(5.0)
+            return real_open(*args, **kwargs)
+
+        self._wire(monkeypatch, tmp_path, "# page\n", _slow_open)
+        pipeline = MagicMock(ingest_file=AsyncMock())
+        task = asyncio.ensure_future(
+            kh._background_agent_sync(
+                source_id, "https://example.com/x", "x", store, pipeline, MagicMock()
+            )
+        )
+        await async_wait_until(entered.is_set)
+        task.cancel()
+        # Queued behind the task's cancel wakeup, so the finally has started
+        # before the worker is let go.
+        asyncio.get_running_loop().call_soon(release.set)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert self._staged(tmp_path) == [], "the cancelled write orphaned its file"
+        pipeline.ingest_file.assert_not_awaited()
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_removes_the_created_file(self, store, monkeypatch, tmp_path):
+        """The create lands and the write then fails: the file is still removed."""
+        import os
+
+        source_id = await asyncio.to_thread(_seed_source, store)
+
+        def _full_disk(real_open, *args, **kwargs):
+            os.close(real_open(*args, **kwargs))
+            raise OSError(28, "No space left on device")
+
+        self._wire(monkeypatch, tmp_path, "# a page the disk cannot hold\n", _full_disk)
+        pipeline = MagicMock(ingest_file=AsyncMock())
+
+        await kh._background_agent_sync(
+            source_id, "https://example.com/x", "x", store, pipeline, MagicMock()
+        )
+
+        assert self._staged(tmp_path) == [], "the created file was left behind"
+        pipeline.ingest_file.assert_not_awaited()
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"

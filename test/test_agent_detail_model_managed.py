@@ -267,6 +267,11 @@ async def test_a_skills_patch_keeps_a_uri_a_concurrent_writer_added(tmp_path):
 
     with (
         patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path),
+        # Isolate the mate scope (``_agent_detail_candidates``'s second walked
+        # root) from whatever this machine's real ``~/.kiro/mates/agents/``
+        # holds; without this an unrelated file there would add extra
+        # ``_read_agent_spec`` calls and desync the ``calls["n"] == 2`` race.
+        patch("kiro_crew.config.paths.mate_agents_dir", lambda: tmp_path / "mates-empty"),
         patch("kiro_crew.dashboard.handlers.agents._read_agent_spec", side_effect=racing_read),
         patch(
             "kiro_crew.dashboard.handlers.agents.apply_skill_mapping",
@@ -358,3 +363,55 @@ async def test_a_resource_change_over_a_malformed_fresh_value_does_not_split_it(
     assert not (
         isinstance(landed, list) and any(len(r) == 1 for r in landed)
     ), f"a malformed value was split into characters: {landed!r}"
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 / Opus 5.5 F2 (security): the dashboard PATCH re-records the
+# dashboard-author ownership digest only for a PRE-confirmed managed spec, so a
+# routine edit does not freeze it against a tightened ceiling, and a user file
+# at the stem is never stamped managed.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_patch_renews_digest_for_a_confirmed_dashboard_author(tmp_path):
+    """A model edit on the managed dashboard-author spec rewrites its bytes. The PATCH must
+    re-record the ownership digest to match -- otherwise the next rebuild sees a mismatch,
+    stops re-filtering the spec's grants against a tightened ceiling, and reports success
+    anyway. The pre-edit file is our confirmed managed write, so the renewal fires."""
+    name = "kirocrew-dashboard-author"
+    cfg = tmp_path / f"{name}.json"
+    spec = {"name": name, "model": "claude-old", "mcpServers": {"kirocrew-core": {}}}
+    cfg.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    # Record the digest of exactly these bytes -> the pre-edit file is confirmed ours.
+    agent_state.set_managed_digest(name, agent_state.spec_digest(spec))
+
+    request = _patch_request(name, {"model": "claude-new"})
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    written = json.loads(cfg.read_text(encoding="utf-8"))
+    # The digest was renewed to the WRITTEN bytes -> the file still confirms as ours.
+    assert agent_state.get_managed_digest(name) == agent_state.spec_digest(written)
+
+
+@pytest.mark.asyncio
+async def test_patch_does_not_stamp_a_user_file_at_the_dashboard_author_stem(tmp_path):
+    """A user authored their own spec at the once-user-creatable stem (NO recorded digest).
+    A PATCH that edits it must NOT record the managed digest for the user's bytes -- doing
+    so would make the next rebuild overwrite their charter. The renewal is gated on the
+    pre-edit content already being our confirmed managed write."""
+    name = "kirocrew-dashboard-author"
+    cfg = tmp_path / f"{name}.json"
+    user = {"name": name, "model": "claude-old", "prompt": "the user's own charter"}
+    cfg.write_text(json.dumps(user, indent=2) + "\n", encoding="utf-8")
+    assert agent_state.get_managed_digest(name) is None  # user file, no record
+
+    request = _patch_request(name, {"model": "claude-new"})
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    # No digest recorded for the user's bytes -> the file is still NOT ours.
+    assert agent_state.get_managed_digest(name) is None

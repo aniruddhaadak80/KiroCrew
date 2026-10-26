@@ -117,9 +117,8 @@ TMPFS_EVENT_PCT = 80.0
 LOAD_EVENT_FACTOR = 2.0
 
 #: Config files watched for a rewrite. METADATA ONLY — ``stat`` never opens the
-#: file, which is what keeps ``.env`` (a credential store) inside the rule that
-#: fenced files are metadata, never bytes.
-# Watched for metadata only, never opened. ``.env`` is deliberately absent: the
+#: file.
+# ``.env`` is deliberately absent: the
 # sandbox hides it in every mode, and its size and modification time sitting in an
 # agent-readable diagnostic leaf would describe a file the mask exists to keep out
 # of reach, including when its secrets were last rotated.
@@ -148,27 +147,6 @@ def _pinned_dir_fd_supported() -> bool:
         and os.unlink in getattr(os, "supports_dir_fd", set())
         and os.listdir in getattr(os, "supports_fd", set())
     )
-
-
-def _is_link_or_reparse_point(path: Path) -> bool:
-    """Whether *path* is a link or a reparse point, judged without following it.
-
-    ``os.lstat`` describes the entry itself, so a planted symlink, directory
-    junction or other reparse point is reported as one rather than as whatever it
-    points at. An absent path is not a link — the append is free to create it.
-    Metadata that cannot be read at all is treated as a link, because a write
-    whose target is unknown is the case this guard exists to refuse.
-    """
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    if stat.S_ISLNK(st.st_mode):
-        return True
-    attributes = getattr(st, "st_file_attributes", 0)
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
 def _finite(number: float, field: str) -> float:
@@ -378,7 +356,9 @@ def _read_self_process(procfs: Path) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - a probe failure is a null field, not an error
         logger.debug("diag: rss probe failed", exc_info=True)
     try:
-        for line in (procfs / "self" / "status").read_text(encoding="utf-8").splitlines():
+        # ``Name:`` is the raw comm, which need not be UTF-8; ``Threads:`` is ASCII.
+        status = (procfs / "self" / "status").read_text(encoding="utf-8", errors="replace")
+        for line in status.splitlines():
             key, _, rest = line.partition(":")
             if key == "Threads":
                 out["threads"] = int(rest.strip())
@@ -419,6 +399,7 @@ def _read_posture() -> dict[str, Any]:
             "slice_tasks_limit": status.slice_tasks_limit,
             "slice_tasks_own": status.slice_tasks_own,
             "slice_tasks_tight": status.slice_tasks_tight,
+            "memory_pressure_level": status.memory_pressure_level,
         }
     except Exception:  # noqa: BLE001
         logger.debug("diag: posture probe failed", exc_info=True)
@@ -433,6 +414,7 @@ def _read_posture() -> dict[str, Any]:
             "slice_tasks_limit": None,
             "slice_tasks_own": None,
             "slice_tasks_tight": None,
+            "memory_pressure_level": None,
         }
 
 
@@ -609,7 +591,9 @@ class Recorder:
 
     def _prepare_directory(self) -> bool:
         try:
-            self._dir().mkdir(parents=True, exist_ok=True)
+            from kiro_crew.owner_only_files import ensure_directory
+
+            ensure_directory(self._dir())  # 0700 in the data home
         except OSError:
             logger.warning("diag recorder cannot create its directory; disabling", exc_info=True)
             return False
@@ -920,8 +904,8 @@ class Recorder:
         way to replace a config file is write-a-temp-then-rename, which can land
         inside one mtime granule: comparing mtime alone would miss exactly the
         rewrite that a careful writer performs. No file is opened, so this stays
-        inside the rule that fenced files are metadata and never bytes — which
-        matters most for ``.env``.
+        inside the rule that fenced files are metadata and never bytes.
+        ``.env`` is not in :data:`WATCHED_CONFIG_FILES` at all.
         """
         try:
             base = self._config_dir()

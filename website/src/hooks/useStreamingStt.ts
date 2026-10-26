@@ -5,6 +5,9 @@ import { streamErrorMessage } from '../lib/sttProviders'
 import type { SttModelProgress } from '../lib/sttProviders'
 import { joinTranscript } from '../lib/dictationText'
 import { i18nT } from '../i18n/t'
+import { MAX_TIMER_DELAY_MS } from '../utils/timerDelay'
+import { withBase } from '@/lib/basePath'
+import { dispatchMcNotification, DICTATION_STOPPED_KIND } from './notificationEvent'
 
 /**
  * Streaming STT over `/api/ws/stt`.
@@ -45,7 +48,6 @@ const PREPARE_TIMEOUT_FALLBACK_MS = 300000
 // Older gateways omit their finalization budget. Give their default five-minute
 // native decode ceiling a little transport/cleanup headroom.
 const DEFAULT_FINAL_TIMEOUT_MS = 315000
-const MAX_TIMER_DELAY_MS = 2147483647
 // 16 kHz mono Int16: retain a preparation window of speech before auto-stopping.
 const MAX_BUFFERED_BYTES = (READY_TIMEOUT_MS / 1000) * 16000 * 2
 const WORKLET_FLUSH_TIMEOUT_MS = 500
@@ -357,6 +359,7 @@ export function useStreamingStt ({ onPartial, onFinal, onCaptureStop, onError, o
           // failed session has no finals to deliver -- from clearing the one
           // explanation the user got.
           reportedError = true
+          if (!captureStoppedRef.current) dispatchMcNotification(DICTATION_STOPPED_KIND)
           onErrorRef.current?.(
             streamErrorMessage(String(msg.code || ''), String(msg.message || '')) ||
             i18nT('hooks.useStreamingStt.stt_error'),
@@ -435,8 +438,9 @@ export function useStreamingStt ({ onPartial, onFinal, onCaptureStop, onError, o
       // Finals commit earlier utterances; a last partial belongs to the next
       // unfinished utterance and must survive an interrupted connection too.
       const combined = joinTranscript([...finalsRef.current, lastPartial])
-      if (!captureStoppedRef.current && !reportedError) {
-        onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_lost'))
+      if (!captureStoppedRef.current) {
+        dispatchMcNotification(DICTATION_STOPPED_KIND)
+        if (!reportedError) onErrorRef.current?.(i18nT('hooks.useStreamingStt.stt_connection_lost'))
       }
       if (combined) onFinalRef.current(combined)
       else onPartialRef.current('')  // clear any dangling partial when nothing transcribed
@@ -454,11 +458,18 @@ export function useStreamingStt ({ onPartial, onFinal, onCaptureStop, onError, o
 
     const ctx = new AudioContext()
     ctxRef.current = ctx
+    // The two startup failures below get different messages because the user
+    // does something different about each. This one is a download: the module
+    // comes from the dashboard server, so the connection is what to check.
     try {
-      await ctx.audioWorklet.addModule('/pcm-worklet.js')
+      await ctx.audioWorklet.addModule(withBase('/pcm-worklet.js'))
     } catch {
-      if (sessionRef.current === session && !session.cancelled) {
-        onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_worklet_unavailable'))
+      // `ctxRef.current !== ctx` means cleanup() already closed this context: the
+      // socket ended first (its own handler reported why), and closing the
+      // context is what rejected the pending load. Reporting a download failure
+      // then would replace the real cause with "check your connection".
+      if (sessionRef.current === session && !session.cancelled && ctxRef.current === ctx) {
+        onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_module_load_failed'))
         cleanup()
       }
       return false
@@ -467,11 +478,15 @@ export function useStreamingStt ({ onPartial, onFinal, onCaptureStop, onError, o
       void ctx.close()
       return false
     }
+    // The module is loaded by now, so a refusal here is the browser declining to
+    // start audio processing, which an autoplay rule does to a context resumed
+    // outside a user gesture. A fresh press is a fresh gesture, so the message
+    // sends the user back to dictate again rather than to the connection.
     try {
       if (ctx.state === 'suspended') await ctx.resume()
     } catch {
       if (sessionRef.current === session) {
-        onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_worklet_unavailable'))
+        onErrorRef.current?.(i18nT('hooks.useStreamingStt.audio_start_failed'))
         cleanup()
       }
       return false
@@ -520,7 +535,10 @@ export function useStreamingStt ({ onPartial, onFinal, onCaptureStop, onError, o
       }
       buffer.push(chunk)
       bufferedBytes += chunk.byteLength
-      if (bufferedBytes >= MAX_BUFFERED_BYTES && !captureStoppedRef.current) stop()
+      if (bufferedBytes >= MAX_BUFFERED_BYTES && !captureStoppedRef.current) {
+        dispatchMcNotification(DICTATION_STOPPED_KIND)
+        stop()
+      }
     }
     source.connect(node)
     // The processor writes no output samples (silence). Connecting that silent

@@ -1,4 +1,4 @@
-"""Tests for the prepare-pr preflight.py write-permission gate.
+"""Tests for the kirocrew-prepare-pr preflight.py write-permission gate.
 
 The gate closes a stranding failure mode: a comment/issue-triggered agent run
 does all its work (clone, plan, implement, test, review, commit) and only
@@ -45,6 +45,7 @@ import time
 from pathlib import Path
 
 import pytest
+from git_maintenance_helpers import GIT_MAINTENANCE_OFF_CONFIG, git_maintenance_off_entries
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
 
@@ -55,7 +56,7 @@ PREFLIGHT = str(
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "scripts"
     / "preflight.py"
 )
@@ -91,6 +92,8 @@ def _fixture_git_env() -> dict[str, str]:
             "GIT_CONFIG_VALUE_0": "",
         }
     )
+    # Last, so the entry lands after the GIT_CONFIG_COUNT this helper set.
+    env.update(git_maintenance_off_entries(env))
     return env
 
 
@@ -118,6 +121,9 @@ def _repo_pair_template(tmp_path_factory) -> tuple[str, str]:
     os.makedirs(origin_dir)
     _git(origin_dir, "init", "--bare")
     _git(origin_dir, "symbolic-ref", "HEAD", "refs/heads/main")
+    # A push starts receive-pack here without our env (see git_maintenance_helpers).
+    for key, value in GIT_MAINTENANCE_OFF_CONFIG:
+        _git(origin_dir, "config", key, value)
 
     _git(str(root), "clone", origin_dir, "work")
     _git(clone_dir, "checkout", "-b", "main")
@@ -128,6 +134,14 @@ def _repo_pair_template(tmp_path_factory) -> tuple[str, str]:
     _git(clone_dir, "push", "-u", "origin", "main")
 
     return clone_dir, origin_dir
+
+
+def test_the_template_origin_keeps_auto_maintenance_off(_repo_pair_template) -> None:
+    # A push into a copy starts receive-pack there without the fixture env, so
+    # only the origin's own config keeps it from starting auto maintenance.
+    _, template_origin = _repo_pair_template
+    for key, value in GIT_MAINTENANCE_OFF_CONFIG:
+        assert (key, _git(template_origin, "config", "--local", "--get", key)) == (key, value)
 
 
 @pytest.fixture
@@ -722,6 +736,7 @@ class TestProbeTimeout:
         rc 124 - the call returns promptly instead of blocking on the child."""
         monkeypatch.chdir(tmp_path)
         mod = _preflight_module()
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(tmp_path))
         start = time.monotonic()
         rc, out, err = mod.run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
         elapsed = time.monotonic() - start
@@ -729,10 +744,22 @@ class TestProbeTimeout:
         assert "timed out" in err
         assert elapsed < 15, "run() blocked on the hanging child instead of killing it"
 
+    def test_a_call_without_a_bound_gets_the_git_bound(self, tmp_path, monkeypatch):
+        """gh auth status, gh pr view and the rev-list pass no timeout; none is unbounded."""
+        monkeypatch.chdir(tmp_path)
+        mod = _preflight_module()
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(tmp_path))
+        monkeypatch.setattr(mod, "GIT_TIMEOUT_S", 1)
+        start = time.monotonic()
+        rc, _, err = mod.run([sys.executable, "-c", "import time; time.sleep(30)"])
+        assert rc == 124 and "timed out" in err
+        assert time.monotonic() - start < 15
+
     def test_run_without_timeout_expiry_passes_through(self, tmp_path, monkeypatch):
         """A subprocess that finishes inside the bound is unaffected."""
         monkeypatch.chdir(tmp_path)
         mod = _preflight_module()
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(tmp_path))
         rc, out, err = mod.run([sys.executable, "-c", "print('ok')"], timeout=30)
         assert rc == 0
         assert out == "ok"
@@ -848,8 +875,20 @@ class TestBatchLauncherGuard:
 
     @pytest.mark.parametrize("arg", ["a&b", "a|b", "a%PATH%b", 'x"y', "a\r\nb"])
     def test_metachar_arg_refused_for_cmd_launcher(self, tmp_path, monkeypatch, arg):
+        """The launcher sits OUTSIDE the fenced working tree, so the batch
+        metacharacter guard - not the working-tree fence one check earlier -
+        is what refuses it.  ``tmp_path`` may itself lie inside a git checkout
+        (a ``TMPDIR`` pinned under the repo), so the fence root is pinned at
+        the seam ``run()`` reads to a sibling that is not the fake's ancestor
+        rather than left to the host's ``git rev-parse``."""
+        work = tmp_path / "clone"
+        work.mkdir()
+        monkeypatch.chdir(work)
         mod = self._preflight_module()
-        fake = tmp_path / "gh.cmd"
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(work))
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "gh.cmd"
         fake.write_text("@echo off\r\n", encoding="utf-8")
         monkeypatch.setattr(mod.shutil, "which", lambda name: str(fake))
         rc, out, err = mod.run(["gh", arg])
@@ -859,6 +898,7 @@ class TestBatchLauncherGuard:
     def test_clean_args_pass_for_non_batch_target(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         mod = self._preflight_module()
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(tmp_path))
         rc, out, err = mod.run([sys.executable, "-c", "print('ok')"])
         assert rc == 0
         assert out == "ok"
@@ -923,6 +963,7 @@ class TestBatchLauncherGuard:
         work = tmp_path / "clone"
         work.mkdir()
         monkeypatch.chdir(work)
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(work))
         rc, out, err = mod.run([sys.executable, "-c", "print('ok')"])
         assert rc == 0
         assert out == "ok"

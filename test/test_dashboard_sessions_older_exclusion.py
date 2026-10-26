@@ -65,6 +65,7 @@ def _make_request(
     state._slots = slots or {}
 
     request = MagicMock(spec=web.Request)
+    request.get = {}.get  # the dashboard user: no app claim
     request.app = {"state": state}
     request.query = query or {}
     return request
@@ -366,10 +367,10 @@ async def test_user_only_keeps_a_taskrunner_row_as_the_declared_residual() -> No
 
 @pytest.mark.asyncio
 async def test_user_only_drops_the_workflow_siblings_the_registry_never_listed() -> None:
-    """``wf-unpooled``, ``wf-worker`` and ``wf-scope`` are minted as session keys but
-    are absent from ``_TELEMETRY_LOCAL_PREFIXES``, so a filter derived from that
-    registry silently missed them. The literal list is what closes that gap, and
-    ``_in_namespace`` requires a separator so ``wf`` cannot swallow its own siblings.
+    """``wf-unpooled`` and ``wf-worker`` are minted as session keys and are absent from
+    ``_TELEMETRY_LOCAL_PREFIXES``, so a filter derived from that registry cannot see
+    them. The literal list is what closes that gap, and ``_in_namespace`` requires a
+    separator so ``wf`` cannot swallow its own siblings.
     """
     sessions = [
         {"key": "wf_run7_1"},
@@ -377,7 +378,6 @@ async def test_user_only_drops_the_workflow_siblings_the_registry_never_listed()
         {"key": "wf-unpooled_run7_2"},
         {"key": "wf-worker_run7_a1b2"},
         {"key": "wf-author_run7_a1"},
-        {"key": "wf-scope_run7"},
         {"key": "dashboard_chat-1"},
     ]
     request = _make_request(sessions, query={"user_only": "1"})
@@ -386,3 +386,39 @@ async def test_user_only_drops_the_workflow_siblings_the_registry_never_listed()
 
     assert _keys(body) == ["dashboard_chat-1"]
     assert body["total"] == 1
+
+
+def _real_request(log: ConversationLog, query: dict[str, str]) -> web.Request:
+    """A request over a REAL log, so ``list_sessions`` and ``has_messages`` read files."""
+    state = MagicMock()
+    state.conversation_log = log
+    state._slots = {}
+    request = MagicMock(spec=web.Request)
+    request.get = {}.get  # the dashboard user: no app claim
+    request.app = {"state": state}
+    request.query = query
+    return request
+
+
+@pytest.mark.asyncio
+async def test_user_only_drops_a_never_used_session(tmp_path) -> None:
+    """A tab closed before its first message leaves only a metadata line.
+
+    The pane showed it under its storage key (``dashboard_chat-3-<ts>``), and
+    opening it showed nothing. A titled empty session and an untitled one with
+    rows both stay: only "no title and no rows" is dropped.
+    """
+    log = ConversationLog(base_dir=tmp_path)
+    log.update_metadata("dashboard:chat-3-1790874654", {"agent": "kirocrew"})
+    log.update_metadata("dashboard:named", {"title": "Planning"})
+    log.append("dashboard:used", "user", "hello")
+    log.append("dashboard:reply-only", "assistant", "a cron-style reply")
+    log.update_metadata("dashboard:reply-only", {"agent": "kirocrew"})
+
+    body = await _call(_real_request(log, {"user_only": "1"}))
+
+    assert sorted(_keys(body)) == ["dashboard_named", "dashboard_reply-only", "dashboard_used"]
+    assert body["total"] == 3
+
+    full = await _call(_real_request(log, {}))
+    assert "dashboard_chat-3-1790874654" in _keys(full), "the full inventory must still list it"

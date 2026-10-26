@@ -52,6 +52,7 @@ from kiro_crew.messaging.inbound_spool import (
 )
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.session_allocation import SessionClosingError
+from kiro_crew.testing.wait import async_wait_until
 
 # ── Pipeline stand-ins, mirroring test_messaging_dispatch.py ──────────────────
 
@@ -65,7 +66,7 @@ class _Sessions:
         self.successes = 0
         self.failures = 0
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         return object(), False, False
 
     def begin_turn(self, key):
@@ -215,7 +216,8 @@ def _spool(path: Path, **kw: Any) -> SpooledInbound:
 def test_every_shared_channel_turn_declares_an_inbound_route() -> None:
     root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
     calls: list[tuple[Path, ast.Call]] = []
-    for path in root.glob("*/transport_dispatch.py"):
+    # A channel's dispatcher includes the owners beside its facade (``transport_dispatch_*``).
+    for path in [*root.glob("*/transport_dispatch.py"), *root.glob("*/transport_dispatch_*.py")]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         calls.extend(
             (path, node)
@@ -1210,10 +1212,10 @@ def test_a_cancelled_refusal_handler_still_lands_the_write(spool_home: Path) -> 
             assert not spool_home.exists(), "the write had not been released yet"
             release.set()
             # Let the shielded inner task finish before the loop closes.
-            for _ in range(50):
-                if spool_home.exists() and S.pending_refusal_write_count() == 0:
-                    break
-                await asyncio.sleep(0.02)
+            await async_wait_until(
+                lambda: spool_home.exists() and S.pending_refusal_write_count() == 0,
+                describe=lambda: f"{S.pending_refusal_write_count()} write(s) still pending",
+            )
             assert S.pending_refusal_write_count() == 0
         finally:
             S.record_refusal_sync = real_sync  # type: ignore[assignment]
@@ -1364,7 +1366,7 @@ def test_the_spool_root_exists_before_a_mask_has_to_bind_over_it(
     """A mask over an absent name is no mask, and this store is created on first write.
 
     ``mount(2)`` cannot cover a path that does not exist and the launcher's
-    ``SENSITIVE_DIRS`` loop is guarded on ``isdir``, so on a host where no inbound
+    ``sensitive_dirs`` loop is guarded on ``isdir``, so on a host where no inbound
     message has been refused the spool root is skipped and every sandbox spawned
     first runs with the name unmasked. That sandbox can create the directory itself
     and leave an entry the gateway reads on the next start and quotes as the

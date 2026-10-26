@@ -13,6 +13,7 @@ the managed-venv step-up staying exactly as it was.
 from __future__ import annotations
 
 import json
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -405,6 +406,48 @@ class TestStatusAndDecline:
         assert update_stepup.read_pending() is not None
 
 
+@pytest.mark.asyncio
+class TestReleaseChannelReadOffTheLoop:
+    """The floor check's channel read is a file read; it must not run on the loop.
+
+    ``release_channel()`` reads ``<data home>/channel``. The arm-status route is
+    the About panel's poll, so an inline read stalls the loop once per poll.
+    """
+
+    @pytest.fixture()
+    def channel_reads(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        reads: list[int] = []
+
+        def _tracked_read() -> str:
+            reads.append(threading.get_ident())
+            return "stable"
+
+        monkeypatch.setattr(updates, "_release_channel", _tracked_read)
+        return reads
+
+    async def test_arm_reads_the_channel_off_the_loop(self, packaged, channel_reads) -> None:
+        loop_thread = threading.get_ident()
+        resp = await updates._arm_packaged_app(_request({"version": "0.6.0"}))
+        assert resp.status == 200
+        assert channel_reads, "the floor check must still resolve the channel"
+        assert loop_thread not in channel_reads, "the channel read ran on the event loop"
+
+    async def test_status_reads_the_channel_off_the_loop(self, packaged, channel_reads) -> None:
+        packaged.arm(target_version="0.6.0", requested_by="chat-1")
+        loop_thread = threading.get_ident()
+        resp = await updates.api_update_arm_status(_request())
+        assert json.loads(resp.body.decode())["armed"] is True
+        assert channel_reads, "the floor re-check must still resolve the channel"
+        assert loop_thread not in channel_reads, "the channel read ran on the event loop"
+
+    async def test_no_version_skips_the_channel_read(self, packaged, channel_reads) -> None:
+        """No target version means no floor check, so no read at all."""
+        await updates._arm_packaged_app(_request({}))
+        packaged.arm(target_version="", requested_by="chat-1")
+        await updates.api_update_arm_status(_request())
+        assert channel_reads == []
+
+
 class TestAgentReachability:
     def test_arm_is_mixed_so_an_agent_can_present_the_secret(self) -> None:
         """The agent entry point must be reachable by an agent.
@@ -447,3 +490,72 @@ class TestCliApprove:
         cli_server._update_approve()
         out = capsys.readouterr().out
         assert "Settings" in out and "About" in out
+
+    def test_approval_goes_over_the_socket_and_never_falls_back_to_tcp(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The nonce + secret ride the unix socket, and a stale socket is fatal.
+
+        The approval request carries BOTH the single-use nonce and the local
+        secret, so a TCP retry when the socket is stale could hand both to a
+        foreign process holding the loopback port. This proves the opener is the
+        no-fallback ``unix_socket_urlopen`` (not ``loopback_urlopen``): when the
+        socket raises a stale-connect error, the CLI reports the gateway as not
+        running rather than reaching for TCP.
+        """
+        import socket as _socket
+        import time
+        import urllib.error
+
+        from kiro_crew import cli_server
+        from kiro_crew.platform import update_capability, update_stepup
+
+        if not hasattr(_socket, "AF_UNIX"):
+            pytest.skip("no AF_UNIX on this platform")
+
+        monkeypatch.setattr(update_capability, "derive_capability", _wheel_capability)
+        monkeypatch.setattr(
+            update_stepup,
+            "read_pending",
+            lambda: update_stepup.PendingUpdate(
+                request_id="rid",
+                nonce="n0nce",
+                version="9.9.9",
+                channel="stable",
+                created_at=time.time(),
+            ),
+        )
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 7777)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port, **_kw: "sekret")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.urls.dashboard_socket_path", lambda _port: "/run/gw.sock"
+        )
+        # The socket file is PRESENT (bound) but goes stale at connect time: the
+        # path exists, so the socket branch is taken, and the stale-connect error
+        # is fatal rather than retried over TCP.
+        monkeypatch.setattr(cli_server.os.path, "exists", lambda _p: True)
+
+        tcp_calls: list[object] = []
+        monkeypatch.setattr(
+            cli_server,
+            "loopback_urlopen",
+            lambda *a, **k: tcp_calls.append((a, k)),
+        )
+        monkeypatch.setattr(
+            cli_server,
+            "tcp_verified_urlopen",
+            lambda *a, **k: tcp_calls.append((a, k)),
+        )
+
+        def stale_socket(_req, _timeout, *, socket_path, verify_peer=None):
+            raise urllib.error.URLError(FileNotFoundError(socket_path))
+
+        monkeypatch.setattr(cli_server, "unix_socket_urlopen", stale_socket)
+
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_approve()
+
+        assert exc.value.code == 1
+        assert tcp_calls == [], "a stale socket must not fall back to TCP with the nonce+secret"
+        out = capsys.readouterr().out
+        assert "not running" in out

@@ -492,7 +492,11 @@ class TestOutboundRest:
 
         monkeypatch.setattr(client, "_api", _api)
         assert await client.edit_message_components("c1", "m1", []) is True
-        assert calls[0] == ("PATCH", "/channels/c1/messages/m1", {"components": []})
+        assert calls[0] == (
+            "PATCH",
+            "/channels/c1/messages/m1",
+            {"components": [], "flags": 4},
+        )
 
     @pytest.mark.asyncio
     async def test_create_dm_channel_success_and_failure(
@@ -731,6 +735,46 @@ class TestRunConnection:
         assert session.ws_urls == [_GATEWAY_URL]
         assert session.ws_kwargs[0]["max_msg_size"] == 0
         assert session.ws_kwargs[0]["heartbeat"] == dc._WS_HEARTBEAT_SECS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad",
+        ["not json {oops secret-ish", "[]", "5", "null", '"a string"'],
+        ids=["unparseable", "list", "number", "null", "string"],
+    )
+    async def test_bad_text_frame_is_dropped_and_the_connection_keeps_reading(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        bad: str,
+    ) -> None:
+        # One bad TEXT frame must cost that frame, not the connection: the
+        # gateway loop's catch-all would otherwise reconnect, re-identify
+        # and stall 5 s. The frame after it must still be dispatched.
+        client = _make_client()
+        ws = FakeWS(
+            [
+                _WSMessage(aiohttp.WSMsgType.TEXT, bad),
+                _WSMessage(aiohttp.WSMsgType.TEXT, json.dumps({"op": _OP_HEARTBEAT_ACK})),
+                _WSMessage(aiohttp.WSMsgType.CLOSED),
+            ],
+            close_code=1000,
+        )
+        _bind_session(client, FakeSession(ws=ws), monkeypatch)
+        client._hb_acked = False
+
+        with caplog.at_level(logging.WARNING, logger=dc.logger.name):
+            try:
+                await client._run_connection()
+            except Exception as exc:
+                pytest.fail(f"a bad frame escaped the read loop: {type(exc).__name__}")
+
+        assert client._hb_acked is True
+        dropped = [r for r in caplog.records if "dropping" in r.getMessage()]
+        assert len(dropped) == 1
+        # Only safe metadata is logged, never the frame body.
+        assert "secret-ish" not in caplog.text
+        assert "a string" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_resume_url_is_preferred_when_a_session_exists(
@@ -1520,11 +1564,15 @@ class TestMentionSuppression:
         await client.send_message_with_files("c1", "@here look", [payload_file])
         await client.edit_message_with_files("c1", "m1", "@here look", [payload_file])
         await client.respond_interaction("i1", "tok", "@everyone status")
+        await client.respond_interaction("i2", "tok", "public status", ephemeral=False)
 
-        assert len(seen) == 5
+        assert len(seen) == 6
         for payload in seen:
             body = payload.get("data", payload)
             assert body["allowed_mentions"] == {"parse": []}, payload
+            assert body["flags"] & 4, payload
+        assert seen[4]["data"]["flags"] == 4 | 64
+        assert seen[5]["data"]["flags"] == 4
 
     @pytest.mark.asyncio
     async def test_the_mention_text_survives_so_only_the_ping_is_removed(
@@ -1666,11 +1714,10 @@ class TestApplicationCommandRegistration:
 
 class TestEphemeralInteractionResponse:
     @pytest.mark.asyncio
-    async def test_ephemeral_sets_the_flag_and_visible_omits_it(
+    async def test_ephemeral_ors_with_suppress_embeds_flag(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """EPHEMERAL is message flag 1<<6. A command reply carries runtime state
-        or a login link, so it is the default."""
+        """EPHEMERAL (1<<6) composes with the always-on SUPPRESS_EMBEDS (1<<2)."""
         client = _make_client()
         seen: list[Any] = []
 
@@ -1684,5 +1731,5 @@ class TestEphemeralInteractionResponse:
         assert seen[0][0] == "/interactions/i1/tok/callback"
         # CHANNEL_MESSAGE_WITH_SOURCE
         assert seen[0][1]["type"] == 4
-        assert seen[0][1]["data"]["flags"] == 64
-        assert "flags" not in seen[1][1]["data"]
+        assert seen[0][1]["data"]["flags"] == 64 | 4
+        assert seen[1][1]["data"]["flags"] == 4

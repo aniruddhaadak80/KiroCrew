@@ -9,10 +9,9 @@ things must see that ceiling, and these tests pin both:
   (``/sys/fs/cgroup/memory.max``, absent on a bare host) and host
   ``MemAvailable`` -- so posture reads ``tight``/``critical`` and spawns are
   refused while the kernel is throttling the agent subtree;
-* the ``initialize`` handshake extends its budget while the slice is
-  throttling and refuses a still-alive, slow kiro-cli at the deadline with a
-  typed overload error instead of killing it and retrying into the same
-  throttle.
+* the ``initialize`` handshake refuses a still-alive, slow kiro-cli at the
+  end of its cold-start budget with a typed overload error while the slice is
+  throttling, instead of killing it and retrying into the same throttle.
 
 Each test here fabricates the slice's cgroup files under a temp directory and
 points ``sandbox._agents_slice_cgroup_dir`` at it; nothing reads the machine
@@ -34,7 +33,7 @@ import kiro_crew.sandbox as sb
 import kiro_crew.subagent as sa
 from kiro_crew.acp import runtime as runtime_mod
 from kiro_crew.acp.runtime import (
-    _INIT_TIMEOUT_UNDER_THROTTLE,
+    _INITIALIZE_TIMEOUT,
     _REQUEST_TIMEOUT,
     AcpRequestTimeout,
     AcpRuntime,
@@ -65,9 +64,10 @@ def _fabricate_slice(
     (slice_dir / "memory.high").write_text(f"{high}\n", encoding="utf-8")
     (slice_dir / "memory.max").write_text(f"{maximum}\n", encoding="utf-8")
     (slice_dir / "memory.current").write_text(f"{current}\n", encoding="utf-8")
-    (slice_dir / "memory.events").write_text(
-        f"low 0\nhigh {high_events}\nmax 0\noom 0\noom_kill 0\n", encoding="utf-8"
-    )
+    for events in ("memory.events", "memory.events.local"):
+        (slice_dir / events).write_text(
+            f"low 0\nhigh {high_events}\nmax 0\noom 0\noom_kill 0\n", encoding="utf-8"
+        )
     return slice_dir
 
 
@@ -113,6 +113,76 @@ class TestAgentsSliceHeadroom:
         monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
         assert sa._agents_slice_available_gb() == 0.0
 
+    def test_inactive_page_cache_is_headroom(self, tmp_path, monkeypatch, no_container_cgroup):
+        """A build-heavy host fills the slice with page cache up to memory.high
+        and leaves it there. That cache is reclaimable, so it must not read as a
+        full slice: this shape raised a 0.0 GB critical alert on a host with
+        370 GB available."""
+        slice_dir = _fabricate_slice(tmp_path, high=370 * GIB, maximum=394 * GIB, current=364 * GIB)
+        (slice_dir / "memory.stat").write_text(
+            f"anon {57 * GIB}\nfile {279 * GIB}\nactive_file {126 * GIB}\n"
+            f"inactive_file {151 * GIB}\nshmem {2 * GIB}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
+        # 370 - (364 - 151 - 126); anon and shmem stay counted as used.
+        assert sa._agents_slice_available_gb() == pytest.approx(283.0)
+
+    def test_active_page_cache_is_headroom(self, tmp_path, monkeypatch, no_container_cgroup):
+        """A 64 GB host at 38% RAM read 4 GB free because 24.7 GB of active
+        file cache counted as used. The kernel reclaims active cache too, so
+        only anon and shmem fill this slice."""
+        slice_dir = _fabricate_slice(
+            tmp_path, high=int(46.3 * GIB), maximum=int(49.4 * GIB), current=int(46.1 * GIB)
+        )
+        (slice_dir / "memory.stat").write_text(
+            f"anon {int(7.5 * GIB)}\nfile {int(36.6 * GIB)}\n"
+            f"active_file {int(24.7 * GIB)}\ninactive_file {int(4.0 * GIB)}\n"
+            f"shmem {int(7.9 * GIB)}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
+        # 46.3 - (46.1 - 24.7 - 4.0)
+        assert sa._agents_slice_available_gb() == pytest.approx(28.9, abs=0.01)
+
+    def test_dirty_and_writeback_cache_stay_used(self, tmp_path, monkeypatch, no_container_cgroup):
+        """Dirty and writeback pages must reach disk before the kernel can
+        drop them, so they are not headroom even on the file lists."""
+        slice_dir = _fabricate_slice(tmp_path, high=20 * GIB, maximum=26 * GIB, current=18 * GIB)
+        (slice_dir / "memory.stat").write_text(
+            f"active_file {6 * GIB}\ninactive_file {4 * GIB}\n"
+            f"file_dirty {3 * GIB}\nfile_writeback {1 * GIB}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
+        # 20 - (18 - (6 + 4 - 3 - 1))
+        assert sa._agents_slice_available_gb() == pytest.approx(8.0)
+
+    def test_dirty_beyond_cache_subtracts_nothing(self, tmp_path, monkeypatch, no_container_cgroup):
+        """The stat lines are not one atomic snapshot; a dirty figure ahead of
+        the cache figures must never add to usage."""
+        slice_dir = _fabricate_slice(tmp_path, high=20 * GIB, maximum=26 * GIB, current=18 * GIB)
+        (slice_dir / "memory.stat").write_text(
+            f"active_file {1 * GIB}\ninactive_file {1 * GIB}\nfile_dirty {3 * GIB}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
+        assert sa._agents_slice_available_gb() == pytest.approx(2.0)
+
+    def test_cache_read_ahead_of_usage_never_exceeds_the_ceiling(
+        self, tmp_path, monkeypatch, no_container_cgroup
+    ):
+        slice_dir = _fabricate_slice(tmp_path, high=20 * GIB, maximum=26 * GIB, current=1 * GIB)
+        (slice_dir / "memory.stat").write_text(f"inactive_file {2 * GIB}\n", encoding="utf-8")
+        monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
+        assert sa._agents_slice_available_gb() == pytest.approx(20.0)
+
+    def test_unreadable_stat_counts_all_usage(self, tmp_path, monkeypatch, no_container_cgroup):
+        slice_dir = _fabricate_slice(tmp_path, high=20 * GIB, maximum=26 * GIB, current=19 * GIB)
+        (slice_dir / "memory.stat").write_text("inactive_file garbage\n", encoding="utf-8")
+        monkeypatch.setattr(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path))
+        assert sa._agents_slice_available_gb() == pytest.approx(1.0)
+
     def test_max_sentinel_on_high_falls_back_to_hard_ceiling(
         self, tmp_path, monkeypatch, no_container_cgroup
     ):
@@ -133,25 +203,20 @@ class TestAgentsSliceHeadroom:
 
 
 class TestCompositeProbePicksTheBindingCeiling:
-    def test_slice_tighter_than_container(self, monkeypatch):
-        monkeypatch.setattr(sa, "_container_cgroup_available_gb", lambda: 12.0)
-        monkeypatch.setattr(sa, "_agents_slice_available_gb", lambda: 3.0)
-        assert sa._cgroup_available_gb() == 3.0
-
-    def test_container_tighter_than_slice(self, monkeypatch):
-        monkeypatch.setattr(sa, "_container_cgroup_available_gb", lambda: 2.0)
-        monkeypatch.setattr(sa, "_agents_slice_available_gb", lambda: 9.0)
-        assert sa._cgroup_available_gb() == 2.0
-
-    def test_only_the_slice_constrains(self, monkeypatch):
-        monkeypatch.setattr(sa, "_container_cgroup_available_gb", lambda: -1.0)
-        monkeypatch.setattr(sa, "_agents_slice_available_gb", lambda: 5.5)
-        assert sa._cgroup_available_gb() == 5.5
-
-    def test_neither_constrains(self, monkeypatch):
-        monkeypatch.setattr(sa, "_container_cgroup_available_gb", lambda: -1.0)
-        monkeypatch.setattr(sa, "_agents_slice_available_gb", lambda: -1.0)
-        assert sa._cgroup_available_gb() == -1.0
+    @pytest.mark.parametrize(
+        ("container", "slice_gb", "want"),
+        [
+            pytest.param(12.0, 3.0, 3.0, id="test_slice_tighter_than_container"),
+            pytest.param(2.0, 9.0, 2.0, id="test_container_tighter_than_slice"),
+            # -1.0 is the probes' "no limit found" answer.
+            pytest.param(-1.0, 5.5, 5.5, id="test_only_the_slice_constrains"),
+            pytest.param(-1.0, -1.0, -1.0, id="test_neither_constrains"),
+        ],
+    )
+    def test_the_tighter_ceiling_wins(self, monkeypatch, container, slice_gb, want):
+        monkeypatch.setattr(sa, "_container_cgroup_available_gb", lambda: container)
+        monkeypatch.setattr(sa, "_agents_slice_available_gb", lambda: slice_gb)
+        assert sa._cgroup_available_gb() == want
 
 
 class TestAdmissionSeesTheSlice:
@@ -224,7 +289,7 @@ class TestAgentsSliceThrottling:
         monkeypatch.setattr(sb, "time", SimpleNamespace(monotonic=_clock))
         # First read only baselines.
         assert sb.agents_slice_throttling() is False
-        (slice_dir / "memory.events").write_text(
+        (slice_dir / "memory.events.local").write_text(
             "low 0\nhigh 4200\nmax 0\noom 0\noom_kill 0\n", encoding="utf-8"
         )
         assert sb.agents_slice_throttling() is True
@@ -246,7 +311,7 @@ class TestAgentsSliceThrottling:
         monkeypatch.setattr(sb, "_SLICE_THROTTLE_PROBE_SEEN", 7)
         monkeypatch.setattr(sb, "_SLICE_THROTTLE_EDGE_AT", None)
         monkeypatch.setattr(sb, "time", SimpleNamespace(monotonic=lambda: 5000.0))
-        (slice_dir / "memory.events").write_text(
+        (slice_dir / "memory.events.local").write_text(
             "low 0\nhigh 8\nmax 0\noom 0\noom_kill 0\n", encoding="utf-8"
         )
         first = sb.agents_slice_throttling()
@@ -282,9 +347,13 @@ def _uninitialized_runtime() -> tuple[AcpRuntime, MagicMock]:
 
 class TestInitializeHandshakeUnderThrottle:
     @pytest.mark.asyncio
-    async def test_unthrottled_host_keeps_the_plain_budget(self, monkeypatch):
+    @pytest.mark.parametrize("throttled", [False, True], ids=["unthrottled", "throttled"])
+    async def test_initialize_gets_the_cold_start_budget(self, monkeypatch, throttled):
+        """A cold start is not a control-plane round trip: kiro-cli answers
+        ``initialize`` only once it has started, which can outlast the plain
+        request budget on an unthrottled host too."""
         rt, _ = _uninitialized_runtime()
-        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: False)
+        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: throttled)
         seen: dict[str, object] = {}
 
         async def _fake_send(method, params, timeout=None):
@@ -295,34 +364,20 @@ class TestInitializeHandshakeUnderThrottle:
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
         await rt._initialize_handshake({})
         assert seen["method"] == "initialize"
-        assert seen["timeout"] == _REQUEST_TIMEOUT
+        assert seen["timeout"] == _INITIALIZE_TIMEOUT
+        assert _INITIALIZE_TIMEOUT > _REQUEST_TIMEOUT
 
-    @pytest.mark.asyncio
-    async def test_throttled_host_gets_the_extended_budget(self, monkeypatch):
-        rt, _ = _uninitialized_runtime()
-        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: True)
-        seen: dict[str, object] = {}
-
-        async def _fake_send(method, params, timeout=None):
-            seen["timeout"] = timeout
-            return {"agentCapabilities": {}}
-
-        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
-        await rt._initialize_handshake({})
-        assert seen["timeout"] == _INIT_TIMEOUT_UNDER_THROTTLE
-        assert _INIT_TIMEOUT_UNDER_THROTTLE > _REQUEST_TIMEOUT
-
-    def test_extended_budget_expires_before_the_startup_watchdog_reaps(self):
+    def test_cold_start_budget_expires_before_the_startup_watchdog_reaps(self):
         """A subagent's ``info._pid`` is recorded only after ``provider.start()``
         returns, so the startup watchdog (``_is_startup_stalled_impl``: turns==0,
         ``_pid is None``, no first stream, ``_exec_started`` older than
         ``_STARTUP_TIMEOUT_SECS``) sees "no runtime" for the whole handshake.
-        If the throttled budget were as long as the watchdog window, the
-        reaper's ``_force_reap`` would kill the live runtime before
+        If the budget were as long as the watchdog window, the reaper's
+        ``_force_reap`` would kill the live runtime before
         ``AcpRuntimeOverloaded`` could be raised, and the caller would see a
         killed process instead of the overload verdict. Keep a margin for the
         subprocess spawn that runs between ``_exec_started`` and the handshake."""
-        assert _INIT_TIMEOUT_UNDER_THROTTLE <= sa._STARTUP_TIMEOUT_SECS - 30
+        assert _INITIALIZE_TIMEOUT <= sa._STARTUP_TIMEOUT_SECS - 30
 
     @pytest.mark.asyncio
     async def test_alive_and_throttled_at_deadline_is_overload(self, monkeypatch):
@@ -356,88 +411,74 @@ class TestInitializeHandshakeUnderThrottle:
 
     @pytest.mark.asyncio
     async def test_throttle_that_begins_mid_handshake_is_still_overload(self, monkeypatch):
-        """Without a still-pending request to wait on (the fake raises a bare
-        timeout), a late-detected throttle can only be reported as overload."""
+        """A fresh gateway's first probe only baselines the counter, so the
+        spawn-time read can miss a throttle already under way; the deadline's
+        own read still names the overload."""
         rt, _ = _uninitialized_runtime()
         readings = iter([False, True])
         monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: next(readings))
-        seen: dict[str, object] = {}
 
         async def _stall(method, params, timeout=None):
-            seen["timeout"] = timeout
             raise AcpRequestTimeout("Request initialize timed out")
 
         monkeypatch.setattr(rt, "_send_and_await", _stall)
         with pytest.raises(AcpRuntimeOverloaded):
             await rt._initialize_handshake({})
-        # Unthrottled at spawn, so the plain budget applied.
-        assert seen["timeout"] == _REQUEST_TIMEOUT
 
     @pytest.mark.asyncio
-    async def test_late_detected_throttle_keeps_the_request_pending(self, monkeypatch):
-        """A fresh gateway's first probe only baselines the counter, so the
-        spawn-time read misses a throttle already under way and the plain
-        budget applies. When the deadline then sees the throttle with the
-        process alive, the SAME initialize must be given the rest of the
-        extended budget -- its late answer is the handshake, not a leak."""
-        rt, _ = _uninitialized_runtime()
-        readings = iter([False, True])
-        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: next(readings))
-        loop = asyncio.get_running_loop()
-        pending: asyncio.Future = loop.create_future()
-        rt._pending_requests[7] = pending
-
-        async def _stall(method, params, timeout=None):
-            exc = AcpRequestTimeout(f"Request {method} timed out after {timeout:g}s")
-            exc.req_id = 7
-            exc.adopted_future = pending
-            raise exc
-
-        monkeypatch.setattr(rt, "_send_and_await", _stall)
-        loop.call_later(0.01, pending.set_result, {"agentCapabilities": {"late": True}})
-        result = await rt._initialize_handshake({})
-        assert result == {"agentCapabilities": {"late": True}}
-
-    @pytest.mark.asyncio
-    async def test_late_detected_throttle_still_overloads_at_the_extended_deadline(
-        self, monkeypatch
-    ):
-        rt, _ = _uninitialized_runtime()
-        readings = iter([False, True])
-        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: next(readings))
-        monkeypatch.setattr(runtime_mod, "_INIT_TIMEOUT_UNDER_THROTTLE", _REQUEST_TIMEOUT + 0.02)
-        loop = asyncio.get_running_loop()
-        pending: asyncio.Future = loop.create_future()
-        rt._pending_requests[9] = pending
-
-        async def _stall(method, params, timeout=None):
-            exc = AcpRequestTimeout(f"Request {method} timed out after {timeout:g}s")
-            exc.req_id = 9
-            exc.adopted_future = pending
-            raise exc
-
-        monkeypatch.setattr(rt, "_send_and_await", _stall)
-        with pytest.raises(AcpRuntimeOverloaded) as raised:
-            await rt._initialize_handshake({})
-        # The overload names the FULL budget the process was given.
-        assert f"{_REQUEST_TIMEOUT + 0.02:g}s" in str(raised.value)
-        # And the abandoned request is unregistered, so the reader loop has
-        # nothing to resolve for it.
-        assert 9 not in rt._pending_requests
-
-    @pytest.mark.asyncio
-    async def test_send_and_await_keeps_a_timed_out_initialize_registered(self, monkeypatch):
-        """The extension above is only possible if the transport hands the
-        still-pending request back instead of dropping it on timeout."""
+    async def test_unthrottled_slow_cold_start_succeeds_within_the_budget(self, monkeypatch):
+        """The reported failure: no throttle, kiro-cli answers ``initialize``
+        after the plain request budget. Through the real transport, with both
+        budgets scaled down, the late answer is the handshake."""
         rt, proc = _uninitialized_runtime()
-        proc.stdin.write = MagicMock()
+        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: False)
+        monkeypatch.setattr(runtime_mod, "_REQUEST_TIMEOUT", 0.05)
+        monkeypatch.setattr(runtime_mod, "_INITIALIZE_TIMEOUT", 5.0)
+        loop = asyncio.get_running_loop()
+
+        def _answer() -> None:
+            for req_id in list(rt._pending_requests):
+                rt._pending_requests.pop(req_id).set_result({"agentCapabilities": {"ok": True}})
+
+        proc.stdin.write = MagicMock(side_effect=lambda _data: loop.call_later(0.2, _answer))
+        result = await rt._initialize_handshake({})
+        assert result == {"agentCapabilities": {"ok": True}}
+
+    @pytest.mark.asyncio
+    async def test_initialize_past_the_budget_still_times_out(self, monkeypatch):
+        rt, _ = _uninitialized_runtime()
+        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: False)
+        monkeypatch.setattr(runtime_mod, "_INITIALIZE_TIMEOUT", 0.05)
         with pytest.raises(AcpRequestTimeout) as raised:
-            await rt._send_and_await("initialize", {}, timeout=0.01)
-        req_id = getattr(raised.value, "req_id", None)
-        adopted = getattr(raised.value, "adopted_future", None)
-        assert req_id is not None and adopted is not None
-        assert rt._pending_requests[req_id] is adopted
-        assert not adopted.done()
+            await rt._initialize_handshake({})
+        assert not isinstance(raised.value, AcpRuntimeOverloaded)
+        assert "timed out after 0.05s" in str(raised.value)
+
+    @pytest.mark.asyncio
+    async def test_failed_handshake_cleanup_leaves_no_unretrieved_future(self, monkeypatch):
+        """The timed-out ``initialize`` is unregistered, so the cleanup kill's
+        ``_mark_dead`` has no pending future to fail that nobody will read --
+        the source of asyncio's "Future exception was never retrieved"."""
+        import gc
+
+        rt, _ = _uninitialized_runtime()
+        monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: False)
+        monkeypatch.setattr(runtime_mod, "_INITIALIZE_TIMEOUT", 0.05)
+        loop = asyncio.get_running_loop()
+        reported: list[dict] = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+        try:
+            with pytest.raises(AcpRequestTimeout):
+                await rt._initialize_handshake({})
+            assert not rt._pending_requests
+            rt._mark_dead("killed (failed init handshake cleanup)")
+            await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous)
+        assert [c.get("message") for c in reported] == []
 
     @pytest.mark.asyncio
     async def test_exited_process_is_a_plain_timeout(self, monkeypatch):
@@ -475,7 +516,10 @@ class TestInitializeHandshakeUnderThrottle:
         assert "_initialize_handshake(client_capabilities)" in src
         before, after = src.split("_initialize_handshake(client_capabilities)", 1)
         assert "require_unchanged_derived_spec" in after
-        assert "failed init handshake cleanup" in after
+        # The guard runs its teardown as one shielded task; the kill lives there.
+        assert "self._failed_start_cleanup()" in after
+        cleanup = inspect.getsource(AcpRuntime._failed_start_cleanup)
+        assert "failed init handshake cleanup" in cleanup
 
 
 def test_overload_error_is_exported_from_the_runtime_module():

@@ -1,4 +1,5 @@
 import { QueryClient } from '@tanstack/react-query'
+import { isEdgeChallengeError } from './apiError'
 
 /**
  * True when the error is an HTTP 429 (edge/proxy rate limit). When the
@@ -34,8 +35,38 @@ export const isDeadlineError = (error: unknown): boolean =>
  * settles at ~31s once the single retry and its backoff are counted.
  */
 export const retryPolicy = (failureCount: number, error: unknown): boolean =>
-  isDeadlineError(error) ? false
-    : isThrottleError(error) ? failureCount < 4 : failureCount < 1
+  // The gateway's own 403 is deliberately absent: there the one retry is what makes
+  // a refreshed cookie recover invisibly.
+  isEdgeChallengeError(error) ? false
+    : isDeadlineError(error) ? false
+      : isThrottleError(error) ? failureCount < 4 : failureCount < 1
+
+/** A failure the gateway's own handler did not answer: a fetch rejection
+ *  (`TypeError: Failed to fetch` -- a restart, a dropped forwarded link) or a
+ *  fronting proxy's 502/504, plus the gateway's own "retry shortly" 503. */
+const isUnansweredRead = (error: unknown): boolean => {
+  if (error instanceof TypeError) return true
+  const status = typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined
+  return status === 502 || status === 503 || status === 504
+}
+
+/**
+ * `retryPolicy`, plus a short ladder for a read that never got the gateway's
+ * answer (`isUnansweredRead`). One retry ~1s later still lands inside a
+ * restart or a link blip; three (1s, 2s, 4s) ride it out before a read says it
+ * failed. Opt-in per query, for page reads whose failure is a standing notice.
+ */
+export const retryThroughRestart = (failureCount: number, error: unknown): boolean =>
+  isUnansweredRead(error) ? failureCount < 3 : retryPolicy(failureCount, error)
+
+/**
+ * `refetchInterval` for a read whose failure is a standing notice: re-read
+ * every 30s while it is failed, never while it holds an answer. With the
+ * socket still up no reconnect re-reads it, and an idle page fires nothing
+ * else, so without this the notice outlived the blip that caused it.
+ */
+export const refetchWhileFailed = (query: { state: { status: string } }): number | false =>
+  query.state.status === 'error' ? 30_000 : false
 
 /**
  * Jittered exponential backoff for throttles (1s → 2s → 4s → 8s, ±500ms so

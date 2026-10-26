@@ -30,7 +30,7 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from . import ledger as L
 from .contracts import TRACK_BUG, Candidate, Proposal, TargetProfile
-from .git_safety import GIT_SAFE_CONFIG, require_pinned
+from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 
 # Module logger — Phase B is where the "no diff produced" outcome (a top effectiveness
 # killer: the agent investigated and authored nothing) originates. Logging every
@@ -42,15 +42,17 @@ _log = logging.getLogger("auto_improvement.spine.proposer")
 #: helpers (driver/gate/commit/pr_recipe/agent_runner/pr_watchers). The proposer runs `add -A`
 #: and `diff` on the HOST over the worktree the agent wrote to, and both consult (and can SPAWN)
 #: `core.fsmonitor`; any git also runs `core.hooksPath` hooks. `-c` overrides on OUR argv beat
-#: the repo config. Part of the D-120 hook-hardening class (Opus 5 review pressed on
-#: completeness). `worktree`/`branch` subcommands take no untrusted tree but share the helper.
+#: the repo config. Part of the D-120 hook-hardening class. `worktree`/`branch`
+#: subcommands take no untrusted tree but share the helper.
 _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     require_pinned(cwd)
     return subprocess.run(
-        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG] + args, capture_output=True, **UTF8_TEXT
+        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG, *hook_off_args(cwd)] + args,
+        capture_output=True,
+        **UTF8_TEXT,
     )
 
 
@@ -97,7 +99,6 @@ class Proposer:
         # `test_a_planted_clean_filter_does_not_run`). These two calls bypass `_git` (they set
         # `capture_output` and a custom pathspec), so they must pin explicitly like every
         # sibling helper. Missed here because the structural test only checked `proposer._git`.
-        # Raised by the Opus review.
         require_pinned(worktree)
         # Stage everything first so NEW (untracked) files are included in the diff. A bug
         # fix's reproducing test is always a new file; ``git diff base_sha`` alone omits
@@ -105,7 +106,7 @@ class Proposer:
         # the RED stage of the test to stage at base). ``git add -A`` then a diff of the
         # index against base captures adds + modifications + deletions.
         subprocess.run(
-            ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "add", "-A"],
+            ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, *hook_off_args(worktree), "add", "-A"],
             capture_output=True,
             **UTF8_TEXT,
         )
@@ -121,6 +122,7 @@ class Proposer:
                 "-C",
                 str(worktree),
                 *_GIT_SAFE_CONFIG,
+                *hook_off_args(worktree),
                 "diff",
                 "--cached",
                 base_sha,

@@ -5,144 +5,140 @@ per-chunk scan clears both halves, so nothing reports it: the reader sees the
 key and the operator sees a clean send. The splitter therefore has to know about
 credentials before it chooses a boundary, and every path that turns one chunk
 into one message has to tell it, which is what the enumeration below enforces.
+
+This module keeps the enumeration and the splitter core: the char and byte
+splitters, ``chunk_for_transport``, the budget search, the terminal repair, the
+last-step regrade and the dashboard legs. The seams under a delivered message,
+each channel's own send path, the grade by every reading, and Discord's rotation
+with the delivery tallies live in the ``test_split_credential_boundary_<topic>.py``
+parts. The key, the source root and the screen readers they share live in
+``split_credential_boundary_helpers.py``.
 """
 
 from __future__ import annotations
 
 import ast
+import dataclasses
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
+from source_corpus import parsed_candidates, src_root
+from split_credential_boundary_helpers import (
+    HEAD,
+    KEY,
+    SPLITTERS,
+    SRC,
+    TAIL,
+    _name_of,
+    _on_screen,
+    _rejoins,
+)
 
-import kiro_crew
 from kiro_crew.messaging.display_safety import (
     canonicalize_display,
     joins_to_a_credential,
     redact_for_display,
 )
-from kiro_crew.messaging.renderer import (
-    _default_redactor,
-    chunk_text,
-    count_redaction_tags,
-    repaired_after_a_sent_tail,
-)
+from kiro_crew.messaging.renderer import _default_redactor, chunk_for_transport, chunk_text
 from kiro_crew.messaging.split import (
     _WHITESPACE_RUN,
-    _made_collapse_clean,
     _redact_only_the_rejoined_span,
     _rejoins_a_key,
     _under_a_safe_budget,
     bounded_for_delivery,
     chunk_utf8_bytes,
-    offset_clear_of_a_sent_tail,
     repaired_for_delivery,
+    split_markdown_bytes,
     split_markdown_safe,
 )
-from kiro_crew.telegram.renderer import (
-    _split_markdown,
-    _split_markdown_bounded,
-    _split_markdown_table_aware,
-    _table_blocks,
+from kiro_crew.messaging.transport import TransportCapabilities
+
+#: No splitter call needs an exception any more: an already-redacted argument (the
+#: WhatsApp prefix-stable branch's ``redact_for_display`` body) is recognised as
+#: guarded by ``_repaired_names``, so the universal assertion below stays universal
+#: -- a call that neither passes a redactor nor cuts already-redacted text fails.
+KNOWN_DELIVERY_MODULES = frozenset(
+    {
+        "dashboard/chat_mirror.py",
+        "discord/renderer.py",
+        "feishu/client.py",
+        "messaging/renderer.py",
+        "slack/renderer.py",
+        "teams/renderer.py",
+        "telegram/renderer.py",
+        "webex/renderer.py",
+        "wecom/renderer.py",
+        "whatsapp/renderer.py",
+    }
 )
-from kiro_crew.whatsapp.renderer import _redact_all, render_chunks, to_whatsapp_text
-
-#: AWS's own documented example key, the same fixture the display-safety tests
-#: use, so no real credential shape is introduced anywhere.
-KEY = "AKIAIOSFODNN7EXAMPLE"
-HEAD, TAIL = KEY[:10], KEY[10:]
-
-SRC = Path(kiro_crew.__file__).parent
-
-#: Every path that delivers one splitter chunk as one message. A boundary there
-#: is a seam between two messages a reader reads in order, so each of these must
-#: pass its redactor at every splitter call. Enumerated rather than discovered:
-#: a path that maintains none of the state is invisible to a search for the
-#: state's names, and those are exactly the ones left open.
-DELIVERY_PATHS = (
-    "slack/renderer.py",
-    "webex/renderer.py",
-    "whatsapp/renderer.py",
-    "teams/renderer.py",
-    "wecom/renderer.py",
-    "dashboard/chat_mirror.py",
-    "telegram/renderer.py",
-)
-
-SPLITTERS = frozenset({"split_markdown_safe", "chunk_utf8_bytes"})
-
-
-def _rejoins(chunks: list[str]) -> bool:
-    """Does any boundary hand the reader a key neither chunk holds?
-
-    The rendered pair, because a platform drops the whitespace at a message's
-    edges: the test models the screen the same way the splitter does.
-    """
-    return any(
-        joins_to_a_credential(chunks[i].rstrip(), chunks[i + 1].lstrip(), _default_redactor)
-        for i in range(len(chunks) - 1)
-    )
-
-
-def _on_screen(chunks: list[str]) -> str:
-    """What a reader scrolling the delivered messages reads, as one string.
-
-    Each message's edge whitespace goes, because the platform drops it, and a
-    chunk holding nothing else contributes nothing at all -- which is why it
-    separates nothing.
-    """
-    return "".join(chunk.strip() for chunk in chunks)
-
-
-def _name_of(node: ast.expr) -> str:
-    """The bare name a call or reference resolves to, attribute access included."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return ""
 
 
 def _repaired_names(tree: ast.AST) -> set[str]:
-    """Names bound to the output of :func:`repaired_for_delivery` in *tree*.
+    """Names bound to text that already carries the seam guarantee, in *tree*.
 
-    Text that predicate returns is safe to cut again by contract -- it is only
-    returned once the form with every whitespace run removed reads clean -- so a
-    cut of it needs no redactor, and MUST NOT take one: a credential-aware cut may
-    decline to cut at all, which is exactly what a caller re-bounding to a hard
-    transport cap cannot accept. Recognising the name keeps the gate closed rather
-    than granting the file a blanket exception.
+    Only :func:`repaired_for_delivery` counts: it is returned only once the form
+    with every whitespace run removed reads clean, so no later cut can rejoin a
+    key. The subject is then already safe to cut, so the cut needs no redactor and
+    MUST NOT take one (a credential-aware cut may decline to cut, which a caller
+    re-bounding to a hard transport cap cannot accept).
+
+    ``redact_for_display`` / ``_display_safe`` are deliberately NOT here: they do
+    no whitespace collapsing (``strip_ansi`` -> redactor -> ``_strip_format_chars``
+    -> ``canonicalize_display``), so ``AKIA\\nIOSFODNN7EXAMPLE`` passes through them
+    unredacted and a later no-redactor cut at that newline delivers the key whole
+    across two messages. Certifying their output "safe to cut again" would weaken
+    the universal ``test_every_splitter_call_passes_a_redactor`` gate to a property
+    only ``repaired_for_delivery`` (and the splitter's own answers) establish. The
+    WhatsApp prefix-stable branch instead routes its ``redacted`` through
+    ``repaired_for_delivery`` before the no-redactor cut.
+
+    Recognising the name keeps the gate closed instead of exempting the call.
     """
+    guaranteed_by_call = {
+        "repaired_for_delivery",
+    }
+
+    def _guaranteeing_call(value: ast.expr) -> bool:
+        # ``x = f(...)`` or ``x = f(...).strip()`` -- unwrap trailing whitespace
+        # trims, which cannot reopen a key, to reach the safety-establishing call.
+        node: ast.expr = value
+        while (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"strip", "rstrip", "lstrip"}
+        ):
+            node = node.func.value
+        return isinstance(node, ast.Call) and _name_of(node.func) in guaranteed_by_call
+
     names: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+        if not isinstance(node, ast.Assign):
             continue
-        if _name_of(node.value.func) != "repaired_for_delivery":
+        if not _guaranteeing_call(node.value):
             continue
-        names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+        for target in node.targets:
+            # ``x = f(...)`` binds the whole return; ``x, _ = f(...)`` binds the
+            # first element (the redacted body for the tuple-returning sinks).
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)) and target.elts:
+                first = target.elts[0]
+                if isinstance(first, ast.Name):
+                    names.add(first.id)
     return names
 
 
-def _own_body_calls(func: ast.AsyncFunctionDef) -> list[ast.Call]:
-    """Every call in *func*'s OWN body, nested function definitions excluded.
+class SplitterCall(NamedTuple):
+    """One splitter call: which splitter, its keywords, and the function holding it."""
 
-    A closure defined inside a coroutine is usually the thing handed to a worker
-    thread, so a call inside it runs off the loop and is not an offender. Counting
-    it would report the very pattern being asked for as a violation.
-    """
-    calls: list[ast.Call] = []
-    stack: list[ast.AST] = list(ast.iter_child_nodes(func))
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            continue
-        if isinstance(node, ast.Call):
-            calls.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    return calls
+    splitter: str
+    keywords: frozenset[str]
+    function: str
 
 
-def _splitter_calls(tree: ast.AST) -> list[tuple[str, set[str]]]:
-    """Every splitter call in *tree* as ``(splitter, keyword names)``.
+def _splitter_calls(tree: ast.AST) -> list[SplitterCall]:
+    """Every splitter call in *tree*, each with the function that holds it.
 
     Both shapes count. A renderer that offloads the splitter to a worker thread
     passes it as a REFERENCE to ``asyncio.to_thread`` and hands the arguments to
@@ -151,45 +147,143 @@ def _splitter_calls(tree: ast.AST) -> list[tuple[str, set[str]]]:
 
     A cut whose subject is already-repaired text is reported as guarded, because
     the repair carries the guarantee the redactor would be there to establish.
+
+    The enclosing function is carried because an exemption is a claim about one
+    call: without it the only key available is the module, and a module-wide key
+    exempts calls no claim describes.
     """
     repaired = _repaired_names(tree)
-    calls: list[tuple[str, set[str]]] = []
+    # A splitter call handed STRAIGHT to ``repaired_for_delivery`` as the pieces it
+    # grades is a MEASUREMENT split, not a delivery: its boundaries are never sent
+    # as-is -- ``repaired_for_delivery`` reads them to decide whether a cut at that
+    # budget would rejoin a key, and the caller then delivers a re-split of the
+    # returned collapse fixed point (or the already-safe source when it returns
+    # ``None``). This is the same grade-then-resplit idiom ``messaging/renderer.py``
+    # uses on the byte splitter; recognising it keeps the gate closed on a
+    # genuinely-safe shape instead of forcing a redactor into a cut that must stay
+    # prefix-stable. Only the call in the pieces position is spared -- the delivery
+    # re-split still has to name a ``repaired_for_delivery`` result.
+    measurement: set[int] = set()
+    graded_sources: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+        if not (isinstance(node, ast.Call) and _name_of(node.func) == "repaired_for_delivery"):
             continue
-        keywords = {kw.arg for kw in node.keywords if kw.arg}
-        if node.args and _name_of(node.args[0]) in repaired:
-            keywords.add("redactor")
-        called = _name_of(node.func)
-        if called in SPLITTERS:
-            calls.append((called, keywords))
-        elif called == "to_thread" and node.args:
-            offloaded = _name_of(node.args[0])
-            if offloaded in SPLITTERS:
-                calls.append((offloaded, keywords))
+        if node.args:
+            # The body handed to the grader as its SOURCE is grade-covered: the
+            # grade returns a collapse fixed point when a cut would rejoin a key,
+            # and ``None`` only when the body is ALREADY a fixed point safe to cut.
+            # So the caller's fallback -- cutting this same body when the grade
+            # returned ``None`` -- delivers a body the grader vouched for.
+            source_name = _name_of(node.args[0])
+            if source_name:
+                graded_sources.add(source_name)
+        if len(node.args) >= 2:
+            measurement.add(id(node.args[1]))
+    calls: list[SplitterCall] = []
+    stack: list[tuple[ast.AST, str]] = [(tree, "")]
+    while stack:
+        node, holder = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            inner = holder
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner = child.name
+            if isinstance(child, ast.Call):
+                keywords = {kw.arg for kw in child.keywords if kw.arg}
+                if child.args and _name_of(child.args[0]) in repaired:
+                    keywords.add("redactor")
+                if child.args and _name_of(child.args[0]) in graded_sources:
+                    # Cutting a body the grader vouched for (its ``None`` = safe).
+                    keywords.add("redactor")
+                if id(child) in measurement:
+                    # The pieces this cut produced are graded, never delivered.
+                    keywords.add("redactor")
+                called = _name_of(child.func)
+                if called in SPLITTERS:
+                    calls.append(SplitterCall(called, frozenset(keywords), holder))
+                elif called == "to_thread" and child.args:
+                    offloaded = _name_of(child.args[0])
+                    if offloaded in SPLITTERS:
+                        calls.append(SplitterCall(offloaded, frozenset(keywords), holder))
+            stack.append((child, inner))
     return calls
 
 
-class TestEveryDeliveryPathIsEnumerated:
-    """The enforcement: a path that forgets the redactor fails here."""
+def _modules_that_split() -> dict[str, list[SplitterCall]]:
+    """Every module under ``src/kiro_crew`` that calls a redactor-accepting splitter.
 
-    @pytest.mark.parametrize("path", DELIVERY_PATHS)
-    def test_the_path_still_reaches_a_splitter(self, path: str) -> None:
-        calls = _splitter_calls(ast.parse((SRC / path).read_text(encoding="utf-8")))
-        assert calls, (
-            f"{path} reaches no splitter. If its delivery moved, move it in "
-            "DELIVERY_PATHS too -- an empty list would otherwise pass the "
-            "redactor check below by having nothing to check."
+    DERIVED by walking the tree, not curated. A curated list of delivery paths has
+    one failure mode that matters: a path nobody adds to it is not merely
+    unchecked, it is invisible, and the paths most likely to be forgotten are the
+    new ones. Reaching a splitter is a property of the code, so the population
+    reads it off the code -- a module joins the moment it calls one, and the
+    enforcement below then applies to it without anyone remembering to say so.
+
+    ``messaging/split.py`` itself is skipped: it DEFINES these functions and its
+    own recursive cut deliberately passes no redactor one level down.
+
+    Parses only the files whose text spells a splitter's name
+    (``test/source_corpus.py``'s shared, narrowed read): a call is recorded by the
+    identifier it calls or hands to ``to_thread``, so a file without that identifier
+    holds no call to record, and the narrowing drops no module. This runs at import,
+    which is collection time here and the body of any test elsewhere that imports
+    this module to drive one of its gates, so it must cost a few files, not the tree.
+    """
+    found: dict[str, list[tuple[str, set[str]]]] = {}
+    root = src_root()
+    for path, _text, tree in parsed_candidates(
+        require_any=sorted(SPLITTERS), skip_syntax_errors=False
+    ):
+        relative = path.relative_to(root).as_posix()
+        if relative == "messaging/split.py":
+            continue
+        calls = _splitter_calls(tree)
+        if calls:
+            found[relative] = calls
+    return found
+
+
+#: Resolved once at collection time: the tests below parametrize over it.
+SPLITTING_MODULES = _modules_that_split()
+
+
+def _unguarded(path: str) -> list[SplitterCall]:
+    """Every call in *path* that passes no redactor."""
+    return [call for call in SPLITTING_MODULES[path] if "redactor" not in call.keywords]
+
+
+class TestEveryDeliveryPathIsEnumerated:
+    """The enforcement: a path that forgets the redactor fails here.
+
+    The population is derived from the tree, so "enumerated" means the code says
+    so rather than that somebody listed it.
+    """
+
+    def test_the_walk_reaches_the_channels_that_deliver(self) -> None:
+        """A derivation that finds nothing, or too little, must not pass quietly."""
+        missing = sorted(KNOWN_DELIVERY_MODULES - set(SPLITTING_MODULES))
+        assert not missing, (
+            f"the module walk did not reach {missing}, so the population is smaller "
+            "than the tree really holds and an unguarded call in a module it missed "
+            "would pass unseen. If delivery genuinely moved out of one of these, "
+            "move it in KNOWN_DELIVERY_MODULES too."
         )
 
-    @pytest.mark.parametrize("path", DELIVERY_PATHS)
+    @pytest.mark.parametrize("path", sorted(SPLITTING_MODULES))
     def test_every_splitter_call_passes_a_redactor(self, path: str) -> None:
-        calls = _splitter_calls(ast.parse((SRC / path).read_text(encoding="utf-8")))
-        unguarded = [name for name, keywords in calls if "redactor" not in keywords]
-        assert not unguarded, (
-            f"{path} calls {unguarded} with no redactor, so the boundary is "
+        """Universal, no exceptions: every splitter call is guarded.
+
+        Guarded means one of two things ``_splitter_calls`` recognises: the call
+        passes ``redactor=``, or its subject is already-redacted text (the output
+        of ``repaired_for_delivery`` / ``redact_for_display``), which carries the
+        same seam guarantee. A call that is neither chooses its boundary by length
+        alone and can sever a key across two adjacent messages.
+        """
+        offenders = _unguarded(path)
+        assert not offenders, (
+            f"{path} calls {[call.splitter for call in offenders]} with no redactor in "
+            f"{sorted({call.function for call in offenders})}, so the boundary is "
             "chosen by a length budget alone and a severed key reaches two "
-            "adjacent messages."
+            "adjacent messages. Pass redactor=, or cut already-redacted text."
         )
 
 
@@ -337,6 +431,152 @@ class TestTheByteBudgetCarriesTheSameGuarantee:
         assert KEY in unguarded[0].rstrip() + unguarded[1].lstrip()
         guarded = chunk_utf8_bytes(text, 66, redactor=_default_redactor)
         assert KEY not in "".join(part.strip() for part in guarded)
+
+
+class TestChunkForTransportGradesTheByteSeam:
+    """``chunk_for_transport`` closes the seam on a byte-capped channel too.
+
+    The byte splitter takes no redactor, and ``bounded_for_delivery`` grades only
+    the slices IT cuts inside a chunk -- never the splitter's own inter-chunk
+    seams. So the entry point has to grade the split SEQUENCE before bounding it,
+    the same guarantee the char branch gets by threading the redactor into its
+    splitter. Without it a credential straddling a byte-splitter boundary ships
+    whole across two delivered messages on Webex and WeCom.
+    """
+
+    def _byte_capped(self, max_bytes: int) -> TransportCapabilities:
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        return dataclasses.replace(
+            WEBEX_CAPABILITIES,
+            max_message_bytes=max_bytes,
+            max_message_chars=max_bytes,
+        )
+
+    def test_the_raw_byte_split_alone_would_hand_over_the_key(self) -> None:
+        # Control: the byte splitter with no redactor leaves the key rejoinable
+        # across a seam, which is exactly the leak the entry point must close. The
+        # key straddles a line break, so the splitter cuts HEAD and TAIL into
+        # adjacent chunks the reader reads as one key once the break is gone.
+        text = f"{HEAD}\n{TAIL} trailing here to force more content and length beyond"
+        raw = split_markdown_bytes(text, 11)
+        assert len(raw) > 1
+        assert _rejoins(raw)
+
+    def test_chunk_for_transport_closes_that_seam(self) -> None:
+        text = f"{HEAD}\n{TAIL} trailing here to force more content and length beyond"
+        chunks = chunk_for_transport(text, self._byte_capped(11))
+        assert len(chunks) > 1
+        assert not _rejoins(chunks)
+        assert KEY not in _on_screen(chunks)
+
+    def test_clean_byte_capped_text_is_unchanged(self) -> None:
+        text = "a table row | another cell | a third cell that makes this long"
+        chunks = chunk_for_transport(text, self._byte_capped(20))
+        assert "".join(chunks) == text
+
+    def _char_capped(self, max_chars: int) -> TransportCapabilities:
+        # A char-capped channel: max_message_bytes=0 takes chunk_for_transport's
+        # CHARACTER branch (messaging/renderer.py), the one F2 lives on.
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        return dataclasses.replace(
+            WEBEX_CAPABILITIES, max_message_bytes=0, max_message_chars=max_chars
+        )
+
+    def test_the_byte_path_never_returns_a_rejoining_sequence(self) -> None:
+        """F2: exhaustion must fall closed, not return the last unsafe sequence.
+
+        The re-grade loop shrinks the byte budget toward the 1-byte floor and, if
+        even the floor cannot separate the halves (a run wider than one byte between
+        them), gives up the whitespace via the splitter's fail-closed answer rather
+        than returning a sequence that still rejoins. Across budgets from the
+        transport cap down to a few bytes -- including the heading-marker seam and a
+        wide-space straddle -- no delivered sequence may read as a key, and the call
+        must terminate.
+        """
+        from kiro_crew.messaging.renderer import _default_redactor as _dr
+
+        head, tail = "AKIAIOSFOD", "NN7EXAMPLE"
+        bodies = (
+            head + "# " + tail + " x" * 20,  # heading-marker seam (F7 shape)
+            head + " " * 40 + tail + " filler" * 20,  # wide-space straddle -> floor
+        )
+        for body in bodies:
+            for budget in (7439, 512, 64, 20, 13, 9):
+                chunks = chunk_for_transport(body, self._byte_capped(budget))
+                assert chunks, "nothing delivered"
+                for reading in (
+                    canonicalize_display("".join(chunks)),
+                    "".join(canonicalize_display(c) for c in chunks),
+                ):
+                    assert _dr(reading) == reading, (
+                        f"byte path returned a rejoining sequence at budget {budget} "
+                        f"for {body[:24]!r}"
+                    )
+
+    def test_a_byte_heading_marker_seam_clean_whole_text_is_regraded(self) -> None:
+        """F7: a repair that returns the source unchanged must still be re-graded.
+
+        ``repaired_for_delivery`` answers with the source UNCHANGED when no literal
+        span collapses to a key and the whole-text canonical collapse reads clean.
+        But this PR's ``^``-anchored heading rule is POSITION-dependent: a mid-line
+        ``AKIA# NN7EXAMPLE`` is clean whole-text (the ``#`` is not line-leading), yet
+        a byte cut that makes ``# NN7EXAMPLE`` piece-leading strips the ``#`` at
+        render and rejoins the key across two messages. A single re-split of the
+        unchanged repair reproduces that unsafe sequence, so the byte path must
+        re-grade and shrink the budget until the delivered sequence is clean.
+        """
+        from kiro_crew.messaging.renderer import _default_redactor as _dr
+
+        head, tail = "AKIAIOSFOD", "NN7EXAMPLE"
+        # budget 10: the byte cut lands exactly so ``# NN7EXAMPLE`` is piece-leading
+        # (measured; the OLD one-pass byte path leaked this exact fixture).
+        body = head + "# " + tail + " x" * 20
+        assert _dr(body) == body, "fixture must be clean whole-text (mid-line #)"
+        chunks = chunk_for_transport(body, self._byte_capped(10))
+        assert chunks, "nothing delivered"
+        # The reader-view for a heading marker is the CANONICALISED per-frame form:
+        # Webex/WeCom render a piece-leading ``#`` away, so ``_on_screen`` (which only
+        # strips edge whitespace) does not see this seam -- canonicalise each frame.
+        for reading in (
+            canonicalize_display("".join(chunks)),
+            "".join(canonicalize_display(c) for c in chunks),
+        ):
+            assert _dr(reading) == reading, (
+                "the heading-marker seam rejoined the key across byte-capped messages "
+                "-- the repaired re-split was not re-graded"
+            )
+
+    def test_the_char_branch_caps_an_oversized_fence_scaffolding_chunk(self) -> None:
+        """F2: the char path must not ship a chunk OVER the budget.
+
+        ``split_markdown_safe`` is documented to return a chunk over the budget by
+        its fence scaffolding -- a logical line (here a long fence opener/info
+        string) that admits no clean cut is placed whole, adding the reopener and
+        synthetic closer on top. Every caller delivers each unit as its own message
+        and the transport truncates a larger one with no signal, so the entry point
+        must hand ``bounded_for_delivery`` the hard character cutter (``chunk_text``)
+        rather than defaulting back to the splitter that produced the oversized
+        chunk. Every delivered chunk must sit within the budget.
+        """
+        budget = 20
+        # A no-clean-cut fence corpus: lines that admit no boundary clean on both
+        # sides are placed whole with their reopen/closer scaffolding on top, so
+        # ``split_markdown_safe`` returns chunks well over the budget (documented in
+        # split.py). Same shape test_messaging_split.py uses for this regime.
+        bare = "`" * 24 + "\n"
+        fenced = "y" + "`" * 18 + "\n"
+        text = "hi\n" + bare + "```py\n" + fenced + "```\n" + "z\n"
+        # Premise: the plain splitter alone leaves over-budget chunks.
+        raw = split_markdown_safe(text, budget)
+        assert any(len(chunk) > budget for chunk in raw), "fixture has no oversized chunk"
+        # chunk_for_transport must cap every delivered chunk to the budget.
+        chunks = chunk_for_transport(text, self._char_capped(budget))
+        assert chunks, "nothing delivered"
+        assert all(
+            len(chunk) <= budget for chunk in chunks
+        ), f"an over-budget chunk survived: {[len(c) for c in chunks]}"
 
 
 class TestAKeySpanningMoreThanTwoChunks:
@@ -503,10 +743,13 @@ class TestTheTerminalKeepsWhatItCan:
         assert "".join(chunks).replace("\n", "") == safe.replace("\n", "")
 
     def test_only_named_helpers_rewrite_whitespace(self) -> None:
-        """Every whitespace rewrite is in one of three named places.
+        """Every whitespace rewrite is in one of four named places.
 
-        Two read to decide, one rewrites to repair. A fourth would be a fresh way
-        for a valid span to lose its formatting without anyone deciding it should.
+        One reads to decide, two rewrite to repair, and one is the last resort
+        behind the cutter-graded repair, reached only once every narrower repair
+        still rejoins a key across the caller's own re-cut. A fifth would be a
+        fresh way for a valid span to lose its formatting without anyone deciding
+        it should.
         """
         import kiro_crew.messaging.split as split_module
 
@@ -526,6 +769,7 @@ class TestTheTerminalKeepsWhatItCan:
             "_collapses_to_a_key",
             "_redact_only_the_rejoined_span",
             "_made_collapse_clean",
+            "_flattened_for_any_cut",
         }, rewriters
 
     def test_the_terminal_fallback_is_a_collapse_fixed_point(self) -> None:
@@ -578,8 +822,15 @@ class TestTheLastStepIsGradedToo:
         assert all(KEY not in piece for piece in self.SLICED)
         assert KEY in _on_screen(self.SLICED)
 
+    def test_the_cutter_is_required(self) -> None:
+        with pytest.raises(TypeError):
+            repaired_for_delivery(self.SOURCE, self.SLICED, _default_redactor)
+
     def test_the_repair_fires_on_that_sequence(self) -> None:
-        assert repaired_for_delivery(self.SOURCE, self.SLICED, _default_redactor) is not None
+        assert (
+            repaired_for_delivery(self.SOURCE, self.SLICED, _default_redactor, lambda text: [text])
+            is not None
+        )
 
     def test_a_clean_sequence_needs_no_repair(self) -> None:
         assert (
@@ -587,6 +838,7 @@ class TestTheLastStepIsGradedToo:
                 "ordinary text here and more of it",
                 ["ordinary text here", "and more of it"],
                 _default_redactor,
+                lambda text: [text],
             )
             is None
         )
@@ -594,7 +846,9 @@ class TestTheLastStepIsGradedToo:
     @pytest.mark.parametrize("cap", [5, 9, 13, 20, 40])
     def test_the_repair_survives_any_re_cut(self, cap: int) -> None:
         """Why one grade per chunk is enough: the repair is safe to bound again."""
-        repaired = repaired_for_delivery(self.SOURCE, self.SLICED, _default_redactor)
+        repaired = repaired_for_delivery(
+            self.SOURCE, self.SLICED, _default_redactor, lambda text: [text]
+        )
         assert repaired is not None
         assert KEY not in _on_screen(chunk_text(repaired, cap) or [repaired])
 
@@ -609,7 +863,7 @@ class TestTheLastStepIsGradedToo:
         source = f"one line\n\ntwo {HEAD}\n{TAIL} three\n\nfour line"
         pieces = split_markdown_safe(source, 20)
         assert "".join(pieces).count("\n") < source.count("\n"), "the join is lossy here"
-        repaired = repaired_for_delivery(source, pieces, _default_redactor)
+        repaired = repaired_for_delivery(source, pieces, _default_redactor, lambda text: [text])
         assert repaired is not None
         assert repaired.count("\n") > "".join(pieces).count("\n")
         assert repaired.startswith("one line\n\ntwo ")
@@ -643,7 +897,7 @@ class TestTheLastStepIsGradedToo:
         assert (
             _redact_only_the_rejoined_span(source, _default_redactor) is None
         ), "no span of the literal text names this key"
-        fallback = repaired_for_delivery(source, pieces, _default_redactor)
+        fallback = repaired_for_delivery(source, pieces, _default_redactor, lambda text: [text])
         assert fallback is not None
         collapsed = _WHITESPACE_RUN.sub("", canonicalize_display(fallback))
         assert _default_redactor(collapsed) == collapsed
@@ -654,826 +908,73 @@ class TestTheLastStepIsGradedToo:
         assert "repaired_for_delivery" in called
 
 
-class TestASealedPrefixCannotBeCompletedLater:
-    """A sealed chunk ending in a credential PREFIX is the case a seal grade misses.
+class TestTheDashboardHandlerLegsOffloadTheSplitter:
+    """The dashboard proactive-send legs must not grade on the event loop.
 
-    The prefix matches nothing, so every scan passes it and the message goes out;
-    the characters completing the key arrive afterwards. A sent message cannot be
-    recalled, so the side still open is the one not yet delivered, and it gives up
-    exactly the span that completes the key.
+    This PR threaded the credential-aware redactor into the char path
+    (``messaging/renderer.py`` ``split_markdown_safe(..., redactor=redactor)``), so a
+    ``chunk_for_transport`` call now runs the whole-text budget search (up to 128
+    dense probes plus span-repair passes) rather than a plain length cut. The two
+    dashboard handler legs -- ``_deliver_channel_dm`` and ``_send_to_channel_target``
+    -- call it with model-authored, length-unchecked text on the gateway's single
+    loop thread, where a large body would stall past the loop watchdog's 25s
+    dump-then-exit alarm. Both must offload it, as the renderer's own send legs do.
     """
 
-    SENT = f"{'w ' * 20}{HEAD}"
-    LATER = f"{TAIL} and then more ordinary trailing prose."
+    def _handler_calls(self) -> dict[str, list[tuple[str, bool]]]:
+        """Per function: each ``chunk_for_transport`` call and whether it is offloaded.
 
-    def test_the_seal_grade_cannot_see_it(self) -> None:
-        """The premise: nothing is wrong with the sealed chunk when it seals."""
-        assert KEY not in self.SENT
-        assert not _default_redactor(self.SENT) != self.SENT
-
-    def test_the_pair_hands_the_reader_the_key(self) -> None:
-        assert KEY in _on_screen([self.SENT, self.LATER])
-        assert joins_to_a_credential(self.SENT.rstrip(), self.LATER.lstrip(), _default_redactor)
-
-    def test_a_clean_pair_needs_no_offset(self) -> None:
-        assert offset_clear_of_a_sent_tail(self.SENT, "ordinary prose.", _default_redactor) == 0
-        assert repaired_after_a_sent_tail(self.SENT, "ordinary prose.", _default_redactor) is None
-
-    def test_the_offset_covers_only_the_completing_span(self) -> None:
-        offset = offset_clear_of_a_sent_tail(self.SENT, self.LATER, _default_redactor)
-        assert 0 < offset <= len(TAIL) * 2
-        assert not joins_to_a_credential(
-            self.SENT.rstrip(), self.LATER[offset:].lstrip(), _default_redactor
-        )
-
-    def test_the_repair_closes_the_seam(self) -> None:
-        repaired = repaired_after_a_sent_tail(self.SENT, self.LATER, _default_redactor)
-        assert repaired is not None
-        assert KEY not in _on_screen([self.SENT, repaired])
-
-    def test_everything_after_that_span_is_the_reply(self) -> None:
-        repaired = repaired_after_a_sent_tail(self.SENT, self.LATER, _default_redactor)
-        assert repaired is not None
-        assert repaired.endswith("ordinary trailing prose.")
-
-    def test_a_rotation_no_longer_hands_it_over(self) -> None:
-        """The reproduction, through the function Telegram rotates with."""
-        sent: list[str] = []
-
-        def rotate(buf: str, tail: str) -> tuple[str, str]:
-            pieces = _split_markdown(buf, 400)
-            if len(pieces) <= 1:
-                return buf, tail
-            for piece in pieces[:-1]:
-                repaired = repaired_after_a_sent_tail(tail, piece, _default_redactor)
-                piece = repaired if repaired is not None else piece
-                sent.append(piece)
-                tail = piece
-            return pieces[-1], tail
-
-        buf, tail = rotate(("w " * 199) + KEY[:4], "")
-        buf, tail = rotate(buf + KEY[4:] + " and more ordinary prose after it.", tail)
-        assert sent, "the first frame must have sealed something"
-        # The retained tail is shown in the live bubble rather than sealed, and that
-        # is where the renderer repairs it -- the same grade against the same record.
-        shown = repaired_after_a_sent_tail(tail, buf, _default_redactor) or buf
-        assert KEY not in "".join(part.strip() for part in sent) + shown.strip()
-
-    def test_both_streaming_legs_offload_and_record_it(self) -> None:
-        for path in ("telegram/renderer.py", "whatsapp/turn_renderer.py"):
-            tree = ast.parse((SRC / path).read_text(encoding="utf-8"))
-            offloaded = {
-                _name_of(node.args[0])
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and _name_of(node.func) == "to_thread" and node.args
-            }
-            attributes = {
-                node.attr
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Attribute) and node.attr == "_sent_tail"
-            }
-            assert attributes, f"{path} must remember what it already sent"
-            assert offloaded & {
-                "repaired_after_a_sent_tail",
-                "_seam_safe",
-            }, f"{path} must offload the repair"
-        # WhatsApp shows text from two places -- the streaming flush and the final
-        # pass -- and each one sits under a message already sent, so a guard on one
-        # of them is not a guard on the channel.
-        wa = ast.parse((SRC / "whatsapp" / "turn_renderer.py").read_text(encoding="utf-8"))
-        repairs = [
-            node
-            for node in ast.walk(wa)
-            if isinstance(node, ast.Call)
-            and _name_of(node.func) == "to_thread"
-            and node.args
-            and _name_of(node.args[0]) == "repaired_after_a_sent_tail"
-        ]
-        assert len(repairs) >= 2, "both of WhatsApp's send paths must run the repair"
-        recording = {
-            node.name
-            for node in ast.walk(wa)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name != "__init__"
-            for stmt in ast.walk(node)
-            if isinstance(stmt, ast.Assign)
-            and any(isinstance(t, ast.Attribute) and t.attr == "_sent_tail" for t in stmt.targets)
-        }
-        assert len(recording) >= 2, (
-            "each send path must record what it sent, or the next chunk is graded "
-            f"against a stale predecessor -- only {sorted(recording)} does"
-        )
-
-
-class TestEverySealingPathInheritsTheSeamGuard:
-    """One grader and one writer, in the sinks, not at the call sites.
-
-    Five paths seal a segment as its own message -- a length rotation, an
-    upload-hold rotation, a steer boundary, a degraded table chunk and the end of
-    the turn -- so a guard written at one of them is not a guard on the channel.
-    Both sinks run the same helper, and no caller carries a seam rule of its own.
-    """
-
-    TELEGRAM = "telegram/renderer.py"
-
-    def _tree(self) -> ast.AST:
-        return ast.parse((SRC / self.TELEGRAM).read_text(encoding="utf-8"))
-
-    def test_both_sinks_run_the_seam_helper(self) -> None:
-        tree = self._tree()
-        reached = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for call in ast.walk(node)
-            if isinstance(call, ast.Call)
-            and (
-                _name_of(call.func) == "_seam_safe"
-                or (
-                    _name_of(call.func) == "to_thread"
-                    and call.args
-                    and _name_of(call.args[0]) == "_seam_safe"
-                )
-            )
-        }
-        assert {"_seal_text", "_seal_chunk_html"} <= reached, reached
-
-    def test_the_record_has_exactly_one_writer(self) -> None:
-        """A second writer is a second place to forget, which is the whole defect."""
-        tree = self._tree()
-        writers = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for stmt in ast.walk(node)
-            if isinstance(stmt, ast.Assign)
-            and any(isinstance(t, ast.Attribute) and t.attr == "_sent_tail" for t in stmt.targets)
-        }
-        assert writers == {"__init__", "_record_sent"}, writers
-
-    def test_the_record_waits_for_a_confirmed_delivery(self) -> None:
-        """Unsent text may not become the predecessor.
-
-        Every send and edit path can fail. Recording before one confirms would grade
-        the next message against text no reader ever saw, and the next delivered
-        message would give up a leading span for a key nobody read.
+        Offloaded = it is the first argument to ``asyncio.to_thread`` rather than a
+        direct call.
         """
-        tree = self._tree()
-        repair = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_seam_safe"
+        from kiro_crew.dashboard.handlers import messaging
+
+        # The legs run from a messaging_api owner the facade composes, so the scan
+        # parses the facade and every owner, and fails if a leg lives in a file it
+        # does not parse.
+        owners = sorted((SRC / "dashboard" / "messaging_api").glob("[!_]*.py"))
+        assert owners, "the messaging_api owners were not found"
+        files = [SRC / "dashboard" / "handlers" / "messaging.py", *owners]
+        for leg in ("_deliver_channel_dm", "_send_to_channel_target"):
+            held = Path(getattr(messaging, leg).__code__.co_filename)
+            assert held.parts[-2:] in {path.parts[-2:] for path in files}, (leg, held)
+        tree = ast.Module(
+            body=[
+                stmt for path in files for stmt in ast.parse(path.read_text(encoding="utf-8")).body
+            ],
+            type_ignores=[],
         )
-        assert not [
-            stmt
-            for stmt in ast.walk(repair)
-            if isinstance(stmt, ast.Assign)
-            and any(isinstance(t, ast.Attribute) and t.attr == "_sent_tail" for t in stmt.targets)
-        ], "the repair must not record; _record_sent does, after a delivery confirms"
-        recorders = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for call in ast.walk(node)
-            if isinstance(call, ast.Call) and _name_of(call.func) == "_record_sent"
-        }
-        assert {"_seal_text", "_seal_chunk_html"} <= recorders, recorders
-
-    def test_the_degraded_tail_is_graded_after_the_re_split(self) -> None:
-        """The tail sits under a chunk the same pass sealed, which is newer."""
-        tree = self._tree()
-        degraded = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_seal_without_rich"
-        )
-        assert [
-            call
-            for call in ast.walk(degraded)
-            if isinstance(call, ast.Call)
-            and _name_of(call.func) == "to_thread"
-            and call.args
-            and _name_of(call.args[0]) == "_seam_safe"
-        ], "the re-split tail must be graded against what the reader can now see"
-
-    def test_no_sealing_caller_carries_its_own_seam_rule(self) -> None:
-        """Every seal reaches the guard through the sink, so none repeats it."""
-        tree = self._tree()
-        callers = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for call in ast.walk(node)
-            if isinstance(call, ast.Call)
-            and _name_of(call.func) in {"_seal_current", "_seal_chunk_html", "_seal_text"}
-        }
-        assert callers, "the sealing paths are gone"
-        bespoke = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in callers
-            for call in ast.walk(node)
-            if isinstance(call, ast.Call)
-            and (
-                _name_of(call.func) == "repaired_after_a_sent_tail"
-                or (
-                    _name_of(call.func) == "to_thread"
-                    and call.args
-                    and _name_of(call.args[0]) == "repaired_after_a_sent_tail"
-                )
-            )
-        }
-        assert not bespoke, f"these callers duplicate the sink's guard: {bespoke}"
-
-
-class TestEveryDeliveryPathCountsWhatItShipped:
-    """A boundary repair adds a placeholder, and the notice has to see it.
-
-    Each capped path tallied the SOURCE it cut, so a reply whose only redaction
-    came from the repair announced none. Enumerated rather than discovered: the
-    tally sites share no name and a search for one would miss them.
-    """
-
-    #: Each changed path and the expression its tally must read.
-    TALLIES = [
-        ("teams/renderer.py", 'count_redaction_tags("\\n".join(chunks))'),
-        ("slack/renderer.py", "count_redaction_tags(self._delivered or clean_text)"),
-        ("webex/renderer.py", "count_redaction_tags(delivered_text)"),
-        ("wecom/renderer.py", 'count_redaction_tags("\\n".join(chunks))'),
-        ("whatsapp/turn_renderer.py", 'count_redaction_tags("\\n".join(chunks))'),
-    ]
-
-    @pytest.mark.parametrize("path,expected", TALLIES)
-    def test_the_tally_reads_the_delivered_text(self, path: str, expected: str) -> None:
-        source = (SRC / path).read_text(encoding="utf-8")
-        assert expected in source, f"{path} must count what shipped, not its source"
-
-    def test_a_repair_adds_a_placeholder_the_notice_must_see(self) -> None:
-        """The premise: the repair really does introduce one."""
-        repaired = repaired_after_a_sent_tail(
-            f"{'w ' * 20}{HEAD}", f"{TAIL} and trailing prose.", _default_redactor
-        )
-        assert repaired is not None
-        assert count_redaction_tags(repaired)[0] == 1
-
-
-class TestTheSealLoopRepairsWhatItSends:
-    """WhatsApp seals chunk by chunk, and each one sits under the last.
-
-    The forward grade asks whether THIS chunk severs a key; it says nothing about
-    the message already sent, whose tail may have been a credential prefix that
-    matched nothing when it sealed.
-    """
-
-    WA = "whatsapp/turn_renderer.py"
-
-    def test_the_loop_repairs_before_it_seals(self) -> None:
-        tree = ast.parse((SRC / self.WA).read_text(encoding="utf-8"))
-        sealed_raw = [
-            call
-            for call in ast.walk(tree)
-            if isinstance(call, ast.Call)
-            and _name_of(call.func) == "_seal_chunk"
-            and call.args
-            and not isinstance(call.args[0], ast.Name)
-        ]
-        assert not sealed_raw, "a chunk must be repaired into a local before it is sealed"
-        repairs = [
-            call
-            for call in ast.walk(tree)
-            if isinstance(call, ast.Call)
-            and _name_of(call.func) == "to_thread"
-            and call.args
-            and _name_of(call.args[0]) == "repaired_after_a_sent_tail"
-        ]
-        assert len(repairs) >= 3, "the seal loop, the live tail and finalization each repair"
-
-    def test_it_records_what_it_sealed_not_the_original(self) -> None:
-        """Recording the original grades the next chunk against unseen text."""
-        source = (SRC / self.WA).read_text(encoding="utf-8")
-        assert "self._sent_tail = sealed.strip()" in source
-        assert "self._sent_tail = rendered[index]" not in source
-
-
-class TestTheLastResortKeepsUnrelatedFormatting:
-    """Only the span that hides the key gives up its whitespace."""
-
-    def _body(self) -> str:
-        broken = f"`{HEAD}`\n`{TAIL}`"
-        return f"First paragraph.\n\n- one bullet\n- another\n\n{broken}\n\nLast **bold** line.\n"
-
-    def test_the_text_needs_the_last_resort(self) -> None:
-        """The premise: neither the literal nor the canonical reading closes it."""
-        body = self._body()
-        assert _redact_only_the_rejoined_span(body, _default_redactor) is None
-        canonical = redact_for_display(canonicalize_display(body), _default_redactor)[0]
-        collapsed = _WHITESPACE_RUN.sub("", canonicalize_display(canonical))
-        assert _default_redactor(collapsed) != collapsed
-
-    def test_the_answer_is_a_collapse_fixed_point(self) -> None:
-        fixed = _made_collapse_clean(self._body(), _default_redactor)
-        collapsed = _WHITESPACE_RUN.sub("", canonicalize_display(fixed))
-        assert _default_redactor(collapsed) == collapsed
-
-    def test_the_breaks_outside_that_span_survive(self) -> None:
-        """Every break but the one inside the key's own span, and all the prose.
-
-        A blanket collapse would leave none of them. Emphasis goes because the
-        answer is the CANONICAL form, which is ``redact_for_display``'s own
-        one-directional trade and not a wider one taken here.
-        """
-        body = self._body()
-        fixed = _made_collapse_clean(body, _default_redactor)
-        assert fixed.count("\n") == body.count("\n") - 1, fixed
-        assert "First paragraph." in fixed
-        assert "- one bullet" in fixed
-        assert "- another" in fixed
-        assert "Last bold line." in fixed
-        assert KEY not in fixed
-
-    def test_a_blanket_collapse_would_keep_none_of_them(self) -> None:
-        """The control, so the narrowing is measured rather than asserted."""
-        body = self._body()
-        blanket = redact_for_display(
-            _WHITESPACE_RUN.sub("", canonicalize_display(body)), _default_redactor
-        )[0]
-        assert blanket.count("\n") == 0
-        assert _made_collapse_clean(body, _default_redactor).count("\n") > 0
-
-
-class TestWhatsAppsOwnSendPathStaysBounded:
-    """A declined cut may not reach a transport that posts each chunk as a message.
-
-    The non-stable split is what the channel's own sender uses, and it has no
-    length bound of its own. The stable split is deliberately NOT bounded: its
-    caller treats earlier chunks as delivered, and a bound would move a boundary
-    under a message already sent.
-    """
-
-    LIMIT = 120
-
-    def _dense(self) -> str:
-        """A key in code spans either side of a break, repeated: no cut is clean."""
-        return " ".join(f"`{HEAD}`\n`{TAIL}`" for _ in range(8))
-
-    def test_the_splitter_alone_would_decline(self) -> None:
-        converted = to_whatsapp_text(self._dense())
-        chunks = split_markdown_safe(converted, self.LIMIT, redactor=_redact_all)
-        assert len(chunks) == 1, "the premise is a declined cut"
-        assert len(chunks[0]) > self.LIMIT, "and the declined answer is over the cap"
-
-    def test_the_channel_send_path_bounds_it(self) -> None:
-        chunks = render_chunks(self._dense(), self.LIMIT)
-        assert len(chunks) > 1
-        assert max(len(chunk) for chunk in chunks) <= self.LIMIT
-
-    def test_no_key_reaches_the_screen_once_bounded(self) -> None:
-        assert KEY not in _on_screen(render_chunks(self._dense(), self.LIMIT))
-
-    def test_the_stable_split_keeps_the_budget_boundaries(self) -> None:
-        """No extra bound runs there: its boundaries are the budget's, unchanged.
-
-        A streaming caller treats all but the last chunk as delivered, so a bound
-        that re-cut them would move a boundary under a message already sent.
-        """
-        converted = to_whatsapp_text(self._dense())
-        assert render_chunks(self._dense(), self.LIMIT, stable=True) == split_markdown_safe(
-            converted, self.LIMIT, redactor=_redact_all, stable=True
-        )
-
-    def test_ordinary_prose_is_untouched(self) -> None:
-        prose = "One ordinary sentence. " * 3
-        assert "".join(render_chunks(prose, self.LIMIT)) == to_whatsapp_text(prose)
-
-
-class TestTelegramTableBlocksAreRedactedBeforeTheGrade:
-    """The grade is sound only on chunks already a fixed point of its own scan.
-
-    A table run bypasses the splitter, so without its own redaction a cell holding
-    a whole credential makes the sequence grade fire for something no seam severed
-    -- and the repair it reaches then flattens the message's markup.
-    """
-
-    BODY = (
-        "col | val\n--- | ---\nrow | "
-        + KEY
-        + "\n\nordinary trailing prose with **bold** and `code` in it."
-    )
-
-    def test_the_key_never_reaches_the_screen(self) -> None:
-        chunks = _split_markdown_table_aware(self.BODY, 600, 4000)
-        assert KEY not in _on_screen(chunks)
-
-    def test_the_message_keeps_its_markup(self) -> None:
-        chunks = _split_markdown_table_aware(self.BODY, 600, 4000)
-        joined = "".join(chunks)
-        assert "**bold**" in joined
-        assert "`code`" in joined
-
-    def test_the_table_still_seals_as_its_own_block(self) -> None:
-        chunks = _split_markdown_table_aware(self.BODY, 600, 4000)
-        assert len(chunks) == 2, "the table run and the prose stay separate messages"
-
-
-class TestTheBackfillCompositionIsOffloaded:
-    """Splitting an uncapped history row may not run on the loop thread.
-
-    The grade redacts and rescans each candidate boundary, an imported row carries
-    no size cap, and the liveness watchdog exits the process after seconds of loop
-    silence.
-    """
-
-    def test_the_units_are_composed_in_a_thread(self) -> None:
-        tree = ast.parse((SRC / "dashboard" / "chat_mirror.py").read_text(encoding="utf-8"))
-        offloaded = False
+        found: dict[str, list[tuple[str, bool]]] = {}
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Await):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            names = {
-                element.id
-                for target in node.targets
-                for element in getattr(target, "elts", [target])
-                if isinstance(element, ast.Name)
-            }
-            call = node.value.value
-            if "recent_turn_units" in names and isinstance(call, ast.Call):
-                offloaded = _name_of(call.func) == "to_thread"
-        assert offloaded, "the backfill units must be composed off the loop thread"
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                if _name_of(call.func) == "chunk_for_transport":
+                    found.setdefault(node.name, []).append(("direct", False))
+                elif (
+                    _name_of(call.func) == "to_thread"
+                    and call.args
+                    and _name_of(call.args[0]) == "chunk_for_transport"
+                ):
+                    found.setdefault(node.name, []).append(("offloaded", True))
+        return found
 
-
-class TestAStreamedReplyNeverRevisesADeliveredChunk:
-    """A streaming caller re-splits its growing body and seals all but the last.
-
-    So chunk *i* must be decided by the text before it and nothing later. Searching
-    the whole body for a safer budget breaks that: one more character can move a
-    boundary under a message already sent, which a count of delivered chunks cannot
-    detect and no later frame can take back.
-    """
-
-    #: The body that reproduced the revision, and the budget it happened at.
-    PAD, LIMIT, CUT = 108, 120, 129
-
-    def _body(self) -> str:
-        return f"{'w' * self.PAD} {HEAD} {TAIL} trailing words after the key here"
-
-    def _split(self, text: str, *, stable: bool) -> list[str]:
-        return split_markdown_safe(text, self.LIMIT, redactor=_default_redactor, stable=stable)
-
-    def test_searching_the_whole_body_revises_a_sealed_chunk(self) -> None:
-        """The state a streaming caller cannot survive, on the searching path."""
-        body = self._body()
-        short = self._split(body[: self.CUT], stable=False)
-        longer = self._split(body[: self.CUT + 1], stable=False)
-        assert len(short) >= 2
-        assert short[0] != longer[0], "one more character revised an already-sealed chunk"
-
-    def test_the_stable_split_leaves_it_alone(self) -> None:
-        body = self._body()
-        short = self._split(body[: self.CUT], stable=True)
-        longer = self._split(body[: self.CUT + 1], stable=True)
-        assert len(short) >= 2
-        assert longer[: len(short) - 1] == short[:-1]
-
-    @pytest.mark.parametrize("cut", [40, 60, 80, 100, 120, 129, 140])
-    def test_every_append_keeps_the_sealed_prefix(self, cut: int) -> None:
-        body = self._body()
-        short = self._split(body[:cut], stable=True)
-        if len(short) < 2:
-            pytest.skip("nothing sealed at this length")
-        longer = self._split(body[: cut + 1], stable=True)
-        assert longer[: len(short) - 1] == short[:-1]
-
-    def test_the_stable_split_still_redacts(self) -> None:
-        """Prefix stability is not bought by dropping the redaction."""
-        chunks = self._split(f"{'w' * 40} {KEY} trailing", stable=True)
-        assert all(KEY not in chunk for chunk in chunks)
-
-    def test_the_streaming_renderer_asks_for_the_stable_split(self) -> None:
-        tree = ast.parse((SRC / "whatsapp" / "turn_renderer.py").read_text(encoding="utf-8"))
-        stable = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and any(kw.arg == "stable" for kw in node.keywords)
-            and _name_of(node.func) == "render_chunks_off_loop"
-        ]
-        assert stable, "the streaming renderer must request the prefix-stable split"
-
-    def test_it_grades_the_seam_before_counting_a_chunk_final(self) -> None:
-        tree = ast.parse((SRC / "whatsapp" / "turn_renderer.py").read_text(encoding="utf-8"))
-        reached = {_name_of(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)} | {
-            _name_of(node.args[0])
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _name_of(node.func) == "to_thread" and node.args
-        }
-        assert "joins_to_a_credential" in reached
-        assert "repaired_after_a_sent_tail" in reached
-
-    def test_the_finalization_repairs_against_what_was_already_sent(self) -> None:
-        """The notice counts what shipped, and the repair subject is one chunk.
-
-        A chunk sealed while its tail was only a credential PREFIX is already on
-        screen, so the completion arriving later can be given up only on the side
-        not yet sent. Each send is graded against the previous one and the shipped
-        list is what the tally reads, so a reply whose only placeholder came from a
-        repair does not announce none.
-        """
-        tree = ast.parse((SRC / "whatsapp" / "turn_renderer.py").read_text(encoding="utf-8"))
-        assigned = {
-            target.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        } | {
-            node.target.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-        }
-        assert "_sent_tail" not in assigned, "the record is an attribute, not a local"
-        attributes = {
-            node.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Attribute) and node.attr == "_sent_tail"
-        }
-        assert attributes, "the renderer must remember what it already sent"
-        assert "shipped" in assigned, "the tally must read the sequence that shipped"
-
-
-class TestTheGradeNeverRunsOnTheEventLoop:
-    """Every site handing the splitter a redactor offloads it.
-
-    The grade redacts and rescans the text once per candidate boundary and the
-    search tries many budgets, so a reply where no cut is clean holds the thread
-    for seconds. One loop carries every channel, every turn and the liveness
-    heartbeat, and the watchdog exits the process when it goes quiet.
-    """
-
-    #: Each path, and the name its offload is expected to wrap.
-    OFFLOADED = [
-        ("webex/renderer.py", "_bounded_chunks"),
-        ("slack/renderer.py", "_bounded"),
-        ("teams/renderer.py", "split_markdown_safe"),
-        ("wecom/renderer.py", "split_markdown_safe"),
-        ("dashboard/chat_mirror.py", "_compose_units"),
-        ("whatsapp/renderer.py", "render_chunks"),
-        ("telegram/renderer.py", "_split_markdown_bounded"),
-        ("whatsapp/turn_renderer.py", "repaired_after_a_sent_tail"),
-    ]
-
-    @pytest.mark.parametrize("path,target", OFFLOADED)
-    def test_the_splitter_call_is_handed_to_a_thread(self, path: str, target: str) -> None:
-        tree = ast.parse((SRC / path).read_text(encoding="utf-8"))
-        offloads = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and _name_of(node.func) == "to_thread"
-            and node.args
-            and _name_of(node.args[0]) == target
-        ]
-        assert offloads, f"{path} must hand {target} to a thread"
-
-    #: Telegram's own splitters, every one of which scans for credentials now that
-    #: the cut is credential-aware. The channel rotates from four places, so "one
-    #: offload exists somewhere in the file" is not the guarantee that matters.
-    TELEGRAM_SCANNERS = frozenset(
-        {
-            "_split_markdown",
-            "_split_markdown_bounded",
-            "_split_markdown_table_aware",
-            "_degraded_table_chunks",
-            "repaired_after_a_sent_tail",
-        }
-    )
-
-    def test_no_telegram_coroutine_calls_a_scanner_directly(self) -> None:
-        """Each rotation site, not just one of them, hands its cut to a thread."""
-        tree = ast.parse((SRC / "telegram" / "renderer.py").read_text(encoding="utf-8"))
-        offenders = [
-            f"{node.name} -> {_name_of(call.func)}"
-            for node in ast.walk(tree)
-            if isinstance(node, ast.AsyncFunctionDef)
-            for call in _own_body_calls(node)
-            if _name_of(call.func) in self.TELEGRAM_SCANNERS
-        ]
-        assert not offenders, (
-            f"these coroutines run a credential scan on the event loop: {offenders}. "
-            "Hand the call to asyncio.to_thread."
+    def test_both_dashboard_legs_offload_the_splitter(self) -> None:
+        calls = self._handler_calls()
+        legs = {"_deliver_channel_dm", "_send_to_channel_target"}
+        reached = legs & set(calls)
+        assert reached == legs, (
+            f"the dashboard proactive-send legs that chunk are {sorted(reached)}, "
+            f"expected {sorted(legs)} -- a renamed/removed leg must update this gate"
         )
-
-    def test_the_repair_loop_is_bounded_by_a_constant(self) -> None:
-        """Unbounded passes would cost thousands of whole-text redactions."""
-        source = (SRC / "messaging" / "split.py").read_text(encoding="utf-8")
-        assert "_DENSE_PROBES)" in source
-        long_runs = "a " * 4000
-        repaired = _redact_only_the_rejoined_span(long_runs, _default_redactor)
-        assert repaired is not None, "clean text needs no passes at all"
-
-
-class TestTheSeamGradeReadsWhatTheReaderSees:
-    """The streaming seam is graded on rendered text, not characters as stored.
-
-    A platform drops the whitespace at a message's edges, so a tail beginning with
-    a tab separates nothing once the two messages sit on screen. The splitter's own
-    predicate strips those edges for that reason, and the seam grade has to agree
-    with it or the two answer different questions about the same boundary.
-    """
-
-    #: A tail that BEGINS with edge whitespace. The splitter never strips leading
-    #: whitespace, and a tab is not a delimiter a hard cut avoids, so a remainder
-    #: can start with one.
-    SEAM = [f"prefix {HEAD}", f"\t{TAIL} rest"]
-
-    def test_the_stored_reading_approves_the_pair(self) -> None:
-        """The bypass: asking about the characters as stored clears this seam."""
-        assert not joins_to_a_credential(self.SEAM[0], "".join(self.SEAM[1:]), _default_redactor)
-
-    def test_the_reader_sees_the_key_whole(self) -> None:
-        assert KEY in _on_screen(self.SEAM)
-        assert all(KEY not in chunk for chunk in self.SEAM)
-
-    def test_the_rendered_reading_refuses_it(self) -> None:
-        rendered = [chunk.strip() for chunk in self.SEAM]
-        assert joins_to_a_credential(rendered[0], "".join(rendered[1:]), _default_redactor)
-
-    def test_the_streaming_renderer_grades_the_rendered_text(self) -> None:
-        """Structural: the seal loop must strip edges before it grades."""
-        tree = ast.parse((SRC / "whatsapp" / "turn_renderer.py").read_text(encoding="utf-8"))
-        stripped_lists = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ListComp)
-            and isinstance(node.elt, ast.Call)
-            and _name_of(node.elt.func) == "strip"
-        ]
-        assert stripped_lists, "the seal loop must grade the rendered chunks"
-
-    def test_both_grades_agree_on_this_seam(self) -> None:
-        """The sequence grade and the seam grade answer the same question."""
-        assert _rejoins_a_key(self.SEAM, _default_redactor)
-
-
-class TestAHardByteCapIsNeverExceeded:
-    """The splitter may answer with the text WHOLE, so a hard-capped transport
-    has to bound the result itself.
-
-    Declining to cut is the fail-closed answer when no budget is clean, and it
-    costs the caller a chunk over its budget. A client that truncates a larger
-    payload would drop the answer's tail with no notice, so that caller grades the
-    sequence once more and cuts the repair back to its budget.
-    """
-
-    def test_webex_bounds_its_own_chunks(self) -> None:
-        from kiro_crew.webex.renderer import WEBEX_MAX_TEXT, _bounded_chunks
-
-        oversized = "x" * 9000
-        body = f"[label](https://example.test/{oversized}/{HEAD} {TAIL})"
-        chunks = _bounded_chunks(body)
-        assert chunks
-        assert all(len(chunk.encode()) <= WEBEX_MAX_TEXT for chunk in chunks)
-
-    def test_a_single_oversized_chunk_is_still_bounded(self) -> None:
-        """The case the grade alone skips: one chunk holds no boundary.
-
-        The splitter's fail-closed answer is a list of ONE chunk, so a grade asked
-        about it reports that nothing rejoins, and the oversized chunk would travel
-        on unbounded -- which is the situation this bound exists for.
-        """
-        budget = 40
-        oversized = ["x" * 300]
-        out = bounded_for_delivery(oversized, budget, _default_redactor)
-        assert len(out) > 1
-        assert all(len(chunk) <= budget for chunk in out)
-        assert "".join(out) == oversized[0], "every character still ships"
-
-    def test_cutting_an_oversized_chunk_cannot_expose_a_key(self) -> None:
-        """Applying the budget first is what lets the grade see the real shape."""
-        budget = 40
-        hidden = ["y" * 30 + f" {HEAD} {TAIL} " + "z" * 30]
-        out = bounded_for_delivery(hidden, budget, _default_redactor)
-        assert all(len(chunk) <= budget for chunk in out)
-        assert KEY not in _on_screen(out)
-
-    def test_text_already_inside_the_budget_is_untouched(self) -> None:
-        assert bounded_for_delivery(["hello"], 40, _default_redactor) == ["hello"]
-
-    def test_webex_keeps_ordinary_text_whole(self) -> None:
-        from kiro_crew.webex.renderer import _bounded_chunks
-
-        prose = "an ordinary answer with nothing to redact in it"
-        assert "".join(_bounded_chunks(prose)) == prose
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "webex/renderer.py",
-            "teams/renderer.py",
-            "wecom/renderer.py",
-            "dashboard/chat_mirror.py",
-            "telegram/renderer.py",
-        ],
-    )
-    def test_every_capped_caller_runs_the_bound(self, path: str) -> None:
-        """A transport that truncates has to bound the splitter's whole answer."""
-        tree = ast.parse((SRC / path).read_text(encoding="utf-8"))
-        called = {_name_of(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
-        offloaded = {
-            _name_of(node.args[0])
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _name_of(node.func) == "to_thread" and node.args
-        }
-        assert "bounded_for_delivery" in (
-            called | offloaded
-        ), f"{path} sends the splitter's answer without bounding it"
-
-
-class TestTheFramesAChannelActuallySends:
-    """One channel end to end, through the function its client sends from."""
-
-    def test_whatsapp_delivery_chunks_cannot_be_rejoined(self) -> None:
-        frames = render_chunks(f"{'w ' * 18}{HEAD}\n{TAIL} and some trailing words", 50)
-        assert frames
-        assert KEY not in "".join(frames)
-        for frame in frames:
-            assert KEY not in frame
-        assert not any(
-            joins_to_a_credential(frames[i], frames[i + 1], _default_redactor)
-            for i in range(len(frames) - 1)
-        )
-
-
-class TestTelegramRotatesWithoutHandingOverAKey:
-    """The rotation cut, through the function the channel rotates with.
-
-    A rotation seals every chunk but the last as its own message and redacts each
-    segment on its own, so a boundary between the halves of a key is a boundary
-    neither message reports. The channel's own budget floor is 400 characters, so
-    the text here is sized against that rather than a toy budget.
-    """
-
-    #: Telegram's ``_MIN_SPLIT_LIMIT``, which is the smallest budget its bounded
-    #: splitter will use, so a smaller one here would not exercise a real cut.
-    BUDGET = 400
-
-    def _body(self) -> str:
-        """Filler, then the key's halves either side of a line break."""
-        return ("w " * 180) + HEAD + "\n" + TAIL + " and some trailing words after it"
-
-    def test_the_budget_alone_hands_the_reader_the_key(self) -> None:
-        """The control: without the redactor this is exactly what ships."""
-        chunks = split_markdown_safe(self._body(), self.BUDGET)
-        assert len(chunks) > 1
-        assert _rejoins(chunks)
-        assert KEY in _on_screen(chunks)
-
-    def test_the_rotation_cut_moves_instead(self) -> None:
-        chunks = _split_markdown(self._body(), self.BUDGET)
-        assert len(chunks) > 1
-        assert not _rejoins(chunks)
-        assert KEY not in _on_screen(chunks)
-        for chunk in chunks:
-            assert KEY not in chunk
-
-    def test_every_character_still_ships(self) -> None:
-        body = self._body()
-        chunks = _split_markdown(body, self.BUDGET)
-        assert "".join(chunks).replace("\n", "") == body.replace("\n", "")
-
-    def test_the_bounded_splitter_carries_the_same_guard(self) -> None:
-        chunks = _split_markdown_bounded(self._body(), self.BUDGET)
-        assert not _rejoins(chunks)
-        assert KEY not in _on_screen(chunks)
-
-    def test_a_declined_cut_is_still_bounded(self) -> None:
-        """A cut the splitter refuses may not travel as one oversized message."""
-        dense = " ".join(f"{HEAD} {TAIL}" for _ in range(40))
-        chunks = _split_markdown_bounded(dense, self.BUDGET)
-        assert chunks
-        assert max(len(chunk) for chunk in chunks) <= self.BUDGET
-
-    def test_ordinary_prose_is_returned_unchanged(self) -> None:
-        prose = "Some ordinary sentence. " * 40
-        assert "".join(_split_markdown(prose, self.BUDGET)).replace("\n", "") == prose.replace(
-            "\n", ""
-        )
-
-    #: A table whose last cell ends its line, then prose. Each block is cut on its
-    #: own, so the boundary between them belongs to neither cut.
-    ACROSS_TWO_BLOCKS = (
-        "col | val\n--- | ---\nrow | " + HEAD + "\n\n" + TAIL + " then ordinary trailing prose."
-    )
-
-    def test_the_two_blocks_alone_hand_over_the_key(self) -> None:
-        """The control: the per-block sequence really does rejoin it."""
-        blocks = ["\n".join(lines) for _, lines in _table_blocks(self.ACROSS_TWO_BLOCKS)]
-        assert len(blocks) == 2
-        assert _rejoins(blocks)
-        assert KEY in _on_screen(blocks)
-
-    def test_the_table_aware_cut_grades_that_seam(self) -> None:
-        chunks = _split_markdown_table_aware(self.ACROSS_TWO_BLOCKS, 600, 80)
-        assert chunks
-        assert not _rejoins(chunks)
-        assert KEY not in _on_screen(chunks)
+        for leg in legs:
+            assert calls[leg], f"{leg} no longer chunks -- drop it from this gate"
+            offloaded = [shape for shape, is_off in calls[leg] if is_off]
+            direct = [shape for shape, is_off in calls[leg] if not is_off]
+            assert offloaded and not direct, (
+                f"{leg} calls chunk_for_transport ON THE LOOP ({direct}); a large "
+                "model-authored body would stall the loop past the 25s watchdog. "
+                "Offload it with asyncio.to_thread like the renderer's send legs."
+            )

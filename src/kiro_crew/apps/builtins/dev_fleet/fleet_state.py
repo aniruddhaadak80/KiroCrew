@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.apps.builtins.dev_fleet import live, repository, runtime
+from kiro_crew.apps.builtins.dev_fleet import git_facts, live, repository, runtime
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform_compat import is_link_or_junction
@@ -48,7 +48,10 @@ def _build_pending() -> bool:
 
 # --- GitHub PR status (TTL-cached, best-effort) ---
 _PR_CACHE: dict[str, dict] = {}
-_PR_TTL = 55
+# One `gh pr list` per non-merged branch per TTL. 300 s keeps today's real refresh:
+# before the git facts cache a fleet pass took 330-370 s, so 55 s never fired
+# sooner. With ~1 s cached passes, 55 s would mean ~2,700 `gh` calls an hour.
+_PR_TTL = 300
 
 _OWNER_REPO: str | None = None
 _OWNER_REPO_RETRY_AT: float = 0.0  # monotonic deadline before retrying a failed lookup
@@ -70,7 +73,10 @@ async def _repo_owner_name() -> str | None:
     )
     if rc != 0:
         return None
-    url = stdout.strip()
+    # Cut before the pattern, not after: this anchors on ``$``, so a retained
+    # ``?access_token=...`` keeps ``.git`` from stripping AND rides into the
+    # ``owner/repo`` this hands to ``gh --repo`` in child argv.
+    url = runtime.remote_url_locator(stdout)
     m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
     return m.group(1) if m else None
 
@@ -390,8 +396,13 @@ def _issue_url(base: str | None, n: int) -> str | None:
 
 def _parse_html_repo_base(remote_url: str) -> str | None:
     """Derive the repo's browser (html) base URL from a git remote URL,
-    normalising scp-style and scheme URLs to https. None when unparseable."""
-    url = (remote_url or "").strip()
+    normalising scp-style and scheme URLs to https. None when unparseable.
+
+    The query is cut first: this result is rendered into an issue-link ``href``,
+    and both patterns below anchor on ``$``, so a remote carrying
+    ``?access_token=...`` would put that token in the link.
+    """
+    url = runtime.remote_url_locator(remote_url)
     if not url:
         return None
     # scp-like: [user@]host:owner/repo(.git)  — (?!/) rejects a scheme "://".
@@ -441,6 +452,10 @@ async def _html_repo_base() -> str | None:
 # per-branch context cache (mirrors _PR_CACHE / _PR_TTL)
 _CTX_CACHE: dict[str, dict] = {}
 _CTX_TTL = 55
+# path -> (git_facts._git_facts key, `git log` output) for _build_context.
+_CTX_LOG_CACHE: dict[str, tuple[tuple, str]] = {}
+# `-10` bounds commits, not bytes: a log longer than this is used once, never kept.
+_CTX_LOG_MAX_CHARS = 64 * 1024
 
 
 async def _resolve_context(
@@ -468,24 +483,37 @@ async def _resolve_context(
     }
 
 
-async def _build_context(branch: str, path: str, pr: dict | None) -> dict:
+async def _build_context(
+    branch: str, path: str, pr: dict | None, facts_key: tuple | None = None
+) -> dict:
     """Resolve {issues, tickets, summary} for a worktree branch. Best-effort:
     the PR body comes from the already-cached PR dict (no NEW gh call) and the
-    commit subjects/bodies from a local `git log`; any failure yields empties."""
+    commit subjects/bodies from a local `git log`; any failure yields empties.
+
+    The log reads only HEAD and the base ref, so with ``facts_key`` (the
+    ``git_facts._git_facts`` key) it is reused until that key changes."""
     remote = await repository._upstream_remote()
     subjects: list[str] = []
     bodies: list[str] = []
-    # Subject + body of the last ~10 non-merge commits, record-separated by
-    # 0x1e (bodies contain newlines, so newline can't delimit records).
-    log = await repository._git(
-        path,
-        "log",
-        f"{remote}/{repository.BASE_BRANCH}..HEAD",
-        "--no-merges",
-        "-10",
-        "--format=%s%x1f%b%x1e",
-        timeout=12,
-    )
+    hit = _CTX_LOG_CACHE.get(path)
+    if facts_key is not None and hit is not None and hit[0] == facts_key:
+        log: str | None = hit[1]
+    else:
+        # Subject + body of the last ~10 non-merge commits, record-separated by
+        # 0x1e (bodies contain newlines, so newline can't delimit records).
+        log = await repository._git(
+            path,
+            "log",
+            f"{remote}/{repository.BASE_BRANCH}..HEAD",
+            "--no-merges",
+            "-10",
+            "--format=%s%x1f%b%x1e",
+            timeout=12,
+        )
+        if facts_key is not None and log is not None and len(log) <= _CTX_LOG_MAX_CHARS:
+            _CTX_LOG_CACHE[path] = (facts_key, log)
+        else:
+            _CTX_LOG_CACHE.pop(path, None)
     if log:
         for rec in log.split("\x1e"):
             rec = rec.strip("\n")
@@ -500,7 +528,9 @@ async def _build_context(branch: str, path: str, pr: dict | None) -> dict:
     return await _resolve_context(branch, subjects, bodies, (pr or {}).get("_body"))
 
 
-async def _context_cached(branch: str | None, path: str, pr: dict | None) -> dict:
+async def _context_cached(
+    branch: str | None, path: str, pr: dict | None, facts_key: tuple | None = None
+) -> dict:
     """TTL-cached per-branch context (same approach as _pr_status_cached)."""
     empty: dict = {"issues": [], "tickets": [], "summary": None}
     if not branch or branch == repository.BASE_BRANCH:
@@ -510,7 +540,7 @@ async def _context_cached(branch: str | None, path: str, pr: dict | None) -> dic
     if ent and (now - ent["ts"]) < _CTX_TTL:
         return ent["data"]
     try:
-        data = await _build_context(branch, path, pr)
+        data = await _build_context(branch, path, pr, facts_key)
     except Exception:  # noqa: BLE001 — context is best-effort, never break fleet
         data = empty
     _CTX_CACHE[branch] = {"data": data, "ts": time.time()}
@@ -1190,7 +1220,8 @@ async def _build_fleet() -> dict:
         path = wt.get("path", "")
         branch = wt.get("branch")
         is_main = wt.get("is_main", False)
-        g = await repository._git_info(path)
+        # Cached on a stat-only key: a poll with nothing changed runs no git here.
+        g, facts_key = await git_facts._git_facts(path)
         pr = (await _pr_status_cached(branch, g.get("head_oid"))) if branch else None
         name = Path(path).name if not is_main else repository.BASE_BRANCH
 
@@ -1239,21 +1270,22 @@ async def _build_fleet() -> dict:
                 except Exception:  # noqa: BLE001
                     pass
 
-        ahead = await repository._git_ahead(path)
         # "shipped" drives the UI's "safe to remove" affordance — require a
         # POSITIVELY clean worktree (dirty is False, not merely unknown), so
         # the confirm dialog never promises a removal the backend will refuse.
+        # `git cherry` is the costly read, so it runs last and only when the
+        # other three already hold.
         shipped = (
             _is_pr_merged(pr)
-            and (ahead is not None and ahead == 0)
             and g["dirty"] is False
             and not is_main
+            and await git_facts._git_ahead_cached(path) == 0
         )
 
         # Per-worktree context (issue/ticket links + purpose one-liner). Skipped
         # for the main checkout (no feature context). Best-effort: never raises.
         ctx = (
-            await _context_cached(branch, path, pr)
+            await _context_cached(branch, path, pr, facts_key)
             if branch and not is_main
             else {"issues": [], "tickets": [], "summary": None}
         )
@@ -1293,6 +1325,10 @@ async def _build_fleet() -> dict:
                 "pod_resources": None,
             }
         )
+    seen = {wt.get("path", "") for wt in worktrees}
+    git_facts._git_facts_retain(seen)
+    for p in [p for p in _CTX_LOG_CACHE if p not in seen]:
+        del _CTX_LOG_CACHE[p]
     # ONE batched resource probe for every running pod, off the row loop so the
     # payload never spawns a subprocess per row per poll. Best-effort and
     # Linux-only (the probe itself degrades to {} off Linux / on failure), so a
@@ -1420,6 +1456,10 @@ async def _build_fleet() -> dict:
         # False only while the gateway's pointer state could not be read: the
         # live/staged fields above are then UNKNOWN, not empty.
         "live_state_known": live_state_known,
+        # False only when the live row is the pointer's target taken on trust: a
+        # packaged gateway cannot confirm it runs that checkout, so the row shows
+        # "live?". An outage is live_state_known above, not this field.
+        "live_verified": live_path is None or pointer.live_verified,
         "manual_restart": live._manual_restart_command(),
         # WHY the gateway cannot be restarted/repointed from here, when it
         # cannot. Same lesson as pods_unavailable_reason below: the previous
@@ -1660,6 +1700,7 @@ async def _disk() -> dict:
 
 __all__ = (
     "_CTX_CACHE",
+    "_CTX_LOG_CACHE",
     "_CTX_MAX_ISSUES",
     "_CTX_MAX_TICKETS",
     "_CTX_TTL",

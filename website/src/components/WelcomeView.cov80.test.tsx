@@ -1,13 +1,25 @@
-import { screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { onTestFinished } from 'vitest'
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from '../test/helpers'
 import WelcomeView from './WelcomeView'
+import { MemoryModeChip } from './MemoryModeChip'
 import { api } from '../api/client'
 import { getThemeBranding } from '../themeBranding'
+import { changeLanguage, registerCatalogs } from '../i18n'
+import zhCN from '../i18n/locales/zh-CN.json'
 import { i18nT } from '../i18n/t'
+import { attachReport, sendErrorToChat } from '../utils/errorReport'
+
+registerCatalogs({ 'zh-CN': { translation: zhCN } })
 
 vi.mock('../api/client', async importOriginal => {
   const mod = await importOriginal<typeof import('../api/client')>()
   return { ...mod, api: { ...mod.api, suggestions: vi.fn() } }
+})
+
+vi.mock('../utils/errorReport', async importOriginal => {
+  const mod = await importOriginal<typeof import('../utils/errorReport')>()
+  return { ...mod, sendErrorToChat: vi.fn(() => true) }
 })
 
 vi.mock('../themeBranding', async importOriginal => {
@@ -52,6 +64,38 @@ describe('WelcomeView', () => {
     expect(setInput).toHaveBeenCalledWith(i18nT('components.welcomeView.suggestion_search_code'))
   })
 
+  it('renders the built-in pills in the active language when the server sends none', async () => {
+    // An empty list is what the server sends when it generated nothing (a new
+    // install, a failed call), so these pills are all a new user sees.
+    const keys = [
+      'components.welcomeView.suggestion_daily_reminder',
+      'components.welcomeView.suggestion_what_next',
+      'components.welcomeView.suggestion_search_code',
+      'components.welcomeView.suggestion_summarize_chat',
+      'components.welcomeView.suggestion_write_design_doc',
+      'components.welcomeView.suggestion_review_changes',
+    ]
+    const english = keys.map(k => i18nT(k))
+    onTestFinished(async () => { await changeLanguage('en') })
+    await act(async () => { await changeLanguage('zh-CN') })
+    const chinese = keys.map(k => i18nT(k))
+
+    const { queryClient } = renderWithProviders(<WelcomeView setInput={vi.fn()} />)
+    await waitFor(() => expect(queryClient.getQueryState(['suggestions'])?.status).toBe('success'))
+
+    for (const text of chinese) expect(screen.getByRole('button', { name: text })).toBeInTheDocument()
+    for (const text of english) expect(screen.queryByRole('button', { name: text })).not.toBeInTheDocument()
+  })
+
+  it('falls back to the built-in pills when every server suggestion is malformed', async () => {
+    suggestions.mockResolvedValue(payload([null, { text: 42 }] as unknown as Suggestions['suggestions']))
+    renderWithProviders(<WelcomeView setInput={vi.fn()} />)
+
+    expect(await screen.findByRole('button', {
+      name: i18nT('components.welcomeView.suggestion_search_code'),
+    })).toBeInTheDocument()
+  })
+
   it('prefers the server suggestions and feeds a clicked pill to the composer', async () => {
     suggestions.mockResolvedValue(payload(['zzq alpha', 'zzq beta']))
     const setInput = vi.fn()
@@ -80,74 +124,61 @@ describe('WelcomeView', () => {
     expect(setInput).toHaveBeenCalledWith('zzq code')
   })
 
-  it('the refresh button forces a regeneration and swaps the pills', async () => {
-    suggestions.mockResolvedValue(payload(['zzq old']))
+  it('offers no refresh control: the suggestion list is fetched once and never forced', async () => {
+    suggestions.mockResolvedValue(payload(['zzq only']))
     renderWithProviders(<WelcomeView setInput={vi.fn()} />)
-    await screen.findByRole('button', { name: 'zzq old' })
+    await screen.findByRole('button', { name: 'zzq only' })
 
-    suggestions.mockResolvedValue(payload(['zzq fresh']))
-    fireEvent.click(
-      screen.getByRole('button', { name: i18nT('components.welcomeView.refresh_suggestions') }),
-    )
-
-    expect(await screen.findByRole('button', { name: 'zzq fresh' })).toBeInTheDocument()
-    expect(suggestions).toHaveBeenCalledWith(true)
+    expect(screen.getAllByRole('button')).toHaveLength(1)
+    expect(suggestions).toHaveBeenCalledTimes(1)
+    expect(suggestions).not.toHaveBeenCalledWith(true)
   })
 
-  it('a failed refresh stops spinning and keeps the current pills', async () => {
-    suggestions.mockResolvedValue(payload(['zzq kept']))
-    renderWithProviders(<WelcomeView setInput={vi.fn()} />)
-    await screen.findByRole('button', { name: 'zzq kept' })
-
-    suggestions.mockRejectedValueOnce(new Error('zzq refresh down'))
-    const refresh = screen.getByRole('button', {
-      name: i18nT('components.welcomeView.refresh_suggestions'),
+  it('a failed suggestions fetch renders an ErrorNotice with the hand-off and keeps the fallback cards', async () => {
+    // The transport pins its structured report to the rejection, as the api client does.
+    const err = attachReport(new Error('zzq suggestions down'), {
+      id: 'zzq-report', at: 1, source: 'api', message: 'zzq suggestions down',
+      status: 503, code: 'zzq_suggestions_unavailable',
     })
-    await act(async () => { fireEvent.click(refresh) })
+    suggestions.mockRejectedValue(err)
+    vi.mocked(sendErrorToChat).mockClear()
+    renderWithProviders(<WelcomeView setInput={vi.fn()} />)
 
-    await waitFor(() => expect(refresh).toBeEnabled())
-    expect(screen.getByRole('button', { name: 'zzq kept' })).toBeInTheDocument()
-  })
-
-  it('orchestrator mode swaps the heading and drops the pills', () => {
-    const setInput = vi.fn()
-    renderWithProviders(<WelcomeView mode="orchestrator" setInput={setInput} />)
-
-    expect(screen.getByText(i18nT('components.welcomeView.autopilot'))).toBeInTheDocument()
+    const notice = await screen.findByRole('alert')
+    // The localized line, never the transport error's own text.
+    expect(notice).toHaveTextContent(i18nT('components.welcomeView.suggestions_failed_to_load'))
+    expect(notice).not.toHaveTextContent('zzq suggestions down')
     expect(
-      screen.queryByRole('button', {
-        name: i18nT('components.welcomeView.refresh_suggestions'),
-      }),
-    ).not.toBeInTheDocument()
+      screen.getByRole('button', { name: i18nT('components.welcomeView.suggestion_search_code') }),
+    ).toBeInTheDocument()
 
-    fireEvent.click(
-      screen.getByRole('button', {
-        name: i18nT('components.welcomeView.try_create_a_plan_to_analyze_kirocrew_code_packa'),
-      }),
-    )
-    expect(setInput).toHaveBeenCalledWith(expect.stringContaining('Create a plan'))
-    expect(suggestions).not.toHaveBeenCalled()
+    // The hand-off still carries the structured report, not just the localized line.
+    fireEvent.click(within(notice).getByRole('button', { name: i18nT('components.askAgent.ask_the_agent') }))
+    expect(sendErrorToChat).toHaveBeenCalledTimes(1)
+    const prompt = vi.mocked(sendErrorToChat).mock.calls[0][0]
+    expect(prompt).toContain('503')
+    expect(prompt).toContain('zzq_suggestions_unavailable')
   })
 
   it('renders the theme logo instead of the stock ghost when one is registered', () => {
     branding.mockReturnValue({ logo: '/zzq-logo.png' })
-    const { container } = renderWithProviders(
-      <WelcomeView mode="orchestrator" setInput={vi.fn()} />,
-    )
+    const { container } = renderWithProviders(<WelcomeView setInput={vi.fn()} />)
     expect(container.querySelector('img[src="/zzq-logo.png"]')).toBeTruthy()
   })
 
-  it('hides the ephemeral affordance entirely when neither handler is passed', () => {
-    renderWithProviders(<WelcomeView mode="orchestrator" setInput={vi.fn()} />)
+  it('never renders the memory chooser (ChatPage puts it above the composer)', () => {
+    renderWithProviders(<WelcomeView setInput={vi.fn()} />)
     expect(
       screen.queryByText(i18nT('components.welcomeView.choose_memory_mode')),
     ).not.toBeInTheDocument()
   })
+})
 
+describe('MemoryModeChip', () => {
   it('picks a memory mode from the popover and closes it', () => {
     const onSwitchMode = vi.fn()
     renderWithProviders(
-      <WelcomeView mode="orchestrator" setInput={vi.fn()} onSwitchMode={onSwitchMode} />,
+      <MemoryModeChip onSwitchMode={onSwitchMode} />,
     )
     fireEvent.click(chooserTrigger())
 
@@ -161,7 +192,7 @@ describe('WelcomeView', () => {
 
   it('offers exactly the two memory modes and nothing else', () => {
     renderWithProviders(
-      <WelcomeView mode="orchestrator" setInput={vi.fn()} onSwitchMode={vi.fn()} />,
+      <MemoryModeChip onSwitchMode={vi.fn()} />,
     )
     fireEvent.click(chooserTrigger())
     const popover = screen
@@ -181,7 +212,7 @@ describe('WelcomeView', () => {
 
   it('an outside mousedown closes the popover, one inside keeps it', () => {
     renderWithProviders(
-      <WelcomeView mode="orchestrator" setInput={vi.fn()} onSwitchMode={vi.fn()} />,
+      <MemoryModeChip onSwitchMode={vi.fn()} />,
     )
     fireEvent.click(chooserTrigger())
 
@@ -197,12 +228,7 @@ describe('WelcomeView', () => {
   it('resets the memory mode from the ephemeral trigger', () => {
     const onSwitchMode = vi.fn()
     renderWithProviders(
-      <WelcomeView
-        mode="orchestrator"
-        setInput={vi.fn()}
-        memoryMode="temporary"
-        onSwitchMode={onSwitchMode}
-      />,
+      <MemoryModeChip memoryMode="temporary" onSwitchMode={onSwitchMode} />,
     )
     fireEvent.click(temporaryUndoTrigger())
     expect(onSwitchMode).toHaveBeenCalledWith('persistent')

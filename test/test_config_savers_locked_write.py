@@ -34,6 +34,7 @@ import pytest
 from aiohttp import web
 
 import kiro_crew.config.loader as loader
+from kiro_crew.secrets import SecretVault
 
 FOREIGN_KEY = "set_by_another_process"
 
@@ -472,7 +473,7 @@ def test_stt_put_keeps_a_write_that_landed_after_its_snapshot(tmp_path: Path, mo
     monkeypatch.setattr(core, "config_path", lambda: cfg)
     # The GET tail probes the host (ffmpeg, optional extras); not the subject here.
     monkeypatch.setattr(core, "_stt_prereq_commands", lambda provider: {})
-    monkeypatch.setattr(core, "is_available", lambda stt: False)
+    monkeypatch.setattr(core, "availability_detail", lambda stt: core.stt.Availability(False))
     injected = _intercept_first_locked_write(monkeypatch, cfg)
 
     req = MagicMock(spec=web.Request)
@@ -932,7 +933,9 @@ def test_save_cancelled_during_the_config_commit_still_writes_the_credential(
             task = asyncio.ensure_future(getattr(mod, handler_name)(req))
             # Let the save validate and park on the held sidecar lock.
             for _ in range(50):
-                await asyncio.sleep(0.02)
+                # The save must still be parked on the OS file lock the worker holds,
+                # and a file lock exposes no parked-waiter signal to wait on.
+                await asyncio.sleep(0.02)  # flake-ok: absence window with no signal to await
                 if json.loads(cfg.read_text(encoding="utf-8"))[channel]["enabled"]:
                     break
             assert not task.done(), "the save did not wait for the sidecar lock"
@@ -956,7 +959,12 @@ def test_save_cancelled_during_the_config_commit_still_writes_the_credential(
     cancelled = asyncio.run(_run())
     assert cancelled, "the cancellation must still reach the caller once the save is done"
     assert json.loads(cfg.read_text(encoding="utf-8"))[channel]["enabled"] is True
-    assert cred_line in env.read_text(encoding="utf-8"), env.read_text(encoding="utf-8")
+    key, _, value = cred_line.partition("=")
+    assert f"{key}=secret://{key}" in env.read_text(encoding="utf-8"), env.read_text(
+        encoding="utf-8"
+    )
+    stored = SecretVault(tmp_path).get(key)
+    assert stored is not None and stored.reveal() == value
 
 
 # ── Rollback after a failed .env write undoes only our keys ────────────────

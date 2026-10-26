@@ -4,8 +4,8 @@ status: partial
 kind: framework
 author: Raymond Chen (chenmingwei23)
 created: 2026-09-07
-last-audited: 2026-09-12
-audited-at: bf09e50e5
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr:
 implementation-prs: [9223]
 tracking-issues: []
@@ -20,8 +20,11 @@ superseded-by: []
 > [`../system-specs/modules/instances.md`](../system-specs/modules/instances.md).**
 > The single-task Fargate engine, configured provisioner lane, task-lifetime and
 > population bounds, direct turn API, and `fargate` registry/SSM tunnel are on
-> main. The body below predates registry parity and still describes registration,
-> the tunnel, and the relay as deferred; those claims are historical. Phase 2's
+> main. The body below predates registry parity. These sections still describe
+> registration, the tunnel, and the relay as deferred, and those claims are
+> historical: Goal 4 in §2, §6 "What stays the same", and the Phase 1 exit
+> criteria in §8. `CONNECTION_METHODS` in `instances/registry.py` includes
+> `fargate`. Phase 2's
 > one-action fan-out and Phase 3's comparative measurements remain unbuilt.
 
 ## Summary
@@ -201,13 +204,13 @@ class LaunchEngine(Protocol):
     """The AWS-touching operations a launch needs, injected for testability."""
     def preflight(self, profile, region) -> None: ...
     def provision(self, *, tag, size_key, profile, region) -> str: ...
-    def begin_signin(self, *, instance_id, profile, region) -> SigninHandle: ...
+    def begin_signin(self, *, instance_id, profile, region, login_target=None) -> SigninHandle: ...
     def register(self, *, instance_id, tag, profile, region) -> None: ...
     def teardown(self, *, tag, profile, region) -> bool: ...
 ```
 
-The EC2 implementation is `RealLaunchEngine` in `src/kiro_crew/cloud/launch_engine.py`,
-163 lines with five references to `ec2`, and the engine is already an injectable
+The snippet is abridged; `launch_job.py` owns the protocol. The EC2 implementation
+is `RealLaunchEngine` in `src/kiro_crew/cloud/launch_engine.py`, and the engine is already an injectable
 field named `cloud_launch_engine` in `src/kiro_crew/dashboard/state.py`, today set
 only by tests. A Fargate backend is a second
 implementation of these five methods. Everything above the seam, which is the
@@ -305,6 +308,65 @@ boot from public sources, Fargate bakes them at build time. That is better for
 reproducibility and it concentrates trust in the image build. What the image is
 built from, and how a launch verifies it is running the digest it asked for, both
 need to be answered.
+
+### The internal-only boundary, and what accepting it accepts
+
+Decided 2026-09-27. **The Fargate lane is internal-only: it runs the operator's
+own crews, and the operator bears the whole risk of what those crews read.** That
+sentence is the security property this section now rests on, and everything below is
+what follows from it.
+
+It had to be decided because the lane could not otherwise run at all. The crew
+container is sandboxed-only: kiro-cli sandboxes the model subprocess in an
+unprivileged user namespace, and Fargate's default seccomp profile denies one.
+Measured on a real task, which pulled its image, fetched both secrets, started
+the supervisor and then exited 1 at the sandbox check. No task-definition field
+changes that — Fargate accepts no `privileged`, offers no `dockerSecurityOptions`,
+and `linuxParameters` admits only `CAP_SYS_PTRACE`.
+
+Taking the model credential out of the worker's environment does not earn the
+other posture, and that was tried first. Reachability is the operative property,
+not residency: the backend answers the engine's token request from the crew's
+vault, so the backend's uid must be able to decrypt it, and the worker runs as a
+child of the backend under that same uid. Measured — a uid-1000 process reads and
+decrypts that vault directly. So an unsandboxed auto-approving worker can reach
+the credential wherever the credential is stored.
+
+**What the boundary accepts, stated plainly and without narrowing it.** On a Fargate
+host the model subprocess runs unsandboxed, that subprocess auto-approves every tool
+it calls, and it can reach the model credential in the crew's vault.
+
+The exposure is NOT limited to a prompt an outsider types. An internal crew consumes
+untrusted CONTENT as a matter of course: tool output, fetched web pages, connector and
+API payloads, repository and ticket text, a file someone else wrote. Any of that can
+carry an injection, and it reaches the unsandboxed worker regardless of who sent the
+prompt. With the flag on, a worker injected through any of those routes can read the
+vault. Saying "no external party sends prompts here" would describe a smaller exposure
+than the one being accepted, so it is not the claim this boundary makes.
+
+What the operator accepts is the whole of that, for their own crews: a prompt-injected
+worker on this task can read the crew's model credential, and the blast radius is the
+operator's own account and their own crew. That is a judgement about whose credential
+is at risk and who bears it, not a claim that injection cannot happen. It is a
+judgement only the operator can make, which is why the switch lives in their file.
+
+**The claim is explicit, and the switch names the boundary rather than the
+consequence.** `cloud.json`'s `fargate` block carries `internal_only`; the
+launcher derives `SMC_INTERNAL_ONLY` from it and a caller cannot supply that
+variable; the container's supervisor reads it and takes one branch. An operator
+therefore cannot ask for "allow unsandboxed" — they can only state whose crews these
+are, and the loosening follows. Absent means not claimed, so a lane that
+says nothing keeps refusing, and every other lane and every local host is
+unchanged.
+
+**What this is not.** It is not the multi-tenant answer and must not be read as
+one. A user namespace is the real containment; where callers are external or a
+task is shared, the answer is a Firecracker-based runtime, which is a different
+design and not this one. `#9355`'s credential broker is not started, and this
+decision does not close it: a brokered short-lived credential is still what makes
+a stolen token bounded rather than long-lived. Section 12 below already says
+remote instances on Fargate remain single-owner; this boundary is that sentence
+made operational.
 
 ### What does not change
 

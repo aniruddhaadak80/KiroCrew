@@ -1,4 +1,7 @@
 import { i18nT } from '../i18n/t'
+import { downloadBlob, downloadUrl } from './download'
+import { confirmUnscannedDownload } from './unscannedDownload'
+import { pathBasename } from './pathBasename'
 
 /** Append resolve=1 for relative paths. The backend resolves such paths
  * against KIROCREW_PROJECT_DIR; absolute and ~-paths pass through unchanged. */
@@ -46,9 +49,13 @@ export function fileReadUrl(filePath: string): string {
  *
  * Use this instead of fileReadUrl when saving a file to disk. fileReadUrl
  * decodes content as UTF-8 with errors='replace', which corrupts binary
- * files (.docx, .pdf, images) by replacing non-text bytes with U+FFFD. */
-export function fileDownloadUrl(filePath: string): string {
-  return withResolve('/api/file-download?path=' + encodeURIComponent(filePath), filePath)
+ * files (.docx, .pdf, images) by replacing non-text bytes with U+FFFD.
+ *
+ * `confirmUnscanned` adds `confirm_unscanned=1`: the owner's yes to a file over
+ * the server's scan limit, which it then sends without the credential scan. */
+export function fileDownloadUrl(filePath: string, opts?: { confirmUnscanned?: boolean }): string {
+  const url = withResolve('/api/file-download?path=' + encodeURIComponent(filePath), filePath)
+  return opts?.confirmUnscanned ? url + '&confirm_unscanned=1' : url
 }
 
 /** Fetch a file's raw bytes through /api/file-download and hand them to the
@@ -65,8 +72,16 @@ export function fileDownloadUrl(filePath: string): string {
  * siblings emit) -- NOT by the bare 400, which the endpoint also returns for an
  * invalid or out-of-project path. So a flagged file reads "blocked by the
  * credential scan" while a rejected path reads the generic "Download failed"
- * the user may retry. Either way the refusal is surfaced through `onError`,
- * never defeated -- the bytes are not reached another way.
+ * the user may retry. The credential copy names the Security panel's
+ * flagged-file delivery setting: the endpoint honours that owner grant, so it
+ * is how the owner releases a flagged file of their own. Either way the
+ * refusal is surfaced through `onError`, never defeated -- the bytes are not
+ * reached another way.
+ *
+ * A file over the server's scan limit answers 409 `large_file_unscanned` and
+ * sends nothing. The owner is asked (`confirmUnscannedDownload`), and only a
+ * yes downloads it, as a plain browser download of the confirmed URL so a
+ * multi-GB file streams to disk instead of filling page memory as a blob.
  */
 export async function downloadFileToDisk(
   filePath: string,
@@ -75,6 +90,14 @@ export async function downloadFileToDisk(
   try {
     const res = await fetch(fileDownloadUrl(filePath))
     if (!res.ok) {
+      let body: { code?: unknown; size?: unknown; limit?: unknown } = {}
+      try { body = (await res.clone().json()) ?? {} } catch { /* non-JSON body */ }
+      if (body.code === 'large_file_unscanned') {
+        const name = downloadFileName(filePath)
+        const yes = await confirmUnscannedDownload({ name, size: Number(body.size) || 0, limit: Number(body.limit) || 0 })
+        if (yes) downloadUrl(fileDownloadUrl(filePath, { confirmUnscanned: true }), name)
+        return
+      }
       // eslint-disable-next-line no-console -- surface download failures for diagnostics
       console.error('downloadFileToDisk failed', res.status, res.statusText)
       // The credential gate aborts a flagged file with `code: content_redacted`
@@ -82,27 +105,26 @@ export async function downloadFileToDisk(
       // that body code, not the status: the endpoint returns 400 for
       // invalid/out-of-project paths too, and those must not read as a
       // credential accusation. A body that will not parse falls back to generic.
-      let code = ''
-      try { code = (await res.clone().json())?.code ?? '' } catch { /* non-JSON body */ }
+      const code = typeof body.code === 'string' ? body.code : ''
       onError(i18nT(code === 'content_redacted'
         ? 'components.markdownPanel.download_blocked_credentials'
         : 'components.markdownPanel.download_failed'))
       return
     }
     const blob = await res.blob()
-    const a = document.createElement('a')
-    const url = URL.createObjectURL(blob)
-    a.href = url
-    a.download = filePath.split('/').pop() || 'download'
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => URL.revokeObjectURL(url), 2_000)
+    downloadBlob(blob, downloadFileName(filePath))
   } catch (err) {
     // eslint-disable-next-line no-console -- surface download failures for diagnostics
     console.error('downloadFileToDisk failed', err)
     onError(i18nT('components.markdownPanel.download_failed'))
   }
+}
+
+/** The name a download of `filePath` lands under: its last segment. Shared by
+ *  the fetch above and by the side panel's last-copy download, which hands the
+ *  buffer of a file no longer on disk to `downloadBlob` under the same name. */
+export function downloadFileName(filePath: string): string {
+  return pathBasename(filePath) || 'download'
 }
 
 /** Build the /api/file-stream URL — Range-capable audio/video serving.
@@ -130,4 +152,29 @@ export function fileStreamUrl(filePath: string): string {
 export function fileOfficePreviewUrl(filePath: string, format?: 'blocks'): string {
   const url = fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-preview')
   return format ? url + '&format=' + format : url
+}
+
+/** Build the /api/file-office-slides URL — the rendered-slides manifest for a
+ * .pptx / .ppt (LibreOffice → PDF → PNG on the gateway host, cached by content).
+ *
+ * Same query shape as the other file endpoints, so it is derived from
+ * fileDownloadUrl like fileOfficePreviewUrl above. The response is either
+ * `{status: 'ready', count, slides}` or `{status: 'unavailable', hint}` when the
+ * host has no LibreOffice; see `api_file_office_slides` in
+ * `src/kiro_crew/dashboard/handlers/office_slides.py`. */
+export function fileOfficeSlidesUrl(filePath: string): string {
+  return fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-slides')
+}
+
+/** Build the /api/file-office-slide URL — one rendered slide (PNG), 1-based.
+ *
+ * `n` and the deck's content `digest` (from the manifest) are appended AFTER
+ * the encoded path (and after `resolve=1` for a relative path), so the path
+ * value is never split by the extra parameters. The digest is what makes the
+ * URL safe to cache: an edited deck has a new digest, hence a new URL, so the
+ * browser can never answer a stale slide for the new file — and the server
+ * refuses a digest that no longer matches the file (409). */
+export function fileOfficeSlideUrl(filePath: string, n: number, digest?: string): string {
+  const base = fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-slide') + '&n=' + String(n)
+  return digest ? base + '&digest=' + encodeURIComponent(digest) : base
 }

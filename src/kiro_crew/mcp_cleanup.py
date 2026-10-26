@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Collection, Iterable, Sized
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.agent_sdk.mcp_refs import RESERVED_TOOL_NAMESPACES
+from kiro_crew.atomic_write import atomic_write, open_access_control_source
 from kiro_crew.config.paths import kiro_home
+from kiro_crew.user_json import loads_user_json
 
 #: kiro-cli's enterprise-governance discriminator. The spec WRITER owns the
 #: literal (``agent._MCP_REGISTRY_TYPE``); this is the copy the readers share, and
@@ -262,6 +265,8 @@ ALWAYS_ON_BIN_MCP_SERVERS = (
     "kirocrew-cron",
     "kirocrew-core",
     "kirocrew-computer",
+    "kirocrew-guide",
+    "kirocrew-mate",
 )
 OPT_IN_BIN_MCP_SERVERS = (
     "kirocrew-dashboard",
@@ -303,7 +308,14 @@ CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
 # only way it is ever granted is by hand. So no legitimate residue can exist
 # under that name, and anything found there is necessarily the user's own: to be
 # left alone, not reclaimed on a technicality about how it happens to be spelled.
-STALE_MANAGED_MCP_SERVERS = frozenset(ALWAYS_ON_BIN_MCP_SERVERS)
+#
+# ``kirocrew-guide`` and ``kirocrew-mate`` are always on but are left out too:
+# no install method ever wrote either to the global file, so an entry there is
+# the user's own.
+STALE_MANAGED_MCP_SERVERS = frozenset(ALWAYS_ON_BIN_MCP_SERVERS) - {
+    "kirocrew-guide",
+    "kirocrew-mate",
+}
 
 
 def _predecessor_mcp_names() -> frozenset[str]:
@@ -418,8 +430,10 @@ def clean_stale_managed_mcp() -> list[str]:
     if not _kiro_mcp_json().is_file():
         return []
     try:
-        data = json.loads(_kiro_mcp_json().read_text(encoding="utf-8"))
+        data = loads_user_json(_kiro_mcp_json().read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
         return []
     servers = data.get("mcpServers", {})
     if not isinstance(servers, dict):
@@ -437,12 +451,47 @@ def clean_stale_managed_mcp() -> list[str]:
     for name in removed:
         del servers[name]
     try:
-        _kiro_mcp_json().write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        logger.info("Removed stale managed MCP entries from kiro mcp.json: %s", removed)
+        _replace_mcp_json(json.dumps(data, indent=2) + "\n")
     except OSError:
         logger.debug("Could not clean kiro mcp.json", exc_info=True)
         return []
+    logger.info("Removed stale managed MCP entries from kiro mcp.json: %s", removed)
     return removed
+
+
+def _replace_mcp_json(content: str) -> None:
+    """Publish *content* as the global mcp.json by temp file + rename, never in place.
+
+    An in-place rewrite truncates first, and a reader that lands in that window
+    sees a 0-byte file -- which the session-start reader deliberately treats as
+    "no servers" (``session_mcp._read_mcp_settings``), so it would read as "no
+    restrictions". Every other
+    writer of this file (Kiro Crew's and kiro-cli's) already replaces it whole.
+
+    The replacement keeps what the in-place write kept: the permission bits and
+    any POSIX ACL are carried onto the new inode, and a symlinked mcp.json (a
+    dotfiles checkout) stays a symlink because its TARGET is what gets replaced.
+    Ownership is the one thing a rename cannot carry -- the new inode belongs to
+    this process -- so a file another user owns is refused with ``OSError``
+    rather than silently taken over; the caller already treats that as "could
+    not clean", the same outcome as an unwritable file.
+    """
+    target = _kiro_mcp_json().resolve()
+    src_fd = open_access_control_source(target)
+    try:
+        info = os.fstat(src_fd) if src_fd is not None else target.stat()
+        geteuid = getattr(os, "geteuid", None)  # absent on Windows
+        if geteuid is not None and info.st_uid != geteuid():
+            raise PermissionError(f"{target} is owned by uid {info.st_uid}; not replacing it")
+        atomic_write(
+            target,
+            content,
+            mode=stat.S_IMODE(info.st_mode),
+            preserve_access_control_from=src_fd,
+        )
+    finally:
+        if src_fd is not None:
+            os.close(src_fd)
 
 
 def _ref_server(ref: str) -> str:
@@ -519,6 +568,12 @@ def prune_dangling_tool_refs(
     servers = config.get("mcpServers")
     if not isinstance(servers, dict):
         return []
+    # Imported lazily so a module-level ``from kiro_crew.mcp_cleanup import ...``
+    # (e.g. in the per-session MCP stub) does not drag in ``agent_sdk`` and its
+    # subtree just to reach this one function. ``RESERVED_TOOL_NAMESPACES`` has
+    # no other reader in this module.
+    from kiro_crew.agent_sdk.mcp_refs import RESERVED_TOOL_NAMESPACES
+
     _base = set(servers) | RESERVED_TOOL_NAMESPACES
     known = {
         "tools": _base | set(declared),

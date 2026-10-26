@@ -61,7 +61,6 @@ class TestHookHandlerIntegration:
         """Hook CRUD operations work through store."""
         store = ScriptHookStore(tmp_path)
 
-        # Create
         hook = store.create(
             {
                 "name": "test-hook",
@@ -72,16 +71,13 @@ class TestHookHandlerIntegration:
         )
         assert hook.id is not None
 
-        # Retrieve
         retrieved = store.get(hook.id)
         assert retrieved is not None
         assert retrieved.name == "test-hook"
 
-        # Update
         updated = store.update(hook.id, {"name": "updated-name"})
         assert updated.name == "updated-name"
 
-        # Delete
         assert store.delete(hook.id) is True
         assert store.get(hook.id) is None
 
@@ -133,7 +129,11 @@ class TestAgentSpawnHookInjection:
 
 class TestHookSessionKeyForwarding:
     """The chat path must forward its session key to fired hooks so downstream
-    hook scripts can attribute each turn to the correct session identity."""
+    hook scripts can attribute each turn to the correct session identity — as
+    ``session_key``, the firing session's own key. Not as ``parent_session_key``:
+    that field names the session that spawned a SUBAGENT, and a hook keyed on
+    its documented meaning took every dashboard composer turn for a subagent's
+    while the runner reused it for its own key."""
 
     @pytest.mark.asyncio
     async def test_session_key_passed_to_fire(self, tmp_path, monkeypatch):
@@ -163,7 +163,10 @@ class TestHookSessionKeyForwarding:
         slot = state.get_or_create_slot("s1")
         await _run_chat(state, slot, "hello")
 
-        # _history_key_for("s1") == "dashboard:s1" — every fired hook must carry it.
+        # _history_key_for("s1") == "dashboard:s1" — every fired hook must carry it
+        # as the session's OWN key, and never as a subagent's parent pointer.
         assert hook_store.fire.await_count > 0
         for call in hook_store.fire.await_args_list:
-            assert call.kwargs.get("parent_session_key") == "dashboard:s1"
+            assert call.kwargs.get("session_key") == "dashboard:s1"
+            assert call.kwargs.get("parent_session_key") is None
+            assert call.kwargs.get("subagent_id") is None

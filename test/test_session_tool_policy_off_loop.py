@@ -373,6 +373,29 @@ async def test_two_specs_declaring_the_agent_name_are_denied_not_emptied(
 
 
 @pytest.mark.asyncio
+async def test_two_identical_specs_declaring_the_agent_name_answer_their_one_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A package installer that flattens dependencies writes the same spec under
+    two package prefixes. Whichever of the pair the session runs, its policy is
+    this one, so the read answers it -- with a SEL ``ok``, not the 409 a
+    differing pair gets -- and the agent's managed MCP servers keep their tools.
+    """
+    spec = json.dumps({"name": AGENT, "managedToolPolicy": {"exclude": ["shell"]}})
+    (tmp_path / f"Alpha-{AGENT}.json").write_text(spec, encoding="utf-8")
+    (tmp_path / f"Beta-{AGENT}.json").write_text(spec, encoding="utf-8")
+
+    sel = MagicMock()
+    monkeypatch.setattr(sessions_mod, "kiro_agents_dir", lambda: tmp_path)
+    monkeypatch.setattr(sessions_mod, "_sel", lambda: sel)
+    response = await sessions_mod.api_session_tool_policy(_request(_state()))
+
+    assert response.status == 200
+    assert _body(response) == {"exclude": ["shell"]}
+    assert sel.log_api_access.call_args.kwargs["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
 async def test_the_declared_name_scan_also_runs_off_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -495,7 +518,7 @@ async def test_the_fence_probe_is_bounded_and_an_oversized_plain_file_still_skip
     (tmp_path / "big.md").write_text("# prose\n" + "x" * 4096, encoding="utf-8")
 
     probe_limits: list[int] = []
-    real_read_head = sessions_mod._read_head
+    real_read_head = agent_discovery._read_head
 
     def recording_read_head(fd: int, limit: int) -> tuple[bytes, bool]:
         probe_limits.append(limit)
@@ -503,7 +526,7 @@ async def test_the_fence_probe_is_bounded_and_an_oversized_plain_file_still_skip
         assert len(head) <= limit
         return head, truncated
 
-    monkeypatch.setattr(sessions_mod, "_read_head", recording_read_head)
+    monkeypatch.setattr(agent_discovery, "_read_head", recording_read_head)
 
     response = await _call(monkeypatch, tmp_path)
     assert response.status == 200
@@ -745,13 +768,13 @@ async def test_the_fence_probe_judges_the_canonical_target_with_the_spec_readers
     canonical = str(target.resolve(strict=True))
 
     seen: list[str] = []
-    real_gate = sessions_mod.is_sensitive_canonical_path
+    real_gate = agent_discovery.is_sensitive_canonical_path
 
     def recording(resolved: str) -> bool:
         seen.append(resolved)
         return real_gate(resolved)
 
-    monkeypatch.setattr(sessions_mod, "is_sensitive_canonical_path", recording)
+    monkeypatch.setattr(agent_discovery, "is_sensitive_canonical_path", recording)
     response = await _call(monkeypatch, agents)
     assert response.status == 200
     assert _body(response) == {}
@@ -763,7 +786,6 @@ async def test_the_fence_probe_judges_the_canonical_target_with_the_spec_readers
 
     monkeypatch.setattr(agent_discovery, "is_sensitive_canonical_path", fenced)
     monkeypatch.setattr(agent_discovery, "_sel", lambda: MagicMock())
-    monkeypatch.setattr(sessions_mod, "is_sensitive_canonical_path", fenced)
     response = await _call(monkeypatch, agents)
     assert response.status == 409
     assert _body(response)["code"] == "policy_unreadable"

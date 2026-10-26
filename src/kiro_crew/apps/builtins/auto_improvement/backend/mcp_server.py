@@ -22,12 +22,14 @@ import json
 import sys
 from typing import Any, Callable
 
+from kiro_crew.json_line import parse_json_object_line, recover_line_id
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 
 from . import deps, progress, runner
 
 #: JSON-RPC 2.0 error codes used here.
+_PARSE_ERROR = -32700
 _METHOD_NOT_FOUND = -32601
 _INVALID_PARAMS = -32602
 _INTERNAL_ERROR = -32603
@@ -277,7 +279,7 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # (`get_finding` proved arguments echo back; the name is the same surface) would leak
         # through both on the reject paths below. Redact ONCE and use the safe value for every
         # audit/error mention; the RAW `name` is used only for the `TOOLS` allowlist lookup,
-        # which is an exact-match dict get and never emitted. Raised by the GPT review.
+        # which is an exact-match dict get and never emitted.
         safe_name = _redact_error(name)
         entry = TOOLS.get(name)
         if entry is None:
@@ -291,8 +293,7 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # coercion made a malformed call (`"arguments": [1,2]` or a bare string) succeed
         # with `result` for any no-required-arg tool instead of returning INVALID_PARAMS —
         # the schema validator only ran against the already-emptied dict, so it never saw
-        # the violation. Absent/None stays valid (arguments are optional). Raised by the
-        # GPT review of this branch.
+        # the violation. Absent/None stays valid (arguments are optional).
         if raw_args is not None and not isinstance(raw_args, dict):
             _audit(safe_name, outcome="denied", request_id=req_id, error="invalid_arguments")
             return _error(req_id, _INVALID_PARAMS, "invalid arguments: expected an object")
@@ -303,7 +304,6 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # and an unknown key was silently ignored instead of refused. The shared validator
         # is fail-closed for exactly this boundary (untrusted `tools/call`), so use it
         # rather than a local check that would drift from the schema in `_schema()`.
-        # Raised by review of this branch.
         # Stays function-local, unlike `redact`/`sel` which were hoisted: this one has an
         # explicit `except ImportError` fallback, which is the `top-level-imports` rule's
         # documented optional-dependency exemption. Hoisting it would make an absent
@@ -381,19 +381,28 @@ def main() -> None:
 
     One malformed line must not end the session: the client may still send valid
     requests afterwards, and dying here would surface as the whole MCP server
-    disappearing mid-session.
+    disappearing mid-session. So the lines are read as bytes and parsed through
+    the shared reader contract (a line that is not UTF-8, not JSON, not an
+    object, or nested past the decoder's ceiling is skipped), and a request
+    whose handling raises is answered as an internal error rather than ending
+    the loop. A skipped line that is a request (a top-level ``method``) with a
+    recoverable top-level id is answered as a parse error, so its caller is
+    not left to its own timeout.
     """
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(request, dict):
-            continue
-        reply = handle(request)
+    for line in sys.stdin.buffer:
+        request = parse_json_object_line(line)
+        if request is None:
+            req_id = recover_line_id(line, requests_only=True)
+            reply = None if req_id is None else _error(req_id, _PARSE_ERROR, "Parse error")
+        else:
+            try:
+                reply = handle(request)
+            except Exception:  # noqa: BLE001 - one request must not end the server
+                print("auto-improvement mcp: a request could not be handled", file=sys.stderr)
+                req_id = request.get("id")
+                reply = (
+                    None if req_id is None else _error(req_id, _INTERNAL_ERROR, "internal error")
+                )
         if reply is None:
             continue
         sys.stdout.write(json.dumps(reply) + "\n")

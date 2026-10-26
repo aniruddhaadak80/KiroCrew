@@ -59,8 +59,35 @@ except ImportError:  # pragma: no cover - standalone fallback
 # exclusion, exactly as it has no owner-only lockdown and no confinement.
 try:
     from kiro_crew.platform_compat import file_lock as _runtime_file_lock
+    from kiro_crew.platform_compat import open_create_or_existing as _runtime_open_creating
 except ImportError:  # pragma: no cover - standalone fallback
     _runtime_file_lock = None  # type: ignore[assignment]
+    _runtime_open_creating = None  # type: ignore[assignment]
+
+# Owner-only directory creation in the data home, same guard shape: standalone
+# creates with the umask default, exactly as it has no owner-only lockdown.
+try:
+    from kiro_crew.owner_only_files import ensure_directory as _runtime_ensure_directory
+except ImportError:  # pragma: no cover - standalone fallback
+    _runtime_ensure_directory = None  # type: ignore[assignment]
+
+
+def _open_creating(name: str, flags: int, mode: int, dir_fd: int | None = None) -> int:
+    """Open *name*, creating it when absent, without the Darwin ``O_CREAT`` race.
+
+    Two processes that both ``openat(dir_fd, name, O_CREAT)`` an absent name can
+    get ``ENOENT`` back on Darwin, and the review that loses fails outright.
+    Creating EXCLUSIVELY first and, when a sibling won, reopening without
+    ``O_CREAT`` is the runtime's ``open_create_or_existing``; the same two steps
+    are spelled here only for standalone use. *flags* carries no create bits.
+    """
+    if _runtime_open_creating is not None:
+        return _runtime_open_creating(name, flags, mode, dir_fd=dir_fd)
+    try:  # pragma: no cover - standalone fallback
+        return os.open(name, flags | os.O_CREAT | os.O_EXCL, mode, dir_fd=dir_fd)
+    except FileExistsError:  # pragma: no cover - standalone fallback
+        return os.open(name, flags, mode, dir_fd=dir_fd)
+
 
 # The ancestor chain, in the two halves that need different mechanisms, both
 # taken from the runtime rather than reimplemented here. Same guard shape as
@@ -299,7 +326,10 @@ def mkdir_refusing_links(directory: str | os.PathLike) -> Path:
     """
     d = Path(directory)
     refuse_linked_parents(d / _CHAIN_PROBE)
-    d.mkdir(parents=True, exist_ok=True)
+    if _runtime_ensure_directory is not None:
+        _runtime_ensure_directory(d)  # 0700 levels in the data home
+    else:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -440,7 +470,7 @@ def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
     walk is the only check that sees a Windows JUNCTION at all, which
     ``os.path.islink`` reports as False.
     Callers own creating the parent, and every one of the nine does -- either
-    `mkdir(parents=True)` directly (`learning`, `report`, `followup`) or
+    :func:`mkdir_refusing_links` directly (`learning`, `report`, `followup`) or
     `ensure_layout` / `ensure_run_layout` (`discovery`, `results`). This function
     deliberately does NOT create it: an `exist_ok` mkdir here RESURRECTS a
     directory tree that a concurrent namespace deletion is removing, so the
@@ -644,13 +674,13 @@ def open_append_nolink(path: str | os.PathLike) -> int:
     target = Path(path)
     refuse_linked_parents(target)
     _refuse_unsafe_leaf(target)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     if not _CAN_PIN_WALK:  # pragma: no cover - exercised on Windows
-        fd = os.open(str(target), flags, 0o600)
+        fd = _open_creating(str(target), flags, 0o600)
     else:
         dir_fd = pin_record_dir(target.parent)
         try:
-            fd = os.open(target.name, flags, 0o600, dir_fd=dir_fd)
+            fd = _open_creating(target.name, flags, 0o600, dir_fd=dir_fd)
         finally:
             os.close(dir_fd)
     try:
@@ -910,13 +940,13 @@ def layout_lock(root: Path | None = None) -> Iterator[None]:
     lock_path = data_dir(root) / _LAYOUT_LOCK_NAME
     refuse_linked_parents(lock_path)
     _refuse_unsafe_leaf(lock_path)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     if not _CAN_PIN_WALK:  # pragma: no cover - exercised on Windows
-        fd = os.open(str(lock_path), flags, 0o600)
+        fd = _open_creating(str(lock_path), flags, 0o600)
     else:
         dir_fd = pin_record_dir(lock_path.parent)
         try:
-            fd = os.open(lock_path.name, flags, 0o600, dir_fd=dir_fd)
+            fd = _open_creating(lock_path.name, flags, 0o600, dir_fd=dir_fd)
         finally:
             os.close(dir_fd)
     try:

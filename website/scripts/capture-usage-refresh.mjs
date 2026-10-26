@@ -37,7 +37,7 @@
  *   11-no-reading      the gateway holds no reading (`{available:false}`) on the KIRO
  *                      backend: the pill's dash stays on screen, the modal stays open
  *                      with its own no-reading sentence + Refresh. (On any other
- *                      harness that payload hides the pill; App.test.tsx pins that.)
+ *                      harness that payload hides the pill; App.topbarAndShortcuts.test.tsx pins that.)
  *   12-pill-no-reading the TOP BAR alone in that state: the dimmed dash with the
  *                      "no balance reading yet; open to refresh" label
  *   13-signin-required the modal when no live Kiro sign-in could be read: the
@@ -175,7 +175,7 @@ async function scene(theme, get, refresh, config = 'ok') {
  */
 async function openModal(page) {
   await page.goto(base + '/settings/display', { waitUntil: 'domcontentloaded' })
-  const pill = page.getByRole('button', { name: /Kiro credit usage/ }).first()
+  const pill = page.getByRole('button', { name: /Kiro account & credits/ }).first()
   await pill.waitFor({ state: 'visible', timeout: 15000 })
   // Let the shell's boot-time reflows (container-query rungs, first metric
   // poll, the query's own retry on a 500) finish so the click lands on a
@@ -231,7 +231,7 @@ for (const theme of ['light', 'dark']) {
     // The pill outside the modal reads the same numbers: one query feeds both.
     // It pools the bonus grant into its compact readout (636 + 500 used of
     // 2000 + 500), so the expected text is the compacted total.
-    const pillText = await page.getByRole('button', { name: /Kiro credit usage/ }).first().textContent()
+    const pillText = await page.getByRole('button', { name: /Kiro account & credits/ }).first().textContent()
     if (!/1\.1K\s*\/\s*2\.5K/.test(pillText || '')) fail(`${theme}: top-bar pill did not update (${pillText})`)
     await page.close()
   }
@@ -303,12 +303,18 @@ for (const theme of ['light', 'dark']) {
   /* ── 06 Settings > Display: no control for the scrape ───────────────────── */
   {
     const { page } = await scene(theme, 'reading', 'reading')
-    await page.goto(base + '/settings/display', { waitUntil: 'domcontentloaded' })
+    // The rail mounts one pane at a time; sweep every Display pane so the
+    // scrape-absence guard keeps its pre-rail whole-page reach (view last = shot).
+    for (const sub of ['zoom', 'terminal', 'theme', 'sidebar', 'view']) {
+      await page.goto(`${base}/settings/display/${sub}`, { waitUntil: 'domcontentloaded' })
+      await page.waitForSelector('[data-settings-card]', { timeout: 15000 })
+      await page.waitForTimeout(400)
+      const text = (await page.textContent('main')) || (await page.textContent('body')) || ''
+      if (/credit|balance|usage_text_scrape/i.test(text)) fail(`${theme}: Settings > Display (${sub}) still mentions the credit meter`)
+    }
     const view = page.getByRole('heading', { name: /^View$/ }).first()
     await view.waitFor({ state: 'visible', timeout: 15000 })
-    await page.waitForTimeout(900)
-    const text = (await page.textContent('main')) || (await page.textContent('body')) || ''
-    if (/credit|balance|usage_text_scrape/i.test(text)) fail(`${theme}: Settings > Display still mentions the credit meter`)
+    await page.waitForTimeout(500)
     await view.scrollIntoViewIfNeeded()
     await page.waitForTimeout(200)
     await shot(page, `06-display-${theme}`)
@@ -403,8 +409,8 @@ for (const theme of ['light', 'dark']) {
     const pill = page.getByRole('button', { name: /no balance reading yet; open to refresh/ })
     await pill.waitFor({ state: 'visible', timeout: 15000 })
     if (!/—/.test((await pill.textContent()) || '')) fail(`${theme}: no-reading pill is not the dash`)
-    if ((await pill.getAttribute('title')) !== 'Kiro credit usage — no balance reading yet; open to refresh') fail(`${theme}: no-reading pill label is not the refresh hint`)
-    if ((await page.getByRole('button', { name: /Kiro credit usage/ }).count()) !== 1) fail(`${theme}: more than one usage segment in the top bar`)
+    if ((await pill.getAttribute('title')) !== 'Kiro account & credits — no balance reading yet; open to refresh') fail(`${theme}: no-reading pill label is not the refresh hint`)
+    if ((await page.getByRole('button', { name: /Kiro account & credits/ }).count()) !== 1) fail(`${theme}: more than one usage segment in the top bar`)
     if ((await page.getByRole('dialog').count()) !== 0) fail(`${theme}: a dialog is open before the pill was clicked`)
     await page.waitForTimeout(2500)
     /* ── 12 the top bar alone: the dimmed dash with its label, no modal ─────── */
@@ -467,7 +473,7 @@ for (const theme of ['light', 'dark']) {
     await pill.waitFor({ state: 'visible', timeout: 15000 })
     if (!/—/.test((await pill.textContent()) || '')) fail(`${theme}: config-unreadable pill is not the dash`)
     if ((await page.getByRole('button', { name: /no balance reading yet/ }).count()) !== 0) fail(`${theme}: the no-reading label shown for an unreadable config`)
-    if ((await page.getByRole('button', { name: /Kiro credit usage/ }).count()) !== 1) fail(`${theme}: more than one usage segment in the top bar`)
+    if ((await page.getByRole('button', { name: /Kiro account & credits/ }).count()) !== 1) fail(`${theme}: more than one usage segment in the top bar`)
     await page.waitForTimeout(2500)
     const readsBeforeOpen = configCount()
     if (readsBeforeOpen < 1) fail(`${theme}: the config was never read`)

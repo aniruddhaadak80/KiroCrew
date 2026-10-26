@@ -241,6 +241,52 @@ describe('hashed-asset 5xx retry', () => {
     expect((await r.result).status).toBe(200)
     expect(r.attempts()).toBe(2)
   })
+
+  it('retries /pcm-worklet.js, the boot-critical dictation module', async () => {
+    // addModule('/pcm-worklet.js') is called once with no retry, and a voice
+    // session cannot start without it. This proves the worker now retries a
+    // transient 5xx on that path to a 200 — the same recovery /assets/ and
+    // /vendor/ get. (It proves the retry, not that any particular toast was
+    // caused by a 5xx here.)
+    const r = assetRequest([503, 200], '/pcm-worklet.js')
+    expect((await r.result).status).toBe(200)
+    expect(r.attempts()).toBe(2)
+  })
+})
+
+// A sign-in link (`/?token=...`, from `kirocrew token`) is honoured only by the
+// gateway's auth middleware, which swaps the link token for a session cookie. A
+// phone whose worker answered it from the cached shell never made that exchange:
+// /api/status came back 403 and the page said "Session expired". Runs the real
+// file, like the tests above.
+describe('sign-in links belong to the gateway', () => {
+  it('never answers a navigation that carries a link token', () => {
+    expect(intercepts('/?token=abc123')).toBe(false)
+    expect(intercepts('/index.html?token=abc123')).toBe(false)
+    expect(intercepts('/artifacts?foo=1&token=abc123')).toBe(false)
+  })
+
+  it('leaves an empty or stale token to the gateway too', () => {
+    // Presence, not value: judging a token is the middleware's job.
+    expect(intercepts('/?token=')).toBe(false)
+  })
+
+  it('never claims a token-bearing request under a prefix it would otherwise retry', () => {
+    expect(intercepts('/assets/App-abc123.js?token=abc123', 'no-cors')).toBe(false)
+  })
+
+  it('still owns a shell navigation without a token, so the skip is not vacuous', () => {
+    expect(intercepts('/')).toBe(true)
+    expect(intercepts('/?tab=chat')).toBe(true)
+    // A parameter that merely contains the word is not the sign-in parameter.
+    expect(intercepts('/?access_token_hint=1')).toBe(true)
+  })
+
+  it('does not write a token navigation into the shell cache', async () => {
+    const r = shellPutsFor('/?token=abc123') as unknown as { puts: string[]; settled: Promise<unknown> }
+    await r.settled
+    expect(r.puts).toEqual([])
+  })
 })
 
 describe('what deliberately gets no retry', () => {

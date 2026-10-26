@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import os
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from pathlib import Path
 import pytest
 from source_corpus import parsed_candidates
 
+from conftest import requires_symlinks
 from kiro_crew import image_artifacts
 from kiro_crew.messaging.outbound_files import (
     REASON_MISSING,
@@ -33,9 +35,12 @@ from kiro_crew.messaging.outbound_files import (
     REASON_SENSITIVE,
     REASON_SYMLINK,
     REASON_UNREADABLE,
+    ApprovedRoot,
     ExtractLimits,
     OutboundFile,
     Rejection,
+    approved_roots,
+    containing_root,
     extract_local_refs,
     extract_local_refs_off_loop,
     is_remote_destination,
@@ -871,6 +876,174 @@ class TestOffLoop:
         assert len(result.rejections) == 1
 
 
+#: What a linked ANCESTOR under an admitted root, aimed at a LOCAL directory
+#: outside it, is refused as. Windows rewrites a local linked prefix to its
+#: target (``screen_windows_linked_ancestors``) and POSIX resolves through it;
+#: on both the descriptor-pinned read then finds the bytes outside the root and
+#: answers ``REASON_UNREADABLE``. Either way the bytes stay on the host.
+_LINKED_ANCESTOR_REASON = REASON_UNREADABLE
+
+
+class TestBrowserSnapshotRoot:
+    """The browser CLI's output directory is an approved root beside the cwd.
+
+    ``playwright-cli`` is forced to write under the data home
+    (``snapshot_dir()``), never under a working directory, so without this
+    second root no screenshot the agent just took could ever travel inline.
+    The root is narrow: the directory itself, lexically, with the read pinned to
+    its canonical spelling -- its parent, its siblings, anything reached through
+    a link, and the directory itself once it is a link, all stay refused.
+    """
+
+    @pytest.fixture
+    def roots(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        from kiro_crew.browser_cli.snapshots import snapshot_dir
+
+        snap = snapshot_dir()
+        snap.mkdir(parents=True, exist_ok=True)
+        return cwd, snap
+
+    def test_the_browser_root_is_listed_after_the_authorized_cwd(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        cwd, snap = roots
+        first, second = approved_roots(str(cwd))
+        assert first == ApprovedRoot(lexical=str(cwd), read_root=str(cwd))
+        assert second.lexical == str(snap)
+        assert second.read_root_is_canonical is True
+
+    def test_the_browser_roots_read_pin_resolves_the_home_but_not_the_leaf(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        """The data home may be reached through an alias; the leaf is literal."""
+        cwd, snap = roots
+        _, browser = approved_roots(str(cwd))
+        assert browser.read_root == os.path.join(os.path.realpath(snap.parent), snap.name)
+        assert Path(browser.read_root).name == snap.name
+
+    def test_no_authorized_cwd_means_no_roots_at_all(self, roots: tuple[Path, Path]) -> None:
+        """The browser root never stands in for an authorization that was withheld."""
+        _, snap = roots
+        assert approved_roots("") == ()
+        assert containing_root(snap / "page-2026-10-13T07-00-00-000Z.png", "") is None
+
+    def test_a_screenshot_in_the_browser_root_is_uploaded(self, roots: tuple[Path, Path]) -> None:
+        cwd, snap = roots
+        shot = _png(snap, "page-2026-10-13T07-00-00-000Z.png")
+        result = extract_local_refs(f"![shot]({shot})", within_root=str(cwd))
+        assert result.rejections == []
+        assert [f.path for f in result.files] == [str(shot)]
+        assert result.files[0].data == _PNG
+
+    def test_the_cwd_still_wins_for_its_own_files(self, roots: tuple[Path, Path]) -> None:
+        cwd, _ = roots
+        shot = _png(cwd, "chart.png")
+        admitted = containing_root(shot, str(cwd))
+        assert admitted is not None and admitted.lexical == str(cwd)
+        assert admitted.read_root_is_canonical is False
+        result = extract_local_refs(f"![x]({shot})", within_root=str(cwd))
+        assert [f.path for f in result.files] == [str(shot)]
+
+    def test_the_browser_roots_parent_is_still_refused(self, roots: tuple[Path, Path]) -> None:
+        """The data home around the snapshot directory holds config and tokens."""
+        cwd, snap = roots
+        outside = _png(snap.parent, "config.png")
+        result = extract_local_refs(f"![x]({outside})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == REASON_SENSITIVE
+        assert "outside the approved workspace" in str(result.rejections[0])
+
+    def test_a_sibling_of_the_browser_root_is_still_refused(self, roots: tuple[Path, Path]) -> None:
+        cwd, snap = roots
+        sibling = _png(snap.parent / "playwright-snapshots-2", "page.png")
+        assert containing_root(sibling, str(cwd)) is None
+        result = extract_local_refs(f"![x]({sibling})", within_root=str(cwd))
+        assert result.files == [] and result.rejections[0].reason == REASON_SENSITIVE
+
+    def test_a_traversal_spelled_through_the_browser_root_is_refused(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        """``..`` is collapsed before comparison, so the spelling buys nothing."""
+        cwd, snap = roots
+        outside = _png(snap.parent, "config.png")
+        spelled = snap / ".." / outside.name
+        assert containing_root(spelled, str(cwd)) is None
+        result = extract_local_refs(f"![x]({spelled})", within_root=str(cwd))
+        assert result.files == [] and result.rejections[0].reason == REASON_SENSITIVE
+
+    @requires_symlinks
+    def test_a_symlink_inside_the_browser_root_is_refused(
+        self, roots: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """A leaf link under the admitted root is refused, not resolved."""
+        cwd, snap = roots
+        real = _png(tmp_path / "elsewhere", "secret.png")
+        link = snap / "page-2026-10-13T07-00-00-000Z.png"
+        link.symlink_to(real)
+        result = extract_local_refs(f"![x]({link})", within_root=str(cwd))
+        assert result.files == [] and result.rejections[0].reason == REASON_SYMLINK
+
+    @requires_symlinks
+    def test_a_linked_ancestor_inside_the_browser_root_cannot_escape_it(
+        self, roots: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """The read is pinned to the browser root, so the descriptor must sit in it."""
+        cwd, snap = roots
+        real = _png(tmp_path / "elsewhere", "secret.png")
+        (snap / "alias").symlink_to(real.parent, target_is_directory=True)
+        through = snap / "alias" / real.name
+        # Lexically inside the admitted root: this is exactly the case the
+        # descriptor recheck exists for.
+        admitted = containing_root(through, str(cwd))
+        assert admitted is not None and admitted.lexical == str(snap)
+        result = extract_local_refs(f"![x]({through})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == _LINKED_ANCESTOR_REASON
+
+    @requires_symlinks
+    def test_a_linked_snapshot_directory_does_not_move_the_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The snapshot directory itself as a link admits nothing.
+
+        The lexical check admits the spelled path -- that is the spelling the
+        agent was handed -- but the read is pinned to the canonical spelling with
+        the leaf kept literal, so the opened descriptor resolves outside it.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        from kiro_crew.browser_cli.snapshots import snapshot_dir
+
+        snap = snapshot_dir()
+        elsewhere = tmp_path / "elsewhere"
+        shot = _png(elsewhere, "page-2026-10-13T07-00-00-000Z.png")
+        snap.symlink_to(elsewhere, target_is_directory=True)
+        spelled = snap / shot.name
+        admitted = containing_root(spelled, str(cwd))
+        assert admitted is not None and admitted.lexical == str(snap)
+        result = extract_local_refs(f"![x]({spelled})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == _LINKED_ANCESTOR_REASON
+
+    @pytest.mark.asyncio
+    async def test_the_async_form_admits_the_browser_root_too(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        """Every channel renderer reaches extraction through the off-loop form."""
+        cwd, snap = roots
+        shot = _png(snap, "page-2026-10-13T07-00-00-000Z.png")
+        result = await extract_local_refs_off_loop(f"![shot]({shot})", within_root=str(cwd))
+        assert [f.path for f in result.files] == [str(shot)]
+
+
 class TestOutboundFile:
     def test_it_is_immutable(self, tmp_path: Path) -> None:
         """A transport must not be able to retarget a validated path."""
@@ -905,7 +1078,7 @@ class TestLinkedAncestorGate:
 
         p = _png(tmp_path)
         self._windows(monkeypatch)
-        monkeypatch.setattr(module, "first_linked_ancestor", lambda _p: str(tmp_path))
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", lambda _p: None)
 
         def _boom_lstat(self: Path) -> bool:  # pragma: no cover
             raise AssertionError("is_symlink ran before the ancestor walk")
@@ -932,7 +1105,7 @@ class TestLinkedAncestorGate:
 
         p = _png(tmp_path)
         self._windows(monkeypatch)
-        monkeypatch.setattr(module, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", Path)
         got = module._inspect(str(p), p, "alt", 10_000, None, None)
         assert isinstance(got, OutboundFile)
         assert got.path == str(p)
@@ -950,7 +1123,7 @@ class TestLinkedAncestorGate:
         def _boom(_p: object) -> None:  # pragma: no cover
             raise AssertionError("ancestor walk ran on POSIX")
 
-        monkeypatch.setattr(module, "first_linked_ancestor", _boom)
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", _boom)
         p = _png(tmp_path)
         got = module._inspect(str(p), p, "alt", 10_000, None, None)
         assert isinstance(got, OutboundFile)
@@ -986,7 +1159,7 @@ class TestLinkedAncestorGate:
 
         p = _png(tmp_path)
         self._windows(monkeypatch)
-        monkeypatch.setattr(module, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", Path)
         monkeypatch.setattr(module, "is_link_or_junction", lambda _p: True)
 
         def _boom_sensitive(_p: str) -> bool:  # pragma: no cover
@@ -997,6 +1170,108 @@ class TestLinkedAncestorGate:
         assert isinstance(got, Rejection)
         assert got.reason == REASON_SYMLINK
         assert got.detail == "symlinks are not uploaded"
+
+    def test_the_probes_run_on_the_screened_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An admitted linked prefix is rewritten: every check and the read use
+        the REWRITTEN path (the linked one is never created, so only it can
+        supply the bytes), and the result keeps the caller's spelling as
+        provenance."""
+        from kiro_crew.messaging import outbound_files as module
+
+        real = _png(tmp_path / "target")
+        linked = tmp_path / "Tasks" / real.name
+        self._windows(monkeypatch)
+        monkeypatch.setattr(
+            module,
+            "screen_windows_linked_ancestors",
+            lambda p: real if Path(p) == linked else None,
+        )
+        got = module._inspect(str(linked), linked, "alt", 10_000, None, None)
+        assert isinstance(got, OutboundFile)
+        assert got.path == str(linked)
+        assert got.data == real.read_bytes()
+
+    def test_an_ancestor_link_aimed_at_unc_is_refused_before_any_resolving_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real shared screen, with only the link metadata stubbed: an
+        ancestor whose reparse target is a UNC share is refused before the
+        sensitive-path check or the leaf lstat could follow it."""
+        from kiro_crew import platform_compat
+        from kiro_crew.messaging import outbound_files as module
+
+        linked = tmp_path / "Tasks"
+        leaf = linked / "shot.png"
+        self._windows(monkeypatch)
+        monkeypatch.setattr(
+            platform_compat,
+            "first_linked_ancestor",
+            lambda p: str(linked) if Path(p) == leaf else None,
+        )
+        monkeypatch.setattr(os, "readlink", lambda _p: r"\\evil-host\share")
+
+        def _boom_lstat(self: Path) -> bool:  # pragma: no cover
+            raise AssertionError("is_symlink ran before the ancestor screen")
+
+        def _boom_sensitive(_p: str) -> bool:  # pragma: no cover
+            raise AssertionError("is_sensitive_path ran before the ancestor screen")
+
+        monkeypatch.setattr(Path, "is_symlink", _boom_lstat)
+        monkeypatch.setattr(module, "is_sensitive_path", _boom_sensitive)
+        got = module._inspect(str(leaf), leaf, "alt", 10_000, None, None)
+        assert isinstance(got, Rejection)
+        assert got.reason == REASON_SYMLINK
+        assert got.detail == "symlinks are not uploaded"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("_winapi") is None, reason="directory junctions are Windows-only"
+)
+class TestRealLocalJunctionAncestor:
+    """No stubs: a junction made with ``_winapi.CreateJunction`` on this host."""
+
+    def test_a_file_below_a_local_junction_inside_the_root_is_uploaded(
+        self, tmp_path: Path
+    ) -> None:
+        import _winapi
+
+        target = tmp_path / "workflow-takeover-tasks"
+        real = _png(target)
+        junction = tmp_path / "Tasks"
+        _winapi.CreateJunction(str(target), str(junction))
+        through = junction / real.name
+        result = extract_local_refs(f"![x]({through})", within_root=str(tmp_path))
+        assert result.rejections == []
+        assert [f.path for f in result.files] == [str(through)]
+        assert result.files[0].data == real.read_bytes()
+
+    def test_a_local_junction_leading_out_of_the_root_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The pinned read, not the ancestor screen, keeps the bytes in the root."""
+        import _winapi
+
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        real = _png(tmp_path / "elsewhere", "secret.png")
+        junction = cwd / "alias"
+        _winapi.CreateJunction(str(real.parent), str(junction))
+        result = extract_local_refs(f"![x]({junction / real.name})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == REASON_UNREADABLE
+
+    def test_a_junction_leaf_is_still_refused(self, tmp_path: Path) -> None:
+        import _winapi
+
+        target = tmp_path / "target"
+        target.mkdir()
+        junction = tmp_path / "shot.png"
+        _winapi.CreateJunction(str(target), str(junction))
+        result = extract_local_refs(f"![x]({junction})", within_root=str(tmp_path))
+        assert result.files == []
+        assert result.rejections[0].reason == REASON_SYMLINK
 
 
 # ---------------------------------------------------------------- generators

@@ -3,9 +3,9 @@
  *
  * Shared by ArtifactDetailPage (the agent-facing count and the "address the N
  * open comments" prompt) and ArtifactPanel (the submit batch). Mirrors the
- * backend's `filter_comments_for_forward` in `artifacts.py`; the client keeps
- * its own copy because the count has to update the moment a thread is resolved
- * optimistically, before the comments query refetches.
+ * backend's `filter_comments_for_forward` in `artifact_store/comments.py`; the
+ * client keeps its own copy because the count has to update the moment a
+ * thread is resolved optimistically, before the comments query refetches.
  *
  * Thread-root granularity: a reply inherits its root's status, so resolving a
  * thread drops the whole thread rather than leaving replies whose parent is
@@ -43,4 +43,20 @@ export function filterCommentsForForward(comments: ArtifactComment[]): ArtifactC
   }
 
   return comments.filter(c => rootOf(c).status !== 'resolved')
+}
+
+/**
+ * The batch a comment Submit sends: forwarding-eligible AND human-authored AND
+ * not already submitted. The three filters answer different questions and all
+ * three are needed: `filterCommentsForForward` drops resolved threads,
+ * `!is_agent` drops agent-authored comments, and `!sentIds.has` stops an
+ * already-submitted batch being re-sent.
+ *
+ * One function for the bar's count AND the sidebar's per-row marker, so the
+ * rows a reader sees marked are exactly the ones the count is made of.
+ */
+export function pendingSubmitComments(
+  comments: ArtifactComment[], sentIds: ReadonlySet<string>,
+): ArtifactComment[] {
+  return filterCommentsForForward(comments).filter(c => !c.is_agent && !sentIds.has(c.id))
 }

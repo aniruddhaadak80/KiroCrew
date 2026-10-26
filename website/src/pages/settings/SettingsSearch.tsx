@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useSettingsSearchGovernance } from '../../components/commandPalette/useSettingsSearchGovernance'
 import { Search } from 'lucide-react'
 import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegistry.gen'
 import {
@@ -16,7 +16,6 @@ import { useListKeyboardNav } from '../../hooks/useListKeyboardNav'
 import { SidePanelDockContext } from '../../components/SidePanelLayout'
 import { SearchInput } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
-import { api } from '../../api/client'
 
 /**
  * SettingsSearch — in-page search over SETTINGS_REGISTRY. On desktop it is the
@@ -78,29 +77,14 @@ export default function SettingsSearch() {
   const [dismissed, setDismissed] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
 
-  // The same `['dashboardConfig']` read the Decisions card uses, so this search and
-  // that card hide together: on a governed install there is no path to the feature,
-  // rather than a hidden card and a live search entry pointing at it.
-  const dashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
-    queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
-    staleTime: 30_000,
-  })
-  // Offer unless the read SUCCEEDED and said otherwise: a failed or in-flight read is
-  // not a denial, and the card this navigates to reports the failure itself.
-  const decisionsEnabled = !dashCfgQ.isSuccess || dashCfgQ.data?.decisions_enabled === true
-  // The same `['tipsStatus']` read ChatPanel uses to drop its Discovery rail group.
-  const tipsQ = useQuery<{ enabled_config: boolean }>({
-    queryKey: ['tipsStatus'],
-    queryFn: () => api.tipsStatus(),
-    staleTime: 30_000,
-  })
-  const tipsEnabled = !tipsQ.isSuccess || tipsQ.data?.enabled_config !== false
+  // The governance every settings search shares, so this search and the panels
+  // it lands on hide a row together.
+  const governance = useSettingsSearchGovernance()
 
   const q = query.trim()
   const results = useMemo(
-    () => (q ? searchSettings(q, { decisionsEnabled, tipsEnabled }) : []),
-    [q, decisionsEnabled, tipsEnabled],
+    () => (q ? searchSettings(q, governance) : []),
+    [q, governance],
   )
   const open = q.length > 0 && !dismissed
 
@@ -169,7 +153,11 @@ export default function SettingsSearch() {
   }
 
   return (
-    <div ref={rootRef} className="relative shrink-0">
+    // `settings-search` (index.css) turns the boxed input's `focus-ring` neutral:
+    // Settings is where the user hunts for a switch, and its desktop search bar
+    // keeps a focus ring (darker border, soft neutral halo) that is never the
+    // theme colour; the mobile glass capsule shows no focus change at all.
+    <div ref={rootRef} className="settings-search relative shrink-0">
       {floating ? (
         // The capsule host owns the chrome, so this input stays borderless;
         // SearchInput has no way to drop its own box.
@@ -177,8 +165,11 @@ export default function SettingsSearch() {
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted pointer-events-none" />
           <input
             {...inputProps}
-            // focus-cue-ok: the cue is the SidePanelLayout capsule's focus-within
-            // border-accent; the ancestor sits in another file, so the gate can't see it.
+            // focus-cue-ok: maintainer decision -- the SidePanelLayout glass
+            // capsule holding this input does not change on focus (no ring, no
+            // colour step, no shadow step, never the accent), in glass mode and
+            // in the solidifying fallbacks alike; the caret is the indicator.
+            // The ancestor sits in another file, so the gate can't see it.
             className="w-full bg-transparent border-none rounded-full pl-8 pr-4 py-2.5 text-[14px] text-text placeholder:text-muted focus:outline-hidden"
           />
         </>

@@ -66,7 +66,7 @@ def _patched(monkeypatch):
 
 
 class TestIsInterrupted:
-    """The predicate mirrors `selectContinuable` in website/src/store/chatSlice.ts."""
+    """The predicate mirrors `selectTurnInterrupted` in website/src/store/chat/selectors.ts."""
 
     def test_empty_transcript_is_not_interrupted(self):
         assert _is_interrupted(_ChatSlot("s")) is False
@@ -417,20 +417,6 @@ class TestChatSlotContinue:
             assert resp.status == 200
 
     @pytest.mark.asyncio
-    async def test_mid_plan_orchestration_is_refused(self, _patched):
-        # An autopilot plan reads `running` False BETWEEN stages, so `running`
-        # alone would let Continue dispatch concurrently with the next stage.
-        slot = _ChatSlot("s")
-        slot.append("user", "hi", "msg msg-u")
-        slot._in_stage_execution = True
-        state = _mock_state(slot)
-        async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat/slots/s/continue")
-            assert resp.status == 409
-            assert (await resp.json())["code"] == "slot_orchestrating"
-        assert not slot._queue
-
-    @pytest.mark.asyncio
     async def test_continuation_never_claims_prior_work_exists(self, _patched):
         # The runner's POSTTOKEN continuation asserts "the work already done
         # above ... is preserved". On a zero-output interruption that is false, so
@@ -615,3 +601,27 @@ class TestChatSlotContinueAfterRepeatedStartFailures:
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/s/continue")
             assert resp.status == 200, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_audit_write_does_not_strand_the_queued_continue():
+    # The recovery entry is committed to the queue before the SEL audit line is
+    # written. If a raising audit write aborted the request there, the entry would
+    # sit undispatched and every later press would be refused with
+    # slot_queue_pending, so the session could never be resumed again.
+    slot = _ChatSlot("s")
+    slot.append("user", "hi", "msg msg-u")
+    slot.append("error", "⟳ Connection lost — please retry.", "msg msg-err")
+    state = _mock_state(slot)
+    mock_sel = MagicMock()
+    mock_sel.log_tool_invocation = MagicMock(side_effect=OSError("sel disk full"))
+    started = AsyncMock(return_value=True)
+    with (
+        patch("kiro_crew.dashboard.chat_handlers.sel", return_value=mock_sel),
+        patch("kiro_crew.dashboard.chat_handlers._start_next_queued_turn", started),
+    ):
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/s/continue")
+            assert resp.status == 200, await resp.text()
+    mock_sel.log_tool_invocation.assert_called_once()
+    started.assert_awaited_once()

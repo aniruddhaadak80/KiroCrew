@@ -1,8 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { PullRequestSource, PullRequestStatus } from '../types'
-import { MAX_PULL_REQUEST_SOURCES } from '../utils/pullRequestLinks'
+import {
+  MAX_PULL_REQUEST_SOURCES,
+  registerSourceProvider,
+  resetSourceProvidersForTests,
+} from '../utils/pullRequestLinks'
 
 const mockApi = vi.hoisted(() => ({
   pullRequestChecks: vi.fn(),
@@ -150,6 +154,10 @@ describe('PullRequestPanel', () => {
     expect(await screen.findByText('Add source tabs')).toBeInTheDocument()
     expect(screen.getByText('Github', { exact: false })).toBeInTheDocument()
     expect(screen.getByText('src/panel.tsx')).toBeInTheDocument()
+    // #8487: the per-file status renders through the catalog ("Modified"), not
+    // the raw wire value ("modified") CSS-capitalized.
+    expect(screen.getByText('Modified')).toBeInTheDocument()
+    expect(screen.queryByText('modified')).toBeNull()
     expect(screen.getByText('1 File Changed')).toBeInTheDocument()
     // Diffs stay unmounted until explicitly expanded, then mount after the
     // drawer animation deferral. Row CONTENT is not asserted here: Pierre
@@ -166,6 +174,54 @@ describe('PullRequestPanel', () => {
     expect(gitlabTab).toBeInTheDocument()
     expect(githubTab.querySelector('[data-provider-mark="github"]')).toBeInTheDocument()
     expect(gitlabTab.querySelector('[data-provider-mark="gitlab"]')).toBeInTheDocument()
+  })
+
+  it('draws a logo-less provider tab with the same neutral mark as its sidebar chip', async () => {
+    // Bitbucket Server ships no logo. Its tab and its session chip
+    // (ChatSidebar.sourceLinkChip.test.tsx) draw one shared neutral glyph, so a
+    // reader can tell they are the same item.
+    const bitbucketUrl = 'https://bitbucket.example.test/projects/PROJ/repos/svc/pull-requests/42'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[
+            { url: github.url, provider: 'github', number: 12, repo: 'widgets' },
+            { url: bitbucketUrl, provider: 'bitbucket_server', number: 42, repo: 'svc' },
+          ]}
+          selectedUrl={github.url}
+          onSelect={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+    const tab = await screen.findByRole('tab', { name: /PR #42/i })
+    const mark = tab.querySelector('[data-provider-mark="neutral"]')
+    expect(mark).not.toBeNull()
+    expect(mark!.getAttribute('class')).toContain('lucide-link-2')
+    expect(mark!.getAttribute('width')).toBe('13')
+    expect(tab.querySelector('.lucide-git-pull-request')).toBeNull()
+  })
+
+  it('labels a Gerrit tab by its change number with the neutral mark', async () => {
+    // Gerrit has no sigil of its own: the long label is the word Gerrit uses
+    // ("Change 466698"), and like Bitbucket Server it ships no logo.
+    const gerritUrl = 'https://gerrit.example.test/c/platform/hal/+/466698'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[
+            { url: github.url, provider: 'github', number: 12, repo: 'widgets' },
+            { url: gerritUrl, provider: 'gerrit', number: 466698, repo: 'platform/hal' },
+          ]}
+          selectedUrl={github.url}
+          onSelect={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+    const tab = await screen.findByRole('tab', { name: /Change 466698/i })
+    expect(tab.querySelector('[data-provider-mark="neutral"]')).not.toBeNull()
+    expect(tab.querySelector('[data-provider-mark="github"]')).toBeNull()
   })
 
   it('copies the head branch name to the clipboard when the branch chip is clicked', async () => {
@@ -209,6 +265,37 @@ describe('PullRequestPanel', () => {
     expect(within(githubTab).getByLabelText('Open')).toBeInTheDocument()
     expect(within(githubTab).getByLabelText('Checks passed')).toBeInTheDocument()
     expect(within(githubTab).queryByLabelText('Checks running')).not.toBeInTheDocument()
+  })
+
+  it('clears a stale cached status on the selected tab when its own read fails outright', async () => {
+    // The selected pull request has no loaded payload AT ALL (a revoked
+    // token, say): the full "Could not load" card renders over it. The
+    // cached status from an earlier successful load must not survive that --
+    // a lingering green tick would contradict the error card sitting right
+    // next to it.
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve(
+      new URL(url).hostname === 'gitlab.com' ? gitlab : Promise.reject(apiError({ error: 'gh: HTTP 401 Bad credentials' })),
+    ).catch(err => { throw err }))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: {
+        [github.url]: { state: 'open', ci: 'passed' },
+        [gitlab.url]: { state: 'merged', ci: 'passed' },
+      },
+    })
+
+    renderPanel()
+    await screen.findByRole('alert')
+
+    // An unrelated tab's own cached status is untouched. Await it explicitly:
+    // pullRequestStatuses resolves on its own independent query, not the one
+    // behind the alert, so asserting on it without awaiting first would be
+    // racing an unresolved promise.
+    const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
+    expect(await within(gitlabTab).findByLabelText('Merged')).toBeInTheDocument()
+
+    const githubTab = screen.getByRole('tab', { name: /PR #12/i })
+    expect(within(githubTab).queryByLabelText('Checks passed')).not.toBeInTheDocument()
+    expect(within(githubTab).queryByLabelText('Open')).not.toBeInTheDocument()
   })
 
   it('shows merge conflicts on selected and background source tabs instead of passing CI', async () => {
@@ -450,6 +537,33 @@ describe('PullRequestPanel', () => {
     expect(alert).not.toHaveTextContent('{"error"')
   })
 
+  it('names the self-managed GitLab host in the login command, not a bare glab auth login', async () => {
+    mockApi.pullRequestSource.mockRejectedValueOnce(
+      new Error('{"error":"glab: 401 Unauthorized Run `glab auth login --hostname git.example.com`, then retry.","code":"provider_error","loginCommand":"glab auth login --hostname git.example.com"}'),
+    )
+
+    renderPanel()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('GitLab CLI login required')
+    expect(alert.querySelector('code')?.textContent).toBe('glab auth login --hostname git.example.com')
+  })
+
+  it('names the GitHub Enterprise host in the login command and labels it GitHub', async () => {
+    mockApi.pullRequestSource.mockRejectedValueOnce(
+      new Error('{"error":"gh: not logged in. Run `gh auth login --hostname ghe.example.com`, then retry.","code":"provider_error","loginCommand":"gh auth login --hostname ghe.example.com"}'),
+    )
+
+    renderPanel()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('GitHub CLI login required')
+    expect(alert.querySelector('code')?.textContent).toBe('gh auth login --hostname ghe.example.com')
+    // Rendered by the shared ErrorNotice, so the agent hand-off is offered too.
+    expect(screen.getByTestId('pull-request-panel-load-error')).toBe(alert)
+    expect(alert).toHaveTextContent('Ask the agent')
+  })
+
   it('preserves trusted-install guidance when the local CLI is unavailable', async () => {
     mockApi.pullRequestSource.mockRejectedValueOnce(
       new Error('{"error":"The local GitHub CLI (gh) was not found in a trusted system location. Install a root-owned `gh` at `/usr/local/libexec/kirocrew/gh`, run `gh auth login`, then retry."}'),
@@ -511,6 +625,44 @@ describe('PullRequestPanel', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
+  it('keeps the cached tab glyph on a background revalidation failure, unlike an outright read failure', async () => {
+    // Deliberate contrast with 'clears a stale cached status...' above: here
+    // `source` is still available (the retained payload), so the glyph must
+    // survive -- only an outright read failure with no payload should clear it.
+    mockApi.pullRequestSource.mockImplementation((url: string) => (
+      new URL(url).hostname === 'gitlab.com' ? Promise.resolve(gitlab) : Promise.reject(apiError({ error: 'gh: HTTP 401 Bad credentials' }))
+    ))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: {
+        [github.url]: { state: 'open', ci: 'passed' },
+        [gitlab.url]: { state: 'open', ci: 'passed' },
+      },
+    })
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData<PullRequestSource>(['pull-request-source', github.url], github, {
+      updatedAt: Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000, // flake-ok: ages the retained payload past the remount window
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[
+            { url: github.url, provider: 'github', number: 12, repo: 'widgets' },
+            { url: gitlab.url, provider: 'gitlab', number: 7, repo: 'service' },
+          ]}
+          selectedUrl={github.url}
+          onSelect={() => {}}
+          onAddToChat={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+    await screen.findByRole('status')
+
+    const githubTab = screen.getByRole('tab', { name: /PR #12/i })
+    expect(await within(githubTab).findByLabelText('Open')).toBeInTheDocument()
+    expect(within(githubTab).getByLabelText('Checks passed')).toBeInTheDocument()
+  })
+
   it('caps rendered source tabs at the per-slot limit', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const sources = Array.from({ length: MAX_PULL_REQUEST_SOURCES + 5 }, (_, index) => ({
@@ -565,6 +717,33 @@ describe('PullRequestPanel', () => {
     )
     expect(screen.getByRole('tab', { name: /Checks running 0\/1/i })).toBeInTheDocument()
   })
+  it('says how many checks are still running and how many failed', async () => {
+    const failed = { ...github.checks[0], name: 'lint', conclusion: 'FAILURE', bucket: 'failed' as const }
+    const pending = { ...github.checks[0], name: 'e2e', status: 'IN_PROGRESS', conclusion: '', bucket: 'pending' as const }
+    const checks = [github.checks[0], failed, pending]
+    mockApi.pullRequestSource.mockResolvedValue({ ...github, checks })
+    mockApi.pullRequestChecks.mockResolvedValue({ checks })
+    renderPanel()
+
+    // A `complete/total` fraction ("1/3") could not say whether two checks were
+    // still running or one had failed and one was running.
+    expect(await screen.findByRole('tab', { name: /Checks 1 running · 1 failed/i })).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: /1\/3/ })).not.toBeInTheDocument()
+  })
+
+  it('never counts a required manual job as running on the Checks tab', async () => {
+    // A GitLab required manual job is bucketed pending, but it waits on a person.
+    const failed = { ...github.checks[0], name: 'lint', conclusion: 'FAILED', status: 'FAILED', bucket: 'failed' as const }
+    const manual = { ...github.checks[0], name: 'deploy', status: 'MANUAL', conclusion: 'MANUAL', bucket: 'pending' as const }
+    const checks = [github.checks[0], failed, manual]
+    mockApi.pullRequestSource.mockResolvedValue({ ...github, checks })
+    mockApi.pullRequestChecks.mockResolvedValue({ checks })
+    renderPanel()
+
+    expect(await screen.findByRole('tab', { name: /Checks running 1\/3/i })).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: /running ·/i })).not.toBeInTheDocument()
+  })
+
   it('uses bounded backoff only while checks remain pending', () => {
     const pending = [{ ...github.checks[0], bucket: 'pending' as const }]
 
@@ -713,6 +892,32 @@ describe('PullRequestPanel', () => {
     expect(screen.getByRole('tablist', { name: 'Pull request sections' })).toBeInTheDocument()
   })
 
+  it('lands a GitHub url spelled in another case on the listed tab, with one load', async () => {
+    // A sidebar chip can name the pull request the panel lists in a different
+    // letter case. GitHub treats them as one pull request, so the panel must
+    // select the listed tab and read it once, not fall back to another tab.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const onReconcile = vi.fn()
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[
+            { url: gitlab.url, provider: 'gitlab', number: 7, repo: 'service', kind: 'change' },
+            { url: github.url, provider: 'github', number: 12, repo: 'widgets', kind: 'change' },
+          ]}
+          selectedUrl={github.url.replace('acme/widgets', 'Acme/Widgets')}
+          onSelect={vi.fn()}
+          onReconcile={onReconcile}
+        />
+      </QueryClientProvider>,
+    )
+    await screen.findByText('Add source tabs')
+    expect(screen.getAllByRole('tab', { name: /PR #12/i })).toHaveLength(1)
+    expect(screen.getByRole('tab', { name: /PR #12/i })).toHaveAttribute('aria-selected', 'true')
+    expect(mockApi.pullRequestSource.mock.calls.map(call => call[0])).toEqual([github.url])
+    expect(onReconcile).toHaveBeenCalledWith(github.url)
+  })
+
   it('offers the comment composer on a pull request with no comments yet', async () => {
     // The thread list owns the "comment on this pull request" box, so gating it on
     // an existing comment would make the FIRST comment the one you cannot post.
@@ -845,6 +1050,44 @@ describe('PullRequestPanel', () => {
   })
 })
 
+describe('PullRequestPanel instance host', () => {
+  it('names the Gerrit server in the header, which the word Gerrit alone cannot', async () => {
+    // Two Gerrit servers both render "Gerrit"; before this only the
+    // open-in-browser tooltip told them apart.
+    renderSource({ ...github, provider: 'gerrit', url: 'https://gerritv.acme.example:9081/c/platform/hal/+/466698', number: 466698, title: 'Gerrit change' })
+    expect(await screen.findByText('Gerrit change')).toBeInTheDocument()
+    const host = screen.getByTestId('pull-request-panel-instance-host')
+    expect(host).toHaveTextContent('gerritv.acme.example:9081')
+    expect(host).toHaveAttribute('title', 'gerritv.acme.example:9081')
+  })
+
+  it('names a GitHub Enterprise host but not github.com, which GitHub already says', async () => {
+    renderSource(github)
+    expect(await screen.findByText('Add source tabs')).toBeInTheDocument()
+    expect(screen.queryByTestId('pull-request-panel-instance-host')).not.toBeInTheDocument()
+    cleanup()
+    renderSource({ ...github, url: 'https://ghe.acme.example/acme/widgets/pull/12' })
+    expect(await screen.findByText('Add source tabs')).toBeInTheDocument()
+    expect(screen.getByTestId('pull-request-panel-instance-host')).toHaveTextContent('ghe.acme.example')
+  })
+
+  it('qualifies Gerrit tabs by project, and by host when the project name repeats across servers', async () => {
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve({ ...github, provider: 'gerrit', url, number: 1 }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const srcs = [
+      { url: 'https://gerrit.acme.example:9080/c/HAL/+/1', provider: 'gerrit' as const, number: 1, repo: 'HAL', kind: 'change' as const },
+      { url: 'https://gerritv.acme.example:9081/c/HAL/+/1', provider: 'gerrit' as const, number: 1, repo: 'HAL', kind: 'change' as const },
+    ]
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel sources={srcs} selectedUrl={srcs[0].url} onSelect={() => {}} onAddToChat={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    expect(await screen.findByRole('tab', { name: /gerrit\.acme\.example:9080\/HAL Change 1/i })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /gerritv\.acme\.example:9081\/HAL Change 1/i })).toBeInTheDocument()
+  })
+})
+
 function renderSource(source: PullRequestSource) {
   mockApi.pullRequestSource.mockImplementation(() => Promise.resolve(source))
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -861,6 +1104,26 @@ function renderSource(source: PullRequestSource) {
 }
 
 describe('PullRequestPanel actions', () => {
+  it('shows a Gerrit change its merge conflict but offers no auto-merge or ready action', async () => {
+    // Gerrit reports merge state (so the conflict banner is real information) but
+    // has no auto-merge and no draft-to-ready write, so neither button may render:
+    // the gateway refuses both as unsupported for this provider.
+    const gerrit: PullRequestSource = {
+      ...github,
+      provider: 'gerrit',
+      url: 'https://gerrit.example.test/c/platform/hal/+/466698',
+      number: 466698,
+      title: 'Gerrit change',
+      mergeable: 'conflicting',
+      mergeStateStatus: 'dirty',
+    }
+    renderSource(gerrit)
+    expect(await screen.findByText('Gerrit change')).toBeInTheDocument()
+    expect(await screen.findByText(/Merge conflicts/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Enable auto-merge/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Ready for review/i })).not.toBeInTheDocument()
+  })
+
   it('requires a confirming click before arming auto-merge', async () => {
     renderSource(github)
     const enable = await screen.findByRole('button', { name: /Enable auto-merge/i })
@@ -995,6 +1258,76 @@ describe('pullRequestMergeBlocker', () => {
     expect(blocker?.handoff).toBeUndefined()
   })
 
+  it('says checks are still running instead of the generic branch-protection copy', () => {
+    const pending = { ...github.checks[0], name: 'e2e', status: 'IN_PROGRESS', conclusion: '', bucket: 'pending' as const }
+    const blocker = pullRequestMergeBlocker({
+      ...github,
+      mergeable: 'mergeable',
+      mergeStateStatus: 'blocked',
+      checks: [github.checks[0], pending],
+    })
+    expect(blocker).toMatchObject({ tone: 'warn', title: 'Merge blocked' })
+    expect(blocker?.detail).toBe('Checks are still running. Merging unblocks once required checks pass and any required reviews are approved.')
+    expect(blocker?.handoff).toBeUndefined()
+  })
+
+  it('keeps the branch-protection copy when the only pending check is a manual gate', () => {
+    // A GitLab required manual job is bucketed pending, but it waits on a
+    // person: "still running" would be false for as long as nobody presses it.
+    const manual = { ...github.checks[0], name: 'deploy', status: 'MANUAL', conclusion: 'MANUAL', bucket: 'pending' as const }
+    const blocker = pullRequestMergeBlocker({
+      ...github,
+      mergeable: 'mergeable',
+      mergeStateStatus: 'blocked',
+      checks: [github.checks[0], manual],
+    })
+    expect(blocker).toMatchObject({ tone: 'warn', title: 'Merge blocked' })
+  })
+
+  it('leads with the failure when a check failed while others still run', () => {
+    const failed = { ...github.checks[0], name: 'lint', conclusion: 'FAILURE', bucket: 'failed' as const }
+    const pending = { ...github.checks[0], name: 'e2e', status: 'IN_PROGRESS', conclusion: '', bucket: 'pending' as const }
+    const blocker = pullRequestMergeBlocker({
+      ...github,
+      mergeable: 'mergeable',
+      mergeStateStatus: 'blocked',
+      checks: [github.checks[0], failed, pending],
+    })
+    expect(blocker).toMatchObject({ tone: 'danger', title: 'Checks failed; others still running' })
+    expect(blocker?.detail).toContain('1 failed and 1 still running, of 3 checks')
+    expect(blocker?.detail).toContain('any required reviews are approved')
+    expect(blocker?.handoff).toBeUndefined()
+  })
+
+  it('keeps the branch-protection copy beside a failure when the only pending check is a manual gate', () => {
+    const failed = { ...github.checks[0], name: 'lint', status: 'FAILED', conclusion: 'FAILED', bucket: 'failed' as const }
+    const manual = { ...github.checks[0], name: 'deploy', status: 'MANUAL', conclusion: 'MANUAL', bucket: 'pending' as const }
+    const blocker = pullRequestMergeBlocker({
+      ...github,
+      mergeable: 'mergeable',
+      mergeStateStatus: 'blocked',
+      checks: [failed, manual],
+    })
+    expect(blocker).toMatchObject({ tone: 'warn', title: 'Merge blocked' })
+  })
+
+  it('keeps the branch-protection copy for a blocked GitLab MR with a failed and a running job', () => {
+    // GitLab reports a merge-gating running pipeline as `unstable`, so `blocked`
+    // here means approvals or discussions block the MR, not the running job.
+    const failed = { ...gitlab.checks[0], name: 'lint', status: 'FAILED', conclusion: 'FAILED', bucket: 'failed' as const }
+    const running = { ...gitlab.checks[0], name: 'e2e', status: 'RUNNING', conclusion: '', bucket: 'pending' as const }
+    const blocker = pullRequestMergeBlocker({
+      ...gitlab,
+      state: 'opened',
+      mergedAt: '',
+      mergeable: 'mergeable',
+      mergeStateStatus: 'blocked',
+      checks: [failed, running],
+    })
+    expect(blocker).toMatchObject({ tone: 'warn', title: 'Merge blocked' })
+    expect(blocker?.detail).toBe('Branch protection requirements (approving reviews or required checks) are not yet satisfied.')
+  })
+
   it("banners open GitLab MRs, whose raw provider state is 'opened'", () => {
     const blocker = pullRequestMergeBlocker({
       ...gitlab,
@@ -1019,6 +1352,42 @@ describe('pullRequestMergeBlocker', () => {
     expect(blocker?.handoff).toContain('merge commits will not unblock the MR')
     expect(blocker?.handoff).toContain('--force-with-lease')
     expect(blocker?.handoff).not.toContain('merge main into the branch')
+  })
+
+  it('hands off a Gerrit conflict or rebase as a new patchset, never a force-push', () => {
+    const gerrit = {
+      ...github,
+      provider: 'gerrit' as const,
+      url: 'https://gerrit.example.test/c/platform/hal/+/466698',
+      number: 466698,
+      baseBranch: 'dev',
+    }
+    const conflict = pullRequestMergeBlocker({ ...gerrit, mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+    expect(conflict).toMatchObject({ tone: 'danger', title: 'Merge conflicts' })
+    expect(conflict?.handoff).toContain('- Change: https://gerrit.example.test/c/platform/hal/+/466698')
+    expect(conflict?.handoff).toContain('refs/for/dev')
+    expect(conflict?.handoff).not.toContain('--force-with-lease')
+    const rebase = pullRequestMergeBlocker({ ...gerrit, mergeable: 'unknown', mergeStateStatus: 'need_rebase' })
+    expect(rebase).toMatchObject({ tone: 'warn', title: 'Rebase required' })
+    expect(rebase?.handoff).toContain('refs/for/dev')
+    expect(rebase?.handoff).not.toContain('--force-with-lease')
+  })
+
+  it('words a blocked Gerrit change as submit rules, not branch protection', () => {
+    // Gerrit has no branch protection: open + mergeable + not submittable means
+    // the submit rules still want votes, and Gerrit's verb is "submit".
+    const blocker = pullRequestMergeBlocker({
+      ...github,
+      provider: 'gerrit',
+      url: 'https://gerrit.example.test/c/platform/hal/+/466698',
+      number: 466698,
+      mergeable: 'mergeable',
+      mergeStateStatus: 'blocked',
+      checks: [{ ...github.checks[0], name: 'Verified', status: 'FAILURE', conclusion: 'FAILURE', bucket: 'failed' as const }],
+    })
+    expect(blocker).toMatchObject({ tone: 'warn', title: 'Submit blocked' })
+    expect(blocker?.detail).toContain('submit rules')
+    expect(blocker?.detail).not.toContain('Branch protection')
   })
 
   it('returns null for clean, unknown, draft, merged, closed, and locked states', () => {
@@ -1149,5 +1518,158 @@ describe('source tab project disambiguation', () => {
     expect(labels.some(text => text.includes('MR !2'))).toBe(true)
     // The project path never leaks into a single-project tab label.
     for (const text of labels) expect(text).not.toContain('group-a/service')
+  })
+})
+
+describe('PullRequestPanel with a review that has several revisions', () => {
+  // A registered provider that keeps the revision in its canonical url.
+  // Revision 1 is OPEN; revision 2 shipped, so the review is merged.
+  const CR = 'https://review.acme.example/cr/123'
+  const REV_1 = `${CR}/revisions/1`
+  const REV_2 = `${CR}/revisions/2`
+  const revision = (url: string): PullRequestSource => url === REV_2
+    ? { ...github, provider: 'acme', url, number: 123, title: 'Widen the seam', state: 'merged', mergedAt: '2026-10-16T09:00:00Z', additions: 30, updatedAt: '2026-10-16T09:00:00Z' }
+    : { ...github, provider: 'acme', url, number: 123, title: 'Widen the seam', state: 'OPEN', mergedAt: '', additions: 20 }
+
+  beforeEach(() => {
+    registerSourceProvider({
+      id: 'acme',
+      displayName: 'Acme Review',
+      parse(url) {
+        const match = /^\/cr\/(\d+)(\/revisions\/\d+)?$/.exec(url.pathname)
+        if (url.hostname !== 'review.acme.example' || !match) return null
+        return { url: url.href, provider: 'acme', number: Number(match[1]), repo: 'acme', kind: 'change' }
+      },
+      chipLabel: link => `CR-${link.number}`,
+      refLabel: n => `CR-${n}`,
+      capabilities: { checks: true, mergeState: true, resolveThreads: true, comment: true },
+    })
+    mockApi.pullRequestSource.mockImplementation((url: string) =>
+      Promise.resolve(url === github.url ? github : revision(url)))
+  })
+  afterEach(() => resetSourceProvidersForTests())
+
+  it('keeps reply and comment drafts mounted while the same review advances revisions', async () => {
+    let resolveRevision!: (value: PullRequestSource) => void
+    const nextRevision = new Promise<PullRequestSource>(resolve => { resolveRevision = resolve })
+    mockApi.pullRequestSource.mockImplementation((url: string) =>
+      url === REV_2 ? nextRevision : Promise.resolve(revision(url)))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const panel = (url: string) => (
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[{ url, provider: 'acme', number: 123, repo: 'acme', kind: 'change' }]}
+          selectedUrl={url}
+          onSelect={() => {}}
+        />
+      </QueryClientProvider>
+    )
+    const { rerender } = render(panel(REV_1))
+    await screen.findByText('Widen the seam', {}, { timeout: 5000 })
+    fireEvent.click(screen.getByRole('tab', { name: /Reviews 3/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reply', exact: true }))
+    const reply = screen.getByRole('textbox', { name: 'Reply', exact: true })
+    fireEvent.change(reply, { target: { value: 'Keep this unsent reply.' } })
+    fireEvent.click(screen.getByRole('button', { name: /Comment on this pull request/i }))
+    const comment = screen.getByRole('textbox', { name: /Comment on this pull request/i })
+    fireEvent.change(comment, { target: { value: 'Keep this unsent comment.' } })
+
+    // Revision 1 is open, so its payload offers the merge-state write.
+    expect(screen.getByRole('button', { name: /Enable auto-merge/i })).toBeInTheDocument()
+    const replySend = within(reply.parentElement!).getByRole('button', { name: 'Reply', exact: true })
+    const commentSend = within(comment.parentElement!).getByRole('button', { name: /Comment on this pull request/i })
+    expect(replySend).toBeEnabled()
+    expect(commentSend).toBeEnabled()
+
+    rerender(panel(REV_2))
+    await waitFor(() => expect(mockApi.pullRequestSource).toHaveBeenCalledWith(REV_2, false), { timeout: 5000 })
+    expect(screen.getByRole('tab', { name: /Reviews 3/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('textbox', { name: 'Reply', exact: true })).toBe(reply)
+    expect(reply).toHaveValue('Keep this unsent reply.')
+    expect(screen.getByRole('textbox', { name: /Comment on this pull request/i })).toBe(comment)
+    expect(comment).toHaveValue('Keep this unsent comment.')
+    // The panel still shows revision 1's open payload, but nothing may write
+    // to revision 1's url while revision 2 loads.
+    expect(screen.getByText('Open')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Enable auto-merge/i })).not.toBeInTheDocument()
+    expect(replySend).toBeDisabled()
+    expect(commentSend).toBeDisabled()
+    // Busy, not dead: assistive tech hears that each paused write is waiting.
+    expect(replySend).toHaveAttribute('aria-busy', 'true')
+    expect(commentSend).toHaveAttribute('aria-busy', 'true')
+    for (const resolve of screen.getAllByRole('button', { name: /^Resolve$|^Reopen$/ })) {
+      expect(resolve).toBeDisabled()
+      expect(resolve).toHaveAttribute('aria-busy', 'true')
+    }
+
+    await act(async () => { resolveRevision(revision(REV_2)) })
+    // The merged badge proves the delayed revision payload has replaced the placeholder.
+    await screen.findByText('Merged', {}, { timeout: 5000 })
+    expect(screen.getByRole('tab', { name: /Reviews 3/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('textbox', { name: 'Reply', exact: true })).toBe(reply)
+    expect(reply).toHaveValue('Keep this unsent reply.')
+    expect(screen.getByRole('textbox', { name: /Comment on this pull request/i })).toBe(comment)
+    expect(comment).toHaveValue('Keep this unsent comment.')
+    // Revision 2 is merged, so it offers no auto-merge; the drafts can send again.
+    expect(screen.queryByRole('button', { name: /Enable auto-merge/i })).not.toBeInTheDocument()
+    expect(replySend).toBeEnabled()
+    expect(commentSend).toBeEnabled()
+    expect(replySend).not.toHaveAttribute('aria-busy', 'true')
+    expect(commentSend).not.toHaveAttribute('aria-busy', 'true')
+  })
+
+  it('does not show the previous review while a different review loads', async () => {
+    const otherUrl = 'https://review.acme.example/cr/456/revisions/1'
+    let resolveOther!: (value: PullRequestSource) => void
+    const otherReview = new Promise<PullRequestSource>(resolve => { resolveOther = resolve })
+    mockApi.pullRequestSource.mockImplementation((url: string) =>
+      url === otherUrl ? otherReview : Promise.resolve(revision(url)))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const panel = (url: string, number: number) => (
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[{ url, provider: 'acme', number, repo: 'acme', kind: 'change' }]}
+          selectedUrl={url}
+          onSelect={() => {}}
+        />
+      </QueryClientProvider>
+    )
+    const { rerender } = render(panel(REV_1, 123))
+    await screen.findByText('Widen the seam', {}, { timeout: 5000 })
+    fireEvent.click(screen.getByRole('tab', { name: /Reviews 3/i }))
+
+    rerender(panel(otherUrl, 456))
+    await waitFor(() => expect(mockApi.pullRequestSource).toHaveBeenCalledWith(otherUrl, false), { timeout: 5000 })
+    expect(screen.queryByText('Widen the seam')).not.toBeInTheDocument()
+    expect(screen.queryByText('Please cover this case.')).not.toBeInTheDocument()
+    await act(async () => { resolveOther({ ...revision(otherUrl), number: 456, title: 'Another review' }) })
+    await screen.findByText('Another review', {}, { timeout: 5000 })
+    expect(screen.getByRole('tab', { name: /Changes 1/i })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('shows the latest revision as merged when the remembered tab is revision 1', async () => {
+    const onReconcile = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[
+            { url: github.url, provider: 'github', number: 12, repo: 'widgets', kind: 'change' },
+            { url: REV_2, provider: 'acme', number: 123, repo: 'acme', kind: 'change' },
+          ]}
+          selectedUrl={REV_1}
+          onSelect={() => {}}
+          onReconcile={onReconcile}
+          onAddToChat={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+
+    expect(await screen.findByText('Widen the seam')).toBeInTheDocument()
+    expect(screen.getByText('Merged')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /auto-merge/i })).not.toBeInTheDocument()
+    expect(mockApi.pullRequestSource).toHaveBeenCalledWith(REV_2, false)
+    expect(mockApi.pullRequestSource).not.toHaveBeenCalledWith(REV_1, expect.anything())
+    expect(onReconcile).toHaveBeenCalledWith(REV_2)
   })
 })

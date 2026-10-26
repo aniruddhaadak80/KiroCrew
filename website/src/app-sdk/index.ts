@@ -27,11 +27,11 @@ import { AppIdentityProvider, useAppIdentity, type AppOrigin } from './identity'
 import { AppQueryClientProvider } from './appQueryClient'
 // The scoped-API layer, kept in its own module so it is NOT published on this
 // barrel -- see the header of ./scopedApi for why.
-import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo } from './scopedApi'
+import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo, type AppUpdate } from './scopedApi'
 // Re-exported as TYPES: the barrel<->vendor-stub parity gate counts value
 // exports, and a type vanishes at runtime, so an app author keeps these names
 // without the stub needing an entry it could not provide.
-export type { AppApi, AppApiError, AppInfo, AppPermissions } from './scopedApi'
+export type { AppApi, AppApiError, AppInfo, AppPermissions, AppUpdate } from './scopedApi'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,7 +92,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   // Voice
   'voice_chunk', 'voice_complete', 'voice_error',
   // Approvals and question cards
-  'approval', 'approval_resolved', 'question_card',
+  'approval', 'approval_resolved', 'question_card', 'elicitation_resolved',
   // Subagent lifecycle
   'subagent_spawn', 'subagent_done', 'subagent_tool', 'subagent_chunk',
   'subagent_snapshot', 'subagent_status', 'subagent_queued',
@@ -136,6 +136,14 @@ const WS_GLOBAL_EVENT_TO_SCOPE: Record<string, string> = {
   // Same scope name the gateway declares in ws_event_scope.py, so an app author
   // gets the real permission to ask for instead of an "unknown event" hint.
   panel_published: 'panels',
+  // A crewmate's dashboard value moved. Metadata only ({slug}), and it rides
+  // `panels` for the same reason `panel_published` does.
+  dashboard_value_written: 'panels',
+  // A crewmate's dashboard PAGE changed -- a template applied, or a version
+  // rolled back. Metadata only ({slug}) like its sibling above, on `panels` for
+  // the same reason: a client that acts on it re-reads through the dashboard
+  // route, which is owner-gated and re-applies that check.
+  dashboard_instance_changed: 'panels',
   log: 'log',
   browser_event: 'browser',
   // NOTE: `slots` is deliberately absent — the list re-push is always
@@ -392,7 +400,9 @@ import React from 'react'
  */
 export function AppApiProvider({
   appName,
+  appDisplayName,
   appVersion = '0.0.0',
+  appUpdate,
   allowedApiPaths,
   allowedEvents,
   active = true,
@@ -404,7 +414,17 @@ export function AppApiProvider({
   children,
 }: {
   appName: string
+  /**
+   * What the user calls this app (the manifest's display name). `appName` is
+   * the app's ID and stays the key for permissions, event scoping and the
+   * developer-facing warnings; this is only for copy shown to the USER -- the
+   * permission-denied refusal row names the app by it. Omitted, the id is used.
+   */
+  appDisplayName?: string
   appVersion?: string
+  /** Cached update state for this app, forwarded to the scoped layer, which
+   *  publishes it as `info.update`. Omitted when the host has no answer. */
+  appUpdate?: AppUpdate
   allowedApiPaths: string[]
   navigateFn: (path: string) => void
   /** Optional since the scoped layer defaults them; see AppScopedApiProvider. */
@@ -431,7 +451,9 @@ export function AppApiProvider({
   const existing = useAppIdentity()
   const scoped = React.createElement(AppScopedApiProvider, {
     appName,
+    appDisplayName,
     appVersion,
+    appUpdate,
     allowedApiPaths,
     allowedEvents,
     active,
@@ -464,6 +486,8 @@ export { default as ChatPanel } from './ChatPanel'
 // `[STEERING …]` without rendering our transcript components.
 export * from './protocol'
 export { default as ChatEmbed } from './ChatEmbed'
+// The keys `ChatEmbed`'s `hide` prop accepts; any other string is a type error.
+export type { ChatEmbedHideKey } from './chatEmbedHide'
 export { default as ChatMessageList } from './ChatMessageList'
 // The transcript's row registry, so an app can add a row type or replace one
 // instead of forking the message list.

@@ -60,7 +60,7 @@ name: Fork Security Scope Review
 #   - harden-runner egress-block + OIDC short-lived Bedrock-only creds bound the
 #     blast radius of any prompt-injection.
 #
-# Mirrors the same-repo lane security-scope-review.yml's contract (Fable 5 model,
+# Mirrors the same-repo lane security-scope-review.yml's contract (Opus 5.5 model,
 # Scope-Verdict header, [SCOPE-REVIEWED] marker). The fork check-run is named
 # exactly "Security Scope Review" so ONE status surfaces on either PR type.
 #
@@ -92,18 +92,11 @@ on:
 permissions: {}
 
 concurrency:
-  # Keyed on (head repository, head branch, head sha), NOT the sha alone: two fork
-  # PRs can share a commit -- the same fork commit pushed under two branch names --
-  # and a sha-only group makes one run cancel the other. The survivor then posts a
-  # check-run keyed to that sha, which BOTH pull requests read, so one of them shows
-  # a verdict computed from the other's diff. Same reason the resolver below
-  # disambiguates on those fields.
-  group: >-
-    fork-security-scope-review-${{
-      github.event.workflow_run.head_repository.full_name
-    }}-${{ github.event.workflow_run.head_branch }}-${{
-      github.event.workflow_run.head_sha
-    }}
+  # A workflow run id is unique per triggering Fast Gate run, including sibling
+  # PRs whose repository/ref/SHA text differs only by case. GitHub retains that
+  # id across run attempts, so reruns still collapse without putting unbounded,
+  # case-sensitive ref text into a case-insensitive concurrency namespace.
+  group: fork-security-scope-review-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
@@ -114,15 +107,18 @@ jobs:
     name: Security Scope Review (generate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # No `checks:` scope, no WRITE anywhere, and no `pull-requests` scope at all:
-    # this job holds the Bedrock credential and prompt-injection is its live risk,
-    # so it must not be able to publish a verdict, and it reads no comment feed.
-    # `actions: read` is the artifact scope for the triggering run; `id-token:
-    # write` is the OIDC assume.
+    # No `checks:` scope and no WRITE anywhere: this job holds the Bedrock
+    # credential and prompt-injection is its live risk, so it must not be able to
+    # publish a verdict. `pull-requests: read` is the comment-feed read of the
+    # "Resolve human override" step, which runs before the credential is minted
+    # and decides only whether the model is called; the same-repo lane's
+    # credential-holding job holds the same read. `actions: read` is the artifact
+    # scope for the triggering run; `id-token: write` is the OIDC assume.
     permissions:
       actions: read
       contents: read
       id-token: write
+      pull-requests: read
     # Only for a SUCCESSFUL Stage 1 run that was itself a fork pull_request.
     if: >-
       github.event.workflow_run.event == 'pull_request'
@@ -134,6 +130,8 @@ jobs:
       base_sha: ${{ steps.pr.outputs.base_sha }}
       in_scope: ${{ steps.scope.outputs.in_scope }}
       verdict: ${{ steps.verdict.outputs.verdict }}
+      override: ${{ steps.human_override.outputs.active }}
+      override_actor: ${{ steps.human_override.outputs.actor }}
     steps:
       # MUST be first: block egress except the endpoints the reviewer needs, so
       # an injection-driven exfil attempt fails at the network layer.
@@ -153,7 +151,7 @@ jobs:
       # way it broke the other five. Carried now so the bump is a no-op instead
       # of a repo-wide fork outage. Rationale: fork-opus-review.yml.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: block
           disable-telemetry: true
@@ -174,8 +172,16 @@ jobs:
             claude.ai:443
             downloads.claude.ai:443
 
+      # STEP TIMEOUTS, here and on the four steps after it. Each of these steps
+      # takes seconds (checkout about two minutes), yet a run can hang in one of
+      # them until the 30-minute JOB timeout kills it (the hang itself is tracked
+      # in issue 23063). A step timeout only makes that hang
+      # end sooner: the job still fails before `Resolve review scope` writes
+      # `in_scope`, and `publish` still fails closed on the empty value. No retry,
+      # so a timed-out step can never turn into a measured answer.
       - name: Resolve and validate PR (authoritative from GitHub)
         id: pr
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -265,9 +271,97 @@ jobs:
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "Resolved PR #$pr  base=$base_sha  head=$head_sha"
 
+      # The writer's accepted `/ai-review override` record for THIS lane at THIS
+      # head, read before anything calls the model. An accepted record skips the
+      # review, and the lane publishes the human decision instead -- a `success`
+      # check-run and the "human override accepted" slot note -- the same outcome
+      # the same-repo lane's override arm produces. Each condition fails closed:
+      # the comment must be authored by `github-actions[bot]` (the handler posts
+      # it only after checking the commenter's write permission), the marker must
+      # be its LEADING bytes, and it must name this lane (or `all`) and this exact
+      # head. A marker for another head or another lane, or one any other account
+      # wrote, is not a record. Neither is a comment feed this step could not
+      # read: the step warns and the lane reviews normally, so a read failure can
+      # cost a model call but never clears a block.
+      #
+      # This lane opens no check-run before `publish`, so `publish` reads the
+      # record again just before it decides: a record posted while this run was
+      # past this read still counts, and the window left is the time between
+      # that second read and the check-run's POST.
+      - name: Resolve human override
+        id: human_override
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.pr }}
+          HEAD: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -uo pipefail
+          exact="<!-- ai-review-human-override target=scope head=$HEAD "
+          all="<!-- ai-review-human-override target=all head=$HEAD "
+          active=false
+          actor=""
+          source=""
+          read_ok=""
+          if [[ ! "${HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || [[ ! "${PR:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::No resolved pull request and head to read an override record for; reviewing normally."
+          else
+            for attempt in 1 2 3; do
+              if comments="$(gh api "repos/$REPO/issues/$PR/comments" --paginate)"; then
+                read_ok=1
+                break
+              fi
+              echo "Reading the PR comments failed on attempt $attempt."
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$attempt"
+              fi
+            done
+            if [ -z "$read_ok" ]; then
+              echo "::warning::Could not read this PR's comments after 3 attempts, so whether a human override is recorded for $HEAD is unknown. Reviewing normally: an unread record is never an accepted one."
+            elif ! record="$(printf '%s' "$comments" \
+              | jq -sr --arg exact "$exact" --arg all "$all" \
+                'add // [] | [.[] | select(.user.login == "github-actions[bot]")
+                | select((.body | startswith($exact)) or (.body | startswith($all)))]
+                | (last.body // "")')"; then
+              echo "::warning::This PR's comments could not be parsed, so whether a human override is recorded for $HEAD is unknown. Reviewing normally: an unread record is never an accepted one."
+            else
+              actor="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\1/p')"
+              source="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\2/p')"
+              if [ -n "$actor" ] && [ -n "$source" ]; then
+                active=true
+                echo "Human override by @$actor (comment $source) accepted for $HEAD."
+              fi
+            fi
+          fi
+          if [ "$active" != "true" ]; then
+            actor=""
+            source=""
+          fi
+          {
+            echo "active=$active"
+            echo "actor=$actor"
+            echo "source=$source"
+          } >> "$GITHUB_OUTPUT"
+
       # Trusted BASE tree for review CONTEXT only. NEVER the fork head.
+      #
+      # STALLED FETCH. On some runs git opens one connection to
+      # github.com:443 -- an allowed endpoint, with nothing blocked -- and then
+      # receives nothing until the step timeout. GIT_HTTP_LOW_SPEED_LIMIT/_TIME
+      # make git abort a transfer that stays under 1000 bytes/s for 120 s, so
+      # actions/checkout (which passes the step env to git) sees a failed fetch
+      # and runs its own fetch retry instead of waiting out the 10 minutes. It
+      # fetches the same pinned ref, so a retry can only produce the same tree
+      # or fail; the step still fails closed. A healthy full fetch moves
+      # megabytes per second, far above the floor.
       - name: Checkout base (trusted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Full history takes 83-187 s on a healthy runner; 10 is ample headroom.
+        timeout-minutes: 10
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+          GIT_HTTP_LOW_SPEED_TIME: "120"
         with:
           ref: ${{ steps.pr.outputs.base_sha }}
           fetch-depth: 0
@@ -279,6 +373,7 @@ jobs:
       # cannot mislead the review. It is read as a DATA file only: never applied
       # to or overlaid on the tree, and nothing runs it.
       - name: Fetch authentic diff (data only — never applied to the tree)
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -286,6 +381,11 @@ jobs:
           BASE_SHA: ${{ steps.pr.outputs.base_sha }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           PATCH: ${{ runner.temp }}/authentic.patch
+          # Same stalled-transfer abort as `Checkout base (trusted)`: a fetch
+          # that stalls fails here in about two minutes instead of five. No
+          # retry: the step fails closed as before.
+          GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+          GIT_HTTP_LOW_SPEED_TIME: "120"
         run: |
           set -uo pipefail
           # COMPLETE diff via git, NOT the compare API: the compare endpoint
@@ -339,6 +439,7 @@ jobs:
       # what "the security surface" means, and only one of them gates a fork.
       - name: Resolve review scope
         id: scope
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -456,8 +557,10 @@ jobs:
       # One assume per model call: an AssumeRole session lasts an hour, and a
       # call that inherits a spent session dies on an expired token with no
       # verdict.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        if: steps.scope.outputs.in_scope == 'true'
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: >-
+          steps.human_override.outputs.active != 'true'
+          && (steps.scope.outputs.in_scope == 'true')
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: us-west-2
@@ -485,14 +588,16 @@ jobs:
           done
           echo "truncated $n persisted set_env_* file(s)"
 
-      - name: Propose candidate legitimate operations (Fable 5)
+      - name: Propose candidate legitimate operations (Opus 5.5)
         id: review
-        if: steps.scope.outputs.in_scope == 'true'
-        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
+        if: >-
+          steps.human_override.outputs.active != 'true'
+          && (steps.scope.outputs.in_scope == 'true')
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           # Inference via Amazon Bedrock (region from the AWS creds step above).
-          # Fable 5's BARE, REGIONAL (`us.`) Bedrock inference-profile id, with an
-          # Opus 4.8 overload fallback — matches the same-repo lane and
+          # Opus 5.5's BARE, REGIONAL (`us.`) Bedrock inference-profile id, with an
+          # Sonnet 5.5 overload fallback — matches the same-repo lane and
           # design-review.yml exactly. The bare `us.` form is load-bearing: an
           # ARN-qualified or region-suffixed id is not resolvable as an inference
           # profile here.
@@ -582,9 +687,14 @@ jobs:
           # deny outranks every allow rule and CLI flag, so the bound holds even if
           # an allowlist entry is later widened. This matches the UX lane, which
           # denies the whole family.
+          #
+          # A COPY of the same-repo lane's arguments, pinned equal to them by
+          # `test_ai_review_workflows_scope_verdict.py`. Not read out of that file:
+          # here it would come from the base checkout, so the fence would follow
+          # the pull request's base rather than this default-branch workflow.
           claude_args: |
-            --model us.anthropic.claude-fable-5
-            --fallback-model us.anthropic.claude-opus-4-8
+            --model us.anthropic.claude-opus-5-5
+            --fallback-model us.anthropic.claude-sonnet-5-5
             --max-turns 80
             --setting-sources user
             --allowedTools "Read,Grep,Glob,Write"
@@ -657,6 +767,10 @@ jobs:
             # from `END`, never taken from a partial read, and the class spells out
             # the five characters `[[:space:]]` matches inside a record so nothing
             # depends on the runners' mawk supporting a POSIX class.
+            # A COPY of the same-repo lane's capture, pinned equal to it by
+            # `test_ai_review_workflows_scope_verdict.py`. Not read out of that
+            # file: this job holds the Bedrock credential and runs no program
+            # read out of a checkout.
             v="$(awk '!found && tolower($0) ~ /^[ \t\v\f\r]*scope-verdict:/ { sub(/^[^:]*:[ \t\v\f\r]*/, ""); gsub(/\r/, ""); value = toupper($0); found = 1 } END { if (found) print value }' "$OUT")"
             [ -n "$v" ] && verdict="$v"
           fi
@@ -712,9 +826,12 @@ jobs:
     # `always()`: a `generate` that died after the model call still owes `publish`
     # its reasoning, and the scrub that lets it be published lives here now. The
     # fork guard is repeated for the same reason `publish` repeats it.
+    # An accepted human override skips the review whole, as on the same-repo
+    # lane: nothing was proposed, so there is nothing to validate or adjudicate.
     if: >-
       always()
       && needs.generate.outputs.in_scope == 'true'
+      && needs.generate.outputs.override != 'true'
       && github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository
@@ -730,7 +847,7 @@ jobs:
       # Still hardened: this job reads a fork-influenced candidate file, so the
       # egress block is what stops anything here from calling out.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: block
           disable-telemetry: true
@@ -758,13 +875,13 @@ jobs:
       # the cause. Aborting here would report a download failure in their place.
       - name: Download the unprobed candidate set
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: scope-candidates-raw
 
       - name: Download the unscrubbed review text
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: scope-review-raw
           path: ${{ runner.temp }}
@@ -985,6 +1102,12 @@ jobs:
             # a COPY and refuse the run, the same refusal the publish path applies to
             # a redacted confirmed row before it reaches the comment. A candidate
             # carrying a credential shape is not a legitimate operation worth adjudicating.
+            #
+            # A COPY of the same-repo lane's probe under this lane's own output key,
+            # pinned equal to it by `test_ai_review_workflows_scope_verdict.py`. Not
+            # read out of that file: shell taken from a checkout would run as
+            # written, while the surface list, the one block this lane does read
+            # from it, is filtered down to quoted paths before any use.
             cp "$NORMALIZED" scrub-probe.json
             probe=0
             python3 "$REDACTOR" --mode json --fail-if-changed scrub-probe.json || probe=$?
@@ -1074,6 +1197,7 @@ jobs:
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository
     strategy:
+      max-parallel: 4
       # Every leg reports. One platform's regression is not evidence about
       # another's, so a fail-fast cancel would hide the rows an operator on the
       # cancelled runner is the only one who can see.
@@ -1089,7 +1213,7 @@ jobs:
       # Still hardened. This job holds no secret, but it RUNS fork code, so the
       # egress block is what stops that code from calling out.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: block
           disable-telemetry: true
@@ -1161,7 +1285,7 @@ jobs:
           done
 
       - name: Download the normalized corpus
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: scope-normalized
           path: scope-corpus
@@ -1264,30 +1388,22 @@ jobs:
   # JOB 3 — publish. CAN WRITE, EXECUTES NOTHING FROM EITHER PR TREE.
   # ==========================================================================
   #
-  # This lane consumes NO `/ai-review override scope` marker TODAY. That is a scope
-  # boundary, not a trust one, and the distinction matters because an earlier version
-  # of this comment claimed a threat that does not exist. For the record: the marker
-  # is NOT carried by a fork pull request's events. `ai-review-human-override.yml`
-  # posts it as `github-actions[bot]` after verifying the commenter holds write
-  # permission, and the same-repo lane authenticates it by that bot login on the BASE
-  # repository's comment feed, read with a BASE token, pinned to one head SHA. Every
-  # link in that chain is available here unchanged -- so reading it would open no
-  # hole a reviewer has been able to name, and neither could this author when asked.
+  # This lane consumes the `/ai-review override scope` record exactly as the
+  # same-repo lane does. `generate`'s "Resolve human override" step reads it from
+  # the BASE repository's comment feed with a BASE token: a comment authored by
+  # `github-actions[bot]` (which `ai-review-human-override.yml` posts only after
+  # verifying the commenter's write permission), the marker as its leading bytes,
+  # and this lane's target (or `all`) at this exact head. An accepted record skips
+  # the model, `validate` and `adjudicate`, and the publish job below completes
+  # the check-run `success` with the override note in the comment slot, without
+  # consulting the per-head floor: the override is the human decision the floor
+  # would otherwise outvote. A record for another head or lane, a look-alike from
+  # any other account, and a feed that could not be read all leave the review to
+  # run normally.
   #
-  # What is missing is the work, not the safety: porting the resolve step into this
-  # job, plus tests that a contributor-authored look-alike comment cannot satisfy the
-  # bot-login check, and that an override for one head does not clear another. That
-  # belongs in its own change rather than in the pull request adding this lane, and
-  # it is tracked in #10109.
-  #
-  # Until then a fork's fail-closed red clears three ways: narrow the rule and push
-  # (this lane re-runs on the new head), re-raise the change from a branch in this
-  # repository where the same-repo lane does consume the override, or have a
-  # maintainer with admin rights dismiss the required check. A transient failure --
-  # an outage, a dead matrix leg -- no longer needs any of those: such a run marks its
-  # own check-run `[scope-floor:unsettled]`, so it sets no per-head floor and a plain
-  # re-run clears it. The gap is narrower than it was, and it is a usability gap for
-  # external contributors rather than a security property.
+  # A transient failure needs none of this: such a run marks its own check-run
+  # `[scope-floor:unsettled]`, so it sets no per-head floor and a plain re-run
+  # clears it.
   publish:
     name: Security Scope Review (publish)
     # BOTH stages, and `generate` is the load-bearing half. Every verdict input
@@ -1321,7 +1437,7 @@ jobs:
       && github.event.workflow_run.head_repository.full_name != github.repository
     steps:
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: block
           disable-telemetry: true
@@ -1344,7 +1460,7 @@ jobs:
       - name: Download the review text
         if: always()
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: scope-review
           path: review
@@ -1352,7 +1468,7 @@ jobs:
       - name: Download every leg's report
         if: always()
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: scope-report-*
           path: reports
@@ -1457,13 +1573,75 @@ jobs:
           if [ "$rows_redacted" = "10" ] \
             || { [ -s "$ROWS" ] && grep -q '\[REDACTED-' "$ROWS"; }; then
             echo "rc=rows-redacted" >> "$GITHUB_OUTPUT"
-            echo "::error::a confirmed row carried a credential shape and was redacted, so it no longer names the operation that was refused. Every surface this lane writes is scrubbed, so reproduce the rows with scripts/deny_diff.py against this head. Narrow the rule at the tier the rows name and push -- this lane re-runs on the new head. This fork lane reads no /ai-review override marker, so a scope judged acceptable by hand clears only through a maintainer: re-raise the change from a branch in this repository, where the same-repo lane does consume an override, or have a maintainer with admin rights dismiss this required check."
+            echo "::error::a confirmed row carried a credential shape and was redacted, so it no longer names the operation that was refused. Every surface this lane writes is scrubbed, so reproduce the rows with scripts/deny_diff.py against this head. Narrow the rule at the tier the rows name and push -- this lane re-runs on the new head -- or record a human override for this head with /ai-review override scope <sha> <class>: <reason>."
             exit 0
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 
       # ONE decision point for the whole lane, so the hard rules live in one
       # place instead of being re-derived by the comment step and the check step.
+      # The same read as `generate`'s, again, immediately before the decision:
+      # this lane's only check-run is the one this job posts, so a record posted
+      # while `generate`, `validate` or `adjudicate` ran has no row for the
+      # handler to find and re-run. `always()`, because the read must not be
+      # skipped by a failed fold. Either read accepting the record is an
+      # accepted override.
+      - name: Resolve human override
+        id: human_override
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.generate.outputs.pr }}
+          HEAD: ${{ needs.generate.outputs.head_sha }}
+        run: |
+          set -uo pipefail
+          exact="<!-- ai-review-human-override target=scope head=$HEAD "
+          all="<!-- ai-review-human-override target=all head=$HEAD "
+          active=false
+          actor=""
+          source=""
+          read_ok=""
+          if [[ ! "${HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || [[ ! "${PR:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::No resolved pull request and head to read an override record for; reviewing normally."
+          else
+            for attempt in 1 2 3; do
+              if comments="$(gh api "repos/$REPO/issues/$PR/comments" --paginate)"; then
+                read_ok=1
+                break
+              fi
+              echo "Reading the PR comments failed on attempt $attempt."
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$attempt"
+              fi
+            done
+            if [ -z "$read_ok" ]; then
+              echo "::warning::Could not read this PR's comments after 3 attempts, so whether a human override is recorded for $HEAD is unknown. Reviewing normally: an unread record is never an accepted one."
+            elif ! record="$(printf '%s' "$comments" \
+              | jq -sr --arg exact "$exact" --arg all "$all" \
+                'add // [] | [.[] | select(.user.login == "github-actions[bot]")
+                | select((.body | startswith($exact)) or (.body | startswith($all)))]
+                | (last.body // "")')"; then
+              echo "::warning::This PR's comments could not be parsed, so whether a human override is recorded for $HEAD is unknown. Reviewing normally: an unread record is never an accepted one."
+            else
+              actor="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\1/p')"
+              source="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\2/p')"
+              if [ -n "$actor" ] && [ -n "$source" ]; then
+                active=true
+                echo "Human override by @$actor (comment $source) accepted for $HEAD."
+              fi
+            fi
+          fi
+          if [ "$active" != "true" ]; then
+            actor=""
+            source=""
+          fi
+          {
+            echo "active=$active"
+            echo "actor=$actor"
+            echo "source=$source"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Decide the lane's conclusion
         id: decide
         if: always()
@@ -1479,13 +1657,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ needs.generate.outputs.pr }}
+          HUMAN_OVERRIDE: ${{ needs.generate.outputs.override == 'true' || steps.human_override.outputs.active == 'true' }}
+          OVERRIDE_ACTOR: ${{ needs.generate.outputs.override_actor || steps.human_override.outputs.actor }}
         run: |
           set -uo pipefail
+          # An accepted human override is this head's verdict, ahead of the ladder
+          # and the per-head floor alike, as on the same-repo lane: the floor
+          # exists so a re-roll cannot soften a measured block, and a writer's
+          # decision at this exact head is not a re-roll.
+          if [ "${HUMAN_OVERRIDE:-}" = "true" ]; then
+            {
+              echo "conclusion=success"
+              echo "title=human override accepted — @${OVERRIDE_ACTOR:-} overrode this lane for this commit"
+              echo "marker=override"
+              echo "settled=yes"
+              echo "remedy="
+            } >> "$GITHUB_OUTPUT"
+            echo "Scope lane conclusion: success — human override by @${OVERRIDE_ACTOR:-} for $HEAD"
+            exit 0
+          fi
           # `settled` records whether THIS run actually MEASURED a verdict. An
           # unsettled run (marker absent, fold or floor error) still fails closed
           # for its own run, but the publish step marks its check-run so it sets
           # NO per-head floor -- one flake must not red the head forever.
           settled="yes"
+          # Empty unless a NAMED validate refusal supplies one below: this step runs
+          # under `set -u`, and the `in_scope == false` pre-check returns without
+          # reaching the ladder that assigns it.
+          remedy=""
           # The marker is the ONLY proof the review ran for THIS revision. A
           # `Scope-Verdict:` header without it is a verdict earned on other code,
           # so an absent or mismatched marker fails CLOSED -- this lane is
@@ -1541,16 +1740,30 @@ jobs:
             if [ "${ADJUDICATE:-}" != "true" ] && [ "${VALIDATE_RC:-}" = "3" ]; then
               nothing_new="true"
             fi
+            # An EMPTY in_scope: `generate` died (timed out, failed, cancelled)
+            # before `Resolve review scope` wrote it. Still unmeasured and still
+            # red -- this only lets the table name that cause instead of the
+            # generic "no leg reported" sentence, which points at the author's diff.
+            scope_unresolved="false"
+            if [ -z "${IN_SCOPE:-}" ]; then
+              scope_unresolved="true"
+            fi
             # THE CONCLUSION LADDER lives in scope_candidates.py so this lane and
             # the same-repo lane cannot drift. This publish job runs the
             # DEFAULT-branch harness (the trusted copy `adjudicate` judged with),
             # never a PR tree, so this call executes no fork code. This step only
             # reads its answer and maps it to a check-run conclusion.
-            conc="$(python3 scripts/scope_candidates.py conclude --lane fork \
+            conc="$(python3 scripts/scope_candidates.py conclude \
               --fold "$fold" --model "${MODEL_VERDICT:-UNKNOWN}" --marker "$marker" \
-              --nothing-new "$nothing_new" --gap-script "$gap_script" --gap-model "$gap_model")"
+              --nothing-new "$nothing_new" --gap-script "$gap_script" --gap-model "$gap_model" \
+              --refusal "${VALIDATE_RC:-}" --scope-unresolved "$scope_unresolved")"
             token="$(printf '%s\n' "$conc" | sed -n 's/^conclusion=//p')"
             title="$(printf '%s\n' "$conc" | sed -n 's/^why=//p')"
+            # The actionable half of a NAMED validate refusal, which the check-run
+            # carries in its summary because a title is capped at 255 characters.
+            # Absent for every other run, and authored by the table rather than
+            # taken from `$VALIDATE_RC`, so no caller string reaches the summary.
+            remedy="$(printf '%s\n' "$conc" | sed -n 's/^remedy=//p')"
             # `settled` comes from the TABLE, never from the token arms below. The
             # table compares against `_UNSETTLED_CONCLUSION` itself, so flipping
             # that constant keeps this correct -- reading it off a `case` arm here
@@ -1567,7 +1780,10 @@ jobs:
             case "$token" in
               pass)        conclusion="success" ;;
               nothing-new) conclusion="neutral" ;;
-              concerns)    conclusion="neutral" ;;
+              # Staged from the BASE commit, the table can still answer
+              # `concerns` until this contract is on the base. That is a PASS
+              # now: there is no soft tier.
+              concerns)    conclusion="success" ;;
               block)       conclusion="failure" ;;
               *)           conclusion="failure"; title="${title:-review incomplete — not a pass}"; settled="no" ;;
             esac
@@ -1616,18 +1832,28 @@ jobs:
               conclusion="failure"
               title="the per-head floor could not be computed, so the lane fails closed"
               settled="no"
+              # The published title is no longer the refusal, so its remedy explains
+              # nothing a reader can act on here.
+              remedy=""
             elif [ "$raised" != "$conclusion" ]; then
               echo "Per-head floor raises $conclusion -> $raised: $floor_why"
               conclusion="$raised"
               title="$floor_why"
+              remedy=""
             fi
           fi
           echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
           echo "title=$title" >> "$GITHUB_OUTPUT"
           echo "marker=$marker" >> "$GITHUB_OUTPUT"
           echo "settled=$settled" >> "$GITHUB_OUTPUT"
+          echo "remedy=$remedy" >> "$GITHUB_OUTPUT"
           echo "Scope lane conclusion: $conclusion — $title"
 
+      # The body is this lane's own: it names the fork lane and the check-run's
+      # conclusion words, so it is not one block with the same-repo lane's. What
+      # the two share is the `[SCOPE-REVIEWED] $HEAD` stamp, and that is a COPY,
+      # pinned equal to the same-repo lane's by
+      # `test_ai_review_workflows_scope_verdict.py`.
       - name: Assemble the comment body
         if: always() && needs.generate.outputs.in_scope != 'false'
         env:
@@ -1640,11 +1866,30 @@ jobs:
           BODY: ${{ runner.temp }}/scope-verdict.md
           ROWS: ${{ runner.temp }}/scope-rows.json
           OUT: ${{ runner.temp }}/scope-comment.md
+          HUMAN_OVERRIDE: ${{ needs.generate.outputs.override == 'true' || steps.human_override.outputs.active == 'true' }}
+          OVERRIDE_ACTOR: ${{ needs.generate.outputs.override_actor || steps.human_override.outputs.actor }}
         run: |
           set -uo pipefail
+          if [ "${HUMAN_OVERRIDE:-}" = "true" ]; then
+            {
+              echo "<!-- security-scope-review -->"
+              echo "## Security Scope Review (fork) -- ✅ human override accepted"
+              echo
+              echo "_@$OVERRIDE_ACTOR overrode this lane for \`$HEAD\` via \`/ai-review override\` (this commit only)._"
+              # STAMPED, as on the same-repo lane, because this body is a completed
+              # verdict FOR THIS HEAD: the record `generate` read is keyed to $HEAD,
+              # so the acceptance is attributable to this revision on the human's own
+              # authority. Without the stamp the guarded upsert reads this body as a
+              # failure notice and leaves a prior BLOCK comment standing over an
+              # override a human already accepted.
+              echo
+              echo "[SCOPE-REVIEWED] $HEAD"
+            } > "$OUT"
+            exit 0
+          fi
           case "$CONCLUSION" in
             success) badge="✅ PASS" ;;
-            neutral) badge="🟡 CONCERNS" ;;
+            neutral) badge="✅ nothing new to adjudicate" ;;
             *)       badge="🔴 BLOCK (blocking)" ;;
           esac
           {
@@ -1674,7 +1919,7 @@ jobs:
             {
               echo "---"
               echo
-              echo "_A confirmed row carried a credential shape, so it was redacted -- and a redacted row no longer names the operation that was refused. The rows are withheld rather than published as this head's finding. Reproduce them with \`scripts/deny_diff.py\` against \`$HEAD\`, then narrow the rule at the tier they name and push -- this lane re-runs on the new head. \`/ai-review override scope\` does NOT clear a fork pull request: this lane consumes no override marker, so a scope judged acceptable by hand clears only through a maintainer, by re-raising the change from a branch in this repository (where the same-repo lane does consume an override) or by dismissing this required check with admin rights._"
+              echo "_A confirmed row carried a credential shape, so it was redacted -- and a redacted row no longer names the operation that was refused. The rows are withheld rather than published as this head's finding. Reproduce them with \`scripts/deny_diff.py\` against \`$HEAD\`, then narrow the rule at the tier they name and push -- this lane re-runs on the new head. A scope a repository writer judged acceptable by hand clears with \`/ai-review override scope $HEAD <class>: <reason>\` on this head._"
             } >> "$OUT"
           # The deterministic body always follows the model's, so a reader who
           # distrusts the prose can read the script's verdict on its own.
@@ -1734,13 +1979,13 @@ jobs:
           [ -z "${PR:-}" ] && { echo "no PR resolved; skipping comment"; exit 0; }
           MARKER="<!-- security-scope-review -->"
           # ONE publication primitive for every marker-comment write in this
-          # lane; test_ai_review_workflows.py pins it byte-identical across all
+          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
           # of them, the way it already pins guarded_comment_upsert, so neither
           # the budget nor the honesty below can drift lane by lane.
           #
           # A marker comment is the ONLY thing a freshness verifier reads. A
           # write that does not land therefore leaves the PR indistinguishable
-          # from one no lane ever reviewed: prepare-pr's pr_status.py refuses a
+          # from one no lane ever reviewed: kirocrew-prepare-pr's pr_status.py refuses a
           # PR whose check-runs, readiness status and mergeable state all pass,
           # and the only way out is manufacturing a new head -- which re-rolls
           # the non-deterministic review lanes and discards the verdicts they
@@ -1996,7 +2241,7 @@ jobs:
             # would invent a BLOCK nobody judged out of an infrastructure fault.
             # The annotation is what says so: the required readiness status reads
             # check-run CONCLUSIONS and has no stamp-freshness read, so the reader
-            # that catches a head with no verdict is prepare-pr's own marker
+            # that catches a head with no verdict is kirocrew-prepare-pr's own marker
             # evaluation, run before a PR is called ready.
             if [ -n "$slot" ]; then
               occupied=""
@@ -2174,13 +2419,24 @@ jobs:
             return 1
           }
           # Guarded upsert (#8292, #8344): the shared function below is defined
-          # byte-identically in every review lane; test_ai_review_workflows.py
+          # byte-identically in every review lane; test_ai_review_workflows_comment_writes.py
           # pins all copies to one canonical body so the invariant cannot
           # drift lane by lane.
           guarded_comment_upsert() {
             local marker="$1" stamp="$2" lane="$3" out_file="$4"
             local matches existing lookup_ok pr_head="" attempt withhold="" write_rc
-            local verdict_read_rc
+            # What reached the slot is recorded as the step output `publication`,
+            # because every arm below returns 0 and the write status would
+            # otherwise end with this function. The fork Opus and GPT finalize
+            # steps read it: a verdict computed for this head is a pass there only
+            # once it is in the slot. `published` is this run's body in the slot,
+            # `superseded` a head this PR has moved past, and `not_published` every
+            # other arm. That includes an earlier run's sample for this head, which
+            # the PR then shows instead of this run's verdict, and an override note
+            # a repeat stopped at: that note names no head the repeat can check, and
+            # an override for THIS head is answered by the finalize step's own
+            # override input.
+            local verdict_read_rc superseded="" publication="not_published"
             # Find the bot's existing marker comment (first match wins) and
             # capture its id. Author filter: only a github-actions[bot]
             # comment can match, so a PR commenter cannot plant the marker and
@@ -2260,19 +2516,55 @@ jobs:
               if [ -z "$pr_head" ]; then
                 withhold="this PR's head was unreadable after 6 attempts, so $HEAD cannot be confirmed current"
               elif [ "$pr_head" != "$HEAD" ]; then
+                # A verdict for a head this PR has MOVED PAST is not worth
+                # retaining, and the write primitive already says so by not
+                # retaining on its own status 4: the run for the current head
+                # publishes the verdict that counts, so a record here would
+                # point a reader at a revision nobody is reviewing.
+                superseded=1
+                publication="superseded"
                 withhold="$HEAD is no longer this PR's head ($pr_head)"
               fi
             fi
             if [ -n "$withhold" ]; then
+              # BOTH arms below withhold BEFORE any write is attempted, so
+              # neither reaches the retention the write primitive performs on
+              # its own withheld arms -- and a verdict that never got as far as
+              # a write is exactly as lost as one whose write failed. So they
+              # retain here, on the primitive's own terms: `withheld`, because
+              # no write was attempted at all and that is the strongest form of
+              # KNOWN non-publication, and the caller's `$stamp $HEAD` as the
+              # proof the body is a verdict for THIS head.
+              #
+              # That proof is also what keeps the no-verdict arm out without a
+              # second condition here: a run that reached no verdict withholds
+              # a failure notice carrying no stamp, so retention declines it
+              # and no record claims a verdict nobody reached. The one case the
+              # proof cannot decide is a head this PR has moved past, whose
+              # body does carry a stamp -- `superseded` is that case, and it is
+              # excluded for the same reason status 4 retains nothing.
+              #
+              # The write status is `none`, not a number: no write was
+              # attempted, and every numeric value would name one that returned
+              # it.
+              #
               # A lookup that ERRORED is not "no comment exists": taking the
               # create path there plants a second marker comment over a
               # possibly-live verdict, which no later run undoes.
               if [ "$lookup_ok" -eq 0 ]; then
                 echo "::warning::Withholding $lane comment for $HEAD ($withhold); the comment lookup also failed, so nothing was posted${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+                if [ -z "$superseded" ]; then
+                  retain_unpublished_verdict withheld none "$stamp $HEAD" "$out_file"
+                fi
+                printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
                 return 0
               fi
               if [ -n "$existing" ] && [ "$existing" != "null" ]; then
                 echo "::warning::Withholding $lane comment for $HEAD ($withhold); left existing comment #$existing untouched"
+                if [ -z "$superseded" ]; then
+                  retain_unpublished_verdict withheld none "$stamp $HEAD" "$out_file"
+                fi
+                printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
                 return 0
               fi
               # The lookup SUCCEEDED and found nothing, so there is no verdict
@@ -2291,6 +2583,11 @@ jobs:
               else
                 echo "::error::$lane could not post its $HEAD notice, so this PR carries no $stamp comment at all.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               fi
+              case "$write_rc" in
+                0) publication="published" ;;
+                4) publication="superseded" ;;
+              esac
+              printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
               return 0
             fi
             if [ "$lookup_ok" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
@@ -2330,6 +2627,11 @@ jobs:
                 echo "::error::$lane produced a verdict for $HEAD but could not publish it, so this run's verdict is not in the slot.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               fi
             fi
+            case "$write_rc" in
+              0) publication="published" ;;
+              4) publication="superseded" ;;
+            esac
+            printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
           }
           guarded_comment_upsert "$MARKER" "[SCOPE-REVIEWED]" "Fork Security Scope Review" "$RUNNER_TEMP/scope-comment.md"
 
@@ -2346,10 +2648,14 @@ jobs:
       # fresh row; the readiness reader collapses rows sharing the id to the
       # newest by CHECK-RUN id, so the fresh row wins.
       #
-      # `details_url` carries this run's URL: a workflow_run-triggered run is
-      # keyed to the DEFAULT branch context, so this stamp is the only link from
-      # the PR head back to the lane run -- the human-override handler reads it to
-      # re-run the lane, and a human clicking the check lands on the run logs.
+      # `output.text` carries this run's id as the lane-run marker
+      # (`<!-- ai-review-fork-lane run=<id> -->`). A workflow_run-triggered run is
+      # keyed to the DEFAULT branch context, so that marker is the only link from
+      # the PR head back to the lane run: the human-override handler reads it to
+      # re-run the lane, and its `Lane run:` line takes a human to the run logs.
+      # `details_url` cannot carry the link. GitHub stores an Actions-created
+      # check-run's details_url as the check-run's own page, whatever the POST
+      # passes.
       # Where a withheld verdict goes, so that it outlives the job that computed
       # it. The step above reports a withheld verdict in an annotation, and an
       # annotation is replaced by the next attempt's -- as is the marker comment
@@ -2371,7 +2677,7 @@ jobs:
           && steps.post.outputs.retained_verdict_artifact != ''
           && needs.validate.outputs.scrub_ok == 'true'
         # NEVER fatal. A lane's conclusion is read by pr-readiness.yml, and for
-        # the three advisory labels ANY non-success conclusion is reported as
+        # the three whole-design labels ANY non-success conclusion is reported as
         # `<label> (BLOCK)` -- a judged-wrong verdict. So a transport flake here,
         # or an `if-no-files-found: error` on a directory that did not survive,
         # would invent a verdict nobody reached. Retention is evidence ABOUT a
@@ -2404,16 +2710,27 @@ jobs:
           WR_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           CONCLUSION: ${{ steps.decide.outputs.conclusion }}
           TITLE: ${{ steps.decide.outputs.title }}
+          REMEDY: ${{ steps.decide.outputs.remedy }}
           SETTLED: ${{ steps.decide.outputs.settled }}
           FOLD_RC: ${{ steps.fold.outputs.rc }}
           BODY: ${{ runner.temp }}/scope-verdict.md
+          HUMAN_OVERRIDE: ${{ needs.generate.outputs.override == 'true' || steps.human_override.outputs.active == 'true' }}
         run: |
           set -uo pipefail
           if [ -z "${HEAD:-}" ]; then
             echo "::warning::no head sha to key a check-run to"
             exit 0
           fi
-          summary="Security scope review for $HEAD. See the PR comment for the confirmed rows."
+          # The GENERIC arm, reached when no deterministic body was folded: no leg
+          # produced rows, so there are none to read in a PR comment or anywhere
+          # else -- and on the `validate`-refusal path that comment is not posted
+          # either, so a pointer at it sends a reader to nothing. The decided title
+          # is the cause, repeated here because a check's summary is what a reader
+          # lands on, and a NAMED refusal appends the action that clears it (#13617).
+          summary="Security scope review for $HEAD — $TITLE. No leg produced confirmed rows, so there are none to read: this run's logs are linked from this check."
+          if [ -n "${REMEDY:-}" ]; then
+            summary="$(printf '%s\n\n%s\n' "Security scope review for $HEAD — $TITLE." "$REMEDY")"
+          fi
           # Carry the deterministic body into the Checks UI itself, capped with a
           # Bash substring rather than a pipe into `head`: a piped cap SIGPIPEs
           # the writer, and `pipefail` turns that into a step failure on exactly
@@ -2421,7 +2738,9 @@ jobs:
           # rewrite is withheld here on the same grounds it is withheld from the
           # comment -- the title above is what carries that fact, and the generic
           # summary is what a reader gets.
-          if [ "${FOLD_RC:-}" = "rows-redacted" ]; then
+          if [ "${HUMAN_OVERRIDE:-}" = "true" ]; then
+            summary="Security scope review for $HEAD — $TITLE. The review was skipped for the accepted /ai-review override, so no leg ran."
+          elif [ "${FOLD_RC:-}" = "rows-redacted" ]; then
             summary="Security scope review for $HEAD. A confirmed row carried a credential shape and was redacted, so the rows are withheld: reproduce them with scripts/deny_diff.py against this head."
           elif [ -s "$BODY" ]; then
             digest="$(cat "$BODY")"
@@ -2436,6 +2755,8 @@ jobs:
           if [ "${SETTLED:-yes}" != "yes" ]; then
             scope_prefix="[scope-floor:unsettled] "
           fi
+          lane_text="$(printf 'Lane run: %s/%s/actions/runs/%s\n\n<!-- ai-review-fork-lane run=%s -->' \
+            "${GITHUB_SERVER_URL:-}" "$REPO" "${GITHUB_RUN_ID:-}" "${GITHUB_RUN_ID:-}")"
           ext_args=()
           if [ -n "${PR:-}" ]; then
             ext_args=(-f external_id="scope-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT")
@@ -2449,7 +2770,8 @@ jobs:
               -f status="completed" -f conclusion="$CONCLUSION" ${ext_args[@]+"${ext_args[@]}"} \
               -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
               -f "output[title]=${scope_prefix}Security Scope Review — $TITLE" \
-              -f "output[summary]=$summary" >/dev/null 2>&1; then
+              -f "output[summary]=$summary" \
+              -f "output[text]=$lane_text" >/dev/null; then
               exit 0
             fi
             sleep 5

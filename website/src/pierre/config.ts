@@ -12,6 +12,8 @@
  */
 import type { BaseCodeOptions, BaseDiffOptions, HunkSeparators, ThemesType, ThemeTypes } from '@pierre/diffs'
 
+import { STATE_ROW_ACTION_ICON, STATE_ROW_ICON } from './treeStateRows'
+
 /** Diff options as our surfaces use them: the deprecated `custom` hunk
  *  separator (a function renderer) is excluded so the shape stays assignable
  *  to Pierre's component-level `FileDiffOptions`. */
@@ -115,6 +117,57 @@ export const PIERRE_WRAP_NO_HSCROLL_CSS = `
  *  (`scripts/capture-pierre-caret-align.mjs` prints both). */
 export const PIERRE_EDIT_CARET_ALIGN_CSS = `
 [data-code]{padding-top:0}
+`
+
+/** Styles the workspace tree's STATE rows -- the one row the tree puts under a
+ *  childless expanded folder (see `./treeStateRows`). Pierre has no slot for
+ *  such a row, so the tree feeds each one to the model as a synthetic child
+ *  whose basename is the label followed by `STATE_ROW_MARKER`. This sheet does
+ *  NOT select by that marker: a real file can end in U+200B as well (an agent
+ *  wrote it, a clone brought it), and a sheet keyed on the path would paint it
+ *  inert. It selects by the decoration the wrapper's `renderRowDecoration`
+ *  emits for a planned row only (`STATE_ROW_ICON`, an `<svg data-icon-name>`
+ *  with no symbol behind it) -- the same plan its selection and context-menu
+ *  guards consult -- and never by the label, which follows the active language
+ *  while this sheet is fixed at model construction. It makes the row read as a
+ *  status line rather than a file: muted text, no file glyph (the lane stays,
+ *  so the label keeps the child indentation), and no pointer response -- no
+ *  hover wash, no click, no "..." menu affordance. Keyboard focus still
+ *  reaches the row like any treeitem; the wrapper's selection guard keeps
+ *  Enter from opening it. Applied through `unsafeCSS` (`@layer unsafe`,
+ *  outranking the library's `@layer base`).
+ *
+ *  The last two rules are the tree's half of the scroll-only scrollbar
+ *  (index.css, lib/scrollReveal.ts): the library paints its thumb on hover
+ *  through `--trees-scrollbar-thumb-current`; here it is transparent until the
+ *  scroller carries `data-scrolling`, then the library's own thumb token.
+ *
+ *  Deliberately NOT italic: Pierre paints a label as two `overflow: hidden`
+ *  spans around its middle-truncation point, and an oblique glyph's overhang is
+ *  clipped at each span's edge -- "file" rendered as "tile" in the capture. */
+// The last rule is the row badge's truncation. Pierre lays a decoration's text
+// out as an end-aligned inline-flex span, which cannot ellipsize, so a narrow
+// row (a folded "packages / core" chain) cut the badge from its START
+// ("me items not shown"). As a block it ends in an ellipsis instead.
+const STATE_ROW_ICON_SVG = `[data-item-section="decoration"] [data-icon-name="${STATE_ROW_ICON}"]`
+const STATE_ROW = `[data-type="item"]:has(${STATE_ROW_ICON_SVG})`
+// The `truncated` row a host can act on (open that folder in a folder tab): styled as a link
+// in the accent colour, not the muted status tone, and it takes the pointer,
+// because activating it IS its job.
+const STATE_ROW_ACTION_ICON_SVG = `[data-item-section="decoration"] [data-icon-name="${STATE_ROW_ACTION_ICON}"]`
+const STATE_ACTION_ROW = `[data-type="item"]:has(${STATE_ROW_ACTION_ICON_SVG})`
+export const PIERRE_TREE_STATE_ROW_CSS = `
+${STATE_ROW}{pointer-events:none;color:var(--trees-fg-muted)}
+${STATE_ROW} [data-item-section="icon"]{visibility:hidden}
+${STATE_ROW} [data-item-section="action"]{display:none}
+${STATE_ROW_ICON_SVG}{display:none}
+${STATE_ACTION_ROW}{cursor:pointer;color:var(--trees-accent);text-decoration:underline;text-underline-offset:2px}
+${STATE_ACTION_ROW} [data-item-section="icon"]{visibility:hidden}
+${STATE_ACTION_ROW} [data-item-section="action"]{display:none}
+${STATE_ROW_ACTION_ICON_SVG}{display:none}
+[data-item-section="decoration"] > span{display:block}
+[data-file-tree-virtualized-scroll]{--trees-scrollbar-thumb-current:transparent}
+[data-file-tree-virtualized-scroll][data-scrolling]{--trees-scrollbar-thumb-current:var(--trees-scrollbar-thumb)}
 `
 
 /** Highlighting worker pool size. Each worker is spawned eagerly at pool
@@ -236,12 +289,36 @@ export const PIERRE_DIFF_DEFAULTS: PierreDiffOptions = {
   expandUnchanged: false,
 }
 
+/** A code or diff surface shows its scrollbar only while it is scrolling, like
+ *  every other scroll box (index.css, `data-scrolling`; lib/scrollReveal.ts
+ *  sets the attribute inside Pierre's shadow root too).
+ *
+ *  Pierre draws into a shadow root, so the dashboard-wide rules never match its
+ *  `[data-code]` scroller, and the library's own sheet paints that box's thumb
+ *  on HOVER of the file (`[data-file]:hover`) and, on Firefox, permanently.
+ *  This sheet lands in the library's `@layer unsafe`, which outranks its
+ *  `@layer base` whatever the specificity: the thumb is transparent until the
+ *  attribute paints it, in the library's own thumb token. The 6px track stays
+ *  reserved, so the reveal moves nothing. The `scrollbar-color` half is fenced
+ *  to Firefox exactly as index.css fences it: the moment Blink sees a standard
+ *  scrollbar property on the box it drops the pseudo-elements and draws its
+ *  15px native bar instead (measured). Folded into both option factories
+ *  below, so every surface carries it without naming it. */
+export const PIERRE_SCROLL_REVEAL_CSS = `
+[data-code]::-webkit-scrollbar-thumb{background-color:transparent}
+[data-code][data-scrolling]::-webkit-scrollbar-thumb{background-color:var(--diffs-bg-context)}
+@supports (-moz-appearance:none){
+[data-code]{scrollbar-color:transparent transparent}
+[data-code][data-scrolling]{scrollbar-color:var(--diffs-bg-context) transparent}
+}
+`
+
 /** Merge per-surface overrides over the shared code-view defaults. */
 export function pierreFileOptions(overrides?: BaseCodeOptions): BaseCodeOptions {
-  return { ...PIERRE_CODE_DEFAULTS, ...overrides }
+  return { ...PIERRE_CODE_DEFAULTS, ...overrides, unsafeCSS: PIERRE_SCROLL_REVEAL_CSS + (overrides?.unsafeCSS ?? '') }
 }
 
 /** Merge per-surface overrides over the shared diff defaults. */
 export function pierreDiffOptions(overrides?: PierreDiffOptions): PierreDiffOptions {
-  return { ...PIERRE_DIFF_DEFAULTS, ...overrides }
+  return { ...PIERRE_DIFF_DEFAULTS, ...overrides, unsafeCSS: PIERRE_SCROLL_REVEAL_CSS + (overrides?.unsafeCSS ?? '') }
 }

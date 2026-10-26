@@ -32,7 +32,7 @@ The file lives in its own data-home directory, ``crew-teams/``, and NOT under
 ``trust/``: ``trust`` is a declared sandbox READ-WRITE exception (in-sandbox code
 appends to the audit log there), so a record under it stays writable by a
 sandboxed command that builds the path at runtime -- the ``crew-panels`` lesson
-in ``sandbox.py``. ``crew-teams`` is instead masked from every sandboxed process
+in ``sandbox_leaves.py``. ``crew-teams`` is instead masked from every sandboxed process
 (``sandbox._CREW_HIDDEN_LEAVES``, pre-created before each spawn so the mask is
 never vacuous) and fenced from agent file tools (``security._CREW_SECRET_LEAVES``).
 Two trusted writers open it, both owner-invoked: the gateway on a dashboard
@@ -119,9 +119,13 @@ TEAMS_MAX = 200
 #: Hard cap on the crewmates one team lists. Same posture as ``TEAMS_MAX``.
 TEAM_MEMBERS_MAX = 500
 
-#: A member is an exact crew name; the agent-name grammar (``_AGENT_NAME_RE``)
-#: allows at most 64 characters. Bounded on read as well as write.
-MEMBER_NAME_MAX_CHARS = 64
+#: A member is an exact crew name -- a free-form display name, bounded by the
+#: same cap ``members.validate_member_name`` applies (``validation.MAX_SHORT_STRING``),
+#: so every crew the roster lists can be teamed. Spelled as a literal because
+#: ``validation`` imports ``security``, which imports this module through
+#: ``memory_stores``; ``test_member_names_are_display_names_not_identifiers``
+#: pins the two equal. Bounded on read as well as write.
+MEMBER_NAME_MAX_CHARS = 500
 
 #: Ids are minted by :func:`_new_team_id` -- 12 lowercase hex characters.
 #: Always applied with ``fullmatch``: ``$`` alone admits a trailing newline.
@@ -133,15 +137,15 @@ _TEAM_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 #: largest document the caps allow -- see :func:`max_document_bytes` and the
 #: test that pins the inequality -- so a valid sequence of writes can never
 #: produce a file the read refuses.
-TEAMS_FILE_MAX_BYTES = 40_000_000
+TEAMS_FILE_MAX_BYTES = 320_000_000
 
 
 def max_document_bytes() -> int:
     """Upper bound on a document every cap admits, in UTF-8 JSON bytes.
 
     Names are capped in CHARACTERS: a team name at ``TEAM_NAME_MAX_CHARS`` and a
-    crew name at the 64 the agent-name grammar allows, each up to 4 bytes per
-    character and up to 6 for a JSON escape. The arithmetic is deliberately
+    crew name at ``MEMBER_NAME_MAX_CHARS`` (the display-name cap), each up to 4
+    bytes per character and up to 6 for a JSON escape. The arithmetic is deliberately
     loose (every entry at its widest, every character escaped) because the point
     is the inequality with :data:`TEAMS_FILE_MAX_BYTES`, not the exact size.
     """
@@ -233,7 +237,15 @@ def _new_team_id() -> str:
 
 
 def _utf8_encodable(value: str) -> bool:
-    """False for a string holding a lone surrogate (JSON-legal, UTF-8-illegal)."""
+    """False for a string holding a lone surrogate (JSON-legal, UTF-8-illegal).
+
+    Kept local rather than imported from ``lesson_validation.utf8_encodable``
+    (its twin): ``crew_teams`` is pulled in early by ``memory_stores`` ->
+    ``security``, and ``lesson_validation`` imports ``model_registry``, whose
+    module load resolves the data home -- which raises on a host with no home
+    directory. A five-line duplicate is cheaper than widening this module's
+    import chain.
+    """
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -553,20 +565,20 @@ def prune_unknown(teams: list[Team], known: set[str]) -> list[Team]:
 def _validate_names(members: object) -> list[str]:
     """Shape and bounds only -- the list a write may RETAIN, registry aside."""
     if not isinstance(members, list):
-        raise TeamError("invalid_members", "members must be a list of crewmate names")
+        raise TeamError("invalid_members", "members must be a list of mate names")
     if len(members) > TEAM_MEMBERS_MAX:
-        raise TeamError("too_many_members", f"a team lists at most {TEAM_MEMBERS_MAX} crewmates")
+        raise TeamError("too_many_members", f"a team lists at most {TEAM_MEMBERS_MAX} mates")
     out: list[str] = []
     for member in members:
         if not isinstance(member, str) or not member:
-            raise TeamError("invalid_members", "members must be a list of crewmate names")
+            raise TeamError("invalid_members", "members must be a list of mate names")
         # The read side refuses a member past MEMBER_NAME_MAX_CHARS or one UTF-8
         # cannot encode (_parse_teams), so the write side must refuse it FIRST,
         # before the registry lookup: a registry key that slipped past the
         # roster's grammar must never be retained into a document the reader
         # would then refuse whole.
         if len(member) > MEMBER_NAME_MAX_CHARS or not _utf8_encodable(member):
-            raise TeamError("invalid_members", "members must be a list of crewmate names")
+            raise TeamError("invalid_members", "members must be a list of mate names")
         if member not in out:
             out.append(member)
     return out
@@ -576,7 +588,7 @@ def _validate_members(members: object, known: set[str]) -> list[str]:
     out = _validate_names(members)
     for member in out:
         if member not in known:
-            raise TeamError("unknown_member", f"no crewmate named {member!r}")
+            raise TeamError("unknown_member", f"no mate named {member!r}")
     return out
 
 
@@ -658,7 +670,7 @@ def update_team(
             joining = [m for m in clean_add if m not in kept]
             if len(kept) + len(joining) > TEAM_MEMBERS_MAX:
                 raise TeamError(
-                    "too_many_members", f"a team lists at most {TEAM_MEMBERS_MAX} crewmates"
+                    "too_many_members", f"a team lists at most {TEAM_MEMBERS_MAX} mates"
                 )
             _detach(teams, joining, keep=team.id)
             team.members = kept + joining

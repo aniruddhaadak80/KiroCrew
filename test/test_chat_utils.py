@@ -10,6 +10,7 @@ import sys
 import pytest
 
 import kiro_crew.dashboard.chat_utils as chat_utils
+from kiro_crew.dashboard import display_battery
 from kiro_crew.dashboard.chat_utils import (
     _history_key_for,
     _normalize_model,
@@ -21,6 +22,7 @@ from kiro_crew.dashboard.chat_utils import (
     _validate_tool_name,
     is_deprecated_model,
 )
+from kiro_crew.security.exfil import scoped_exempt_hosts
 from kiro_crew.trust_patterns import extract_bash_command
 
 
@@ -48,17 +50,17 @@ class TestRedactDeep:
 
 
 class TestExtractBashCommand:
-    def test_json_input(self):
-        assert extract_bash_command('{"command": "ls -la"}') == "ls -la"
-
-    def test_raw_input(self):
-        assert extract_bash_command("ls -la") == "ls -la"
-
-    def test_empty_json(self):
-        assert extract_bash_command("{}") == ""
-
-    def test_invalid_json(self):
-        assert extract_bash_command("not json {") == "not json {"
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            pytest.param('{"command": "ls -la"}', "ls -la", id="test_json_input"),
+            pytest.param("ls -la", "ls -la", id="test_raw_input"),
+            pytest.param("{}", "", id="test_empty_json"),
+            pytest.param("not json {", "not json {", id="test_invalid_json"),
+        ],
+    )
+    def test_extract_bash_command(self, raw, expected):
+        assert extract_bash_command(raw) == expected
 
 
 class TestNormalizeModel:
@@ -97,17 +99,23 @@ class TestValidateToolName:
 
 
 class TestHistoryKeyFor:
-    def test_raw_key(self):
-        assert _history_key_for("chat-1-123") == "dashboard:chat-1-123"
-
-    def test_already_prefixed(self):
-        assert _history_key_for("dashboard:chat-1-123") == "dashboard:chat-1-123"
-
-    def test_filesystem_roundtrip(self):
-        assert _history_key_for("dashboard_chat-1-123") == "dashboard:chat-1-123"
-
-    def test_stacked_prefixes(self):
-        assert _history_key_for("dashboard_dashboard_chat-1") == "dashboard:chat-1"
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            pytest.param("chat-1-123", "dashboard:chat-1-123", id="test_raw_key"),
+            pytest.param(
+                "dashboard:chat-1-123", "dashboard:chat-1-123", id="test_already_prefixed"
+            ),
+            pytest.param(
+                "dashboard_chat-1-123", "dashboard:chat-1-123", id="test_filesystem_roundtrip"
+            ),
+            pytest.param(
+                "dashboard_dashboard_chat-1", "dashboard:chat-1", id="test_stacked_prefixes"
+            ),
+        ],
+    )
+    def test_history_key_for(self, key, expected):
+        assert _history_key_for(key) == expected
 
 
 class TestRemoveQueuedById:
@@ -236,11 +244,12 @@ class TestRedactForDisplay:
         calls = {"n": 0}
         real = chat_utils.redact_exfiltration_urls
 
-        def counted(value):
+        def counted(value, **kwargs):
             calls["n"] += 1
-            return real(value)
+            return real(value, **kwargs)
 
         monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted)
         exempt = {"hosts": frozenset()}
         monkeypatch.setattr(chat_utils, "_exempt_exact_hosts", lambda: exempt["hosts"])
 
@@ -263,9 +272,9 @@ class TestRedactForDisplay:
         real_credentials = chat_utils.redact_credentials
         calls = {"exfiltration": 0, "credentials": 0}
 
-        def counted_exfiltration(value):
+        def counted_exfiltration(value, **kwargs):
             calls["exfiltration"] += 1
-            return real_exfiltration(value)
+            return real_exfiltration(value, **kwargs)
 
         def counted_credentials(value):
             calls["credentials"] += 1
@@ -273,6 +282,8 @@ class TestRedactForDisplay:
 
         monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted_exfiltration)
         monkeypatch.setattr(chat_utils, "redact_credentials", counted_credentials)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted_credentials)
         secret = "AKIAIOSFODNN7EXAMPLE"
         messages = [
             {
@@ -350,9 +361,9 @@ class TestRedactForDisplay:
         real_credentials = chat_utils.redact_credentials
         calls = {"exfiltration": 0, "credentials": 0}
 
-        def counted_exfiltration(value):
+        def counted_exfiltration(value, **kwargs):
             calls["exfiltration"] += 1
-            return real_exfiltration(value)
+            return real_exfiltration(value, **kwargs)
 
         def counted_credentials(value):
             calls["credentials"] += 1
@@ -360,6 +371,8 @@ class TestRedactForDisplay:
 
         monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted_exfiltration)
         monkeypatch.setattr(chat_utils, "redact_credentials", counted_credentials)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted_credentials)
         secret = "AKIAIOSFODNN7EXAMPLE"
         rows = chat_utils.SLOT_DETAIL_MAX_LIMIT
         messages = [
@@ -387,9 +400,110 @@ class TestRedactForDisplay:
         assert sum(cold_calls.values()) >= rows * 6
         assert calls == cold_calls, "a full page must render warm with zero redactor calls"
         entries, accounted_bytes = chat_utils._display_redaction_cache_info()
-        assert entries >= rows * 6, "six distinct strings per row, every one cached"
+        # Strings the battery left unchanged (mid, tool_name) are held as clean
+        # verdicts; the ones it changed are held as outputs. Every one is cached.
+        verdicts = len(chat_utils._display_clean_young) + len(chat_utils._display_clean_old)
+        assert entries + verdicts >= rows * 6, "six distinct strings per row, every one cached"
         assert entries <= chat_utils._DISPLAY_REDACTION_CACHE_MAX_ENTRIES
         assert accounted_bytes <= chat_utils._DISPLAY_REDACTION_CACHE_MAX_BYTES
+
+    def test_long_session_renders_warm_with_zero_redactions(self, monkeypatch):
+        """A whole long session (the unlimited slot-detail read) renders warm.
+
+        Real long sessions hold hundreds of thousands of strings, almost all of
+        which the battery leaves unchanged. When only the output cache held them,
+        its entry cap evicted the session's head before the next render reached
+        it, so every view of a long session ran the full battery again.
+        """
+        chat_utils._clear_display_redaction_cache()
+        real_exfiltration = chat_utils.redact_exfiltration_urls
+        real_credentials = chat_utils.redact_credentials
+        calls = {"n": 0}
+
+        def counted_exfiltration(value, **kwargs):
+            calls["n"] += 1
+            return real_exfiltration(value, **kwargs)
+
+        def counted_credentials(value):
+            calls["n"] += 1
+            return real_credentials(value)
+
+        monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(chat_utils, "redact_credentials", counted_credentials)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted_credentials)
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        rows = 12_000
+        messages = [
+            {
+                "role": "assistant",
+                "content": f"reply {i}" + (f" leaks {secret}" if i % 50 == 0 else " is plain"),
+                "cls": "msg msg-a",
+                "ts": f"2026-09-23T22:{(i // 60) % 60:02d}:{i % 60:02d}Z",
+                "meta": {"mid": f"mid-{i}", "tool_name": f"tool-{i}"},
+            }
+            for i in range(rows)
+        ]
+
+        cold = _prepare_messages(messages, running=False, live_child="")
+        cold_calls = calls["n"]
+        warm = _prepare_messages(messages, running=False, live_child="")
+
+        assert json.dumps(warm) == json.dumps(cold)
+        assert cold_calls >= rows * 3
+        assert calls["n"] == cold_calls, "a repeat render of the session must not redact again"
+        assert secret not in json.dumps(warm), "a hit still serves the redacted output"
+
+        # Content that changes is a different key: it is redacted again.
+        messages[1] = {**messages[1], "content": f"edited {secret}"}
+        again = _prepare_messages(messages, running=False, live_child="")
+        assert calls["n"] > cold_calls
+        assert secret not in again[1]["content"]
+
+    def test_clean_verdicts_are_bounded_by_two_generations(self, monkeypatch):
+        chat_utils._clear_display_redaction_cache()
+        monkeypatch.setattr(chat_utils, "_DISPLAY_CLEAN_GENERATION", 100)
+        for i in range(1_000):
+            assert chat_utils._redact_for_display(f"plain text {i}") == f"plain text {i}"
+            assert len(chat_utils._display_clean_young) <= 100
+            assert len(chat_utils._display_clean_old) <= 100
+        # The oldest verdicts are gone, so their text is checked by the battery again.
+        calls = {"n": 0}
+        real = chat_utils.redact_credentials
+
+        def counted(value):
+            calls["n"] += 1
+            return real(value)
+
+        monkeypatch.setattr(chat_utils, "redact_credentials", counted)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted)
+        chat_utils._redact_for_display("plain text 0")
+        chat_utils._redact_for_display("plain text 999")
+        assert calls["n"] == 1
+
+    def test_clean_verdict_does_not_carry_over_a_narrowed_host_set(self, monkeypatch):
+        """A text ending in NUL + host under fewer hosts is not the clean text it mimics.
+
+        The MAC input is ``text + NUL + hosts``, so ``T`` under ``{a, b}`` and
+        ``T + NUL + a`` under ``{b}`` digest the same bytes. Only the input length
+        tells them apart; a verdict without it would serve the second one, whose
+        URL is not exempt, unredacted.
+        """
+        chat_utils._clear_display_redaction_cache()
+        monkeypatch.setattr(chat_utils, "_exempt_exact_hosts", lambda: frozenset())
+        text = (
+            "See https://a.example.com/x?q=" + "abcdefghijklmnopqrstuvwxyz0123456789" * 4 + " end"
+        )
+        with scoped_exempt_hosts(frozenset({"a.example.com", "b.example.com"})):
+            assert chat_utils._redact_for_display(text) == text, "exempt host stays as written"
+
+        mimic = text + "\0a.example.com"
+        with scoped_exempt_hosts(frozenset({"b.example.com"})):
+            first = chat_utils._redact_for_display(mimic)
+            chat_utils._clear_display_redaction_cache()
+            cold = chat_utils._redact_for_display(mimic)
+        assert cold != mimic, "a.example.com is not exempt here, so its URL is redacted"
+        assert first == cold, "a cached verdict must not change what is shown"
 
     def test_content_cache_key_is_a_keyed_mac_over_text_and_hosts(self, monkeypatch):
         """The retained digest is keyed on a per-process secret, not a bare hash.
@@ -446,7 +560,6 @@ class TestRedactToolField:
 
     def test_multibyte_capped_on_bytes_not_chars(self):
         # 200 emoji × 4 bytes = 800 bytes UTF-8 (each "🎉" is 4 bytes).
-        # Pre-fix this would have passed through if limit were char-based ≥ 200.
         # With true byte cap at 100, the encoded prefix must be ≤ 100 bytes.
         text = "🎉" * 200
         result = _redact_tool_field(text, limit=100)

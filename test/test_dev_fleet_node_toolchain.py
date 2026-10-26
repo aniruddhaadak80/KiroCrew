@@ -27,10 +27,16 @@ from kiro_crew.apps.builtins.dev_fleet import (
     fleet_state,
     http_api,
     live,
+    live_leases,
+    live_plan,
+    live_service,
     repository,
     runtime,
     server,
     worktree_ops,
+    worktree_ops_pods,
+    worktree_ops_removal,
+    worktree_ops_sync,
 )
 from kiro_crew.pod import provision as prov
 
@@ -38,8 +44,14 @@ _DEV_FLEET_MODULES = (
     runtime,
     repository,
     live,
+    live_leases,
+    live_service,
+    live_plan,
     fleet_state,
     worktree_ops,
+    worktree_ops_sync,
+    worktree_ops_pods,
+    worktree_ops_removal,
     http_api,
     server,
 )
@@ -165,7 +177,7 @@ def test_warm_build_path_is_idempotent(node_dir):
 @pytest.mark.parametrize(
     "fn",
     [
-        "_pod_up",
+        "_pod_up_locked",
         "_pod_down",
         "_pod_provision",
         "_sync_start_locked",
@@ -278,7 +290,9 @@ def test_toolchain_bin_searches_the_trusted_path_as_its_base():
 def test_git_resolution_is_untouched_by_the_toolchain_tier():
     """The credential-bearing binaries keep the strict rule. Guards against a
     later refactor routing git through _toolchain_bin."""
-    src = "\n".join(Path(module.__file__).read_text() for module in _DEV_FLEET_MODULES)
+    src = "\n".join(
+        Path(module.__file__).read_text(encoding="utf-8") for module in _DEV_FLEET_MODULES
+    )
     assert '_toolchain_bin("git")' not in src
     assert "_toolchain_bin('git')" not in src
     assert '_toolchain_bin("gh")' not in src

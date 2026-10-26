@@ -18,8 +18,17 @@ import pytest
 
 import kiro_crew.config.paths as paths_mod
 import kiro_crew.hooks as hooks_mod
+from kiro_crew.acp.kas_permissions import kas_tool_match_names
 from kiro_crew.agent_sdk import spec_hooks
-from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.hooks import (
@@ -67,12 +76,14 @@ def _prepare(client, agent, *, is_new=False):
 def notices(monkeypatch) -> list:
     seen: list = []
     monkeypatch.setattr(
-        chat_runner, "append_and_surface", lambda state, slot, role, text, cls: seen.append(text)
+        chat_runner,
+        "append_and_surface",
+        lambda state, slot, role, text, cls, **kw: seen.append(text),
     )
     return seen
 
 
-_OBJECT_HOOKS = {"preToolUse": [{"matcher": "shell", "command": "guard.sh"}]}
+_OBJECT_HOOKS = {"preToolUse": [{"matcher": "execute_bash", "command": "guard.sh"}]}
 
 
 def test_membership_is_kas_only():
@@ -91,7 +102,7 @@ def test_a_kas_session_gets_the_spec_hooks(agents_dir, notices):
     hooks, unreadable, _ = _prepare(_client(ACP_BACKEND_KAS), "a1")
     assert unreadable is False
     assert [(h.event, h.matcher, h.command) for h in hooks] == [
-        (HOOK_EVENT_PRE_TOOL_USE, "shell", "guard.sh")
+        (HOOK_EVENT_PRE_TOOL_USE, "execute_bash", "guard.sh")
     ]
 
 
@@ -106,12 +117,78 @@ def test_an_unreadable_spec_fails_closed(agents_dir, notices):
 
 
 def test_tools_settings_notice_fires_once_per_session(agents_dir, notices):
-    _write_spec(agents_dir, "a1", hooks=_OBJECT_HOOKS, toolsSettings={"shell": {}})
+    _write_spec(
+        agents_dir,
+        "a1",
+        hooks=_OBJECT_HOOKS,
+        toolsSettings={"shell": {"autoAllowReadonly": True}},
+    )
     _prepare(_client(ACP_BACKEND_KAS), "a1", is_new=True)
     _prepare(_client(ACP_BACKEND_KAS), "a1", is_new=False)
     assert len(notices) == 1
-    assert "toolsSettings" in notices[0]
+    assert "toolsSettings.shell.autoAllowReadonly" in notices[0]
     assert "hooks" not in notices[0]
+
+
+def test_translated_tools_settings_raise_no_notice(agents_dir, notices):
+    _write_spec(agents_dir, "a1", toolsSettings={"read": {"deniedPaths": ["~/.ssh"]}})
+    _prepare(_client(ACP_BACKEND_KAS), "a1", is_new=True)
+    assert notices == []
+
+
+def test_a_goose_session_still_hears_that_tools_settings_is_lost(agents_dir, notices):
+    """Only KAS receives the translation; goose fires spec hooks but gets no rules."""
+    _write_spec(agents_dir, "a1", toolsSettings={"read": {"deniedPaths": ["~/.ssh"]}})
+    _prepare(_client(ACP_BACKEND_GOOSE), "a1", is_new=True)
+    assert len(notices) == 1
+    assert "toolsSettings" in notices[0]
+
+
+_PROMPT_AND_STOP_HOOKS = {
+    "stop": [{"command": "done.sh"}],
+    "userPromptSubmit": [{"command": "stamp.sh"}],
+}
+_RUN_NOWHERE = "does not run an agent's hooks"
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+def test_a_new_session_where_nothing_runs_spec_hooks_names_their_events(
+    backend, agents_dir, notices
+):
+    _write_spec(agents_dir, "a1", hooks=_PROMPT_AND_STOP_HOOKS)
+    assert _prepare(_client(backend), "a1", is_new=True) == ([], False, None)
+    assert len(notices) == 1
+    assert _RUN_NOWHERE in notices[0]
+    assert "a1 has hooks on userPromptSubmit, stop." in notices[0]
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+def test_the_run_nowhere_notice_needs_a_new_session_and_a_spec_with_hooks(
+    backend, agents_dir, notices
+):
+    _write_spec(agents_dir, "a1", hooks=_PROMPT_AND_STOP_HOOKS)
+    _write_spec(agents_dir, "plain")
+    _prepare(_client(backend), "a1", is_new=False)
+    _prepare(_client(backend), "plain", is_new=True)
+    assert notices == []
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_GOOSE, ACP_BACKEND_OPENCODE, ACP_BACKEND_PI],
+)
+def test_no_run_nowhere_notice_where_spec_hooks_run_or_nothing_is_ruled(
+    backend, agents_dir, notices
+):
+    _write_spec(agents_dir, "a1", hooks=_PROMPT_AND_STOP_HOOKS)
+    _prepare(_client(backend), "a1", is_new=True)
+    assert not any(_RUN_NOWHERE in text for text in notices)
+
+
+def test_an_unreadable_spec_renders_no_run_nowhere_notice(agents_dir, notices):
+    (agents_dir / "a1.json").write_text("{not json", encoding="utf-8")
+    assert _prepare(_client(ACP_BACKEND_CLAUDE), "a1", is_new=True) == ([], False, None)
+    assert notices == []
 
 
 def test_disabled_and_confirm_documents_do_not_run():
@@ -180,12 +257,12 @@ def test_an_oversized_or_unsafe_matcher_drops_the_hook_and_retains_nothing():
                 "preToolUse": [
                     {"matcher": long, "command": "x"},
                     {"matcher": "sh;rm", "command": "y"},
-                    {"matcher": "sh*", "command": "z"},
+                    {"matcher": "exec*", "command": "z"},
                 ]
             }
         },
     )
-    assert [(h.command, h.matcher) for h in hooks] == [("z", "sh*")]
+    assert [(h.command, h.matcher) for h in hooks] == [("z", "exec*")]
 
 
 def test_conversion_stops_at_the_hook_cap():
@@ -256,6 +333,7 @@ def test_a_governance_denied_spec_hook_does_not_spawn(tmp_path, monkeypatch):
             tool_name="shell",
             parent_session_key="s1",
             extra_hooks=hooks,
+            extra_hooks_tool_names=kas_tool_match_names("run_command"),
         )
     )
     assert [r.blocked for r in results] == [True]
@@ -266,6 +344,9 @@ def test_a_governance_denied_spec_hook_does_not_spawn(tmp_path, monkeypatch):
 async def test_an_in_turn_agent_switch_reloads_the_new_agents_spec_hooks(tmp_path, monkeypatch):
     """After a provider-side switch, the turn's remaining tool calls meet the NEW
     agent's spec hooks: the runner re-prepares them for the agent it switched to."""
+    from chat_test_helpers import pin_kiro_cli_harness
+
+    pin_kiro_cli_harness()
     from unittest.mock import AsyncMock, MagicMock
 
     from chat_test_helpers import _make_state
@@ -314,12 +395,100 @@ async def test_an_in_turn_agent_switch_reloads_the_new_agents_spec_hooks(tmp_pat
 
     client.stream = _stream
     client.stream_command = _stream
+    await _run_switch_turn(state, slot)
+    assert seen == ["helper", "other"]
+
+
+async def _run_switch_turn(state, slot) -> None:
     try:
-        await chat_runner._run_chat(state, slot, "/agent other")
+        # A kiro-cli subcommand, so it reaches the harness: Crew answers a bare
+        # ``/agent <name>`` itself and the provider's switch event never fires.
+        await chat_runner._run_chat(state, slot, "/agent swap other")
     finally:
         tasks = list(state._background_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    assert seen == ["helper", "other"]
+
+
+@pytest.mark.asyncio
+async def test_an_in_turn_switch_that_leaves_the_session_stale_stops_the_turn(
+    tmp_path, monkeypatch
+):
+    """A switch to an agent whose hooks cover what the session auto-approves ends
+    the turn before anything after it is handled: those calls would never reach the
+    permission request, so the hooks could not see them."""
+    from chat_test_helpers import pin_kiro_cli_harness
+
+    pin_kiro_cli_harness()
+    from unittest.mock import AsyncMock, MagicMock
+
+    from chat_test_helpers import _make_state
+
+    from kiro_crew.agent_discovery import clear_list_agents_cache
+    from kiro_crew.agent_sdk import spec_hooks
+    from kiro_crew.config.loader import refresh_materialized_agents
+    from kiro_crew.config.paths import kiro_agents_dir
+    from kiro_crew.providers.base import (
+        EVENT_AGENT_SWITCHED,
+        EVENT_COMPLETE,
+        EVENT_PERMISSION_REQUEST,
+        LLMEvent,
+    )
+
+    d = kiro_agents_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("helper", "other"):
+        (d / f"{name}.json").write_text(json.dumps({"name": name}), encoding="utf-8")
+    clear_list_agents_cache()
+    refresh_materialized_agents()
+
+    async def no_hooks(state, slot, client, agent, *, is_new):
+        return [], False, None
+
+    async def stale(provider, agent_id):
+        return agent_id == "other"
+
+    monkeypatch.setattr(chat_runner, "_prepare_spec_hooks", no_hooks)
+    monkeypatch.setattr(spec_hooks, "hook_projection_stale", stale)
+    state = _make_state(tmp_path)
+    client = MagicMock()
+    client.context_usage_pct = MagicMock(return_value=50.0)
+    client.shutdown = AsyncMock()
+    client.cancel = AsyncMock()
+    client.approve_tool = AsyncMock()
+    client.reject_tool = AsyncMock()
+    state.sessions.get_or_create = AsyncMock(return_value=(client, False, False))
+    state.sessions.release = MagicMock()
+    state.sessions.reset = AsyncMock()
+    state.sessions.set_approval_policy = MagicMock()
+    state.sessions.check_context_usage = MagicMock()
+    state.sessions.record_success = MagicMock()
+    state.sessions.record_failure = AsyncMock()
+    state.sessions.get_slack_link = MagicMock(return_value=(None, None))
+    state.broadcast_ws = MagicMock()
+    state.push_slots_update = MagicMock()
+    state.is_yolo_active = MagicMock(return_value=False)
+    state._background_tasks = set()
+    slot = state.get_or_create_slot("spec-hooks-stale-switch-slot")
+    slot.agent = "helper"
+
+    async def _stream(msg):
+        yield LLMEvent(kind=EVENT_AGENT_SWITCHED, text="other")
+        yield LLMEvent(kind=EVENT_PERMISSION_REQUEST, title="Fetch URL", request_id="r-1")
+        yield LLMEvent(kind=EVENT_COMPLETE)
+
+    client.stream = _stream
+    client.stream_command = _stream
+    recorded: list = []
+    monkeypatch.setattr(
+        chat_runner, "record_provider_agent_switch", lambda *a, **k: recorded.append(a) or None
+    )
+    await _run_switch_turn(state, slot)
+    client.cancel.assert_awaited()
+    client.approve_tool.assert_not_awaited()
+    client.reject_tool.assert_not_awaited()
+    # Refused BEFORE the switch is recorded: the slot keeps its agent.
+    assert recorded == []
+    assert slot.agent == "helper"

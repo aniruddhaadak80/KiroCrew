@@ -11,15 +11,18 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
+from git_maintenance_helpers import git_maintenance_off_entries
 from installer_test_helpers import run_bounded
 from skill_script_helpers import load_skill_script
+
+from kiro_crew import platform_compat
+from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "packaging" / "signing" / "cli-manifest.py"
@@ -670,14 +673,13 @@ wait
     with pytest.raises(subprocess.TimeoutExpired):
         run_bounded(["sh", str(script), str(pidfile)], os.environ.copy(), 5.0, cwd=str(tmp_path))
     pid = int(pidfile.read_text(encoding="utf-8").strip())
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.05)
-    pytest.fail(f"grandchild {pid} survived the bounded run")
+    # Liveness through the repo's own probe (AGENTS.md "Cross-platform"): a raw
+    # ``os.kill(pid, 0)`` is a POSIX idiom that TERMINATES the target on Windows,
+    # and the sweep's caller filter recognises only the sanctioned helper.
+    wait_until(
+        lambda: not platform_compat.pid_exists(pid),
+        describe=lambda: f"grandchild {pid} survived the bounded run",
+    )
 
 
 @pytest.mark.parametrize("pinned", [False, True])
@@ -1208,6 +1210,10 @@ def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
             "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
     )
+    # Dropping GIT_* also drops the suite's maintenance entries, so they go back
+    # on: a detached maintenance run would otherwise keep writing under .git
+    # after the commit returns.
+    hermetic.update(git_maintenance_off_entries(hermetic))
     for argv in (
         ["git", "init", "-q"],
         ["git", "add", "-A"],
@@ -1460,7 +1466,7 @@ def test_installer_authenticates_before_reading_or_downloading_artifact() -> Non
 
     verify = executable.index("openssl dgst -sha256 -verify")
     parse_fields = executable.index("read_field()")
-    wheel_download = executable.index("curl -fsS --proto '=https' \"$WHEEL_URL\"")
+    wheel_download = executable.index("curl -f $CURL_PROGRESS -S --proto '=https' \"$WHEEL_URL\"")
     assert verify < parse_fields < wheel_download
     assert "SHA256SUMS" not in executable, "strict installer must have no unsigned fallback"
 

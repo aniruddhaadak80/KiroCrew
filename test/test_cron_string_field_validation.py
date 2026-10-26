@@ -150,7 +150,6 @@ class TestUpdateJobFieldValidation:
         job = svc.add_job(name="j", message="m", every_secs=3600)
         with pytest.raises(ValueError, match="max length"):
             svc.update_job(job.id, **{field_name: oversize_value})
-        # Job unchanged
         reloaded = svc.list_jobs()[0]
         assert getattr(reloaded, field_name) == getattr(job, field_name)
 
@@ -166,7 +165,6 @@ class TestUpdateJobFieldValidation:
         job = svc.add_job(name="j", message="m", every_secs=3600)
         with pytest.raises(ValueError, match="must be a string"):
             svc.update_job(job.id, **{field_name: non_string_value})
-        # Job unchanged
         reloaded = svc.list_jobs()[0]
         assert getattr(reloaded, field_name) == getattr(job, field_name)
 
@@ -287,6 +285,10 @@ class TestCapAlignment:
         # CRON_ADD_SCHEMA (grants cannot be created through cron_add).
         "secret_env_pin",
         "secret_env_pending_pin",
+        # The app bridge's stamp of the manifest entry an app job was built
+        # from: written by register_app_crons_with_service alone, never via
+        # CRON_ADD_SCHEMA or any operator update. General ID cap applies.
+        "app_manifest_digest",
     }
 
     def test_table_caps_match_cron_add_schema(self):
@@ -340,9 +342,14 @@ class TestAntiDrift:
     # - approval_mode: validated by a separate finite-set check, not length
     # - memory_store: resolved internally from trusted member/session identity;
     #   never accepted from a cron creation or update caller
+    # - managed_by: caller-supplied, but create-only, so it must stay OUT of the
+    #   table (which also gates apply_job_update). Validated by its own stricter
+    #   validate_managed_by (ASCII charset + 200 cap) at its only writer,
+    #   CronService.add_managed_job.
     _RUNTIME_ONLY_FIELDS: frozenset[str] = frozenset(
         {
             "id",
+            "managed_by",
             "last_status",
             "last_error",
             "last_result",

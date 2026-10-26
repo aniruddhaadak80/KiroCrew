@@ -60,8 +60,16 @@ _TOKEN_TTL_SECS = 900
 
 #: Bounds on the stash. A widget is typically a few KB; the cap is generous
 #: enough for a large artifact and small enough that the ceiling is bounded.
+#:
+#: ``_MAX_BYTES`` is the most ONE document may be and the most ALL of them may be
+#: together. It is sized for a large dashboard document: a page at
+#: ``dashboard_frame.MAX_PAGE_BYTES`` (3 MiB), the 20 or so KB the host adds around it,
+#: and a data island of 4 MiB, which is 64 fields of one crew-log entry (64 KiB) each.
+#: 8 MiB takes that with about 1 MiB left for others in flight. An island has no bound
+#: of its own, so a composed document over 8 MiB is refused outright (413), and a retry
+#: cannot change that.
 _MAX_ENTRIES = 64
-_MAX_BYTES = 4 * 1024 * 1024
+_MAX_BYTES = 8 * 1024 * 1024
 
 #: Per-process, so tokens do not survive a restart. That is intentional: the
 #: stash does not either, and the frame re-mints on mount.
@@ -226,12 +234,28 @@ async def serve_sandbox_doc(request: web.Request) -> web.Response:
     resp = web.Response(body=entry[1], content_type="text/html", charset="utf-8")
     # Serving from a real URL must not raise the trust level. `sandbox` gives the
     # document an opaque origin even opened top-level, and the flags are exactly
-    # those the embedding frames grant — no more. `allow-forms` in particular is
-    # NOT granted: neither ArtifactBody nor WidgetFrame allows it, so including it
-    # here would let a document opened top-level submit forms that the same
-    # document cannot submit inside the frame. No `default-src` is added on
-    # purpose: these documents can reach the network, and silently cutting that
-    # off would break existing widgets rather than fix them.
+    # those the embedding frames grant — no more: `allow-scripts`, the
+    # `AGENT_PAGE_SANDBOX` grant in `website/src/lib/widgetSrcdoc.ts`. No
+    # `allow-popups`: links in these documents open through the host's link
+    # bridge (`useFrameLinkBridge`), which opens one only on a real click, so the
+    # document never opens a window of its own. `allow-forms` is not granted either: no
+    # embedding frame allows it, so including it here would let a document opened
+    # top-level submit forms that the same document cannot submit inside the frame.
+    #
+    # The fetch directives close the CONNECT-class channels a model-authored
+    # document could use to send what it holds to another host: `connect-src`
+    # (fetch, XHR, WebSocket, EventSource, sendBeacon, <a ping>), plus
+    # `object-src` (plugins), `base-uri` (re-pointing relative URLs) and
+    # `form-action`. Shipped callers already wrap their html in a `<meta>` CSP
+    # that blocks these (lib/widgetSrcdoc.ts, dashboardDocument.ts), so this
+    # header changes nothing they render; it makes the property hold for ANY
+    # document minted here, meta or not. A meta policy can only add restrictions
+    # on top of this header, never lift them.
+    #
+    # This is NOT complete exfiltration protection. `default-src` is deliberately
+    # unset, so script/style/img/font/frame/media requests to another host stay
+    # as the document's own meta CSP decides (widgets load CDN libraries that
+    # way), and CSP does not govern in-frame navigation (`location`) or WebRTC.
     #
     # `frame-ancestors` is `'self'` PLUS the ancestors `'self'` cannot express.
     # `'self'` is resolved by the browser against the frame's real URL, so it stays
@@ -246,7 +270,8 @@ async def serve_sandbox_doc(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.server import _extra_frame_ancestors
 
     resp.headers["Content-Security-Policy"] = (
-        "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; "
+        "sandbox allow-scripts; "
+        "connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; "
         f"frame-ancestors {frame_ancestors_value(_extra_frame_ancestors(request, request.app))}"
     )
     resp.headers["X-Content-Type-Options"] = "nosniff"

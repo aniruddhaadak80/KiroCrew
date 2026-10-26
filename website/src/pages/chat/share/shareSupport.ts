@@ -4,6 +4,8 @@
  * clipboard/download fallbacks. Kept free of React so every piece is unit
  * testable without a DOM.
  */
+import { clipboardRelayAvailable, clipboardWriteBlockedByPolicy, relayImageCopyToHost } from '../../../lib/paneClipboardRelay'
+import { fetchDashboardConfig } from '../../../api/dashboardConfigQuery'
 
 /** Public repo link baked into the default caption and the card footer. */
 export const SHARE_REPO_URL = 'https://github.com/kirodotdev/KiroCrew'
@@ -43,9 +45,27 @@ export function scanSensitive(text: string): SensitiveKind[] {
   return found
 }
 
+/** The share sites, by the id a policy's `capabilities.social_share` `sites` list names. */
+export const SHARE_SITES = ['x', 'linkedin'] as const
+export type ShareSite = (typeof SHARE_SITES)[number]
+
+/** The sites the ceiling permits now, from `social_share_sites` on
+ *  `/api/dashboard/config`. Fails CLOSED: a failed read, or a server that sends
+ *  no list, offers no site, and `failed` says so, so the dialog can tell the user
+ *  why the buttons are missing instead of dropping them silently. */
+export async function readShareSites(): Promise<{ sites: ShareSite[]; failed: boolean }> {
+  try {
+    const raw: unknown = (await fetchDashboardConfig())?.social_share_sites
+    if (!Array.isArray(raw)) return { sites: [], failed: true }
+    return { sites: SHARE_SITES.filter((s) => raw.includes(s)), failed: false }
+  } catch {
+    return { sites: [], failed: true }
+  }
+}
+
 /** Intent URLs carry TEXT only — no platform lets a URL attach an image, so the
  *  modal's copy action is what carries the card and this link carries the words. */
-export function buildIntentUrl(platform: 'x' | 'linkedin', text: string): string {
+export function buildIntentUrl(platform: ShareSite, text: string): string {
   const t = encodeURIComponent(text)
   return platform === 'x'
     ? `https://x.com/intent/post?text=${t}`
@@ -107,8 +127,12 @@ export function prevUserTextFor(
  * Firefox rejects ClipboardItem writes and Safari is picky about multi-type
  * items, so retry image-only before reporting failure — the caller falls back
  * to a download, never a dead button.
+ *
+ * Inside an embedded instance pane the policy refuses this write outright, so
+ * the host window performs it for the pane (lib/paneClipboardRelay.ts).
  */
 export async function copyImageWithText(blob: Blob, text: string): Promise<boolean> {
+  if (clipboardWriteBlockedByPolicy()) return clipboardRelayAvailable() ? relayImageCopyToHost(blob, text) : false
   if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) return false
   try {
     await navigator.clipboard.write([

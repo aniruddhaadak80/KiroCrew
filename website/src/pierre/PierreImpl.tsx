@@ -6,11 +6,13 @@
  * look/behavior of code and diff rendering is decided.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useSyncExternalStore } from 'react'
-import type { BaseCodeOptions, FileContents, SupportedLanguages } from '@pierre/diffs'
+import type { FileContents, LineAnnotation, SelectedLineRange, SupportedLanguages } from '@pierre/diffs'
 import { EXTENSION_TO_FILE_FORMAT, parsePatchFiles, registerCustomLanguage, setCustomExtension } from '@pierre/diffs'
 import { File, FileDiff, MultiFileDiff, Virtualizer, WorkerPoolContext } from '@pierre/diffs/react'
+import type { FileOptions } from '@pierre/diffs/react'
 import { WorkerPoolManager, type WorkerRequest, type WorkerResponse } from '@pierre/diffs/worker'
 import highlightWorkerUrl from '@pierre/diffs/worker/worker-portable.js?worker&url'
+import { workerUrlWithBuildKey } from '../utils/workerCacheKey'
 import { useIsDark } from '../hooks/useIsDark'
 import { usePlainDiff } from '../hooks/usePlainDiff'
 import ErrorNotice from '../components/ErrorNotice'
@@ -322,12 +324,13 @@ export function normalizePatchHunks(patch: string): string {
  *  active request to a worker, but keying timers by request ID also makes late
  *  responses harmless and keeps the protocol contract explicit. */
 export function createMonitoredWorker(reportFailure: (failure: WorkerPoolFailureCause) => void): Worker {
-  // HTTP caches retain the worker response's old CSP along with its bytes.
-  // The library bundle did not change when WASM was enabled, so its hash alone
-  // cannot retire pre-WASM headers. Keep the revision stable across retries.
-  const url = new URL(highlightWorkerUrl, import.meta.url)
-  url.searchParams.set('csp', 'wasm-v1')
-  const worker = new Worker(url, { type: 'module' })
+  // A same-origin worker takes its CSP from its own cached response header, and
+  // a content hash does not change when a build changes only a header, so the
+  // hash alone cannot retire a header a browser holds under the year-long
+  // policy. Key the URL to the build identity so a new build is a distinct
+  // cache entry and the stranded one is left behind; the key is stable across
+  // this worker's own retries.
+  const worker = new Worker(workerUrlWithBuildKey(new URL(highlightWorkerUrl, import.meta.url)), { type: 'module' })
   const watchdogs = new Map<string, ReturnType<typeof setTimeout>>()
   const clearWatchdog = (id: string) => {
     const timer = watchdogs.get(id)
@@ -583,9 +586,12 @@ export function PierreShell({ pool, generation, children }: {
   return <WorkerPoolContext.Provider key={generation} value={pool ?? undefined}>{children}</WorkerPoolContext.Provider>
 }
 
-export function PierreCodeImpl({ file, options, className, langHint, scrollClassName }: {
+export function PierreCodeImpl({ file, options, className, langHint, scrollClassName, lineAnnotations, selectedLines, renderAnnotation, renderGutterUtility }: {
   file: FileContents
-  options?: BaseCodeOptions
+  /** Full `FileOptions` surface: interaction options (line selection, gutter
+   *  utility, hover callbacks) ride alongside the base code options and are
+   *  merged over the shared defaults the same way. */
+  options?: FileOptions<unknown>
   className?: string
   /** Markdown fence tag; resolved to a highlightable language (falling back
    *  to plain text) when the file has no explicit `lang`. */
@@ -597,6 +603,13 @@ export function PierreCodeImpl({ file, options, className, langHint, scrollClass
    *  IntersectionObserver root. Omit it for snippet surfaces, which are short
    *  and already inside someone else's scroller. */
   scrollClassName?: string
+  /** Line-pinned annotation rows + their renderer — passed through to the
+   *  React `File` top-level props (they are NOT options; see FileProps). */
+  lineAnnotations?: LineAnnotation<unknown>[]
+  /** Controlled line selection (null clears); undefined leaves it to Pierre. */
+  selectedLines?: SelectedLineRange | null
+  renderAnnotation?: (annotation: LineAnnotation<unknown>) => React.ReactNode
+  renderGutterUtility?: (getHoveredLine: () => { lineNumber: number } | undefined) => React.ReactNode
 }) {
   const dark = useIsDark()
   const poolState = usePierreWorkerPool()
@@ -622,7 +635,17 @@ export function PierreCodeImpl({ file, options, className, langHint, scrollClass
     </>
     return scrollClassName ? <div className={scrollClassName}>{fallback}</div> : fallback
   }
-  const code = <File className={className} file={resolvedFile} options={resolved} />
+  const code = (
+    <File
+      className={className}
+      file={resolvedFile}
+      options={resolved}
+      lineAnnotations={lineAnnotations}
+      selectedLines={selectedLines}
+      renderAnnotation={renderAnnotation}
+      renderGutterUtility={renderGutterUtility}
+    />
+  )
   return (
     <PierreShell pool={activePool} generation={poolState.generation}>
       {scrollClassName
@@ -680,14 +703,17 @@ export function PierrePatchImpl({ patch, options, className, renderHeaderMetadat
   const noHunks = files.length > 0 && files.every(f => (f.hunks?.length ?? 0) === 0)
   const looksLikeChanges = /^[+-](?![+-][+-] )/m.test(patch)
   if (files.length === 0 || (noHunks && looksLikeChanges)) {
-    return <PlainCodeFallback text={patch} />
+    return <PlainCodeFallback text={patch} degraded />
   }
   if (activePool === undefined) {
     // No header actions in the fallback (`max-two-buttons-per-row`); they
-    // return with Pierre's own header when a generation is ready.
+    // return with Pierre's own header when a generation is ready. `degraded`:
+    // this text stands in for the diff itself, not for a hold before it
+    // paints, so a caller that draws its own row (`PlainPatchBodyContext`)
+    // gets the hunks' content and the word that the body is plain.
     return <>
       {poolState.phase === 'unavailable' ? <PierreWorkerUnavailableNotice failure={poolState.failure} /> : null}
-      <PlainCodeFallback text={patch} />
+      <PlainCodeFallback text={patch} degraded />
     </>
   }
   return (

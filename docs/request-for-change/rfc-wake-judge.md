@@ -3,10 +3,10 @@ title: Wake judge — a System One model screens auto-nudge ticks
 status: partial
 author: Raymond Chen
 created: 2026-09-22
-last-audited: 2026-09-23
-audited-at: 2fdadc71ac
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr: 12735
-implementation-prs: [12776, 12787, 13759]
+implementation-prs: [12776, 12787, 13759, 14663, 16192]
 tracking-issues: []
 supersedes: []
 superseded-by: []
@@ -29,12 +29,16 @@ route may edit. The judge core is on main as well, from
 `POINT_SCOPE_KEYS`, the evidence collectors, the autonudge tick hook, `judge` on
 `monitor_start` / `monitor_update` and the transcript notice are all on the base
 tree. What is still outstanding is the reader placement §8's PR G entry records,
-and the skills
-that author a brief. No `kirocrew-judge` agent
+the skills
+that author a brief, the `work-ledger` and `self` evidence collectors (§3.2), and
+the UI controls §3.6 lists beyond the provider and LLM-model keys. The calibration
+corrections §8's PR H entry records — the narrowed action override §3 states and
+the mutating-only `owner_acted` §3.1a states — are on main
+([#14663](https://github.com/kirodotdev/KiroCrew/pull/14663)). No `kirocrew-judge` agent
 template is coming: the landed lane runs on the bundled `kirocrew-lite`
 (`JUDGE_AGENT_NAME`), because a judge template would differ from it only in the
 model, which the runner passes per call, and a standing prompt the call already
-states. Code references below were read at `ccba8886cc`.
+states. Code references below were re-read at `9348a25a34`.
 
 ## 1. Problem
 
@@ -108,7 +112,12 @@ them, so shedding them would delete the evidence the question is asked against,
 and because they are bounded and small -- one `pr_checks` item renders a 90-lane
 board in 42 characters -- so they are never the pressure on the budget. Oldest
 prose because a comment body is as old as its comment, while a summary is observed
-on the tick that sends it:
+on the tick that sends it. Within prose, an item already SEEN on an earlier tick
+goes before any fresh one, and the 40-item cap applies the same order: a seen item
+is context the judge already answered about, while a session row past the read
+cursor is never offered again. A fresh item either bound still has to shed fires
+the tick (`shed_fresh`), exactly as a fresh scrub hit does, so nothing new is lost
+and judged quiet:
 
 - `loop`: the owner's instruction, truncated to 1 500 chars, and the
   `wake_when` / `quiet_when` text of the brief in force — the built-in one, or
@@ -117,20 +126,18 @@ on the tick that sends it:
   where `source` names the collector and the target (`session:chat-1751`,
   `pr:kirodotdev/KiroCrew#12735`, `work-ledger:it_42`), `kind` is a closed set
   (`transcript_tail`, `pr_state`, `pr_checks`, `pr_comment`, `pr_review`), and
-  `text` is bounded per item (1 000 chars). `ledger_event` arrives with the work
-  ledger collector.
+  `text` is bounded per item (1 000 chars). `ledger_event` would arrive with the
+  work-ledger collector, which is not on base.
 - `last_verdict`: `{outcome, evidence_items, at}` and nothing else -- the previous
   tick's answer, how many items it rested on, and when. Deliberately text-free and
   carrying no fingerprint of the evidence, so a judge can see that it already
   answered on a comparable amount without being handed that evidence again. It
   cannot establish that the evidence was the SAME evidence.
 
-Questions, asked in parallel, each atomic. The shipped seam speaks Jev's
-`choice` type only (`decisions/types.py`; `_to_wire` refuses anything else), so
-every question is a Choice; widening the wire to `noul`/`score` is a later PR.
-That widening is PR D's: the seam must gain `noul` and `score` wire types before
-a question here can ask for a bare probability or a bounded number instead of
-encoding one as a Choice.
+Questions, asked in parallel, each atomic. The seam supports Jev's `choice`,
+`noul` and `score` types (`decisions/types.py`, `impl_jev._to_wire`; the widening
+is owned by [`rfc-jev-task-executor`](rfc-jev-task-executor.md) §3.2 and shipped
+in #16014). `nudge.wake` still asks every question as a Choice, by design.
 
 | id | type | instructions | options |
 |---|---|---|---|
@@ -145,7 +152,26 @@ Mapping, in code, not in the model:
 - `finished` or `broken` with `confidence ≥ 0.6` → **WAKE** with the verdict
   attached, so the woken session can report and decide to stop; the judge itself
   never ends the loop.
-- `P(wake) ≥ 0.5` or `outcome ∈ {needs_action, needs_human}` → **WAKE**.
+- `P(wake) ≥ 0.5` → **WAKE**.
+- `outcome ∈ {needs_action, needs_human}` → **WAKE**.
+- **Narrowed by §8's PR H entry
+  ([#14663](https://github.com/kirodotdev/KiroCrew/pull/14663)).** That action
+  backstop stops overriding a `needs_owner` that answered `quiet`
+  when the outcome's own confidence sits in `0.4 ≤ P < ACTION_OVERRIDE_MIN_P`
+  (0.6, in `decisions/points/nudge_wake.py`), and the verdict is then **QUIET** naming both readings.
+  `needs_owner` is the only question carrying the owner's `wake_when` / `quiet_when`,
+  so a barely-confident answer to a question carrying no owner criterion must not veto
+  a confident one that does. The band starts at 0.4 because the low-confidence rule
+  below owns everything under it and wakes: an unsure judge never buys silence,
+  whatever `needs_owner` said. The veto also requires the `quiet` answer to be the
+  MORE confident of the two — `P(quiet) > P(outcome)` — as well as clearing
+  `NEEDS_OWNER_MIN_P`. The ranking is what carries the rule, because with two options
+  the chosen answer is the argmax and so already clears 0.5 on its own: without it a
+  `quiet` at 0.51 would silence a `needs_action` at 0.59, which is the very inversion
+  this exception exists to prevent. `NEEDS_OWNER_MIN_P` stays as the floor that
+  excludes a non-argmax provider's unsure answer.
+  This replaced `QUIET_OUTCOMES`-as-an-allowlist as the sole route to silence;
+  `test_quiet_is_exactly_the_two_rules_that_produce_it` pins the result.
 - otherwise → **QUIET**: re-arm, no turn.
 - Low confidence (`< 0.4` on `outcome`) → WAKE. A judge that is unsure hands
   the call to System Two; it never guesses quiet.
@@ -185,13 +211,31 @@ remains a permanent cycle boundary: it accepts no `owner_acted`, and its
 suppressions accept no label from a later turn. A re-owed delivery has its own new
 row.
 
-`owner_acted` is `true` when the woken turn called at least one tool, or answered
-longer than a quiet-cycle reply, or answered with a link; `false` when it called
-nothing and answered short. A turn that changed the loop needs no separate
-signal — `monitor_update` and `autonudge_stop` are tool calls, so the count
-already carries them. The whole rule lives in one function,
-`autonudge_judge.owner_acted`, and an unknown tool-call count reads as acted,
-which is the direction that does not teach the judge to suppress. A quiet verdict
+`owner_acted` on base is `true` when the woken turn called at least one tool, or
+answered longer than a quiet-cycle reply, or answered with a link; `false` when it
+called nothing and answered short. The whole rule lives in one function,
+`autonudge_judge.owner_acted`, and an unknown tool-call count reads as acted, which is
+the direction that does not teach the judge to suppress.
+
+**Narrowed by §8's PR H entry
+([#14663](https://github.com/kirodotdev/KiroCrew/pull/14663)).** Counting a read the
+same as a write makes the label constant, and a label with no variance cannot tune
+the thresholds above. So the TOOL-CALL limb alone is "at least one dispatch that
+could have CHANGED something", where a dispatch is read-only only when its name is
+positively known to be a host-known read-only built-in with trusted provenance
+(`READ_ONLY_BUILTIN_TOOLS`); every MCP call, from any server including Kiro Crew's
+own, counts as having changed something (`autonudge_judge.tool_changed_something`). The reply-length and link limbs are unchanged
+and still answer `true` on their own, so a turn that dispatched only reads but answered
+at length or with a link stays `owner_acted: true` — which is what §3.1a's note about
+weighting a tool-call-only delivery already assumes. `monitor_update` is not read-only, so the
+mutating count still carries it without a second signal. `autonudge_stop` is not
+read-only either, but it needs no mention here: a turn that calls it deactivates or
+removes the loop, and the turn-completion hook returns before it reaches the labelling
+block, so that delivery is left unlabelled — the case the paragraph below on a loop
+that stops during a delivered turn already records. The per-dispatch NAMES are plumbed to `notify_turn_complete`; where an adapter's
+dispatches arrive unnamed the count decides and the label row records
+`tool_names_known: false`, so a threshold read excludes those rows
+rather than pooling two rules as one. A quiet verdict
 that hits the streak floor spends a turn, so it is labelled as a delivery rather
 than counted as a suppression.
 
@@ -285,13 +329,17 @@ the part deliberately pushed off that loop, because a `gh` spawn would block it.
   (bounded per item and in total). A reading whose own status is not `ok` counts
   as a target nobody read whole, which fires.
 - `session`: for each `chat-*` key in `judge.targets`, the transcript rows
-  appended since the last tick, assistant and tool rows only, last status line
+  appended since the last tick, assistant rows only (`EVIDENCE_ROLES`), last status line
   first. Creator-only: the same check `session_read_message` applies. A target
-  the owner may not read is dropped and noted, never fetched.
-- `work-ledger`: when the owning session is a conductor with a work ledger,
-  the new events per open item (typed; they also feed the Phase 3 probe).
-- `self`: the owning session's own ledger `next`, so the judge knows what the
-  owner said it was waiting for.
+  the owner may not read is dropped and noted, never fetched. A target is read
+  in pages of 12 rows, up to 3 per tick, until its cursor reaches the end; one
+  still behind after the last page counts as unread, which fires.
+- `work-ledger` (not on base): when the owning session is a conductor with a work
+  ledger, the new events per open item (typed; they also feed the Phase 3 probe).
+- `self` (not on base): the owning session's own ledger `next`, so the judge
+  knows what the owner said it was waiting for.
+
+Only the `pr` and `session` collectors are on base.
 
 Every collector output goes through the seam's scrub (`has_credential`, the
 canonical redaction pass) before it enters state; a scrub hit drops the item
@@ -321,7 +369,8 @@ The object is optional because the point carries a brief of its own. Once the
 loop is screened, and a loop that arms no `judge` object is screened with the
 built-in brief: **wake**
 when the subject needs its owner — a blocker, a failing check or one whose reading
-is not whole, a question or a ruling addressed to it, a new comment
+is not whole, a fully settled board whose every check has passed, a question or a
+ruling addressed to it, a new comment
 or review whose body asks for a change or asks a question, a terminal state, or the
 exit condition the loop's own message states; **quiet** when nothing has arrived
 for the owner since the last tick. An explicit
@@ -336,6 +385,18 @@ what an owner arming no criteria at all most expects, and resting a red board on
 the judge reading one generic word the way the owner meant it is the wrong bet.
 A reading short of whole is named beside it, since a quiet drawn from half a board
 is a quiet about the wrong half.
+
+A fully settled board whose every check has passed is named for the same reason as
+the failing one, and it is the harder to leave out: the state an owner arming a
+plain watch most often waits FOR is the board going green — the thing they watched
+is done — and a green board answers neither "a blocker" nor "a failing check", so a
+briefless loop without this clause stays quiet about the one settle its owner most
+wants surfaced. A missed "it is green now" strands the owner; a spurious wake costs
+one turn and is self-correcting, so the clause errs on the cheap side. A briefless
+loop armed before this clause picks up the wider default and wakes on a settled
+board where it did not before. `last_verdict` gives the judge the context to answer
+quiet on a settled board it already woke on, the same advisory signal the failing
+case leans on.
 
 The check clause says "failing", not "newly failing", because the state carries the
 CURRENT board and no prior one. What keeps a red board from waking its owner every
@@ -422,17 +483,18 @@ brief is what carries the screening and the lane is what authorizes it.
   scope — before a lane is picked, so an install with no consent recorded has no
   built-in brief on either lane (§7 Q4). That function states the rule;
   `_judge_authority` beside it states the spec half for a loop that wrote criteria,
-  and `config/sections.py` repeats that half as its section's rationale. Neither
+  and `config/sections_decisions.py` repeats that half as its section's rationale. Neither
   names the briefless case, and they sit in files this document does not change.
 
 ### 3.5 Rendering
 
 Every verdict is visible without a turn:
 
-- a transcript notice on the owning session: `Wake judge · quiet (needs_owner
-  0.08, outcome progress_only 0.91) · 2 new rows in chat-1751, checks pending
-  on #12735` — one line, so a human reading the tab sees why nothing fired;
-- the monitor popover shows the last verdict and the quiet streak;
+- a transcript notice on the owning session, rendered by `notice_line` as
+  `Wake judge · <outcome> [(<brief> brief)] · <question> <value> <p>, … · N
+  evidence item(s)` — one line, so a human reading the tab sees why nothing fired;
+- the monitor payload carries the last verdict and `judge_quiet_streak` (the
+  popover does not render the streak; it is API-only);
 - the decisions JSONL log records call metadata and the verdict (no state
   text), under `point=nudge.wake`, for calibration.
 
@@ -465,9 +527,10 @@ judge uses exactly that:
   behaves exactly as today; a spec that names criteria still runs on the LLM
   lane, which this scope does not govern (§3.4).
 - The row's detail panel carries the point's own settings: provider
-  (auto / Jev / LLM), the LLM model (from the advertised model list, "keep the
-  session's own model" by default), and the quiet-streak floor. All three write
-  `decisions.nudge_wake.*` keys registered in the config route's editable set.
+  (auto / Jev / LLM) and the LLM model (from the advertised model list, "keep the
+  session's own model" by default). Both write `decisions.nudge_wake.*` keys in the
+  config route's editable set. A quiet-streak floor control is proposed and not on
+  base.
   Choosing LLM is what turns the LLM lane on (§3.4).
 - Status is the server's verdict, as for every row, and for this point it is read
   from the lane the gate would actually pick rather than from the keystone alone.
@@ -679,4 +742,12 @@ answer on the cheapest lane, where a main turn carries the loop's whole context.
    AUTO-PAUSED rather than deleted, per §7 Q6: it stays listed with `auto_paused`
    and a `last_error` naming the replacement, because removing it would destroy the
    only durable record that the watch existed.
-5. This RFC lands as `docs/request-for-change/rfc-wake-judge.md`.
+5. PR H — calibration corrections, from two defects measured on the landed judge
+   ([#14663](https://github.com/kirodotdev/KiroCrew/pull/14663), merged): the
+   narrowed action override §3's mapping records, gated on a new
+   `ACTION_OVERRIDE_MIN_P`; and `owner_acted` counting only dispatches that could have
+   changed something, which needs the per-dispatch names carried to
+   `notify_turn_complete` and records a new `tool_names_known` on the label row for the
+   adapters that name none. Both are on main. Depends on D's point and on the label rows §3.1a
+   defines.
+6. This RFC lands as `docs/request-for-change/rfc-wake-judge.md`.

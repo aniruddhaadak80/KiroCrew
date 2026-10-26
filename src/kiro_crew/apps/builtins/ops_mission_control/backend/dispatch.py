@@ -246,7 +246,8 @@ def _attach_similar_safely(claimed: ClaimedIncident) -> None:
         # Constructed per call, matching the convention in cli_commands/onboarding_import:
         # there is no shared singleton, and holding one open across cycles would keep a
         # SQLite handle alive for a feature that may never be used on this install.
-        store_obj = VectorMemoryStore(embedding_dim=KiroCrewConfig.load().memory.embedding_dim)
+        cfg = KiroCrewConfig.load()
+        store_obj = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
         # One-shot read: bind the shared callable, but no lazy factory. If the
         # model is cold the callable kicks its background load and returns None;
         # this store closes after the keyword fallback and has no later work for
@@ -587,7 +588,8 @@ def _record_verification_misses(incident: Incident) -> None:
 
     Charged to every entry in ``ledger_matches`` rather than to a single "the one we
     used", because nothing records which match the investigation actually applied
-    (``Incident.proposed_action`` is declared and never assigned). Attributing the miss to
+    (``Incident.proposed_action`` records the proposed action, not which
+    ledger match was applied). Attributing the miss to
     a guess would be worse than attributing it to all of them: ``MAX_MATCHES_PER_SIGNAL``
     is 3, so the blast radius is bounded, and a match that keeps being shown for a failure
     that keeps coming back has genuinely not earned the fast path either.
@@ -768,7 +770,7 @@ async def run_cycle(
     limit = (
         max_claims
         if max_claims is not None
-        else _config_int(_CONFIG_MAX_CLAIMS, DEFAULT_MAX_CLAIMS_PER_CYCLE)
+        else await asyncio.to_thread(_config_int, _CONFIG_MAX_CLAIMS, DEFAULT_MAX_CLAIMS_PER_CYCLE)
     )
 
     claimed: list[ClaimedIncident] = []
@@ -851,14 +853,16 @@ async def run_cycle(
     # absence means anything at all.
     verifications = await asyncio.to_thread(verify_pending_actions, signals, registry.poll_health())
 
-    stale_after = _config_int(_CONFIG_STALE_AFTER, DEFAULT_STALE_AFTER_SECS)
+    stale_after = await asyncio.to_thread(
+        _config_int, _CONFIG_STALE_AFTER, DEFAULT_STALE_AFTER_SECS
+    )
     try:
         released = await asyncio.to_thread(
             store.sweep_stale,
             stale_after,
             # 0 / unset means "derive from the working threshold", which is what
             # ``sweep_stale`` does for ``None``.
-            _config_int(_CONFIG_NEEDS_HUMAN_STALE_AFTER, 0) or None,
+            (await asyncio.to_thread(_config_int, _CONFIG_NEEDS_HUMAN_STALE_AFTER, 0)) or None,
         )
     except OSError:
         # Same policy and same breadth as the proposal expiry above: any

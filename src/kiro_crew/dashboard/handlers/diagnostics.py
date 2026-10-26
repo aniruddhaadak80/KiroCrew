@@ -5,9 +5,10 @@ GET  /api/diagnostics/download/{name}  — download a previously-built bundle
 
 Both share the collector engine in :mod:`kiro_crew.diagnostics`, the exact same
 code path the ``kirocrew doctor --bundle`` CLI uses. Auth + host validation are
-applied globally by the dashboard middleware chain, so these handlers add no
-per-endpoint auth. The blocking collect runs off the event loop via
-``asyncio.to_thread``.
+applied globally by the dashboard middleware chain. Both handlers are also
+owner-gated: a bundle carries the owner's gateway and chat logs, so only the
+dashboard owner may build or download one. The blocking collect and the
+download's path checks run off the event loop via ``asyncio.to_thread``.
 """
 
 from __future__ import annotations
@@ -15,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import urllib.parse
+from pathlib import Path
 
 from aiohttp import web
 
 from kiro_crew import diagnostics
 from kiro_crew.config.loader import config_dir
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,34 @@ def _sel():
     return _pkg.sel()
 
 
+def _audit_collect_allowed_sync(include_logs: bool) -> None:
+    """Best-effort SEL record of an allowed collect; never raises.
+
+    Blocking body of :func:`_audit_collect_allowed`: the first ``sel()`` of a
+    process constructs the log, so handlers reach this through the async
+    wrapper, which runs it off the event loop.
+    """
+    try:
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="diagnostics_collect",
+            tool_kind="collect",
+            outcome="allowed",
+            resources=f"include_logs={include_logs}",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for diagnostics collect failed", exc_info=True)
+
+
+async def _audit_collect_allowed(include_logs: bool) -> None:
+    """Record an allowed collect without stalling the event loop."""
+    try:
+        await asyncio.to_thread(_audit_collect_allowed_sync, include_logs)
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit dispatch for diagnostics collect failed", exc_info=True)
+
+
 async def api_diagnostics_collect(request: web.Request) -> web.Response:
     """POST /api/diagnostics/collect — collect + redact + zip diagnostics.
 
@@ -46,6 +77,9 @@ async def api_diagnostics_collect(request: web.Request) -> web.Response:
     Returns the bundle metadata plus a ``download_url`` and the pre-filled
     GitHub issue URL.
     """
+    owner_denied = await require_owner_dashboard_request(request, "diagnostics.collect")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -59,6 +93,9 @@ async def api_diagnostics_collect(request: web.Request) -> web.Response:
     note = str(body.get("note") or "")
     include_logs = bool(body.get("include_logs", True))
 
+    # The owner gate audits only its refusals; record the allowed build here,
+    # before the collector reads the owner's logs.
+    await _audit_collect_allowed(include_logs)
     try:
         result = await asyncio.to_thread(
             diagnostics.collect_bundle,
@@ -83,6 +120,21 @@ async def api_diagnostics_collect(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+def _servable_bundle_path(filename: str) -> Path | None:
+    """The bundle ``filename`` names, or ``None`` when it may not be served.
+
+    Blocking: both ``resolve()`` calls and the ``is_file()`` stat touch the
+    filesystem, so :func:`api_diagnostics_download` runs this with
+    ``asyncio.to_thread``. ``None`` covers a name that escapes the diagnostics
+    directory, a non-``.zip`` name and a name that is not a regular file.
+    """
+    base = _diagnostics_dir().resolve()
+    path = (base / filename).resolve()
+    if not path.is_relative_to(base) or path.suffix != ".zip" or not path.is_file():
+        return None
+    return path
+
+
 async def api_diagnostics_download(request: web.Request) -> web.StreamResponse:
     """GET /api/diagnostics/download/{filename} — stream a bundle zip.
 
@@ -90,11 +142,13 @@ async def api_diagnostics_download(request: web.Request) -> web.StreamResponse:
     non-``.zip`` names are rejected. Served as ``application/zip`` directly, so
     it does not touch the shared binary-MIME allowlist.
     """
+    owner_denied = await require_owner_dashboard_request(request, "diagnostics.download")
+    if owner_denied is not None:
+        return owner_denied
     filename = request.match_info["filename"]
-    base = _diagnostics_dir().resolve()
-    path = (base / filename).resolve()
+    path = await asyncio.to_thread(_servable_bundle_path, filename)
 
-    if not path.is_relative_to(base) or path.suffix != ".zip" or not path.is_file():
+    if path is None:
         _sel().log_tool_invocation(
             session_key="api",
             source="api",

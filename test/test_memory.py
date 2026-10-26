@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-import pytest
+import ast
+import re
+from collections.abc import Iterable, Iterator
+from pathlib import Path
 
-from conftest import plant_day_link
+import pytest
+from source_corpus import iter_source_texts
+
+from conftest import make_dir_link, plant_day_link
 from kiro_crew.memory import MemoryStore
 
 
@@ -617,45 +623,82 @@ class TestUnreadableActivityTolerance:
         assert "\r" not in activity
 
 
+#: The boundary every history decay description opens with. A copy is found where it
+#: stands once whitespace runs fold to one space, so a copy's value holds each word whole.
+_DECAY_OPENING = "14 full days"
+
+
+def _decay_copies(text: str, length: int) -> list[str]:
+    """The *length* characters from each decay opening in *text*, whitespace runs folded."""
+    normalized = re.sub(r"\s+", " ", text)
+    copies = []
+    start = 0
+    while (index := normalized.find(_DECAY_OPENING, start)) >= 0:
+        copies.append(normalized[index : index + length])
+        start = index + len(_DECAY_OPENING)
+    return copies
+
+
+def _source_decay_copies(
+    sources: Iterable[tuple[Path, str]], length: int
+) -> Iterator[tuple[Path, str]]:
+    """``(path, copy)`` for each decay copy in a ``str`` constant of the *sources* modules.
+
+    *sources* are ``(path, text)`` pairs, and every module is parsed. A copy is a ``str``
+    value, which an escape, a backslash-newline or adjacent literals can spell without
+    the module's text holding its words, so no text filter can narrow this scan.
+    """
+    for path, text in sources:
+        for node in ast.walk(ast.parse(text, filename=str(path))):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for copy in _decay_copies(node.value, length):
+                    yield path, copy
+
+
 class TestHistoryDecayWording:
     PHRASE = "14 full days, then decayed summaries and counts to day 180"
+    #: A drifted copy, planted below as adjacent literals and as escaped digits.
+    DRIFTED = "14 full days, then summaries to day 90"
 
+    # No text can narrow a scan of ``str`` values (see ``_source_decay_copies``), so this
+    # parses every module: 15 s of CPU on a fast host. Its tree_scan group gives it 300 s
+    # (test/conftest.py).
+    @pytest.mark.xdist_group(name="tree_scan_test_memory")
     def test_every_history_decay_description_matches_the_tiers(self):
         """Every source and documentation copy states the exact decay boundary."""
-        import ast
-        import re
-        from pathlib import Path
-
         repo = Path(__file__).resolve().parents[1]
-        paths = list((repo / "src" / "kiro_crew").rglob("*.py"))
-        paths.append(repo / "src" / "kiro_crew" / "docs" / "configuration.md")
-        paths.extend((repo / "docs").rglob("*.md"))
+        documents = {repo / "src" / "kiro_crew" / "docs" / "configuration.md"}
+        documents.update((repo / "docs").rglob("*.md"))
 
-        copies: list[tuple[str, str]] = []
-        for path in sorted(set(paths)):
-            source = path.read_text(encoding="utf-8")
-            if path.suffix == ".py":
-                candidates = (
-                    node.value
-                    for node in ast.walk(ast.parse(source))
-                    if isinstance(node, ast.Constant) and isinstance(node.value, str)
-                )
-            else:
-                candidates = (source,)
-            for candidate in candidates:
-                normalized = re.sub(r"\s+", " ", candidate)
-                start = 0
-                while (index := normalized.find("14 full days", start)) >= 0:
-                    copies.append(
-                        (
-                            path.relative_to(repo).as_posix(),
-                            normalized[index : index + len(self.PHRASE)],
-                        )
-                    )
-                    start = index + len("14 full days")
+        copies = [
+            (path.relative_to(repo).as_posix(), copy)
+            for path, copy in _source_decay_copies(iter_source_texts(), len(self.PHRASE))
+        ]
+        copies.extend(
+            (path.relative_to(repo).as_posix(), copy)
+            for path in sorted(documents)
+            for copy in _decay_copies(path.read_text(encoding="utf-8"), len(self.PHRASE))
+        )
 
         assert copies, "no history decay descriptions found"
         assert all(copy == self.PHRASE for _, copy in copies), copies
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            pytest.param(f"'1' '{DRIFTED[1:]}'", id="adjacent-literals"),
+            pytest.param(rf"'\x31\x34{DRIFTED[2:]}'", id="escaped-digits"),
+        ],
+    )
+    def test_the_scan_sees_copies_the_text_does_not_spell(self, spelling: str) -> None:
+        """A drifted copy in adjacent literals or escaped digits still reaches the gate.
+
+        Neither planted module's text holds ``14``, so a filter on that text would skip
+        both and the gate would pass.
+        """
+        module = [(Path("planted.py"), f"NOTE = (\n    {spelling}\n)\n")]
+        found = [copy for _, copy in _source_decay_copies(module, len(self.PHRASE))]
+        assert found == [self.DRIFTED]
 
     def test_history_decay_boundaries(self, tmp_path):
         """The full, summary, count, and exclusion tiers meet their stated ages."""
@@ -797,7 +840,7 @@ class TestNamedV1StoreUnderFencedTree:
         """
         from datetime import date, timedelta
 
-        from kiro_crew import memory as memory_mod
+        from kiro_crew import memory_files as memory_mod
 
         store = self._named_store(monkeypatch)
         self._fence(monkeypatch, store._workspace)
@@ -904,3 +947,269 @@ class TestNamedV1StoreUnderFencedTree:
         # nolink reader, so the fence leaves the protected preferences in place.
         assert "PREF_SENTINEL" in store.read_preferences()
         assert "## Recent History" not in store.get_activity_context()
+
+
+class TestAtomicWriteTextPublishesOnce:
+    """``MemoryStore._atomic_write_text`` is ONE unconditional publish.
+
+    It is the direct-write path for ``init``'s seeding and the validated
+    private-profile write. Routing a single logical write through the seam's
+    ``write`` more than once doubles every atomic publish (two temp files, two
+    renames) and, for a remote-backed provider, two network round trips — so
+    the count of underlying writes is the property, not merely that the call
+    returns.
+    """
+
+    def test_a_single_atomic_write_calls_the_seam_write_exactly_once(self, tmp_path):
+        store = MemoryStore(workspace=tmp_path)
+        (tmp_path / "memory" / "history").mkdir(parents=True)
+        seam = store._files
+        calls: list[str] = []
+        real_write = seam.write
+
+        def counting_write(path, content, *, newline=None):
+            calls.append(str(path))
+            return real_write(path, content, newline=newline)
+
+        seam.write = counting_write  # type: ignore[method-assign]
+        store._atomic_write_text(store._preferences_file, "# User Preferences\n\n- once\n")
+        assert calls == [str(store._preferences_file)]
+        assert store.read_preferences() == "# User Preferences\n\n- once\n"
+
+
+class TestContextBuildSurvivesLinkedRoot:
+    """A linked memory root must not crash the every-turn context build.
+
+    Pre-seam ``read_preferences``/``read_projects`` ran no link gate and simply
+    read the target; the seam routes them through ``read_text``, whose link
+    refusal now raises ``OSError``. ``get_context`` and ``rebuild_index`` catch
+    only ``UnicodeDecodeError``, so a linked root turned every context build and
+    index rebuild into a hard crash. The refusal is kept (a linked root is never
+    read through), but the section it guards must DEGRADE, not abort the build.
+    """
+
+    def _linked_root_store(self, tmp_path) -> MemoryStore:
+        real = tmp_path / "real-ws"
+        (real / "memory" / "history").mkdir(parents=True)
+        (real / "memory" / "preferences.md").write_text(
+            "# User Preferences\n\n- from target\n", encoding="utf-8"
+        )
+        link_ws = tmp_path / "link-ws"
+        try:
+            make_dir_link(link_ws, real)
+        except (OSError, NotImplementedError):  # pragma: no cover - Windows CI
+            pytest.skip("directory links not available on this platform")
+        return MemoryStore(workspace=link_ws)
+
+    def test_get_context_degrades_instead_of_raising_on_a_linked_root(self, tmp_path):
+        store = self._linked_root_store(tmp_path)
+        # No crash: the refused preferences section is skipped, not raised.
+        ctx = store.get_context()
+        assert isinstance(ctx, str)
+        # The link is refused, so its target's bytes never reach the context.
+        assert "from target" not in ctx
+
+    def test_rebuild_index_does_not_erase_the_index_on_a_refused_root(self, tmp_path, monkeypatch):
+        store = MemoryStore(workspace=tmp_path)
+        store.init()
+        store.write_projects("# Active Projects\n\n- PROJ-123 sentinel\n")
+        store.rebuild_index()
+        before = store.index_row_count()
+        assert before and before > 0
+        assert store.search("sentinel")
+
+        # Now the seam's read gate refuses the root (a linked/untrusted root):
+        # read_text raises OSError. Rebuilding must NOT wipe the existing index
+        # by DELETE-ing it and committing an empty one; it keeps the old index.
+        # Scope the patch to this block so it reverts without touching any other
+        # active patch (a bare monkeypatch.undo() would drop shared ones too).
+        with monkeypatch.context() as refused:
+            refused.setattr(store._files, "_read_root_guard", lambda: False)
+            assert store.rebuild_index() == before
+        # Gate restored on context exit: the index is still the one built before.
+        assert store.index_row_count() == before
+        assert store.search("sentinel")
+
+    def test_rebuild_index_keeps_the_index_when_a_refused_root_enumerates_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """The exact wipe the ``refused`` flag exists to prevent.
+
+        A refused root that ALSO enumerates empty is the dangerous shape: the
+        ungated ``exists()`` answered False for both anchors and the gated
+        ``glob`` answered ``[]``, so ``_indexable`` never ran and ``refused``
+        stayed False -- the ``DELETE FROM memory_fts`` then committed an empty
+        index. The fix routes the two anchors through the GATED read, which
+        raises on the refused root before enumeration matters, so ``refused`` is
+        set and the existing index is kept. This test drives the empty-enumeration
+        path the earlier test (files still present) never reached.
+        """
+        store = MemoryStore(workspace=tmp_path)
+        store.init()
+        store.write_projects("# Active Projects\n\n- PROJ-123 sentinel\n")
+        store.rebuild_index()
+        before = store.index_row_count()
+        assert before and before > 0
+
+        with monkeypatch.context() as refused:
+            # Gate refuses the root (read_text raises OSError) ...
+            refused.setattr(store._files, "_read_root_guard", lambda: False)
+            # ... AND enumeration looks empty: no anchor files, no history days.
+            refused.setattr(store._files, "exists", lambda _p: False)
+            refused.setattr(store._files, "glob", lambda _d, _pat: [])
+            assert store.rebuild_index() == before
+        assert store.index_row_count() == before
+        assert store.search("sentinel")
+
+
+class _FullDiskIndex:
+    """Stands in for the FTS connection: every INSERT and DELETE fails as a full disk does."""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def execute(self, sql, *args):
+        import sqlite3
+
+        if sql.lstrip().upper().startswith(("INSERT", "DELETE")):
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _index_warnings(caplog) -> list:
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "FTS index update failed" in r.getMessage()
+    ]
+
+
+class TestIndexCatchesUpAfterAFailedUpdate:
+    """A memory write whose index update fails is searchable once the cause clears."""
+
+    def test_a_preference_saved_during_a_failure_is_found_once_space_returns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Before the fix the failure was logged at DEBUG and nothing re-indexed the file."""
+        import logging
+
+        store = MemoryStore(workspace=tmp_path)
+        store.write_preferences("- likes tea\n")
+        real = store._get_db
+        monkeypatch.setattr(store, "_get_db", lambda: _FullDiskIndex(real()))
+        caplog.set_level(logging.DEBUG, logger="kiro_crew.memory")
+
+        assert store.write_preferences("- likes tea\n- codename zebracrossing\n")
+        assert store.write_preferences("- likes tea\n- codename zebracrossingwidget\n")
+        monkeypatch.setattr(store, "_get_db", real)
+
+        hits = store.search("zebracrossingwidget")
+        assert [h["path"] for h in hits] == [str(store._preferences_file)]
+        assert store.search("tea"), "the earlier text is still found"
+        assert len(_index_warnings(caplog)) == 1, "one WARNING for the whole failure streak"
+
+    def test_a_streak_that_ends_warns_again_on_the_next_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        store = MemoryStore(workspace=tmp_path)
+        real = store._get_db
+        caplog.set_level(logging.DEBUG, logger="kiro_crew.memory")
+        monkeypatch.setattr(store, "_get_db", lambda: _FullDiskIndex(real()))
+        store.write_preferences("- one\n")
+        monkeypatch.setattr(store, "_get_db", real)
+        store.write_preferences("- two\n")
+        monkeypatch.setattr(store, "_get_db", lambda: _FullDiskIndex(real()))
+        store.write_preferences("- three\n")
+
+        assert len(_index_warnings(caplog)) == 2
+
+    def test_a_normal_write_and_search_log_nothing_new(self, tmp_path, caplog):
+        import logging
+
+        store = MemoryStore(workspace=tmp_path)
+        caplog.set_level(logging.DEBUG, logger="kiro_crew.memory")
+        assert store.write_preferences("- likes zebracrossingwidget\n")
+        assert store.search("zebracrossingwidget")
+        assert not [r for r in caplog.records if "FTS index" in r.getMessage()]
+
+    def test_a_search_catch_up_cannot_overwrite_another_processs_newer_update(
+        self, tmp_path, monkeypatch
+    ):
+        """The catch-up reads a file and commits its row under the writers' own lock.
+
+        Two stores on one workspace stand in for the gateway and a second process
+        (``kirocrew consolidate``). Inside the gateway's catch-up, between its read
+        and its commit, the test checks whether the writers' directory lock is free.
+        If it is, another process's newer save can land there, and the catch-up then
+        commits the older text over it, so the newer text is never found.
+        """
+        import os
+        from pathlib import Path
+
+        from kiro_crew.platform_compat import file_lock
+
+        gateway = MemoryStore(workspace=tmp_path)
+        other = MemoryStore(workspace=tmp_path)
+        gateway.write_preferences("- likes tea\n")
+        real = gateway._get_db
+        monkeypatch.setattr(gateway, "_get_db", lambda: _FullDiskIndex(real()))
+        assert gateway.write_preferences("- likes tea\n- codename oldzebra\n")
+        monkeypatch.setattr(gateway, "_get_db", real)
+
+        lock_file = gateway._memory_dir / ".write.lock"
+        read_text = gateway._files.read_text
+        window: list[str] = []
+
+        def _read_then_probe(path, *args, **kwargs):
+            content = read_text(path, *args, **kwargs)
+            if Path(path) == gateway._preferences_file and not window:
+                fd = os.open(lock_file, os.O_RDWR)
+                try:
+                    with file_lock(fd, exclusive=True, wait=False):
+                        window.append("open")
+                except BlockingIOError:
+                    window.append("held")
+                finally:
+                    os.close(fd)
+                if window == ["open"]:
+                    # Nothing keeps another process out of this read-to-commit window.
+                    assert other.write_preferences("- likes tea\n- codename newzebra\n")
+            return content
+
+        monkeypatch.setattr(gateway._files, "read_text", _read_then_probe)
+        gateway.search("tea")
+        assert window, "the search ran no catch-up"
+        if window == ["held"]:
+            assert other.write_preferences("- likes tea\n- codename newzebra\n")
+
+        reader = MemoryStore(workspace=tmp_path)
+        assert reader.search("newzebra"), (
+            "the catch-up committed older text over another process's newer update "
+            f"(writers' lock during the window: {window[0]})"
+        )
+
+    def test_a_write_that_fails_before_the_index_step_raises_as_before(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import errno
+        import logging
+
+        store = MemoryStore(workspace=tmp_path)
+        store.write_preferences("- likes tea\n")
+        files = store._files
+
+        def _full(*_a, **_kw):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(files, "replace_if", _full)
+        caplog.set_level(logging.DEBUG, logger="kiro_crew.memory")
+        with pytest.raises(OSError):
+            store.write_preferences("- likes coffee\n")
+        assert not _index_warnings(caplog)
+        assert store.search("tea")
+        assert not store.search("coffee")

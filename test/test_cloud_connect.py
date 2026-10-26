@@ -9,6 +9,12 @@ import pytest
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.cloud import aws, connect, ssm
+from kiro_crew.testing.wait import wait_until
+
+#: How long a killed tree's descendant may take to leave the process table.
+#: Well under the 30 s the stand-in descendants sleep, so a test that waited on
+#: a descendant's natural exit instead of the kill fails.
+_DESCENDANT_KILL_SECS = 5.0
 
 
 class TestMintToken:
@@ -270,7 +276,6 @@ class TestKillProcessTree:
         # here — no descendant survives teardown — is identical on both.
         import subprocess
         import sys
-        import time
 
         # Parent spawns a grandchild `sleep`, writes its pid, then waits — so the
         # tree has two members. Start it in its own session (mirrors
@@ -287,9 +292,9 @@ class TestKillProcessTree:
         proc = subprocess.Popen(
             [sys.executable, "-c", script], start_new_session=True, cwd=tmp_path
         )
-        # Bound BEFORE the try: the pidfile read below raises FileNotFoundError /
-        # ValueError whenever the 5s poll budget expires on a loaded host, and the
-        # finally must still be able to skip the grandchild reap in that case.
+        # Bound BEFORE the try: the pidfile wait below fails by name when the
+        # child never writes it, and the finally must still be able to skip the
+        # grandchild reap in that case.
         child_pid: int | None = None
         child_start_id: str | None = None
         # Set once the body has PROVEN the grandchild is gone. The finally must not
@@ -300,10 +305,10 @@ class TestKillProcessTree:
         grandchild_reaped = False
         try:
             # Wait for the grandchild pid to be recorded.
-            for _ in range(50):
-                if pidfile.exists() and pidfile.read_text(encoding="utf-8").strip():
-                    break
-                time.sleep(0.1)
+            wait_until(
+                lambda: pidfile.exists() and pidfile.read_text(encoding="utf-8").strip(),
+                describe=lambda: f"{pidfile} was never written",
+            )
             child_pid = int(pidfile.read_text(encoding="utf-8").strip())
             # Identity, captured WITH the pid. A pid alone is not a handle: the
             # kernel may reassign it the moment the process exits, so the reap in
@@ -317,18 +322,20 @@ class TestKillProcessTree:
 
             # Both the parent and the grandchild must be gone.
             assert proc.poll() is not None, "parent should be reaped"
-            # Poll: the tree kill is asynchronous w.r.t. the grandchild exiting.
-            for _ in range(50):
-                if not _pid_alive(child_pid):
-                    break
-                time.sleep(0.1)
-            assert not _pid_alive(child_pid), "grandchild (same tree) must also be killed"
+            # The tree kill is asynchronous w.r.t. the grandchild exiting. The
+            # bound stays well under the grandchild's own 30 s sleep, so its
+            # natural exit can never stand in for the kill.
+            wait_until(
+                lambda: not _pid_alive(child_pid),
+                timeout=_DESCENDANT_KILL_SECS,
+                describe=lambda: "grandchild (same tree) must also be killed",
+            )
             grandchild_reaped = True
         finally:
             # `connect._kill_process_tree` is the ONLY reaper in the body above and
-            # it is the code under test, so every failing exit — the pidfile read
-            # raising when the 5s poll budget expires, either assertion, a real
-            # regression in the tree kill — abandons a live `time.sleep(30)`
+            # it is the code under test, so every failing exit — the pidfile wait
+            # failing, either assertion, a real regression in the tree kill —
+            # abandons a live `time.sleep(30)`
             # wrapper AND its grandchild for 30s past the test. Both sit in their
             # own session thanks to start_new_session=True, i.e. in a group no
             # run-level sweep of the xdist worker's group can reach. Reap through
@@ -789,14 +796,14 @@ class TestIsLaunchedInstance:
         store.save(keep)
 
         victim = store.root / f"{gone.id}.json"
-        real_read_text = Path.read_text
+        real_read_bytes = Path.read_bytes
 
-        def _read_text(self, *a, **k):
+        def _read_bytes(self):
             if self == victim:
                 raise FileNotFoundError(str(victim))
-            return real_read_text(self, *a, **k)
+            return real_read_bytes(self)
 
-        monkeypatch.setattr(Path, "read_text", _read_text)
+        monkeypatch.setattr(Path, "read_bytes", _read_bytes)
 
         assert connect.is_launched_instance("i-stillhere") is True
         assert connect.is_launched_instance("i-vanishing") is False
@@ -948,3 +955,108 @@ def test_the_printed_paths_match_the_containers_own_constants():
         "CUSTOMER_TURN_PATH": connect.FARGATE_TURN_PATH,
         "HEALTH_PATH": connect.FARGATE_HEALTH_PATH,
     }
+
+
+class TestPortForwardError:
+    """_port_forward_error names a failed tunnel's cause from a classified notice.
+
+    The sibling of the instances-layer forward: both pipe and drain the plugin's
+    stdout, and both run that captured stdout through the same close-notice
+    classifier. The service-supplied reason text is a classification signal only
+    — this path composes its own wording from the recognised shape and never
+    quotes the raw notice. Without capture, or on an unrecognised shape, the exit
+    shape alone drives the reason.
+    """
+
+    # Real plugin close-notice fixtures (see test_fargate_closed_forward_remedy).
+    _SESSION_ID = "user-0123456789abcdef"
+    _IDLE = (
+        f"\nStarting session with SessionId: {_SESSION_ID}\n\n\nSessionId: "
+        f"{_SESSION_ID} : Your session timed out due to inactivity and has "
+        "been terminated.\n\n"
+    )
+    _CLOSED_OTHER = (
+        f"\nStarting session with SessionId: {_SESSION_ID}\n\n\nSessionId: "
+        f"{_SESSION_ID} : Session terminated by operator.\n\n"
+    )
+
+    def _exited(self, rc: int, stdout_buf=None):
+        class _Proc:
+            returncode = rc
+
+            def poll(self):
+                return rc
+
+        p = _Proc()
+        if stdout_buf is not None:
+            p.stdout_buf = stdout_buf  # type: ignore[attr-defined]
+        return p
+
+    def test_none_proc_reports_did_not_start(self):
+        assert "did not start" in connect._port_forward_error(None, 5476)
+
+    def test_still_running_reports_not_ready(self):
+        class _Running:
+            returncode = None
+
+            def poll(self):
+                return None
+
+        msg = connect._port_forward_error(_Running(), 5476)
+        assert "did not become ready" in msg
+
+    def test_exited_without_capture_is_bare_reason(self):
+        # No stdout_buf attribute at all (capture off / nothing written).
+        msg = connect._port_forward_error(self._exited(1), 5476)
+        assert "exited (rc=1)" in msg
+        assert msg.strip().endswith(".")
+
+    def test_idle_shape_names_inactivity_without_quoting(self):
+        msg = connect._port_forward_error(self._exited(0, [self._IDLE]), 5476)
+        assert "exited (rc=0)" in msg
+        assert "no activity" in msg
+        # The service-supplied reason text is a classification signal only — it
+        # must not be quoted into the surfaced reason.
+        assert "timed out due to inactivity" not in msg
+
+    def test_closed_shape_names_aws_close_without_quoting(self):
+        msg = connect._port_forward_error(self._exited(0, [self._CLOSED_OTHER]), 5476)
+        assert "AWS ended the session" in msg
+        assert "terminated by operator" not in msg
+
+    def test_unrecognised_notice_falls_back_to_bare_reason(self):
+        noisy = "ok\r\n" + ("x" * 5000) + "\x07\x00trailer"
+        msg = connect._port_forward_error(self._exited(0, [noisy]), 5476)
+        # Nothing classified, so no cause is appended and no raw bytes leak.
+        assert "exited (rc=0)" in msg
+        assert "x" * 50 not in msg
+        assert "\r" not in msg and "\x07" not in msg and "\x00" not in msg
+        assert msg.strip().endswith(".")
+
+    def test_empty_capture_falls_back_to_bare_reason(self):
+        msg = connect._port_forward_error(self._exited(2, [""]), 5476)
+        assert "exited (rc=2)" in msg
+        assert msg.strip().endswith(".")
+
+    def test_join_waits_for_the_drain_to_land_the_last_chunk(self):
+        # The plugin writes its notice just before exit, so the drain thread may
+        # not have landed it when poll() returns. _classified_cause joins the
+        # drain before reading, so a notice written by a still-running drain is
+        # still classified. The buffer starts empty and a real thread fills it;
+        # the join (not a sleep) is what makes this deterministic — if the join
+        # were absent the read would race an empty buffer.
+        import threading
+
+        buf: list[str] = [""]
+        proc = self._exited(0, buf)
+
+        def _late_fill() -> None:
+            buf[0] = self._IDLE
+
+        thread = threading.Thread(target=_late_fill)
+        proc.stdout_drain = thread  # type: ignore[attr-defined]
+        thread.start()
+
+        msg = connect._port_forward_error(proc, 5476)
+        assert "no activity" in msg
+        assert "timed out due to inactivity" not in msg

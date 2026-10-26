@@ -105,7 +105,7 @@ empty, so the model request fails auth and keeps failing every
 the macOS keychain, or any store that keeps its material outside your home
 directory (or that you hand the helper explicitly). The exact directories the
 sandbox masks — and the stricter set under `strict`/`cc` mode — are listed
-beside `_STANDARD_DIRS` in `sandbox.py`; see
+beside `_STANDARD_DIRS` in `sandbox_tiers.py`; see
 [claude-code-provider.md](../system-specs/modules/claude-code-provider.md).
 
 Do **not** export `ANTHROPIC_AUTH_TOKEN` alongside this setup; an environment
@@ -173,10 +173,11 @@ the harness keeps the verbatim id and resolves its capabilities from the SDK's
 unfiltered list. `ANTHROPIC_MODEL` (and your `~/.claude/settings.json` model)
 is what the SDK resolves when Kiro Crew does not pin a model.
 
-- A chat slot on **auto** uses `ANTHROPIC_MODEL` only until the endpoint's
-  advertised models have been cached (the first session); after that, Crew
-  seeds them as the settings file's `availableModels` and auto resolves to
-  the head of that list.
+- A chat slot on **auto** takes the model from your own settings
+  (`ANTHROPIC_MODEL`, then the `model` in `~/.claude/settings.json`). Crew
+  writes the endpoint's advertised models into the settings file's
+  `availableModels` only when another settings source (your user, project or
+  managed settings) already defines a list.
 - Pin per-slot from the dashboard model chip; the pin rides on
   `session/set_config_option` and wins over the environment.
 - `CLAUDE_CODE_SUBAGENT_MODEL` applies to subagents spawned by the harness
@@ -199,9 +200,16 @@ is what the SDK resolves when Kiro Crew does not pin a model.
   withhold spec-referenced servers. See "MCP tools on a Claude session" in
   [claude-code-provider.md](../system-specs/modules/claude-code-provider.md)
   for the exact rules. A project that already carries its own
-  `.claude/settings.local.json` is the exception: Crew did not author the file
-  that governs tool use there, so that session gets no seed and no
-  `mcpServers` array at all. Tool calls pre-approved in your own `~/.claude`
+  `.claude/settings.local.json` keeps that file untouched. With
+  claude-agent-acp 0.84.0 or later Crew leaves it out of the session instead
+  (`settingSources` `["user"]`, Crew's settings inline), and the session still
+  gets Crew's `mcpServers` array; the cost is that the project's
+  `settings.json` env and plugins and its `CLAUDE.md` do not load. The array
+  is withheld only when the adapter is older or reports no version, a project
+  settings file cannot be examined or sets `hooks` or `sandbox`, or the session
+  asked for a permission mode of its own. See "A project-owned settings file"
+  in [claude-code-provider.md](../system-specs/modules/claude-code-provider.md).
+  Tool calls pre-approved in your own `~/.claude`
   settings (including a `.claude/settings.json` inside a cloned project) never
   reach Crew's approval path, so Crew's deny rules and audit log do not see
   them.

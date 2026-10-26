@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
+from kiro_crew import platform_compat
 from kiro_crew.cli import main
 
 
@@ -138,6 +140,30 @@ class TestWorkspaceArgparse:
             main()
         assert "Created workspace: newws" in capsys.readouterr().out
         assert (tmp_path / "workspace-newws").is_dir(), "config entry without a directory"
+
+    @requires_symlinks
+    def test_create_refuses_a_link_at_the_workspace_dir(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The CLI resolves the dir first; the link at the final name is still refused."""
+        cfg_path = _write_config(tmp_path, _base_config())
+        target = tmp_path / "real-target"
+        target.mkdir()
+        platform_compat.symlink_or_junction(str(target), str(tmp_path / "linked"))
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path),
+            unittest.mock.patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
+            unittest.mock.patch(
+                "sys.argv",
+                ["kirocrew", "workspace", "create", "--name", "newws", "--dir", "linked"],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        assert "is a link" in capsys.readouterr().err
+        assert "newws" not in json.loads(cfg_path.read_text(encoding="utf-8"))["workspaces"]
 
     def test_create_accepts_copy_from(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1000,3 +1026,38 @@ class TestCliRound8Hardening:
         ], "the losing create's copied files leaked into the winner's workspace"
         leftovers = [p.name for p in tmp_path.iterdir() if ".staging-" in p.name]
         assert leftovers == [], f"staging residue: {leftovers}"
+
+
+class TestWorkspaceNameRefusalNamesTheShape:
+    """``workspace create`` refuses a name ``WORKSPACE_NAME_RE`` does not admit, and the
+    refusal states the whole rule: the length bound and the start/end character."""
+
+    @pytest.mark.parametrize("bad", ["my-ws-", "_ws", "w" * 65, "a b"])
+    def test_a_refused_name_states_the_length_and_start_end_rule(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: str
+    ) -> None:
+        cfg_path = _write_config(tmp_path, _base_config())
+        before = cfg_path.read_text(encoding="utf-8")
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path),
+            unittest.mock.patch("sys.argv", ["kirocrew", "workspace", "create", "--name", bad]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "invalid workspace name (expected 1-64 letters" in err
+        assert "starting and ending with a letter or digit" in err
+        assert cfg_path.read_text(encoding="utf-8") == before
+
+    def test_the_hint_matches_the_pattern_it_describes(self) -> None:
+        from kiro_crew.validation import AGENT_NAME_HINT, WORKSPACE_NAME_RE
+
+        assert "1-64" in AGENT_NAME_HINT
+        assert "starting and ending with a letter or digit" in AGENT_NAME_HINT
+        for ok in ["w", "w" * 64, "my-ws_2", "A1"]:
+            assert WORKSPACE_NAME_RE.match(ok), ok
+        for bad in ["w" * 65, "my-ws-", "-ws", "_ws", "ws_", "a b", "a.b"]:
+            assert not WORKSPACE_NAME_RE.match(bad), bad

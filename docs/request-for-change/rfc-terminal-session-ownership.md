@@ -3,8 +3,8 @@ title: Terminal session ownership - one browser owner per PTY
 status: draft
 author: Pearce Kieser, with Codex
 created: 2026-09-01
-last-audited: 2026-09-09
-audited-at: 2188f029d
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr: 7649
 implementation-prs: [8863]
 tracking-issues: [7638, 5656]
@@ -13,6 +13,12 @@ superseded-by: []
 ---
 
 # RFC: Terminal session ownership - one browser owner per PTY
+
+Status: draft (no maintainer acceptance recorded). Phase 1 is on main
+([#8863](https://github.com/kirodotdev/KiroCrew/pull/8863)): every terminal route
+in `src/kiro_crew/dashboard/handlers/terminal.py` requires the dashboard owner
+(`require_owner_dashboard_request`), and displaced handlers are fenced. Phases 2
+and 3 are not built.
 
 Everything measured below was rechecked at `2188f029d`. Paths are repo-relative.
 
@@ -444,7 +450,7 @@ The server emits machine-readable outcomes:
 ready { resumed, generation, resume_credential, shell, fence_shells }
 ownership_conflict
 session_expired
-exit { code, signal }
+exit { status }
 spawn_failed
 terminal_disabled
 protocol_required
@@ -457,10 +463,15 @@ The frontend classifies them:
 | Network close or transient transport error | bounded exponential backoff | Reconnect after exhaustion |
 | `ownership_conflict` | no | Focus owner or perform an explicit transfer |
 | `session_expired` | no | Start a new terminal |
-| `exit` | no | Inspect exit state or start a new terminal |
+| `exit` | no | Close the tab; notify on abnormal exit |
 | `spawn_failed` | no | Inspect error and retry creation |
 | `terminal_disabled` | no | Close the unavailable terminal |
 | `protocol_required` | no | Refresh the dashboard |
+
+On `exit` the server sends `{"type": "exit", "status": N | null}`, closes the
+socket with `4001` and reaps the session, and the client closes the tab. It
+lands ahead of Phase 2, and Phase 2 carries it into the typed outcome set
+unchanged.
 
 The existing `online` and foreground visibility listeners rearm only a
 transport retry chain. They do not rearm terminal outcomes.
@@ -520,7 +531,7 @@ browser elections, or multi-view terminal fanout.
 
 Every phase is independently shippable and independently abandonable.
 
-### Phase 1 - authorize terminal access and fence displaced handlers
+### Phase 1 - authorize terminal access and fence displaced handlers (on main, #8863)
 
 Call the shared `is_owner_dashboard_request` gate (through
 `require_owner_dashboard_request`) on every terminal route and WebSocket upgrade
@@ -650,9 +661,10 @@ attach, rotation, storage, or clean transfer semantics established in Phase 2.
 
 ### Phase 4 - complete lifecycle UX and cleanup
 
-Add `exit`, `spawn_failed`, and `terminal_disabled` handling, visible recovery
+Add `spawn_failed` and `terminal_disabled` handling, visible recovery
 actions, protocol metrics, and cross-window browser coverage. Remove superseded
-timing and compatibility code.
+timing and compatibility code. `exit` handling is not part of this phase; it
+lands independently (see §8).
 
 **Exit criteria:**
 
@@ -782,8 +794,8 @@ capability for a PTY that the gateway itself does not persist.
    single-source each value.
 3. Does a predecessor recovery capability survive a main-window reload in
    `sessionStorage`, or exist only in memory while the source page remains open?
-4. Does PTY exit signaling land with Phase 2's protocol outcomes or remain in
-   Phase 4?
+4. ~~Does PTY exit signaling land with Phase 2's protocol outcomes or remain in
+   Phase 4?~~ Answered: neither. It lands independently of both (§8).
 5. After reload recovery is reliable, does the current 15-minute orphan timeout
    stay unchanged or become shorter?
 6. Does Phase 2 use one protocol version field or infer legacy mode from the

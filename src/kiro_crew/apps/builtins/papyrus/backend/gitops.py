@@ -36,6 +36,10 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.papyrus.backend import procio, store
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_config_hooks import (
+    ConfigHookScanError,
+    config_hook_disable_args_sandboxed_async,
+)
 from kiro_crew.git_divergence import divergence_count_args, parse_divergence_counts
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
@@ -347,6 +351,21 @@ async def _git(
     # Attribute-driven programs are disabled by a file, not by `-c` — see
     # `_pin_attributes_sync` for why the override list cannot cover them.
     await asyncio.to_thread(_pin_attributes_sync, cwd)
+    # A hook defined in config (`hook.<name>.command`, git 2.54+) is not reached by the
+    # `core.hooksPath` pin below, and its name is the repository's choice, so each one git
+    # can see is disabled by name. See `kiro_crew.git_config_hooks`.
+    try:
+        hook_off = await config_hook_disable_args_sandboxed_async(
+            cwd, spawn_argv=sandboxed_spawn_argv, mode="standard"
+        )
+    except SandboxUnavailableError as exc:
+        # The scan runs through the same sandbox the real call does; a missing backend
+        # surfaces the same actionable error here as it does below. Record the refusal in SEL
+        # first, exactly as the real-call branch does, so a scan-refused call is not silent.
+        _audit(args[0] if args else "run", str(cwd), "denied", error="sandbox unavailable")
+        raise GitSandboxUnavailable(str(exc)) from exc
+    except ConfigHookScanError as exc:
+        raise GitError(str(exc)) from exc
     # `-c` overrides BEFORE the subcommand, which is the only place git accepts them and
     # which beats anything in `.git/config`.
     #
@@ -389,6 +408,7 @@ async def _git(
         # --- hooks that fire on ordinary porcelain ---------------------------------
         "-c",
         "core.hooksPath=/dev/null",
+        *hook_off,
         # `core.fsmonitor` holds the PATHNAME OF A HOOK that `git status`/`add` run on
         # every invocation — the same class as `sshCommand`. `false` is the documented
         # "no monitor" value; an empty string would be read as a path.
@@ -481,9 +501,7 @@ async def _git(
     except asyncio.TimeoutError as exc:
         if proc is not None and proc.returncode is None:
             try:
-                await platform_compat.kill_process_tree_async(
-                    proc.pid, platform_compat.SIGKILL
-                )
+                await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
             except (ProcessLookupError, OSError, ValueError):
                 logger.debug("papyrus: git %s already gone before kill", args[:1])
             try:
@@ -521,8 +539,20 @@ def derive_project_name(url: str) -> str:
     return tail.lower()
 
 
-async def clone(url: str, destination: Path) -> None:
-    """Shallow-clone *url* into *destination*.
+def _publish_clone(staging: Path, destination: Path) -> str:
+    """BLOCKING — move a finished clone into place and return its generation.
+
+    Both happen under the paper's config lock, which a delete also takes, so no
+    delete can land between the move and the read: the generation names the paper
+    this clone made.
+    """
+    with store.config_lock(destination):
+        os.rename(staging, destination)
+        return store.project_generation(destination)
+
+
+async def clone(url: str, destination: Path) -> str:
+    """Shallow-clone *url* into *destination* and return the new paper's generation.
 
     *destination* must NOT exist and must already have been produced by
     :func:`.store.safe_project_dir` — this function does not validate it. The URL
@@ -537,6 +567,10 @@ async def clone(url: str, destination: Path) -> None:
 
     The rename is ``os.rename``, which fails rather than merging if the destination
     appeared meanwhile, so the loser reports a conflict and the winner keeps its tree.
+
+    The generation (:func:`.store.project_generation`) is read in the same locked
+    step as the rename, so a caller can later tell whether the folder still holds
+    the paper this call cloned.
     """
     if not GIT_URL_RE.match(url or ""):
         raise GitError("url must be http(s)://, git://, ssh://, or git@host:path")
@@ -558,7 +592,7 @@ async def clone(url: str, destination: Path) -> None:
     try:
         # Atomic within a filesystem, and it REFUSES to clobber a non-empty directory —
         # which is what makes the loser of a race fail instead of overwriting.
-        await asyncio.to_thread(os.rename, staging, destination)
+        return await asyncio.to_thread(_publish_clone, staging, destination)
     except OSError as exc:
         await _remove_tree(staging)
         raise GitError("a project with that name already exists", output=str(exc))
@@ -674,9 +708,7 @@ async def pull(project: Path) -> tuple[str, bool]:
         stashed = code == 0 and "no local changes" not in (out + err).lower()
 
     try:
-        code, out, err = await _git(
-            ["pull", "--rebase"], cwd=project, timeout=NETWORK_TIMEOUT_SEC
-        )
+        code, out, err = await _git(["pull", "--rebase"], cwd=project, timeout=NETWORK_TIMEOUT_SEC)
     except GitError:
         # The pull never produced an exit code (timeout / git vanished). Put the
         # tree back before surfacing the error; a best-effort pop, because failing

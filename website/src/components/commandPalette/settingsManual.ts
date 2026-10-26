@@ -31,7 +31,7 @@ export function connectionsOAuthClientEntryId(slug: string): string {
  * Contract per entry: entries are KEY-ONLY (the i18n gate forbids English
  * prose literals in hand-written source). Generation resolves `label` (and
  * `description`) from the English catalogs — the registry is an English
- * search corpus — and SecurityPanel.tsx carries a
+ * search corpus — and each SecurityPanel section owner (SecurityPanel*.tsx) carries a
  * `data-setting-label={i18nT('<labelKey>')}` anchor on the section's wrapper
  * so deep-link highlighting (useSettingHighlight) finds the element in any
  * locale.
@@ -166,21 +166,10 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     occurrence: 1,
   },
   {
-    // Gateway auto-update / update-notification toggle. Its rendered label is a
-    // ternary (self-update-capable installs read "Auto-update on restart"), which
-    // the extractor cannot resolve; indexed under the notify wording so it does
-    // not collide with the desktop SettingsToggle's generated entry.
-    id: 'about.update-notifications',
-    labelKey: 'pages.settings.aboutPanel.notify_when_an_update_is_available',
-    tab: 'about',
-    type: 'toggle',
-    occurrence: 1,
-    configKey: 'auto_update',
-  },
-  {
     // Per-channel notification mute + priority overrides: rows are fetched at
     // runtime (channel names are data), so one entry covers the Sources card.
     id: 'notifications.sources',
+    params: { sub: 'sources' },
     labelKey: 'pages.settings.notificationsPanel.sources',
     descriptionKey: 'pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio',
     tab: 'notifications',
@@ -190,6 +179,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   {
     // Range slider — no slider primitive exists; stepper is the nearest shape.
     id: 'notifications.volume',
+    params: { sub: 'sound' },
     labelKey: 'pages.settings.notificationsPanel.volume',
     tab: 'notifications',
     type: 'stepper',
@@ -203,6 +193,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   // SettingsSelect renders the resolved label as its own data-setting-label.
   {
     id: 'notifications.sound-category-all',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_all',
     descriptionKey: 'pages.settings.notificationsPanel.category_all_description',
     tab: 'notifications',
@@ -211,6 +202,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-turn',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_turn',
     descriptionKey: 'pages.settings.notificationsPanel.category_turn_description',
     tab: 'notifications',
@@ -218,7 +210,17 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     occurrence: 1,
   },
   {
+    id: 'notifications.sound-category-dictation',
+    params: { sub: 'percategory' },
+    labelKey: 'pages.settings.notificationsPanel.category_dictation',
+    descriptionKey: 'pages.settings.notificationsPanel.category_dictation_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
     id: 'notifications.sound-category-cron',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_cron',
     descriptionKey: 'pages.settings.notificationsPanel.category_cron_description',
     tab: 'notifications',
@@ -227,6 +229,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-approval',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_approval',
     descriptionKey: 'pages.settings.notificationsPanel.category_approval_description',
     tab: 'notifications',
@@ -235,6 +238,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-hook',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_hook',
     descriptionKey: 'pages.settings.notificationsPanel.category_hook_description',
     tab: 'notifications',
@@ -243,6 +247,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-heartbeat',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_heartbeat',
     descriptionKey: 'pages.settings.notificationsPanel.category_heartbeat_description',
     tab: 'notifications',
@@ -251,6 +256,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-subagent',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_subagent',
     descriptionKey: 'pages.settings.notificationsPanel.category_subagent_description',
     tab: 'notifications',
@@ -259,6 +265,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-taskrunner',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_taskrunner',
     descriptionKey: 'pages.settings.notificationsPanel.category_taskrunner_description',
     tab: 'notifications',
@@ -267,6 +274,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-agent',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_agent',
     descriptionKey: 'pages.settings.notificationsPanel.category_agent_description',
     tab: 'notifications',
@@ -275,6 +283,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   {
     id: 'notifications.sound-category-skills',
+    params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_skills',
     descriptionKey: 'pages.settings.notificationsPanel.category_skills_description',
     tab: 'notifications',
@@ -294,6 +303,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     // Color-dot swatch row — circular color buttons don't fit
     // SettingsButtonGroup's text-button pattern (comment at the render site).
     id: 'display.default-for-new-sessions',
+    params: { sub: 'sidebar' },
     labelKey: 'pages.settings.displayPanel.default_for_new_sessions',
     descriptionKey: 'pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color',
     tab: 'display',

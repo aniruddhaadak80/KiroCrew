@@ -21,7 +21,7 @@ consumer                                      projection it reads
 ``agent_sdk.tool_gate`` own-leaf exclusion    :data:`AGENT_AUTH_DECLARATIONS`
 ``agent_sdk.backends`` logout-recycle set     :func:`backends_retired_by_host_logout`
 ``acp`` auth-required message                 :func:`signed_out_message`
-``cli_doctor`` sign-in row                    :func:`declaration_for`
+``doctor_checks.agents`` sign-in row          :func:`declaration_for`
 ``GET /api/acp-backends`` auth object         :func:`declaration_for`
 ============================================  ================================
 
@@ -255,6 +255,19 @@ class AgentAuthDeclaration:
     #: re-spell where its file lands, never name a different file.
     override_relative_leaves: Tuple[str, ...] = ()
 
+    #: The phrase in this harness's OWN error text that means it cannot reach a
+    #: model until the operator signs it in or configures a provider.
+    #:
+    #: Matched case-insensitively as a substring of a JSON-RPC error's ``data`` and
+    #: ``message``. A match is the evidence :attr:`signed_out_message` needs, so the
+    #: client shows that message and does not retry: a respawn meets the same
+    #: missing configuration. The phrase is copied from a live capture of the
+    #: harness, never guessed, because a phrase that also appears in a transient
+    #: failure would turn a retryable error into a terminal one. Empty means the
+    #: harness's signed-out answers are already read by the shared auth vocabulary
+    #: (or have not been captured yet).
+    signed_out_signature: str = ""
+
     # There is deliberately NO field for re-exposing a file the mask hides.
     #
     # A re-exposure is an EDIT to the mask, and the rule this class exists to
@@ -285,6 +298,10 @@ class AgentAuthDeclaration:
             raise ValueError(f"{self.backend!r} declares no sign-in remedy")
         if not self.signed_out_message.strip():
             raise ValueError(f"{self.backend!r} declares no signed-out message")
+        if self.signed_out_signature and not self.signed_out_signature.strip():
+            # A blank phrase is a substring of every error, so it would make every
+            # failure of this harness terminal and hide its real cause.
+            raise ValueError(f"{self.backend!r} declares a blank signed-out signature")
         stray = tuple(
             leaf for leaf in self.adapter_own_leaves if leaf not in self.credential_leaves
         )
@@ -380,11 +397,11 @@ _KIRO_SIGNED_OUT = (
 # process had, so its messages name both remedies. Plain prose (no backticks, no
 # "--") in the remedy: the panel renders it as text.
 _KAS_REMEDY = (
-    "Sign in from Developer → Agent Backend → Kiro sign-in, or run kiro-cli login "
+    "Sign in from Settings → Agent Harness → Kiro sign-in, or run kiro-cli login "
     "in your terminal if kiro-cli owns the sign-in, then start a new chat."
 )
 _KAS_SIGNED_OUT = (
-    "Not signed in to Kiro. Sign in again from Developer → Agent Backend → Kiro sign-in, "
+    "Not signed in to Kiro. Sign in again from Settings → Agent Harness → Kiro sign-in, "
     "or run `kiro-cli login` in your terminal if kiro-cli owns the sign-in, then start a "
     "new chat."
 )
@@ -557,16 +574,31 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
             "needs no key: name it as the provider instead. Neither is checked here: "
             "the harness reads them."
         ),
+        # Names the keyring case because it is the one ``goose configure`` alone
+        # cannot fix. goose keeps keys in the OS keyring by default, and the
+        # sandboxed child cannot reach the session bus it lives behind (measured:
+        # ``busctl --user`` inside Crew's sandbox answers "Permission denied"). goose
+        # 1.52.0, driven live with no reachable bus, logs "Keyring unavailable. Using file
+        # storage for secrets.", reads only ``secrets.yaml``, and answers
+        # ``session/prompt`` with -32000 ``Authentication required``. With the key
+        # in ``secrets.yaml`` instead, the same run reaches its provider.
         signed_out_message=(
-            "goose has no provider configured. Run `goose configure` in your terminal "
-            "to set one up, or configure a locally served model, then start a new "
-            "chat."
+            "goose has no provider it can use here: none is configured, or its key "
+            "is in the system keyring, which Kiro Crew's sandbox cannot open. Run "
+            "`GOOSE_DISABLE_KEYRING=true goose configure` in your terminal so the key "
+            "is saved to goose's secrets.yaml, or configure a locally served model, "
+            "then start a new chat."
         ),
         # Excluded deliberately: it resolves its own provider secret, so a
         # ``kiro-cli logout`` says nothing about whether a running goose session can
         # still reach its model.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # goose 1.50.1 and 1.52.0, driven live with no provider configured, answer
+        # ``session/new`` with -32603 and ``Failed to resolve provider:
+        # Configuration value not found: GOOSE_PROVIDER``. No session opens, so no
+        # retry can help until ``goose configure`` has run.
+        signed_out_signature="Failed to resolve provider",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_PI,
@@ -603,6 +635,13 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # still authenticated.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # pi-acp 0.0.34, driven live with an empty pi home, answers ``session/new``
+        # with -32000 ``Authentication required: Configure an API key or log in
+        # with an OAuth provider.`` It raises that same text when pi lists no
+        # model or reports a 401/403, so no respawn helps until the operator signs
+        # in. The phrase is pi-acp's own, not the SDK's generic prefix, so no other
+        # harness's auth answer matches it.
+        signed_out_signature="Configure an API key or log in with an OAuth provider",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_DEEPSEEK,
@@ -694,6 +733,11 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # logout does not touch either.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_HOST_VAULT,
+        # dsh 0.1.5-rc.3, driven live with no key in its environment and an empty
+        # ``DSH_HOME``, opens the session and then answers the first
+        # ``session/prompt`` with -32603 ``... no API key for provider route
+        # "deepseek-official"; store DEEPSEEK_API_KEY ...``.
+        signed_out_signature="no API key for provider route",
     ),
 )
 
@@ -809,6 +853,18 @@ def signed_out_message(backend: str) -> str:
     return declaration_for(backend).signed_out_message
 
 
+def reports_signed_out(backend: str, text: str) -> bool:
+    """Whether *text* is *backend*'s own answer for "not signed in / not configured".
+
+    Reads only the phrase *backend* declares in
+    :attr:`AgentAuthDeclaration.signed_out_signature`, so one harness's wording
+    can never classify another harness's error. A True answer is the evidence
+    :func:`signed_out_message` asks for.
+    """
+    signature = declaration_for(backend).signed_out_signature
+    return bool(signature) and signature.casefold() in text.casefold()
+
+
 def entitlement_label(backend: str) -> str:
     """What to call *backend*'s entitlement source in front of an operator.
 
@@ -889,6 +945,7 @@ __all__ = [
     "home_override_env_vars",
     "missing_declarations",
     "override_anchored_leaves",
+    "reports_signed_out",
     "signed_out_message",
     "signs_in_separately",
 ]

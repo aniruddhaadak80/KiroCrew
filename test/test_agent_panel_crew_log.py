@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -37,6 +37,7 @@ from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log import projection as crew_log
+from kiro_crew.crew_log import store
 from kiro_crew.crew_log.entry_types import (
     PANEL_CREW_KEY_LIMIT,
     PANEL_ENTRY_TYPE,
@@ -109,6 +110,36 @@ def _lines(unit_id: str = UNIT) -> list[dict[str, Any]]:
     return out
 
 
+def _rewrite_log(unit_id: str, edit: "Callable[[list[str]], list[str]]") -> None:
+    """Read a unit's log, map its lines through *edit*, and write them back.
+
+    The read and the write are held under the unit's own append lock, the one the
+    emitter's writer thread takes to append and to roll a failed append back. A
+    publish hands its line to that writer and returns once the line is on disk, but
+    the writer owns the file beyond that return: a later publish's append, and the
+    truncate that rolls one back on a failed fsync, both run on the writer thread.
+    So a test that reaches past the store to rewrite the file races those: the
+    rewrite and an append can interleave their bytes, or a rollback can cut the
+    rewritten file back to a size that predates it, and the fold then reads a log
+    short by whole entries. Taking the same lock serializes the rewrite against the
+    writer, so the file the fold reads is the one the test wrote.
+
+    The rewrite is also bracketed as a completed cut (``_open_cut`` before the bytes,
+    ``_close_cut`` after), the way the store brackets every change to a committed
+    record. A warm fold trusts the records it already consumed for as long as the
+    unit's cut counter reads the same, so a rewrite that left the counter alone would
+    be invisible to any fold that ran before it, and the fold would keep the stamp
+    the rewrite meant to damage.
+    """
+    lock_path = store._lock_path(lg.KIND_SESSION, unit_id)
+    path = lg.crew_log_path(lg.KIND_SESSION, unit_id)
+    with store._open_lock(lock_path):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        store._open_cut(path.parent)
+        path.write_text("\n".join(edit(lines)) + "\n", encoding="utf-8")
+        store._close_cut(path.parent)
+
+
 # --------------------------------------------------------------------- emitter
 
 
@@ -135,7 +166,7 @@ def test_the_emitter_is_a_no_op_with_the_crew_log_off(monkeypatch):
     create a log behind the operator's back when the feature is off.
     """
     _unit()
-    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
     crew_log_emit.reset_caches()
 
     _publish()
@@ -239,7 +270,7 @@ def test_an_evicted_owner_is_counted_not_silently_dropped():
     assert value["owners_omitted"] == 2
 
 
-def test_eviction_ranks_on_fold_order_not_on_a_stamp():
+def test_eviction_ranks_on_fold_order_not_on_a_stamp(monkeypatch):
     """A planted unreadable ``time`` must not decide whose panel is evicted.
 
     ``_panel_iso`` answers the empty string for a ``time`` no ``datetime`` can hold,
@@ -259,20 +290,9 @@ def test_eviction_ranks_on_fold_order_not_on_a_stamp():
         _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
 
     # The first crew publishes again, so it is newest by fold order.
-    _publish(crew_key=keys[0], title="republished", data={"cycle": 99})
-
-    # Damage ONLY that last entry, so the empty stamp is the one it keeps.
-    path = lg.crew_log_path(lg.KIND_SESSION, UNIT)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    last = max(
-        i
-        for i, raw in enumerate(lines)
-        if raw.strip() and json.loads(raw).get("type") == PANEL_ENTRY_TYPE
-    )
-    entry = json.loads(lines[last])
-    entry["time"] = 10**19
-    lines[last] = json.dumps(entry)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "now_ms", lambda: 10**19)
+        _publish(crew_key=keys[0], title="republished", data={"cycle": 99})
 
     # One more owner than the cap allows, which forces exactly one eviction.
     _publish(crew_key=keys[PANEL_OWNER_LIMIT], title="newcomer", data={"cycle": 7})
@@ -284,6 +304,42 @@ def test_eviction_ranks_on_fold_order_not_on_a_stamp():
     # The crew that published least recently is the one evicted, not the one whose
     # stamp is unreadable.
     assert keys[1] not in value["owners"], "fold order did not decide the eviction"
+
+
+def test_a_file_rewrite_waits_for_the_unit_append_lock():
+    """A test rewriting a unit's log holds the lock the writer appends under.
+
+    A publish returns once its line is on disk, but the emitter's writer thread owns
+    the file past that return: a later publish's append, and the truncate that rolls
+    a failed append back, both run there. A rewrite that reached straight past the
+    store could interleave its bytes with one of those or be truncated by a
+    rollback, and the fold would then read a log short by whole entries -- the shape
+    behind the eviction above dropping the crew it was meant to keep. The guarantee
+    that closes it is that :func:`_rewrite_log` takes the unit's own append lock, so
+    this holds that lock and shows the rewrite cannot proceed until it is released.
+    """
+    import threading
+
+    _unit()
+    _publish(data={"cycle": 1})
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _rewrite() -> None:
+        started.set()
+        _rewrite_log(UNIT, lambda lines: lines)
+        finished.set()
+
+    lock_path = store._lock_path(lg.KIND_SESSION, UNIT)
+    with store._open_lock(lock_path):
+        worker = threading.Thread(target=_rewrite)
+        worker.start()
+        assert started.wait(timeout=5.0), "the rewrite thread never started"
+        # The lock is held here, so the rewrite must be parked waiting for it.
+        assert not finished.wait(timeout=0.5), "the rewrite did not wait for the lock"
+    worker.join(timeout=5.0)
+    assert finished.is_set(), "the rewrite never completed once the lock was free"
 
 
 def test_the_recorded_order_beats_a_backward_header_clock(monkeypatch):
@@ -396,14 +452,16 @@ def test_an_unreadable_time_costs_the_stamp_not_the_panel():
     """
     _unit()
     _publish(data={"cycle": 47})
-    path = lg.crew_log_path(lg.KIND_SESSION, UNIT)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for i, raw in enumerate(lines):
-        entry = json.loads(raw) if raw.strip() else {}
-        if entry.get("type") == PANEL_ENTRY_TYPE:
-            entry["time"] = 10**19  # outside what a datetime can hold
-            lines[i] = json.dumps(entry)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _damage_every_panel(lines: list[str]) -> list[str]:
+        for i, raw in enumerate(lines):
+            entry = json.loads(raw) if raw.strip() else {}
+            if entry.get("type") == PANEL_ENTRY_TYPE:
+                entry["time"] = 10**19  # outside what a datetime can hold
+                lines[i] = json.dumps(entry)
+        return lines
+
+    _rewrite_log(UNIT, _damage_every_panel)
 
     value = _folded()
     assert value["published_at"] == "", "an unreadable time must answer the empty stamp"
@@ -537,8 +595,10 @@ def test_the_owner_count_is_bounded_and_evicts_the_oldest():
 #: The reference page's own reader hint, as the paragraph it is written in. The
 #: pins below derive what a reader is promised from THIS text rather than from a
 #: list kept here, so a hint that grows a field the record does not carry reds.
-#: The panel type is the page's last documented type, so its hint is the last one.
+#: Read inside the panel type's own subsection, so a type documented after it does
+#: not move the anchor.
 _READER_HINT_HEAD = "**Reader hint**"
+_PANEL_SUBSECTION = "### `panel/published`"
 
 
 def _reader_hint() -> str:
@@ -547,9 +607,10 @@ def _reader_hint() -> str:
         Path(__file__).resolve().parents[1] / "docs" / "reference" / "crew-log" / "session-types.md"
     )
     text = page.read_text(encoding="utf-8")
-    # The panel type is the page's last documented type, so its hint is the last
-    # one on the page; sliced to the blank line that ends the paragraph.
-    head = text.rindex(_READER_HINT_HEAD)
+    # The hint inside the panel type's subsection, sliced to the blank line that
+    # ends the paragraph.
+    start = text.index(_PANEL_SUBSECTION)
+    head = text.index(_READER_HINT_HEAD, start)
     para = text[head:].split("\n\n", 1)[0]
     assert "crew_key" in para, "the panel type's reader hint moved; re-anchor this"
     return para
@@ -607,13 +668,14 @@ def test_every_field_the_reader_hint_names_is_reachable_along_the_hints_own_path
 
 
 def test_an_evicted_crew_has_no_record_and_reads_the_count_from_the_top_level():
-    """The evicted reader's whole path, which is the case the count exists for.
+    """The evicted reader's path: absence under its own key, count at the top level.
 
     Eviction is ``del owners[oldest]``, so a crew whose record was evicted finds
     NOTHING under its own ``crew_key`` -- not an empty record. That is why the count
     cannot live on the per-owner record: the crew it is about has none. The fold's
-    top-level count is what this reader reads instead, and this pins that it is there
-    and non-zero in exactly that state.
+    top-level count is what this reader reads instead, and this pins that the key is
+    ABSENT (a placeholder record would break the reader) and the count is non-zero in
+    exactly that state.
     """
     _unit()
     keys = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 1)]
@@ -627,6 +689,31 @@ def test_an_evicted_crew_has_no_record_and_reads_the_count_from_the_top_level():
     assert evicted not in value["owners"]
     assert value["owners"].get(evicted) is None
     # So the top level is the only thing that can tell this reader it was evicted.
+    assert value["owners_omitted"] == 1
+
+
+def test_a_non_zero_count_does_not_attribute_the_loss_to_the_asking_crew():
+    """The false-positive direction the count cannot rule out, pinned as behaviour.
+
+    ``_panel_step`` increments on ANY owner's eviction with no reference to the
+    asking key, so a crew that never published on a busy slot reads exactly what a
+    genuinely evicted crew reads: no record of its own, and the same non-zero count.
+    Pinned as an executable assertion (not only in prose) so a ``_panel_step`` change
+    that increments on the asking key, or seeds a placeholder for an evicted owner,
+    reddens here rather than shipping green.
+    """
+    _unit()
+    publishers = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 1)]
+    for i, key in enumerate(publishers):
+        _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
+
+    value = _folded()
+    evicted = publishers[0]
+    never_published = "z" * 40
+
+    # Both read absence, and both read the same count. Indistinguishable by design.
+    assert evicted not in value["owners"]
+    assert never_published not in value["owners"]
     assert value["owners_omitted"] == 1
 
 
@@ -656,31 +743,6 @@ def test_no_record_under_owners_is_ever_empty_so_absence_is_the_only_signal():
     assert fresh["owners_omitted"] == 0
 
 
-def test_a_non_zero_count_does_not_attribute_the_loss_to_the_asking_crew():
-    """The false-positive direction, which the count genuinely cannot rule out.
-
-    ``_panel_step`` increments on ANY owner's eviction with no reference to the
-    asking key, so a crew that never published on a busy slot reads exactly what a
-    genuinely evicted crew reads: no record of its own, and the same non-zero count.
-    Pinned so the documentation can never be tightened back into claiming an
-    attribution, and so the true-positive pin above is not mistaken for the whole
-    guarantee.
-    """
-    _unit()
-    publishers = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 1)]
-    for i, key in enumerate(publishers):
-        _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
-
-    value = _folded()
-    evicted = publishers[0]
-    never_published = "z" * 40
-
-    # Both read absence, and both read the same count. Indistinguishable by design.
-    assert evicted not in value["owners"]
-    assert never_published not in value["owners"]
-    assert value["owners_omitted"] == 1
-
-
 def test_a_zero_count_speaks_only_about_this_fold_not_about_publishing():
     """``0`` says this FOLD recorded no eviction. It says nothing about publishing.
 
@@ -706,11 +768,11 @@ def test_a_zero_count_speaks_only_about_this_fold_not_about_publishing():
 
 
 def test_a_slot_that_evicted_nobody_still_reports_the_count_as_zero():
-    """The count's other direction: zero is an answer, not an absent field.
+    """Zero is an answer, not an absent field, on a slot that published and evicted
 
-    A reader that cannot distinguish "no eviction" from "this fold does not report
-    evictions" is back to guessing, so the field is present on a slot that published
-    and evicted nobody -- the ordinary case, distinct from the empty fold above.
+    nobody -- the ordinary case, distinct from the empty fold above. A reader that
+    cannot tell "no eviction" from "this fold does not report evictions" is back to
+    guessing, so the field is present and zero here.
     """
     _unit()
     _publish(title="fleet", data={"cycle": 47})
@@ -737,7 +799,8 @@ def test_no_panel_prose_claims_the_count_identifies_the_evicted_crew():
     that field lives on the owner's own record, so telling a reader its history was
     trimmed is something the fold can keep.
     """
-    source = Path(crew_log.__file__).read_text(encoding="utf-8")
+    folds = sorted(Path(crew_log.__file__).parent.glob("projection*.py"))
+    source = "".join(path.read_text(encoding="utf-8") for path in folds)
 
     assert "exactly like a crew that never published on this slot" not in source
     # The correction is present, so this pin cannot pass by the prose being deleted.

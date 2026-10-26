@@ -53,9 +53,15 @@ from kiro_crew.messaging.queue_receipt import ReceiptQueue, receipt_text
 
 
 class _Surface:
-    """A receipt surface with its address already bound (what a channel supplies)."""
+    """A receipt surface with its address already bound (what a channel supplies).
+
+    ``address_key`` is part of that binding: the registry compares it to decide whether
+    a caller writes to the bubble's own conversation, so a fake without one addresses
+    nothing and every write is withheld.
+    """
 
     label = "fake"
+    address_key = "fake\x00chat"
 
     def __init__(self) -> None:
         self.sent: list[str] = []
@@ -119,7 +125,14 @@ def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
         # mid-turn burst would have left one.
         async with queue.lock:
             await queue.create_or_grow_locked("s", surface, "what time is it", _CALLER)
-        return await stop_running_turn(sessions, "s", queue=queue, surface=surface, owner=_CALLER)
+        return await stop_running_turn(
+            sessions,
+            "s",
+            queue=queue,
+            surface=surface,
+            owner=_CALLER,
+            deliver=AsyncMock(),
+        )
 
     return asyncio.run(go())
 
@@ -504,7 +517,11 @@ class TestLayering:
     #: ``kiro_crew.slack`` transitively, so a RUNTIME import of either -- at any
     #: nesting depth -- is the ``messaging -> slack`` edge in disguise. Typing-only
     #: imports under ``if TYPE_CHECKING:`` are the sanctioned way to name them.
-    _DUCK_TYPED_SERVICES = ("kiro_crew.subagent", "kiro_crew.taskrunner")
+    _DUCK_TYPED_SERVICES = (
+        "kiro_crew.subagent",
+        "kiro_crew.taskrunner",
+        "kiro_crew.taskrunner_parts",
+    )
 
     def test_the_duck_typed_services_are_never_imported_at_runtime(self) -> None:
         """A deferred in-function import is still an edge: the channel ``spawn``
@@ -667,6 +684,23 @@ class TestSpawn:
         assert manager.spawn_async.await_args.kwargs["parent_session_key"] == "slack:C1:1"
 
     @pytest.mark.asyncio
+    async def test_a_refused_spawn_is_reported_as_refused_not_spawned(self) -> None:
+        """A refusal comes back as a terminal record, not None; a non-batch one is
+        announced nowhere else, so the reply must say it never started."""
+        manager = MagicMock(max_concurrent=2)
+        manager.spawn.return_value = SimpleNamespace(
+            id="r1", done=True, error="spawn refused: gateway admission is closed"
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply.startswith("⚠️ Subagent `r1` was not started: gateway admission is closed")
+        assert "spawn refused" not in reply and "Spawned" not in reply
+        manager.spawn.return_value = SimpleNamespace(
+            id="r2", done=True, error="never started: waiting for memory (pressure)"
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply.startswith("⚠️ Subagent `r2` was not started: waiting for memory")
+
+    @pytest.mark.asyncio
     async def test_an_empty_argument_declines(self) -> None:
         assert await spawn_task_reply("", MagicMock()) is None
         assert await spawn_command_reply("spawn    ", MagicMock()) is None
@@ -826,6 +860,21 @@ class TestCron:
 
 
 class TestTaskRunner:
+    @pytest.mark.asyncio
+    async def test_a_disabled_task_runner_app_refuses_the_start(self, tmp_path: Any) -> None:
+        spec = tmp_path / "plan.yaml"
+        spec.write_text("steps: []", encoding="utf-8")
+        runner = MagicMock(running=False)
+        runner.start_background = AsyncMock()
+        with patch(
+            "kiro_crew.apps.manager._read_installed",
+            return_value=SimpleNamespace(enabled=False),
+        ) as read:
+            out = await task_command_reply(f"task run {spec}", runner) or ""
+        assert "Task Runner is disabled" in out
+        read.assert_called_once_with("projects")
+        runner.start_background.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_project_run_is_accepted_as_an_alias(self, tmp_path: Any) -> None:
         spec = tmp_path / "plan.yaml"

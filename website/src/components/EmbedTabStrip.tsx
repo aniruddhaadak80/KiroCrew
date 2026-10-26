@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { matchPath, useLocation, useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
-import { useAppSelector, useAppDispatch } from '../store'
-import { createSlot } from '../store/chatSlice'
+import { useAppSelector, useAppDispatch, useAppStore } from '../store'
+import { createChatForView, type CreatedChatView } from '../lib/createdChatView'
 import { X, Plus } from 'lucide-react'
 import ErrorNotice from './ErrorNotice'
 import { errMessage } from '../utils/thunkError'
+import { safeSetSessionItem } from '../utils/safeStorage'
+import { isUntitledSession, sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import {
   TAB_STATUS_COLOR,
@@ -15,8 +17,6 @@ import {
   truncateTabTitle,
   type TabStatus,
 } from '../lib/sessionTabs'
-import type { ChatSlot } from '../types'
-
 import { i18nT } from '../i18n/t'
 interface Tab { slug: string }
 
@@ -28,6 +28,23 @@ interface EmbedTabsWindow extends Window {
 
 const STORAGE_KEY = 'kirocrew-embed-tabs'
 const STORAGE_INDEX_KEY = 'kirocrew-embed-active-index'
+
+/**
+ * The tabs to open with. A chat the page was opened on (`/embed/chat/:slug`)
+ * is always the active tab: an open tab holding it is selected, a Sessions tab
+ * becomes it, and otherwise it is added. Without this the mount navigation
+ * below would replace the deep link with the restored tab's URL.
+ */
+function initialTabs(activeSlot: string | null, linkedSlug: string | null): { tabs: Tab[]; index: number } {
+  const restored = loadTabs(activeSlot)
+  if (!linkedSlug) return restored
+  const open = restored.tabs.findIndex(t => t.slug === linkedSlug)
+  if (open !== -1) return { tabs: restored.tabs, index: open }
+  if (restored.tabs[restored.index]?.slug === '') {
+    return { tabs: restored.tabs.map((t, i) => i === restored.index ? { slug: linkedSlug } : t), index: restored.index }
+  }
+  return { tabs: [...restored.tabs, { slug: linkedSlug }], index: restored.tabs.length }
+}
 
 function loadTabs(activeSlot: string | null): { tabs: Tab[]; index: number } {
   // Priority: sessionStorage > window.__kirocrewTabs > activeSlot > empty
@@ -49,11 +66,17 @@ function loadTabs(activeSlot: string | null): { tabs: Tab[]; index: number } {
 export default function EmbedTabStrip() {
   const navigate = useNavigate()
   const dispatch = useAppDispatch()
+  const store = useAppStore()
   const slots = useAppSelector(s => s.dashboard.slots)
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
 
-  const [tabs, setTabs] = useState<Tab[]>(() => loadTabs(activeSlot).tabs)
-  const [activeIndex, setActiveIndex] = useState(() => loadTabs(activeSlot).index)
+  const { pathname } = useLocation()
+  const [initial] = useState(() => {
+    const linkedSlug = matchPath('/embed/chat/:slug', pathname)?.params.slug || null
+    return { ...initialTabs(activeSlot, linkedSlug), linked: !!linkedSlug }
+  })
+  const [tabs, setTabs] = useState<Tab[]>(initial.tabs)
+  const [activeIndex, setActiveIndex] = useState(initial.index)
 
   const tabsRef = useRef(tabs)
   tabsRef.current = tabs
@@ -67,20 +90,42 @@ export default function EmbedTabStrip() {
     didMountNav.current = true
     const tab = tabs[activeIndex]
     if (!tab) return
+    // A deep link may have changed the restored tabs: store what is shown.
+    if (initial.linked) persist(tabs, activeIndex)
     if (tab.slug) navigate(`/embed/chat/${tab.slug}?sid=${tab.slug}`, { replace: true })
     else navigate('/embed/sessions', { replace: true })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const createSlotMutation = useMutation({
-    mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
-    onSuccess: (slot: ChatSlot) => {
+    // The tab the user was on when they asked, passed in so a late success can
+    // tell a tab switch. The route is no guide here: the embedded chat rewrites
+    // its own `/embed/chat/<slug>` when the create opens the new session. The
+    // tab is held by identity, not index: a drag reorder moves the user's tab
+    // to another index but keeps the same object, and a Sessions tab has no
+    // slug that tells it apart from another.
+    mutationFn: (_fromTab: Tab | undefined) => createChatForView(dispatch, store.getState, undefined),
+    onSuccess: ({ slot, opened, shown: onSamePage }: CreatedChatView, fromTab: Tab | undefined) => {
       const key = slot?.key
       if (!key) return
+      // The `activeSlot` effect below can already have put the new session in
+      // a Sessions tab, whether the user asked from it or opened it during
+      // the create. That tab shows it, so a second tab for it would be a
+      // duplicate.
+      if (tabsRef.current.some(t => t.slug === key)) return
+      // The tab and the page are separate questions. When the create opened
+      // the session and the user is still on the tab they asked from, the
+      // store already shows it there, so that tab's place goes to the new
+      // tab and the strip stays in step with the chat. Only a user still on
+      // the chat page is navigated to it: one who went to a page such as
+      // embedded Settings stays there, and its Back lands on the new session
+      // under the new tab. A user who switched tabs keeps the tab they
+      // picked; the new session still gets its tab, behind it.
+      const selected = opened && !!fromTab && tabsRef.current[activeIndexRef.current] === fromTab
       const newTabs = [...tabsRef.current, { slug: key }]
-      const newIndex = newTabs.length - 1
+      const newIndex = selected ? newTabs.length - 1 : activeIndexRef.current
       setTabs(newTabs)
       setActiveIndex(newIndex)
-      navigate(`/embed/chat/${key}?sid=${key}`)
+      if (selected && onSamePage) navigate(`/embed/chat/${key}?sid=${key}`)
       persist(newTabs, newIndex)
     },
   })
@@ -88,8 +133,10 @@ export default function EmbedTabStrip() {
   // Persist to sessionStorage + notify plugin on every change
   const persist = useCallback((newTabs: Tab[], newIndex: number) => {
     const slugs = newTabs.map(t => t.slug)
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(slugs))
-    sessionStorage.setItem(STORAGE_INDEX_KEY, String(newIndex))
+    // Storage can be full or denied in a host iframe; the host event and the
+    // navigation that follow must still happen.
+    safeSetSessionItem(STORAGE_KEY, JSON.stringify(slugs))
+    safeSetSessionItem(STORAGE_INDEX_KEY, String(newIndex))
     window.dispatchEvent(new CustomEvent('kirocrew-tab-update', {
       detail: { tabs: slugs, activeIndex: newIndex }
     }))
@@ -203,6 +250,28 @@ export default function EmbedTabStrip() {
 
   // --- Drag reorder: tab follows cursor, reorder on drop ---
   const dragRef = useRef<{ index: number; slug: string; startX: number; active: boolean } | null>(null)
+  // Armed only when setPointerCapture THROWS on pointer-down (see
+  // onPointerDown below). An uncaptured drag gets no retargeting and no
+  // lostpointercapture, so a release outside the strip never reaches it and
+  // the reorder state strands mid-drag. Window-level up/cancel listeners for
+  // that specific pointerId are the one place the terminal event can still
+  // be heard — the same acquisition-side fallback the shared usePointerDrag
+  // hook arms.
+  const fallbackRef = useRef<{ pointerId: number; dispose: () => void } | null>(null)
+  const disarmFallback = useCallback(() => {
+    fallbackRef.current?.dispose()
+    fallbackRef.current = null
+  }, [])
+  // Latest-ref routing for the window fallback armed in onPointerDown: the
+  // end handlers below are defined after it, so the fallback calls through
+  // here instead of naming them (same latest-ref pattern as tabsRef).
+  const dragEndRef = useRef({
+    up: (_e: React.PointerEvent | PointerEvent) => {},
+    cancel: () => {},
+  })
+  // If the component unmounts mid-uncaptured-drag, the window listeners must
+  // not outlive it.
+  useEffect(() => disarmFallback, [disarmFallback])
   const [dragSlug, setDragSlug] = useState<string | null>(null)
   const [dragOffset, setDragOffset] = useState(0)
   const tabRefs = useRef<(HTMLDivElement | null)[]>([])
@@ -231,13 +300,37 @@ export default function EmbedTabStrip() {
     const strip = stripRef.current
     if (!strip) return
 
+    // A new press replaces whatever drag dragRef held, so a fallback armed
+    // for the outgoing pointer goes with it.
+    disarmFallback()
     dragRef.current = {
       index,
       slug: tabs[index].slug || `new-${index}`,
       startX: e.clientX,
       active: false,
     }
-    strip.setPointerCapture(e.pointerId)
+    let captured = true
+    try { strip.setPointerCapture(e.pointerId) } catch { captured = false }
+    if (!captured) {
+      // The drag still starts (tab activation below still runs), but the
+      // gesture must remain terminable: without retargeting, a release
+      // outside the strip never reaches it.
+      const pointerId = e.pointerId
+      const onWindowEnd = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        if (ev.type === 'pointercancel') dragEndRef.current.cancel()
+        else dragEndRef.current.up(ev)
+      }
+      window.addEventListener('pointerup', onWindowEnd)
+      window.addEventListener('pointercancel', onWindowEnd)
+      fallbackRef.current = {
+        pointerId,
+        dispose: () => {
+          window.removeEventListener('pointerup', onWindowEnd)
+          window.removeEventListener('pointercancel', onWindowEnd)
+        },
+      }
+    }
 
     // Activate the tab being dragged
     if (index !== activeIndex) {
@@ -278,12 +371,14 @@ export default function EmbedTabStrip() {
   }
 
   const onPointerCancel = () => {
+    disarmFallback()
     dragRef.current = null
     setDragSlug(null)
     setDragOffset(0)
   }
 
-  const onPointerUp = (e: React.PointerEvent) => {
+  const onPointerUp = (e: React.PointerEvent | PointerEvent) => {
+    disarmFallback()
     const d = dragRef.current
     dragRef.current = null
     if (!d?.active) {
@@ -335,9 +430,21 @@ export default function EmbedTabStrip() {
     }, 0)
   }
 
+  // Publish the end handlers for the window fallback armed in onPointerDown.
+  dragEndRef.current = { up: onPointerUp, cancel: onPointerCancel }
+
   const getTitle = (slug: string, _index: number) => {
     if (!slug) return i18nT('components.embedTabStrip.sessions')
-    return slots.find(s => s.key === slug)?.title || slug
+    // A slug with no slot row has an unknown title, so it shows the slug
+    // rather than claiming the session is untitled.
+    const slot = slots.find(s => s.key === slug)
+    return slot ? sessionDisplayTitle(slot) : slug
+  }
+  // An untitled tab's hover keeps its key, so two untitled tabs stay tellable
+  // apart; the label itself never shows the key.
+  const getHoverTitle = (slug: string, title: string) => {
+    const slot = slug ? slots.find(s => s.key === slug) : undefined
+    return slot && isUntitledSession(slot) ? `${title} · ${slug}` : title
   }
 
   // Status dot color per tab
@@ -380,6 +487,7 @@ export default function EmbedTabStrip() {
               role="tab"
               tabIndex={0}
               aria-selected={active}
+              title={getHoverTitle(tab.slug, title)}
               onPointerDown={e => onPointerDown(e, i)}
               onClick={() => { if (!dragRef.current?.active) selectTab(i) }}
               onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectTab(i) } }}
@@ -412,7 +520,7 @@ export default function EmbedTabStrip() {
                 onPointerDown={e => e.stopPropagation()}
                 onClick={e => { e.stopPropagation(); closeTab(i) }}
                 className={`transition-opacity ${
-                  active ? 'opacity-60 hover:opacity-100 hover:text-text' : 'opacity-0 group-hover/tab:opacity-60 group-focus-within/tab:opacity-60 hover:!opacity-100 hover:text-text'
+                  active ? 'opacity-60 hover:opacity-100 hover:text-text' : 'opacity-0 group-hover/tab:opacity-60 [@media(hover:none)]:opacity-60 group-focus-within/tab:opacity-60 hover:!opacity-100 hover:text-text'
                 }`}
                 aria-label={i18nT('components.embedTabStrip.close_tab')}
               >
@@ -439,7 +547,7 @@ export default function EmbedTabStrip() {
         onClick={e => {
           if (e.shiftKey) {
             // Shift+click: create new session directly
-            createSlotMutation.mutate()
+            createSlotMutation.mutate(tabsRef.current[activeIndexRef.current])
           } else {
             addTab()
           }

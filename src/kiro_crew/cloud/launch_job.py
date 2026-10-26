@@ -200,6 +200,8 @@ class LaunchJob:
     #: read is answered by reading them. Kept off ``error`` because the retry
     #: worker clears that field as routine state, which would drop the guard.
     target_unreadable: bool = False
+    # Explicit EC2 subnet (the VPC follows from it); empty = network auto-discovery.
+    subnet_id: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -228,6 +230,7 @@ class LaunchJob:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "login_target": self.login_target.to_dict(),
+            "subnet_id": self.subnet_id,
         }
 
     @classmethod
@@ -271,6 +274,7 @@ class LaunchJob:
             provider_id=str(d.get("provider_id") or BUILTIN_PROVISIONER_ID),
             login_target=login_target,
             target_unreadable=target_unreadable,
+            subnet_id=str(d.get("subnet_id") or ""),
         )
 
 
@@ -345,6 +349,7 @@ class LaunchJobStore:
         provider_id: str = BUILTIN_PROVISIONER_ID,
         step_labels: Optional[Mapping[str, str]] = None,
         login_target: Optional[KiroLoginTarget] = None,
+        subnet_id: str = "",
     ) -> LaunchJob:
         """Build + persist a fresh PENDING job.
 
@@ -363,11 +368,12 @@ class LaunchJobStore:
         job = LaunchJob(
             id=_new_job_id(),
             profile=profile,
-            region=region,
+            region=region or _default_region(),
             size_key=size_key,
             provider_id=provider_id,
             steps=default_steps(step_labels),
             login_target=login_target or KiroLoginTarget(),
+            subnet_id=subnet_id,
         )
         # Claim ownership BEFORE the file exists. `reap_orphans` spares only jobs this
         # process owns, and it runs off the event loop: a reap already in flight can
@@ -905,6 +911,30 @@ def _rollback_failed_provision(
     logger.warning("Rollback of %s after provision failure did not confirm", job.tag)
 
 
+def _default_region() -> str:
+    """The region a launch uses when the caller named none.
+
+    The operator's configured region first, then the AWS default the config
+    itself falls back to. Resolved HERE rather than at each call site because
+    every provisioner's preflight refuses an empty region -- the Fargate
+    identity check reports it as ``region='' is not a region``, which reads as a
+    malformed value rather than an absent one -- and a caller that simply has no
+    region to send (the Settings form posting a body without the field) would
+    otherwise fail at preflight instead of using the region the operator already
+    configured.
+
+    Guarded, because a launch must not fail on an unreadable config file: an
+    unreadable one leaves the region empty and the preflight refusal stands,
+    which is the same outcome as before and names the real problem.
+    """
+    try:
+        from kiro_crew.cloud.config import CloudConfig
+
+        return str(CloudConfig.load().region or "")
+    except Exception:  # noqa: BLE001 - a bad config is the preflight's to report
+        return ""
+
+
 def _new_tag() -> str:
     return f"kc-{secrets.token_hex(3)}"
 
@@ -964,8 +994,10 @@ def run_launch(
         # 2) Provision (create instance + install; blocks until healthy)
         _check_cancel()
         s = _activate(STEP_PROVISION)
+        # Only the built-in EC2 engine takes a subnet; the handler refuses it elsewhere.
+        subnet = {"subnet_id": job.subnet_id} if job.subnet_id else {}
         job.instance_id = engine.provision(
-            tag=job.tag, size_key=job.size_key, profile=job.profile, region=job.region
+            tag=job.tag, size_key=job.size_key, profile=job.profile, region=job.region, **subnet
         )
         s.detail = job.instance_id
         s.state = STEP_DONE

@@ -1,8 +1,9 @@
 // Configuring a remote crew from the pre-dashboard gateway-failure dialog.
 //
 // When the offer is coherent, and the validated store write it performs, live
-// here so both are unit-testable without an Electron runtime. The dialog markup
-// and the input window stay in the supervisor.
+// here so both are unit-testable without an Electron runtime. The failure-dialog
+// markup stays in the supervisor; the Add/Edit Remote Crew input window lives in
+// runtime/gateway/remote-crew-prompt.js.
 
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
 const { isSelectablePort, setRemoteHostConfig } = require("./host-config");
@@ -42,8 +43,8 @@ function remoteCrewAction({ localGatewayOff = false, remoteHost = "" } = {}) {
  * refused, otherwise what the store holds for this port. A refused save writes
  * nothing, so the store cannot supply them.
  *
- * @param {{host?: unknown, binPath?: unknown, remotePort?: unknown, remotePath?: unknown}} source
- * @returns {{host: string, binPath: string, remotePort: string, remotePath: string}}
+ * @param {{host?: unknown, binPath?: unknown, remotePort?: unknown, remotePath?: unknown, manageTunnel?: unknown}} source
+ * @returns {{host: string, binPath: string, remotePort: string, remotePath: string, manageTunnel: boolean}}
  */
 function remoteCrewDraft(source = {}) {
   return {
@@ -51,6 +52,7 @@ function remoteCrewDraft(source = {}) {
     binPath: String(source.binPath || ""),
     remotePort: String(source.remotePort || ""),
     remotePath: String(source.remotePath || ""),
+    manageTunnel: source.manageTunnel === true,
   };
 }
 
@@ -59,7 +61,7 @@ function remoteCrewDraft(source = {}) {
  * was dismissed without saving. Only a JSON object payload counts as a save.
  *
  * @param {unknown} title
- * @returns {{host: string, binPath: string, remotePort: string, remotePath: string}|null}
+ * @returns {{host: string, binPath: string, remotePort: string, remotePath: string, manageTunnel: boolean}|null}
  */
 function parseRemoteCrewFields(title) {
   const payload = String(title || "");
@@ -73,6 +75,7 @@ function parseRemoteCrewFields(title) {
     binPath: String(parsed.binPath || "").trim(),
     remotePort: String(parsed.remotePort || "").trim(),
     remotePath: String(parsed.remotePath || "").trim(),
+    manageTunnel: parsed.manageTunnel === true,
   };
 }
 
@@ -85,7 +88,7 @@ function parseRemoteCrewFields(title) {
  *
  * @param {{get: (key: string) => unknown, set: (key: string, value: unknown) => void}} store
  * @param {number|string} port
- * @param {{host?: unknown, binPath?: unknown, remotePort?: unknown, remotePath?: unknown}} fields
+ * @param {{host?: unknown, binPath?: unknown, remotePort?: unknown, remotePath?: unknown, manageTunnel?: unknown}} fields
  * @returns {{saved: boolean, error: string|null}}
  */
 function saveRemoteCrewConfig(store, port, fields = {}) {
@@ -102,14 +105,29 @@ function saveRemoteCrewConfig(store, port, fields = {}) {
   const remotePath = String(fields.remotePath || "").trim();
   const error = validateRemoteSettings(host, binPath, remotePort, remotePath);
   if (error) return { saved: false, error };
-  setRemoteHostConfig(store, port, { host, binPath, remotePort, remotePath });
+  const manageTunnel = fields.manageTunnel === true;
+  setRemoteHostConfig(store, port, { host, binPath, remotePort, remotePath, manageTunnel });
   return { saved: true, error: null };
+}
+
+/** The label both remote-crew forms show on the managed-tunnel option. */
+const TUNNEL_OPTION_LABEL = "Keep an SSH tunnel to this crew open";
+
+/** The hint under that option, worded the same in every form that offers it. */
+function tunnelOptionHint(port) {
+  return (
+    "Kiro Crew opens this tunnel itself and reopens it after sleep or a dropped connection. " +
+    "Your SSH host must sign in without a password prompt (a key or agent). " +
+    `Leave unchecked only if something else, such as a VPN or kubectl port-forward, must keep carrying port ${port}.`
+  );
 }
 
 module.exports = {
   MISSING_HOST_ERROR,
+  TUNNEL_OPTION_LABEL,
   parseRemoteCrewFields,
   remoteCrewAction,
   remoteCrewDraft,
   saveRemoteCrewConfig,
+  tunnelOptionHint,
 };

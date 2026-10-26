@@ -20,10 +20,13 @@
  * relayed, so no policy is duplicated here. The parent is the gate.
  *
  * Two call sites: `hooks/useNativeNotification.ts` (bell notes, which is also
- * how an approval reaches the OS) and `hooks/useWebSocket.ts` (chat finished).
+ * how an approval reaches the OS) and `hooks/websocket/turnCompletion.ts`
+ * (chat finished).
  */
 import { isEmbeddedPane } from './embedded'
 import { parseLoopbackOriginPort } from './tunnelOrigin'
+import { appPathname } from './basePath'
+import { isElectron } from './electron'
 
 export const NATIVE_NOTIFY_TYPE = 'mc-native-notify'
 export const NATIVE_NOTIFY_VERSION = 1
@@ -40,6 +43,12 @@ export interface NativeNotifyOptions {
   silent?: boolean
   /** Pane-local URL; not relayed (the parent shows its own app icon). */
   icon?: string
+  /**
+   * Click payload. `url` is the note's deep link, read by the service worker's
+   * `notificationclick`, so a banner that replaces a same-tag push banner keeps
+   * the push banner's destination. Not relayed.
+   */
+  data?: { url?: string }
 }
 
 /** Wire shape a pane posts to its parent. */
@@ -70,7 +79,7 @@ export interface NativeNotifyEnvelope {
 export function relayTargetOrigin(): string | null {
   if (!isEmbeddedPane()) return null
   try {
-    if (window.location.pathname.startsWith('/embed/')) return null
+    if (appPathname().startsWith('/embed/')) return null
     if (!document.referrer) return null
     const origin = new URL(document.referrer).origin
     return parseLoopbackOriginPort(origin) === null ? null : origin
@@ -121,11 +130,47 @@ export function postNativeNotification(title: string, options: NativeNotifyOptio
     return
   }
   if (typeof Notification === 'undefined') return
-  try {
-    new Notification(title, { ...options, silent })
-  } catch {
-    /* unsupported platform */
+  deliverNativeNotification(title, { ...options, silent })
+}
+
+/**
+ * Show an OS notification, preferring the service worker registration over the
+ * page-context `new Notification(...)` constructor.
+ *
+ * The constructor throws "Illegal constructor" in an installed iOS PWA (and on
+ * Android Chrome, #1828), where the OS only permits notifications through
+ * `ServiceWorkerRegistration.showNotification()`. When a service worker is
+ * registered we deliver through it; otherwise (a desktop browser with no active
+ * registration) we fall back to the constructor. The desktop app always uses
+ * the constructor: that is the call Electron renders as an OS banner
+ * (electron/permission-handler.js `notifications`), while a service-worker
+ * notification there can resolve without showing anything. Both paths swallow their
+ * errors: an uncaught throw on the WebSocket message path kills the rest of the
+ * handler, and an unsupported platform is not the caller's problem.
+ */
+function deliverNativeNotification(title: string, options: NotificationOptions): void {
+  const withConstructor = () => {
+    try {
+      new Notification(title, options)
+    } catch {
+      /* unsupported platform */
+    }
   }
+  if (!isElectron && typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+    // navigator.serviceWorker.ready never settles when registration failed or
+    // was unregistered (stale-shell heal). Race against a timeout so the
+    // constructor fallback fires instead of hanging silently.
+    const SW_READY_TIMEOUT_MS = 2_000
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), SW_READY_TIMEOUT_MS))
+    Promise.race([navigator.serviceWorker.ready, timeout])
+      .then((reg) => {
+        if (reg) return reg.showNotification(title, options)
+        withConstructor()
+      })
+      .catch(withConstructor)
+    return
+  }
+  withConstructor()
 }
 
 /**

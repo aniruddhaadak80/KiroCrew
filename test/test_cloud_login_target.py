@@ -406,7 +406,10 @@ class TestLoginModule:
         # The directory is reaped once the login process exits.
         assert 'rm -rf "$(dirname "$0")"' in pinned
         plain = login._device_login_command(replace_existing=False)
-        assert "python3" not in plain and "nohup stdbuf" in plain and "mktemp" not in plain
+        # No driver staging for Builder ID: no python3, no pty directory. (The route
+        # prelude's own one-line `mktemp` for the probe's stderr is not that.)
+        assert "python3" not in plain and "nohup stdbuf" in plain
+        assert "kirocrew-login-pty" not in plain and "mktemp -d" not in plain
 
     def test_driver_staging_failure_is_reported_by_name(self, monkeypatch):
         _ssm_script(
@@ -970,10 +973,10 @@ class TestHandlerBoundary:
         monkeypatch.setattr(sessions_mod, "scrub_agent_subprocess_env", lambda: {})
         current: dict[str, object] = {}
 
-        async def fake_spawn(*argv, **kw):
+        async def fake_spawn(argv, **kw):
             return current["proc"]
 
-        monkeypatch.setattr(sessions_mod, "create_subprocess_limited", fake_spawn)
+        monkeypatch.setattr(sessions_mod, "spawn_supervised_oneshot", fake_spawn)
         current["proc"] = _Proc(1, b"Error: session expired")
         assert await sessions_mod._fetch_whoami_or_none("/bin/kiro-cli") is None
         current["proc"] = _Proc(0, b"{}")

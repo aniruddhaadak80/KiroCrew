@@ -32,7 +32,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from kiro_crew import cron as cron_module
-from kiro_crew.cron import CronJob, CronService, _RunClaim, _RunMarkers
+from kiro_crew.cron import CronJob, CronService, _RunClaim
 from kiro_crew.cron_inflight import clear_marker as _clear_marker
 from kiro_crew.cron_inflight import read_markers
 from kiro_crew.dashboard.handlers.cron import api_cron_cancel, api_cron_run
@@ -300,7 +300,6 @@ class TestCancelInsideTheClaimWindow:
         assert wrapper is not None and wrapper.cancelled()
         assert executed == []
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks
         assert job.last_status == "error"
         assert (job.last_error or "").startswith("Cancelled by user")
         runs, total = await svc._history.get_job_history(job.id)
@@ -361,7 +360,6 @@ class TestCancelInsideTheClaimWindow:
         ), f"the run was dispatched {dispatched!r} while cancel() was tearing it down"
         assert wrapper.done() and not wrapper.cancelled() and wrapper.result() is False
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 1
         assert runs[0]["status"] == "cancelled"
@@ -455,7 +453,6 @@ class TestCancelInsideTheClaimWindow:
 
         assert second.done() and not second.cancelled() and second.result() is True
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks
         assert (job.last_error or "").startswith("Cancelled by user")
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
@@ -558,7 +555,6 @@ class TestCancelInsideTheClaimWindow:
 
         assert tracked.done() and not tracked.cancelled() and tracked.result() is True
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
         assert [r["status"] for r in runs] == ["cancelled", "cancelled"]
@@ -646,7 +642,6 @@ class TestCancelInsideTheClaimWindow:
 
         assert read_markers(tmp_path) == []
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
         assert [r["status"] for r in runs] == ["cancelled", "cancelled"]
@@ -657,8 +652,8 @@ class TestCancelInsideTheClaimWindow:
     ) -> None:
         """Two cancellations in flight at once each finalize as cancelled.
 
-        cancel() marks the run it releases, and that run's ``finally`` consumes
-        the marker only after a full executor round trip (``clear_marker``).
+        cancel() flags the run it takes, and that run's ``finally`` reads the
+        flag only after a full executor round trip (``clear_marker``).
         While the first run's finalizer is still in that trip, a replacement Run
         is accepted through the real route, dispatches, and is cancelled too;
         then the first finalizer resumes. A marker keyed by job id alone is ONE
@@ -697,7 +692,7 @@ class TestCancelInsideTheClaimWindow:
                         clearing.parked(1), "the first run never reached its marker clear"
                     )
                     assert not prior.done()
-                    assert svc._cancelled_jobs.has(job.id, prior_claim)
+                    assert prior_claim.cancelled
 
                     # The replacement is accepted, dispatches, and is cancelled too.
                     replacement = await client.post(f"/api/crons/{job.id}/run")
@@ -718,18 +713,15 @@ class TestCancelInsideTheClaimWindow:
                     assert total == 2
                     assert [r["status"] for r in runs] == ["cancelled", "cancelled"]
 
-                    # The first finalizer resumes and consumes ITS cancellation;
-                    # the replacement's marker has to survive it.
+                    # The first finalizer resumes and settles ITS cancellation;
+                    # the replacement's flag has to survive it.
                     clearing.release(1).set()
                     await _settled(prior)
                     assert prior.cancelled()
-                    assert svc._cancelled_jobs.has(job.id, later_claim), (
-                        "the prior run's finalizer consumed the replacement run's cancel "
-                        "marker, so the replacement will finalize as if it had completed"
+                    assert later_claim.cancelled, (
+                        "the prior run's finalizer cleared the replacement run's cancel "
+                        "flag, so the replacement will finalize as if it had completed"
                     )
-                    assert not svc._cancelled_jobs.has(
-                        job.id, prior_claim
-                    ), "the prior run's finalizer consumed a marker that was not its own"
 
                     # Then the replacement's finalizer: cancelled, not completed.
                     clearing.release(2).set()
@@ -738,7 +730,6 @@ class TestCancelInsideTheClaimWindow:
             finally:
                 clearing.release_all()
 
-        assert not svc._cancelled_jobs._marks
         assert job.id not in svc._claims
         runs, total = await svc._history.get_job_history(job.id)
         assert [r["status"] for r in runs] == ["cancelled", "cancelled"], (
@@ -773,15 +764,30 @@ class TestCancelInsideTheClaimWindow:
         gate = _SnapshotGate(svc, park_call=4)
         merging = _FirstCallGate(svc._merge_job_result)
         state = _make_state(svc)
+        # The first run's refresh is NOT parked here (call 4 is the replacement's), so
+        # by the time the route's response reaches the client ``_run_claimed_manual``
+        # may already have swapped the claim's task for its inner ``_run_job_isolated``
+        # task -- whose result is None, not the wrapper's True. Reading
+        # ``svc._claims[job.id].task`` after the POST therefore named one task or the
+        # other by scheduling luck (red in two of five full-suite runs of a sweep).
+        # The wrapper is taken from the seam the route hands it through instead.
+        attached: list[asyncio.Task[Any]] = []
+        real_attach = svc.attach_run_task
+
+        def _attach(job_id: str, task: asyncio.Task[Any]) -> None:
+            attached.append(task)
+            real_attach(job_id, task)
+
         with (
             patch.object(svc, "_synced_snapshot", gate),
             patch.object(svc, "_merge_job_result", merging),
+            patch.object(svc, "attach_run_task", _attach),
         ):
             try:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    first = svc._claims[job.id].task
+                    first = attached[0]
                     # The first run has released its claim and parks in its merge;
                     # its wrapper resumes only once that merge and the history
                     # append are done.
@@ -1179,7 +1185,6 @@ class TestCancelInsideTheClaimWindow:
 
         assert executed == [job.id]
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks
         assert (job.last_error or "").startswith("Cancelled by user")
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 1
@@ -1273,7 +1278,6 @@ class TestCancelInsideTheClaimWindow:
         assert executed == [], "the cancelled-before-start run executed"
         assert task.done()
         assert job.id not in svc._claims
-        assert not svc._cancelled_jobs._marks, "the run's cancel marker was never consumed"
         # The task stamped nothing: a task handed the claim but not re-checking
         # it would have drawn a generation and stamped the monotonic start and
         # the jitter on a claim that is not its own to release.
@@ -1334,28 +1338,18 @@ class TestRunJobClaim:
         assert svc._claims[job.id] is claim
 
 
-class TestRunMarkers:
-    def test_markers_are_keyed_by_run_identity_not_equality(self) -> None:
-        """Two like-for-like claims are two runs: each marker is consumed by its own run only."""
-        markers = _RunMarkers()
+class TestRunFlags:
+    def test_cancel_and_reap_flags_belong_to_one_run_object(self) -> None:
+        """Two like-for-like claims are two runs: a flag set on one is not the other's."""
         first = _RunClaim(trigger="manual", claimed_at=1.0, marker_run="same")
         second = _RunClaim(trigger="manual", claimed_at=1.0, marker_run="same")
         assert first is not second
+        assert not (first.cancelled or first.reaped or second.cancelled or second.reaped)
 
-        markers.mark("job", first)
-        markers.mark("job", first)  # marking the same run twice is one marker
-        assert markers.has("job", first)
-        assert markers.has("job", first) and not markers.has("job", second)
-        assert not markers.has("job", None)
-
-        markers.mark("job", second)
-        assert markers.consume("job", first) is True
-        assert markers.has("job", second), "consuming one run's marker removed the other's"
-        assert markers.consume("job", first) is False
-        assert markers.consume("job", second) is True
-        assert not markers._marks
-        assert markers.consume("job", second) is False
-        assert markers.consume("other", None) is False
+        first.cancelled = True
+        second.reaped = True
+        assert first.cancelled and not first.reaped
+        assert second.reaped and not second.cancelled
 
 
 class TestTerminalMergeGeneration:

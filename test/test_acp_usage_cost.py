@@ -24,9 +24,6 @@ from kiro_crew.acp.types import AcpPromptStats, TurnUsage
 
 
 class TestParseUsageCost:
-    def test_flat_cost_amount(self):
-        assert parse_usage_cost({"cost": {"amount": 0.42, "currency": "USD"}}) == 0.42
-
     def test_nested_usage_cost_fallback(self):
         update = {"usage": {"used": 1, "size": 2, "cost": {"amount": 1.5}}}
         assert parse_usage_cost(update) == 1.5
@@ -66,32 +63,41 @@ class TestParseUsageCost:
     def test_malformed_degrades_to_absent(self, cost):
         assert parse_usage_cost({"cost": cost}) is None
 
-    def test_zero_amount_is_valid(self):
-        assert parse_usage_cost({"cost": {"amount": 0}}) == 0.0
-
-    def test_non_usd_currency_drops_cost(self):
-        # Consumers store the result in cost_usd fields — a non-USD amount
-        # must degrade to absent, never be mislabeled as USD.
-        assert parse_usage_cost({"cost": {"amount": 0.42, "currency": "EUR"}}) is None
-
-    def test_absent_currency_is_lenient(self):
-        # Adapters that omit currency keep working; USD is assumed.
-        assert parse_usage_cost({"cost": {"amount": 0.42}}) == 0.42
-
-    def test_currency_match_is_case_sensitive_exact_usd(self):
-        # ISO 4217 codes are uppercase; a lowercase "usd" is treated as
-        # not-USD and drops the cost (exact-match posture, pinned).
-        assert parse_usage_cost({"cost": {"amount": 0.42, "currency": "usd"}}) is None
-
-    def test_non_string_currency_drops_cost(self):
-        # A non-string currency value is present-and-not-"USD" → absent.
-        assert parse_usage_cost({"cost": {"amount": 0.42, "currency": 42}}) is None
-
-    def test_explicit_null_currency_treated_as_absent(self):
-        # Policy: "present (not None)" — an explicit
-        # JSON null reads as the adapter omitting currency, so lenience applies.
-        # Pinned so a refactor to `"currency" in cost` can't silently flip it.
-        assert parse_usage_cost({"cost": {"amount": 0.42, "currency": None}}) == 0.42
+    @pytest.mark.parametrize(
+        ("cost", "expected"),
+        [
+            pytest.param({"amount": 0.42, "currency": "USD"}, 0.42, id="flat_cost_amount"),
+            pytest.param({"amount": 0}, 0.0, id="zero_amount_is_valid"),
+            # Consumers store the result in cost_usd fields — a non-USD amount
+            # must degrade to absent, never be mislabeled as USD.
+            pytest.param(
+                {"amount": 0.42, "currency": "EUR"}, None, id="non_usd_currency_drops_cost"
+            ),
+            # Adapters that omit currency keep working; USD is assumed.
+            pytest.param({"amount": 0.42}, 0.42, id="absent_currency_is_lenient"),
+            # ISO 4217 codes are uppercase; a lowercase "usd" is treated as
+            # not-USD and drops the cost (exact-match posture, pinned).
+            pytest.param(
+                {"amount": 0.42, "currency": "usd"},
+                None,
+                id="currency_match_is_case_sensitive_exact_usd",
+            ),
+            # A non-string currency value is present-and-not-"USD" → absent.
+            pytest.param(
+                {"amount": 0.42, "currency": 42}, None, id="non_string_currency_drops_cost"
+            ),
+            # Policy: "present (not None)" — an explicit JSON null reads as the
+            # adapter omitting currency, so lenience applies. Pinned so a refactor
+            # to `"currency" in cost` can't silently flip it.
+            pytest.param(
+                {"amount": 0.42, "currency": None},
+                0.42,
+                id="explicit_null_currency_treated_as_absent",
+            ),
+        ],
+    )
+    def test_currency_policy(self, cost, expected):
+        assert parse_usage_cost({"cost": cost}) == expected
 
     def test_nested_shape_currency_guard_applies(self):
         # The guard runs after the flat/nested resolution, so the nested
@@ -175,15 +181,16 @@ class TestPromptStatsCostDelta:
         nxt.apply_cost_cumulative(0.40)
         assert math.isclose(nxt.cost_usd, 0.15)
 
-    def test_cumulative_reset_never_emits_negative_delta(self):
+    def test_cumulative_drop_rebases_and_bills_nothing(self):
         stats = AcpPromptStats()
         stats.apply_cost_cumulative(0.25)
-        # Adapter restarted: cumulative dropped below the baseline. The new
-        # total is spend since the reset — taken whole, never negative.
+        # The ledger came back at a total Crew never saw: taking it whole would
+        # re-bill a restored session's lifetime, so it rebases and bills $0.
         stats.apply_cost_cumulative(0.05)
-        assert math.isclose(stats.cost_usd, 0.30)
-        assert stats.cost_usd >= 0.25  # never went down
+        assert math.isclose(stats.cost_usd, 0.25)
         assert math.isclose(stats.cost_session_usd, 0.05)
+        stats.apply_cost_cumulative(0.07)
+        assert math.isclose(stats.cost_usd, 0.27)
 
     def test_reset_context_state_drops_baseline(self):
         stats = AcpPromptStats()
@@ -254,6 +261,8 @@ class TestToTurnUsage:
 def _bare_client() -> AcpClient:
     client = AcpClient.__new__(AcpClient)  # avoid spawning a real process
     client.last_prompt_stats = AcpPromptStats()
+    # No identity read at spawn; _reset_state then keeps its prefix-matched untrack.
+    client._spawn_start_token = None
     return client
 
 
@@ -315,12 +324,13 @@ class TestClientTracking:
         client._track_prompt_usage({"stopReason": "end_turn"})
         assert client.last_prompt_stats.to_turn_usage() == TurnUsage()
 
-    def test_reset_state_drops_cost_baseline(self):
-        """A replacement process restarts the adapter's cumulative cost counter
-        at zero. If the delta baseline survived ``_reset_state``, a new counter
-        that catches back up to the old total would bill only the difference
-        (the monotonic guard cannot see a caught-up counter), silently dropping
-        spend."""
+    def test_reset_state_keeps_cost_baseline(self):
+        """``_reset_state`` leaves the baseline to how the next session opens.
+
+        A restore of the same session brings the old ledger back, so the
+        baseline must survive the process; a ``session/new`` zeroes it through
+        ``begin_cost_session``.
+        """
         from collections import deque
         from unittest.mock import patch
 
@@ -342,13 +352,12 @@ class TestClientTracking:
         with patch("kiro_crew.session._untrack_pid"):
             client._reset_state()
 
-        assert client.last_prompt_stats.cost_session_usd == 0.0
-        # The already-billed per-turn delta is kept (carry_over() zeroes it at
-        # the next turn boundary); only the process-scoped baseline restarts.
+        assert client.last_prompt_stats.cost_session_usd == pytest.approx(0.50)
+        # The already-billed per-turn delta is kept; carry_over() zeroes it at
+        # the next turn boundary.
         assert client.last_prompt_stats.cost_usd == pytest.approx(0.50)
-        # The new process's first reading is billed whole, not delta'd against
-        # the dead process's counter.
         client.last_prompt_stats = client.last_prompt_stats.carry_over()
+        client.last_prompt_stats.begin_cost_session("s-new")
         client.last_prompt_stats.apply_cost_cumulative(0.55)
         assert client.last_prompt_stats.cost_usd == pytest.approx(0.55)
 
@@ -369,8 +378,8 @@ class TestPersistGateFires:
         stats.apply_prompt_token_usage(100, 50, 30, 20)
         u = stats.to_turn_usage()
 
-        # The chat-runner persist gate (chat_runner.py) drops an all-zero row, so
-        # the claude seam must produce a nonzero field for the row to be written.
+        # The chat-runner persist gate (_on_complete in chat_turn/turn_stats.py) drops an
+        # all-zero row, so the claude seam must produce a nonzero field for the row to be written.
         assert u.input_tokens or u.output_tokens or u.credits
 
         usage_mod.persist_token_record("slot-1", "test-model", u, "acp")

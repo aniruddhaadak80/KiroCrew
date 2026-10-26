@@ -28,8 +28,8 @@ import {
   sourceProjectHost,
   sourceProjectPath,
   sourceProviderDescriptor,
-  type PullRequestLink,
   type PullRequestProvider,
+  type SourceLinkRef,
   type SourceProviderCapabilities,
   type SourceProviderIcon,
 } from './pullRequestLinks'
@@ -44,12 +44,14 @@ export interface SourceProviderMeta {
   /** Short reference, for the title suffix where the title already precedes it:
    *  `#12`, `!12`, `CR-123`. */
   numberLabel: (n: number) => string
-  /** Which bundled logo to draw, or null for a provider that ships none. */
+  /** Which bundled logo to draw, or null for a provider that ships none. Read by
+   *  `SourceProviderMark`, the one resolver every source-link surface draws through. */
   logo: 'github' | 'gitlab' | null
   /** A registered provider's own glyph component, carried verbatim from its
-   *  descriptor. Checked by renderers BEFORE the `logo` name so an edition mark
-   *  wins over the neutral fallback; built-ins never set it. Still "no JSX in
-   *  this util": it is a component reference the renderer instantiates. */
+   *  descriptor. Drawn when there is no bundled `logo` (a registered provider
+   *  never has one), ahead of the neutral fallback, so an edition mark wins over
+   *  it; built-ins never set it. Still "no JSX in this util": it is a component
+   *  reference the renderer instantiates. */
   icon?: SourceProviderIcon
   /** True when this provider's objects are "pull requests" rather than "merge
    *  requests". Selects between the EXISTING catalog key pairs rather than
@@ -66,7 +68,7 @@ const GITHUB_META: SourceProviderMeta = {
   numberLabel: n => `#${n}`,
   logo: 'github',
   pullRequestWording: true,
-  capabilities: { checks: true, mergeState: true, resolveThreads: true, comment: true },
+  capabilities: { checks: true, mergeState: true, mergeActions: true, resolveThreads: true, comment: true },
 }
 
 const GITLAB_META: SourceProviderMeta = {
@@ -76,16 +78,46 @@ const GITLAB_META: SourceProviderMeta = {
   numberLabel: n => `!${n}`,
   logo: 'gitlab',
   pullRequestWording: false,
-  // Checks and merge state are read for GitLab; the thread and comment WRITES
-  // are GitHub-only in the gateway, which is why `CommentThreads` renders its
-  // read-only notice for a merge request today. These flags encode that, so the
-  // panel keeps rendering exactly what it renders now.
-  capabilities: { checks: true, mergeState: true, resolveThreads: false, comment: false },
+  // Checks, merge state, and the thread and comment writes (resolve, reopen,
+  // reply, top-level comment) are all served for GitLab by the gateway.
+  capabilities: { checks: true, mergeState: true, mergeActions: true, resolveThreads: true, comment: true },
+}
+
+const BITBUCKET_SERVER_META: SourceProviderMeta = {
+  id: 'bitbucket_server',
+  displayName: 'Bitbucket Server',
+  refLabel: n => i18nT('components.pullRequestPanel.pr_number', { number: n }),
+  numberLabel: n => `#${n}`,
+  logo: null,
+  pullRequestWording: true,
+  // Read-only: the gateway serves the overview, files, comments and build
+  // status, and refuses every write for this provider.
+  capabilities: { checks: true, mergeState: false, mergeActions: false, resolveThreads: false, comment: false },
+}
+
+const GERRIT_META: SourceProviderMeta = {
+  id: 'gerrit',
+  displayName: 'Gerrit',
+  // Gerrit names a change by its bare number and has no sigil of its own, so the
+  // long form is the word Gerrit itself uses ("Change 466698") and the short
+  // form falls to `#`, the convention most forges share.
+  refLabel: n => i18nT('components.pullRequestPanel.change_number', { number: n }),
+  numberLabel: n => `#${n}`,
+  logo: null,
+  pullRequestWording: true,
+  // Read-only: the gateway serves the overview, files, review threads, label
+  // votes as checks and the merge state, and refuses every write for this
+  // provider. `mergeState` without `mergeActions`: the conflict banner is real
+  // information, while Gerrit has no auto-merge and no draft-to-ready write
+  // this panel could offer.
+  capabilities: { checks: true, mergeState: true, mergeActions: false, resolveThreads: false, comment: false },
 }
 
 const BUILTIN_META: Readonly<Record<string, SourceProviderMeta>> = {
   github: GITHUB_META,
   gitlab: GITLAB_META,
+  bitbucket_server: BITBUCKET_SERVER_META,
+  gerrit: GERRIT_META,
 }
 
 /** Fail-closed defaults for a provider nothing has described: label it the way
@@ -103,7 +135,7 @@ function fallbackMeta(provider: string): SourceProviderMeta {
     numberLabel: n => `#${n}`,
     logo: null,
     pullRequestWording: true,
-    capabilities: { checks: false, mergeState: false, resolveThreads: false, comment: false },
+    capabilities: { checks: false, mergeState: false, mergeActions: false, resolveThreads: false, comment: false },
   }
 }
 
@@ -134,7 +166,11 @@ export function sourceProviderMeta(provider: PullRequestProvider): SourceProvide
     // the descriptor that supplied it.
     icon: typeof descriptor.icon === 'function' ? descriptor.icon : undefined,
     pullRequestWording: true,
-    capabilities: descriptor.capabilities,
+    // A descriptor predating `mergeActions` meant it by `mergeState`.
+    capabilities: {
+      ...descriptor.capabilities,
+      mergeActions: descriptor.capabilities.mergeActions ?? descriptor.capabilities.mergeState,
+    },
   }
 }
 
@@ -175,9 +211,9 @@ export function sourceProviderCapabilities(
  *  different hosts count as distinct and engage qualification. The `MR`/`PR`
  *  word stays with `refLabel` and the i18n catalog; the prefix is an
  *  identifier, not prose, exactly like a provider `displayName`. */
-export function sourceTabQualifier(
-  sources: PullRequestLink[],
-): (link: PullRequestLink) => string | null {
+export function sourceTabQualifier<T extends SourceLinkRef>(
+  sources: T[],
+): (link: T) => string | null {
   const identities = new Set<string>()
   const hostsByPath = new Map<string, Set<string>>()
   for (const item of sources) {
@@ -190,7 +226,7 @@ export function sourceTabQualifier(
     hosts.add(host)
   }
   if (identities.size <= 1) return () => null
-  const fullQualifier = (link: PullRequestLink): string[] | null => {
+  const fullQualifier = (link: SourceLinkRef): string[] | null => {
     const path = sourceProjectPath(link)
     if (!path) return null
     const segments = path.split('/')

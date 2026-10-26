@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -33,12 +34,14 @@ def reset_module_state(monkeypatch):
     mcp_shared._last_startup_race_time = 0.0
     mcp_shared._last_startup_race_key = ""
     mcp_shared._failure_count = 0
+    mcp_shared._last_failure_class = ""
     yield
     mcp_shared._excluded_tools_by_session.clear()
     mcp_shared._last_failure_time = 0.0
     mcp_shared._last_startup_race_time = 0.0
     mcp_shared._last_startup_race_key = ""
     mcp_shared._failure_count = 0
+    mcp_shared._last_failure_class = ""
 
 
 @pytest.fixture
@@ -108,9 +111,9 @@ class TestSuccessCaching:
         monkeypatch.setattr(mcp_shared, "loopback_urlopen", urlopen)
         assert mcp_shared._resolve_excluded_tools() == {"blocked"}
         request = urlopen.call_args.args[0]
-        assert request.full_url == f"http://localhost:{expected_port}/api/session-tool-policy"
+        assert request.full_url == f"http://127.0.0.1:{expected_port}/api/session-tool-policy"
         assert request.get_header("X-internal-secret") == "synthetic-bound-secret"
-        secret.assert_called_once_with(expected_port)
+        secret.assert_called_once_with(expected_port, dial_host="127.0.0.1")
 
     def test_first_call_queries_gateway_then_caches(
         self, fake_sel, patch_session_setup, monkeypatch
@@ -330,6 +333,28 @@ class TestLongCacheFailures:
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.forbidden" in ops
 
+    def test_403_from_a_closed_enterprise_gate_refuses_the_call(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        """The enterprise gate's 403 is not a decision about this caller.
+
+        It refuses every route while closed, this read included, so the exclusion
+        list is unread: the call must be refused, not served as ``policy_forbidden``.
+        Not cached, so the first read after the gate reopens succeeds.
+        """
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        body = b'{"error": "locked", "code": "enterprise_gate_closed", "reason": "login_required"}'
+        urlopen = MagicMock(side_effect=_make_http_error(403, body))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            policy = mcp_shared._resolve_tool_policy()
+        assert policy.excluded == set()
+        assert policy.unresolved == "gateway_locked"
+        assert policy.unresolved in mcp_shared._UNRESOLVED_REFUSES_CALL
+        assert mcp_shared._last_failure_time == 0.0
+        assert mcp_shared._last_startup_race_time == 0.0
+        ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
+        assert "tool_policy.gateway_locked" in ops
+
     def test_409_member_identity_unavailable_is_identity_unattested(
         self, fake_sel, patch_session_setup, monkeypatch
     ):
@@ -359,6 +384,10 @@ class TestLongCacheFailures:
         ]
         assert audits, "the identity refusal must have its own audit event"
         assert "token=absent" in audits[0]["resources"]
+        # Which process asked, so a short-lived tokenless server can be traced
+        # to its launcher after it has exited.
+        assert f"pid={os.getpid()}" in audits[0]["resources"]
+        assert f"ppid={os.getppid()}" in audits[0]["resources"]
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.unreadable" not in ops
         assert mcp_shared._last_failure_time == 0.0
@@ -541,6 +570,60 @@ class TestLongCacheFailures:
         with patch.object(mcp_shared, "loopback_urlopen", urlopen):
             mcp_shared._resolve_tool_policy()
         assert urlopen.call_count == 0
+
+
+class TestFailureCause:
+    """A ``resolution_failed`` read names the exception that caused it."""
+
+    def _failed_event(self, fake_sel):
+        events = [
+            c.kwargs
+            for c in fake_sel.log_api_access.call_args_list
+            if c.kwargs.get("operation") == "tool_policy.resolution_failed"
+        ]
+        assert len(events) == 1, events
+        return events[0]
+
+    def test_audit_event_carries_the_exception_class_and_message(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        urlopen = MagicMock(side_effect=ConnectionRefusedError("gateway port closed"))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            policy = mcp_shared._resolve_tool_policy()
+        assert policy.unresolved == "resolution_failed"
+        assert policy.detail == "ConnectionRefusedError"
+        event = self._failed_event(fake_sel)
+        assert event["error"] == "ConnectionRefusedError: gateway port closed"
+        assert event["resources"] == "error_class=ConnectionRefusedError"
+
+    def test_message_is_redacted_and_capped(self, fake_sel, patch_session_setup, monkeypatch):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        token = "ghp_" + "a1B2" * 9
+        urlopen = MagicMock(side_effect=OSError(f"bad {token} " + "x" * 500))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            mcp_shared._resolve_tool_policy()
+        error = self._failed_event(fake_sel)["error"]
+        assert error.startswith("OSError: bad ")
+        assert token not in error
+        assert len(error) <= len("OSError: ") + mcp_shared._FAILURE_MESSAGE_MAX
+
+    def test_negative_cache_hit_still_names_the_class(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        urlopen = MagicMock(side_effect=TimeoutError("timed out"))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            mcp_shared._resolve_tool_policy()
+            cached = mcp_shared._resolve_tool_policy()
+        assert urlopen.call_count == 1
+        assert cached.detail == "TimeoutError"
+        hits = [
+            c.kwargs
+            for c in fake_sel.log_api_access.call_args_list
+            if c.kwargs.get("operation") == "tool_policy.negative_cache_hit"
+        ]
+        assert hits and hits[-1]["error"] == "TimeoutError"
 
 
 # ─────────────────────────────────────────────────────────────────────

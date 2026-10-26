@@ -11,8 +11,8 @@ those messages gets discussed.
 Posting a reply runs the crewmate's turn in an isolated ``thread:<slot>:<mid>``
 session with the parent message, the main-chat context around it and the
 thread so far as its envelope; the crewmate's answer lands in the same thread.
-The turn runs under the side chat's tool posture -- read-only on the kiro
-harness, no tools elsewhere -- because the thread panel has no approval card
+The turn runs under the side chat's tool posture -- read-only on the kiro,
+KAS and claude harnesses, no tools elsewhere -- because the thread panel has no approval card
 to fall back to. Actions still go through the main chat.
 """
 
@@ -27,13 +27,20 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew.acp_backends import ACP_BACKENDS_SIDE_READONLY
+from kiro_crew.acp_backends import ACP_BACKEND_GOOSE, ACP_BACKENDS_SIDE_READONLY
 from kiro_crew.agent_discovery import warm_project_agent_names
+from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.drivers.acp import (
+    claude_adapter_honours_session_options,
+    goose_side_home_supported,
+)
 from kiro_crew.agent_sdk.host_auth import signed_out_message
 from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access, slot_not_found
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.dashboard.ws import broadcast_thread_reply
 from kiro_crew.history import (
@@ -54,6 +61,7 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.members import DM_SLOT_MODE
 from kiro_crew.security import StreamRedactor, redact
 from kiro_crew.sel import sel
+from kiro_crew.start_priority import StartPriority
 
 logger = logging.getLogger(__name__)
 
@@ -96,11 +104,38 @@ THREAD_INSTRUCTIONS = (
 THREAD_BOUNDARY_PROMPT = (
     "This thread is read-only: lookups work here, but changes don't. Reading "
     "files, searching, fetching pages and read-only shell commands run without "
-    "asking, so use them when a reply needs them. Writing or editing files, "
+    "asking, so use them when a reply needs them. If a file-read, search or "
+    "fetch tool is refused, use a read-only shell command (cat, grep, ls) "
+    "instead rather than retrying it. Writing or editing files, "
     "shell commands that modify anything, and MCP tools are refused here, even "
     "when the user asks for them. Never claim that a tool is unconfigured or "
     "suggest enabling it. If the user wants a change made, tell them to ask in "
     "the main chat."
+)
+
+#: The read-only boundary for a thread session with no shell tool (claude, which
+#: starts it with only its read built-ins).
+THREAD_BOUNDARY_PROMPT_NO_SHELL = (
+    "This thread is read-only: lookups work here, but changes don't. Reading "
+    "files, searching the codebase, and searching or fetching web pages run "
+    "without asking, so use them when a reply needs them. There is no shell "
+    "here. Writing or editing files, running commands, and MCP tools are "
+    "refused here, even when the user asks for them. Never claim that a tool is "
+    "unconfigured or suggest enabling it. If the user wants a change made, tell "
+    "them to ask in the main chat."
+)
+
+#: The read-only boundary for a thread session that can list folders and view
+#: images but has no shell and no tool that reads a file's text (goose).
+THREAD_BOUNDARY_PROMPT_LISTING = (
+    "This thread is read-only: lookups work here, but changes don't. Listing "
+    "folders and viewing images run without asking, so use them when a reply "
+    "needs them. There is no shell here and no tool that reads a file's text, "
+    "so answer questions about file contents from the chat. Writing or editing "
+    "files, running commands, and MCP tools are refused here, even when the "
+    "user asks for them. Never claim that a tool is unconfigured or suggest "
+    "enabling it. If the user wants a change made, tell them to ask in the "
+    "main chat."
 )
 
 THREAD_BOUNDARY_PROMPT_NO_TOOLS = (
@@ -122,10 +157,10 @@ _NO_TEXT_FALLBACK_NO_TOOLS = (
 #: One sentence per failure. A retry line only where a retry can succeed.
 _FAILED_FALLBACK = "The reply didn't go through. Try again."
 _UNREADABLE_FALLBACK = "This chat's threads can't be read right now, so the reply was not kept."
-_NO_SPEC_FALLBACK = "This crewmate can't reply in threads right now. Ask in the main chat."
+_NO_SPEC_FALLBACK = "This mate can't reply in threads right now. Ask in the main chat."
 _CREWMATE_GONE_FALLBACK = (
-    "This crewmate is no longer available, so the reply was not answered. "
-    "Restore the crewmate or choose another one."
+    "This mate is no longer available, so the reply was not answered. "
+    "Restore the mate or choose another one."
 )
 _FULL_FALLBACK = "This thread is full. Ask in the main chat instead."
 _SIDECAR_FULL_FALLBACK = (
@@ -312,6 +347,8 @@ def build_thread_message(
     text: str,
     *,
     tools_available: bool,
+    shell_available: bool = True,
+    file_reads_available: bool = True,
 ) -> str:
     """The whole envelope, every time: a thread turn always cold-starts its
     session, so nothing carries over between replies."""
@@ -344,7 +381,15 @@ def build_thread_message(
         if elided:
             lines.insert(0, f"[{elided} earlier {'reply' if elided == 1 else 'replies'} not shown]")
         parts.append(f"{_THREAD_HEADER}\n" + "\n".join(lines) + f"\n{_BLOCK_END}")
-    parts.append(THREAD_BOUNDARY_PROMPT if tools_available else THREAD_BOUNDARY_PROMPT_NO_TOOLS)
+    if not tools_available:
+        parts.append(THREAD_BOUNDARY_PROMPT_NO_TOOLS)
+    else:
+        if shell_available:
+            parts.append(THREAD_BOUNDARY_PROMPT)
+        elif file_reads_available:
+            parts.append(THREAD_BOUNDARY_PROMPT_NO_SHELL)
+        else:
+            parts.append(THREAD_BOUNDARY_PROMPT_LISTING)
     parts.append(f"User: {text}")
     return "\n\n".join(parts)
 
@@ -355,23 +400,7 @@ def build_thread_message(
 def _deny_foreign_app(request: web.Request, slot: _ChatSlot, operation: str) -> web.Response | None:
     """App tokens see only their own slots (App Kit §5.2); a crewmate chat is
     never app-owned, so an app caller gets the anti-enumeration 404."""
-    request_app = request.get("app", "")
-    if not request_app:
-        return None
-    if slot._app and request_app == slot._app:
-        return None
-    try:
-        sel().log_api_access(
-            caller=request_app,
-            operation=operation,
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot",
-        )
-    except Exception:  # noqa: BLE001 -- the refusal must reach the caller regardless
-        logger.debug("SEL audit unavailable for thread refusal", exc_info=True)
-    return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    return deny_app_slot_access(request.get("app", ""), slot, slot.key, operation)
 
 
 async def threads_enabled() -> bool:
@@ -393,7 +422,7 @@ def _feature_off() -> web.Response:
     # The same shape the app-isolation refusal answers with, so a caller cannot
     # tell "threads are off" from "no such slot": the feature's presence is not
     # enumerable.
-    return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    return slot_not_found()
 
 
 def _resolve_slot(
@@ -406,14 +435,14 @@ def _resolve_slot(
         )
     slot = state.get_slot(slot_key)
     if slot is None:
-        return None, web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return None, slot_not_found()
     denied = _deny_foreign_app(request, slot, operation)
     if denied is not None:
         return None, denied
     if slot.mode != DM_SLOT_MODE:
         return None, web.json_response(
             {
-                "error": "Threads live on a crewmate's chat.",
+                "error": "Threads live on a mate's chat.",
                 "code": "not_crewmate_chat",
             },
             status=409,
@@ -629,7 +658,7 @@ async def api_chat_thread_reply(request: web.Request) -> web.Response:
     if flight_key in _in_flight:
         return web.json_response(
             {
-                "error": f"{slot.agent or 'Your crewmate'} is still replying. Wait for that reply.",
+                "error": f"{slot.agent or 'Your mate'} is still replying. Wait for that reply.",
                 "code": "thread_turn_in_flight",
             },
             status=409,
@@ -713,7 +742,16 @@ async def api_chat_thread_reply(request: web.Request) -> web.Response:
         )
         task = asyncio.create_task(
             _run_thread_turn(
-                state, slot, mid, run_id, text, parent, context_before, flight_key, identity
+                state,
+                slot,
+                mid,
+                run_id,
+                text,
+                parent,
+                context_before,
+                flight_key,
+                identity,
+                start_priority=owner_start_priority(request),
             )
         )
         state._background_tasks.add(task)
@@ -839,6 +877,7 @@ async def _run_thread_turn(
     context_before: list[dict[str, Any]],
     flight_key: str,
     identity: str | None,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> None:
     """Background task: one crewmate reply into the thread on *mid*.
 
@@ -932,10 +971,25 @@ async def _run_thread_turn(
                 exc_info=True,
             )
         tools_available = backend is not None and backend in ACP_BACKENDS_SIDE_READONLY
-        if tools_available:
+        # The same confinement per harness as a Side Chat turn
+        # (dashboard/handlers/side.py): claude and goose through the session
+        # shape their client starts for ``side_read_only``, kiro-cli through the
+        # derived spec.
+        claude_thread = tools_available and is_claude_backend_name(backend)
+        if claude_thread and not await asyncio.to_thread(claude_adapter_honours_session_options):
+            tools_available = claude_thread = False
+        if backend == ACP_BACKEND_GOOSE and not goose_side_home_supported():
+            tools_available = False
+        goose_thread = tools_available and backend == ACP_BACKEND_GOOSE
+        session_kwargs: dict[str, Any] = {}
+        if claude_thread or goose_thread:
+            agent: str | None = kiro_agent or slot_agent
+            approval_policy = ToolApprovalPolicy.READ_ONLY
+            session_kwargs["side_read_only"] = True
+        elif tools_available:
             base_agent = kiro_agent or slot_agent or "kirocrew"
             published = await asyncio.to_thread(publish_readonly_spec, base_agent, project)
-            agent: str | None = published.name
+            agent = published.name
             approval_policy = ToolApprovalPolicy.READ_ONLY
         else:
             agent = kiro_agent or slot_agent
@@ -947,7 +1001,11 @@ async def _run_thread_turn(
         # envelope. A retained session would stay bound to the agent and cwd of
         # the turn that created it after the slot's project or agent changed.
         provider, _is_new, _resumed = await state.sessions.get_or_create(
-            session_key, agent=agent, cwd=project
+            session_key,
+            agent=agent,
+            cwd=project,
+            start_priority=start_priority,
+            **session_kwargs,
         )
         acquired_key = session_key
         threads = await asyncio.to_thread(log.read_threads, history_key)
@@ -957,6 +1015,8 @@ async def _run_thread_turn(
             threads.get(mid, []),
             text,
             tools_available=tools_available,
+            shell_available=not (claude_thread or goose_thread),
+            file_reads_available=not goose_thread,
         )
         try:
             response_text = redact(
@@ -975,7 +1035,9 @@ async def _run_thread_turn(
             logger.warning("Thread turn aborted (prompt busy): slot=%s mid=%s", slot.key, mid)
             _final(_FAILED_FALLBACK, is_error=True)
             return
-        if not chunks:
+        # The returned text, not the streamed chunks: a prompt-busy retry starts its
+        # text over, so chunks from an earlier attempt can stand beside an empty answer.
+        if not response_text:
             response_text = (
                 _NO_TEXT_FALLBACK_TOOLS if tools_available else _NO_TEXT_FALLBACK_NO_TOOLS
             )

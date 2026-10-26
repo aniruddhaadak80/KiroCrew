@@ -63,6 +63,7 @@ vi.mock('../hooks/useBranding', () => ({
 
 import { fileExplorerApi } from '../apps/file-explorer/api'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { copyToClipboard } from '../utils/clipboard'
 import { i18nT } from '../i18n/t'
 import { STORAGE_KEY } from '../apps/file-explorer/constants'
@@ -194,6 +195,35 @@ describe('FileExplorerPage saved state', () => {
     expect(leftPx()).toBe('280px')
     expect(screen.getByText('Select a file to view')).toBeInTheDocument()
     await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith(ROOT, 2))
+  })
+
+  // A saved tab outside every allowed root (the old '/' default)
+  // could only 403, wedging the page; it reopens at the default root.
+  it('replaces a restored tab outside the allowed roots with the default root', async () => {
+    seedSaved({ folderTabs: [{ id: 'ft-r', rootPath: '/', label: '', expanded: { '/': true } }] })
+    renderPage()
+    await ready()
+    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith(ROOT, 2))
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith('/', 2)
+    expect(tabBox().getByText('user')).toBeInTheDocument()
+  })
+
+  it('keeps a restored tab that sits below an allowed root', async () => {
+    const sub = '/home/user/src'
+    seedSaved({ folderTabs: [{ id: 'ft-s', rootPath: sub, label: '', expanded: { [sub]: true } }] })
+    renderPage()
+    await ready()
+    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith(sub, 2))
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith(ROOT, 2)
+  })
+
+  it('keeps a Windows tab below its root across separator and case differences', async () => {
+    vi.mocked(fileExplorerApi.health).mockResolvedValue({ allowedRoots: ['C:\\Users\\me'], home: 'C:\\Users\\me' })
+    const saved = 'c:/Users/me/project'
+    seedSaved({ folderTabs: [{ id: 'ft-w', rootPath: saved, label: '', expanded: { [saved]: true } }] })
+    renderPage()
+    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith(saved, 2))
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith('C:\\Users\\me', 2)
   })
 
   it('persists the live tab state after the debounce window', async () => {
@@ -380,10 +410,9 @@ describe('FileExplorerPage reveal', () => {
   })
 
   it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
-    // The copy-fallback confirmation is centralized in api.revealPath itself
-    // (client.ts), right next to its copyToClipboard call, so this call site
-    // must not also alert — that would double-notify once the real client
-    // resolves.
+    // The copy fallback is centralized in revealOrOpen (FilePathMenu.tsx),
+    // which calls api.revealPath and then copyToClipboard itself without an
+    // alert, so this call site must not add one once the real client resolves.
     const reveal = spyReveal({ ok: true, copy: '/home/user/notes.txt' })
     const alerted = captureAlert()
     renderPage()
@@ -497,13 +526,18 @@ describe('FileExplorerPage folder tabs', () => {
     expect(document.querySelector('.mc-fe-tab-folder')).toHaveClass('is-active')
   })
 
-  it('closing the last folder tab replaces it with a fresh root tab', async () => {
+  it('closing the last folder tab replaces it with a fresh tab at the default root', async () => {
     renderPage()
     await ready()
+    const before = document.querySelector('.mc-fe-tab-folder')
     await userEvent.click(screen.getByLabelText('Close workspace tab'))
-    // No tabs would leave nothing to render, so the page substitutes '/'.
-    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith('/', 2))
+    // No tabs would leave nothing to render, so the page substitutes a fresh
+    // tab -- at the health-derived default root, not '/', which an allowed-root
+    // backend answers with 403.
+    await waitFor(() => expect(document.querySelector('.mc-fe-tab-folder')).not.toBe(before))
     expect(document.querySelectorAll('.mc-fe-tab-folder')).toHaveLength(1)
+    expect(tabBox().getByText('user')).toBeInTheDocument()
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith('/', 2)
   })
 
   it('closing a folder tab discards the file tabs that belonged to it', async () => {
@@ -726,9 +760,11 @@ describe('FileExplorerPage shortcuts and search', () => {
   it('closes the workspace tab with the command chord when no file is open', async () => {
     renderPage()
     await ready()
+    const before = document.querySelector('.mc-fe-tab-folder')
     act(() => { chord('w') })
-    // Last tab closed → substituted with a '/' root.
-    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith('/', 2))
+    // Last tab closed → substituted with a fresh tab at the default root.
+    await waitFor(() => expect(document.querySelector('.mc-fe-tab-folder')).not.toBe(before))
+    expect(tabBox().getByText('user')).toBeInTheDocument()
   })
 
   it('leaves unmodified keys alone', async () => {
@@ -866,6 +902,32 @@ describe('FileExplorerPage backend banner', () => {
     // Cached data keeps the page initialized, so the banner is reachable.
     await waitFor(() => expect(screen.getByText(/Backend not reachable/)).toBeInTheDocument())
     expect(screen.getByText(/connection refused/)).toBeInTheDocument()
+  })
+
+  it('shows the banner, not an endless skeleton, when the first health call is refused (app disabled)', async () => {
+    vi.mocked(fileExplorerApi.health).mockRejectedValue(
+      new ApiError(
+        403,
+        "app 'file-explorer' is not enabled",
+        '{"code":"app_not_enabled","error":"app \'file-explorer\' is not enabled"}',
+      ),
+    )
+    renderPage()
+    await waitFor(() => expect(fileExplorerApi.health).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByText(/This app is disabled/)).toBeInTheDocument())
+    expect(screen.queryByText(/Backend not reachable/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Apps$/ })).toBeInTheDocument()
+    expect(document.querySelector('[data-slot="skeleton"]')).not.toBeInTheDocument()
+  })
+
+  it('keeps "Backend not reachable", not a skeleton, when the first health call fails to connect', async () => {
+    vi.mocked(fileExplorerApi.health).mockRejectedValue(new Error('connection refused'))
+    renderPage()
+    await waitFor(() => expect(fileExplorerApi.health).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByText(/Backend not reachable/)).toBeInTheDocument())
+    expect(screen.getByText(/connection refused/)).toBeInTheDocument()
+    expect(screen.queryByText(/This app is disabled/)).not.toBeInTheDocument()
+    expect(document.querySelector('[data-slot="skeleton"]')).not.toBeInTheDocument()
   })
 
   it('surfaces a folder-open (tree) failure instead of a silent blank pane', async () => {

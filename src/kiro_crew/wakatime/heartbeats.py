@@ -1,9 +1,13 @@
 """Turn agent coding activity into WakaTime heartbeats (the send side).
 
-The read side (stats, export, the productivity view) lives elsewhere in this
-package. This module is the producer: a completed agent turn that ran a
-filesystem-write or shell tool is coding activity, and it schedules one
-heartbeat whose entity is the session's project directory.
+The read side lives outside this module: the client's read verbs, the
+dashboard's stats and export handlers (``dashboard/handlers/wakatime.py``) and
+the Overview page's WakaTime tab. This module is the producer: a completed agent
+turn that ran a filesystem-write or shell tool is coding activity. It emits a
+cadence heartbeat when a coding tool is CONFIRMED by an approved permission
+decision so WakaTime can accrue turn duration from the gaps between beats, and one
+attribution-carrying heartbeat at turn end (the token and line-change deltas);
+every beat's entity is the session's project directory.
 
 Design constraints, all load-bearing:
 
@@ -38,6 +42,12 @@ from kiro_crew.wakatime.service import resolve_api_key, resolve_base_url
 
 logger = logging.getLogger(__name__)
 
+#: Strong references to in-flight send tasks. The event loop holds tasks only
+#: weakly, so a fire-and-forget task nothing else references can be collected
+#: mid-send and its heartbeat silently lost.
+_pending: set[asyncio.Task[None]] = set()
+
+
 #: Tool names that count as coding activity. A read-only tool (grep, fs_read)
 #: is not, on its own, coding: the turn only produces a heartbeat when it
 #: mutated the workspace or ran a command. Mirrors the filesystem-write and
@@ -58,6 +68,23 @@ CODING_TOOL_NAMES = frozenset(
 #: WakaTime client documents no smaller service limit, so this keeps each
 #: outbound row bounded without constraining ordinary project names.
 _MAX_ENTITY_CHARS = 256
+
+#: Minimum wall-clock gap between cadence heartbeats within one turn. WakaTime
+#: derives duration from the gaps between heartbeats and coalesces heartbeats
+#: into ~2-minute buckets, so emitting on every confirmed coding tool would
+#: flood the API without adding resolution WakaTime keeps. One cadence
+#: heartbeat per bucket is the finest granularity that survives coalescing, so
+#: the caller throttles confirmation-time emission to this interval.
+#: Attribution (tokens, line changes) rides only the end-of-turn heartbeat, so
+#: a throttled cadence beat never drops a token or line count.
+#:
+#: Source for the ~2-minute window: WakaTime's own editor plugins throttle
+#: repeated edit heartbeats for one file to once every two minutes (e.g.
+#: wakatime/zed-wakatime), and WakaTime's duration algorithm combines
+#: consecutive heartbeats whose gap is under the keystroke-timeout window
+#: (default two minutes) into a single duration. Matching that window keeps our
+#: cadence at the coalescing granularity rather than above it.
+CADENCE_MIN_INTERVAL_SECS = 120.0
 
 
 def is_coding_tool(tool_name: str) -> bool:
@@ -99,7 +126,7 @@ def line_changes_from_file_changes(file_changes: Any) -> int:
     entries are still counted; a non-list input returns 0. This feeds a
     heartbeat, never a decision.
     """
-    if not isinstance(file_changes, list) or not file_changes:
+    if not isinstance(file_changes, list):
         return 0
     total = 0
     for fc in file_changes:
@@ -165,7 +192,7 @@ def _make_heartbeat(
     an external service. The AI-coding category and the aggregate token and
     line-change deltas carry the attribution WakaTime needs without one.
 
-    Every AI field is dropped when zero/empty: the WakaTime schema treats them
+    Every AI field is dropped unless positive: the WakaTime schema treats them
     as nullable, and sending a zero would dilute per-session averages.
     """
     hb: dict[str, Any] = {
@@ -184,6 +211,13 @@ def _make_heartbeat(
     if ai_line_changes > 0:
         hb["ai_line_changes"] = ai_line_changes
     return hb
+
+
+def _schedule_send(heartbeat: dict[str, Any]) -> None:
+    """Schedule one ``send_heartbeat`` task and keep it alive until it finishes."""
+    task = asyncio.get_running_loop().create_task(send_heartbeat(heartbeat))
+    task.add_done_callback(_pending.discard)
+    _pending.add(task)
 
 
 def note_coding_activity(
@@ -207,15 +241,43 @@ def note_coding_activity(
             return
         heartbeat = _make_heartbeat(
             project,
-            ai_input_tokens=max(0, int(ai_input_tokens or 0)),
-            ai_output_tokens=max(0, int(ai_output_tokens or 0)),
-            ai_line_changes=max(0, int(ai_line_changes or 0)),
+            ai_input_tokens=int(ai_input_tokens or 0),
+            ai_output_tokens=int(ai_output_tokens or 0),
+            ai_line_changes=int(ai_line_changes or 0),
         )
-        loop = asyncio.get_running_loop()
-        loop.create_task(send_heartbeat(heartbeat))
+        _schedule_send(heartbeat)
     except Exception:
         # Producing a heartbeat must never disturb the turn that produced it.
         logger.debug("wakatime: note_coding_activity failed", exc_info=True)
+
+
+def note_coding_cadence(project: str | None) -> None:
+    """Schedule one attribution-free cadence heartbeat. Never raises, never awaits.
+
+    Emitted when a coding tool is CONFIRMED by an approved permission decision,
+    so a long turn produces several heartbeats spread across it: WakaTime
+    derives duration from the gaps between heartbeats, and a single end-of-turn
+    beat gives it none. This beat carries NO token or line-change fields — those
+    ride the end-of-turn ``note_coding_activity`` beat alone, so cadence
+    emission never double-counts attribution against it however often the caller
+    fires.
+
+    Unlike ``note_coding_activity`` this reads NO config on the calling thread:
+    it is invoked from the per-decision confirmation path, so it does zero
+    synchronous I/O and simply schedules the send. ``send_heartbeat`` re-checks
+    the opt-in and resolves the destination off the loop inside its own task,
+    dropping the row when the feature is disabled — so a scheduled beat costs
+    one coroutine that early-returns when the user has not opted in. The caller
+    throttles emission to ``CADENCE_MIN_INTERVAL_SECS`` and applies the
+    interactive-user / non-restricted / non-app / non-restored scope before
+    calling.
+    """
+    try:
+        heartbeat = _make_heartbeat(project)
+        _schedule_send(heartbeat)
+    except Exception:
+        # Producing a heartbeat must never disturb the turn that produced it.
+        logger.debug("wakatime: note_coding_cadence failed", exc_info=True)
 
 
 async def send_heartbeat(heartbeat: dict[str, Any]) -> None:

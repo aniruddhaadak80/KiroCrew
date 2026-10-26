@@ -22,7 +22,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
 
-from kiro_crew import history_projection, platform_compat
+from kiro_crew import history_projection, pinned_fs, platform_compat
 from kiro_crew.acp_backends import ACP_BACKEND_KIRO
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import chat_threads, ws
@@ -227,13 +227,33 @@ def test_the_flag_is_off_by_default_and_editable_from_the_dashboard():
     assert core._EDITABLE_CONFIG["dashboard.crewmate_threads"] == {"type": "bool"}
 
 
-def _stub_turn(monkeypatch):
+def _stub_turn(monkeypatch, *, hold: asyncio.Event | None = None):
     """Replace the background turn with a no-op that only clears the in-flight
-    mark, as the real turn's ``finally`` does."""
+    mark, as the real turn's ``finally`` does.
+
+    Pass *hold* when a test needs the reservation to still be held while it makes
+    its next request: the fake turn then waits on that event before clearing the
+    mark, so the test decides when the turn ends instead of the event loop. The
+    call is recorded before the wait, so a caller counting turns sees it either
+    way.
+    """
     calls: list[dict[str, Any]] = []
 
-    async def _fake(state, slot, mid, run_id, text, parent, context_before, flight_key, identity):
+    async def _fake(
+        state,
+        slot,
+        mid,
+        run_id,
+        text,
+        parent,
+        context_before,
+        flight_key,
+        identity,
+        start_priority=None,
+    ):
         calls.append({"mid": mid, "text": text, "parent": parent, "context_before": context_before})
+        if hold is not None:
+            await hold.wait()
         chat_threads._in_flight.discard(flight_key)
 
     monkeypatch.setattr(chat_threads, "_run_thread_turn", _fake)
@@ -717,9 +737,40 @@ def test_a_leftover_staged_sidecar_is_never_written_over(tmp_path, monkeypatch):
     assert log.read_threads(key)[mid][0]["content"] == "kept"
 
 
+def _descriptors_pointing_at(directory: pathlib.Path) -> int | None:
+    """How many open descriptors of THIS process refer to *directory*.
+
+    Each descriptor's target is resolved through the kernel (``/proc/self/fd``
+    on Linux, ``F_GETPATH`` on macOS, both behind ``pinned_fs.fd_real_path``),
+    so unrelated handles a shared xdist worker opens and closes on its own
+    schedule are never counted. ``None`` when this host cannot enumerate or
+    resolve descriptors at all -- a whole-process count is not a substitute,
+    it drifts by a few on a loaded macOS runner.
+    """
+    want = os.path.realpath(directory)
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        try:
+            fds = [int(name) for name in os.listdir(fd_dir) if name.isdigit()]
+        except OSError:
+            continue
+        break
+    else:
+        return None
+    resolved = 0
+    n = 0
+    for fd in fds:
+        target = pinned_fs.fd_real_path(fd)
+        if target is None:
+            continue  # closed since the listing (the listing's own fd), or unresolvable
+        resolved += 1
+        if os.path.realpath(target) == want:
+            n += 1
+    return n if resolved else None
+
+
 @pytest.mark.skipif(
-    not platform_compat.IS_POSIX or platform_compat.count_open_fds() is None,
-    reason="descriptor pinning is POSIX-only and needs a readable descriptor count",
+    not platform_compat.IS_POSIX or _descriptors_pointing_at(pathlib.Path(os.getcwd())) is None,
+    reason="descriptor pinning is POSIX-only and needs per-descriptor targets",
 )
 def test_a_failed_sidecar_staging_leaks_no_descriptor(tmp_path):
     """The delete pins the `.threads` directory before moving the sidecar aside;
@@ -740,27 +791,10 @@ def test_a_failed_sidecar_staging_leaks_no_descriptor(tmp_path):
         # Count the descriptors that point AT the sidecar directory, not every
         # descriptor in the process: unrelated handles (a logger, a database, a
         # pool worker) open and close on their own schedule in a shared worker.
-        # Only Linux exposes the target of each descriptor; elsewhere the whole
-        # process count is the best reading available.
-        def _pinned() -> int:
-            try:
-                fds = os.listdir("/proc/self/fd")
-            except OSError:
-                return platform_compat.count_open_fds() or 0
-            n = 0
-            for fd in fds:
-                try:
-                    target = os.readlink(f"/proc/self/fd/{fd}")
-                except OSError:
-                    continue
-                if target == str(path.parent):
-                    n += 1
-            return n
-
-        before = _pinned()
+        before = _descriptors_pointing_at(path.parent)
         for _ in range(5):
             assert log.delete_session(key) is False
-        after = _pinned()
+        after = _descriptors_pointing_at(path.parent)
     finally:
         os.chmod(path.parent, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- restores the fixture's own owner-only mode after the 0o500 lockout above so tmp_path can be cleaned; nothing published.  # noqa: E501  # fmt: skip
     assert after == before
@@ -1045,7 +1079,18 @@ async def test_second_reply_while_the_crewmate_is_replying_is_refused(tmp_path, 
     state = _make_state(tmp_path)
     _, mid = _member_slot(state)
 
-    async def _hold(state, slot, mid, run_id, text, parent, context_before, flight_key, identity):
+    async def _hold(
+        state,
+        slot,
+        mid,
+        run_id,
+        text,
+        parent,
+        context_before,
+        flight_key,
+        identity,
+        start_priority=None,
+    ):
         pass  # never clears the mark: the turn is still running
 
     monkeypatch.setattr(chat_threads, "_run_thread_turn", _hold)
@@ -1066,10 +1111,20 @@ async def test_second_reply_while_the_crewmate_is_replying_is_refused(tmp_path, 
 @pytest.mark.asyncio
 async def test_two_replies_racing_through_the_store_write_run_one_turn(tmp_path, monkeypatch):
     """The reservation is taken before the store write suspends, so a
-    double-click cannot start two turns on one thread."""
+    double-click cannot start two turns on one thread.
+
+    The winner's turn is held open for the whole gather. Without that, the loser's
+    409 is a scheduling accident: the winner's turn can clear the mark before the
+    loser reaches the check, and two replies that never overlapped both answer 202
+    -- which is correct behaviour, not the defect this test names. Holding the turn
+    is how the file's other in-flight test pins the same thing, and it also makes
+    the losing status a statement about the reservation rather than about how the
+    loop happened to interleave two sockets on the machine that ran it.
+    """
     state = _make_state(tmp_path)
     slot, mid = _member_slot(state)
-    calls = _stub_turn(monkeypatch)
+    hold = asyncio.Event()
+    calls = _stub_turn(monkeypatch, hold=hold)
     async with _client(state) as client:
         a, b = await asyncio.gather(
             client.post(
@@ -1079,8 +1134,14 @@ async def test_two_replies_racing_through_the_store_write_run_one_turn(tmp_path,
                 f"/api/chat/threads/{mid}/reply", json={"slot_key": _MEMBER_SLOT, "text": "two"}
             ),
         )
+        # The turn is still running, so the reservation the loser was refused by
+        # is still there to be seen. Asserting it here is what keeps the hold
+        # honest: remove the hold and this fails before the status assertion does.
+        assert f"{slot.key}:{mid}" in chat_threads._in_flight
+        hold.set()
         for task in list(state._background_tasks):
             await task
+    assert f"{slot.key}:{mid}" not in chat_threads._in_flight
     assert sorted([a.status, b.status]) == [202, 409]
     assert len(calls) == 1
     assert len(_threads(state, slot)[mid]) == 1
@@ -1424,6 +1485,81 @@ async def test_turn_without_tools_uses_reject_all_and_the_no_tools_boundary(tmp_
 
 
 @pytest.mark.asyncio
+async def test_a_claude_turn_runs_read_only_on_a_confined_session(tmp_path, monkeypatch):
+    """On claude the thread gets the Side Chat's claude shape: the base agent's
+    session requested with ``side_read_only``, READ_ONLY, and a boundary that
+    names no shell."""
+    state = _make_state(tmp_path)
+    slot, mid = _member_slot(state)
+    calls = _arm_turn(state, monkeypatch, answer="ok", backend="claude")
+    monkeypatch.setattr(chat_threads, "claude_adapter_honours_session_options", lambda: True)
+    assert _seed_reply(state, slot, mid, "user", "hi") == "ok"
+    await _run_thread_turn(
+        state, slot, mid, "run-1", "hi", _parent(), [], f"{slot.key}:{mid}", _identity(state, slot)
+    )
+    acquired = next(c for c in calls if "key" in c)
+    streamed = next(c for c in calls if "message" in c)
+    assert acquired["agent"] == "kirocrew"
+    assert acquired["side_read_only"] is True
+    assert streamed["approval_policy"] == chat_threads.ToolApprovalPolicy.READ_ONLY
+    assert chat_threads.THREAD_BOUNDARY_PROMPT_NO_SHELL in streamed["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_goose_turn_runs_read_only_on_its_own_goose_home(tmp_path, monkeypatch):
+    """On goose the thread gets the Side Chat's goose shape: the base agent's
+    session requested with ``side_read_only``, READ_ONLY, and a boundary that
+    names neither a shell nor a file-text read."""
+    state = _make_state(tmp_path)
+    slot, mid = _member_slot(state)
+    calls = _arm_turn(state, monkeypatch, answer="ok", backend="goose")
+    monkeypatch.setattr(chat_threads, "goose_side_home_supported", lambda: True)
+    assert _seed_reply(state, slot, mid, "user", "hi") == "ok"
+    await _run_thread_turn(
+        state, slot, mid, "run-1", "hi", _parent(), [], f"{slot.key}:{mid}", _identity(state, slot)
+    )
+    acquired = next(c for c in calls if "key" in c)
+    streamed = next(c for c in calls if "message" in c)
+    assert acquired["agent"] == "kirocrew"
+    assert acquired["side_read_only"] is True
+    assert streamed["approval_policy"] == chat_threads.ToolApprovalPolicy.READ_ONLY
+    assert chat_threads.THREAD_BOUNDARY_PROMPT_LISTING in streamed["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_goose_turn_on_a_host_without_a_side_home_runs_no_tools(tmp_path, monkeypatch):
+    state = _make_state(tmp_path)
+    slot, mid = _member_slot(state)
+    calls = _arm_turn(state, monkeypatch, answer="ok", backend="goose")
+    monkeypatch.setattr(chat_threads, "goose_side_home_supported", lambda: False)
+    assert _seed_reply(state, slot, mid, "user", "hi") == "ok"
+    await _run_thread_turn(
+        state, slot, mid, "run-1", "hi", _parent(), [], f"{slot.key}:{mid}", _identity(state, slot)
+    )
+    acquired = next(c for c in calls if "key" in c)
+    streamed = next(c for c in calls if "message" in c)
+    assert "side_read_only" not in acquired
+    assert streamed["approval_policy"] == chat_threads.ToolApprovalPolicy.REJECT_ALL
+
+
+@pytest.mark.asyncio
+async def test_a_claude_turn_on_an_unverified_adapter_runs_no_tools(tmp_path, monkeypatch):
+    state = _make_state(tmp_path)
+    slot, mid = _member_slot(state)
+    calls = _arm_turn(state, monkeypatch, answer="ok", backend="claude")
+    monkeypatch.setattr(chat_threads, "claude_adapter_honours_session_options", lambda: False)
+    assert _seed_reply(state, slot, mid, "user", "hi") == "ok"
+    await _run_thread_turn(
+        state, slot, mid, "run-1", "hi", _parent(), [], f"{slot.key}:{mid}", _identity(state, slot)
+    )
+    acquired = next(c for c in calls if "key" in c)
+    streamed = next(c for c in calls if "message" in c)
+    assert "side_read_only" not in acquired
+    assert streamed["approval_policy"] == chat_threads.ToolApprovalPolicy.REJECT_ALL
+    assert THREAD_BOUNDARY_PROMPT_NO_TOOLS in streamed["message"]
+
+
+@pytest.mark.asyncio
 async def test_empty_answer_becomes_the_visible_boundary_line(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     events = _capture_broadcasts(state)
@@ -1435,6 +1571,32 @@ async def test_empty_answer_becomes_the_visible_boundary_line(tmp_path, monkeypa
     final = _finals(events)[-1]
     assert "read-only" in final["content"]
     assert "main chat" in final["content"]
+    assert "is_error" not in final
+    stored = _threads(state, slot)[mid]
+    assert stored[-1]["role"] == "assistant" and stored[-1]["content"] == final["content"]
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_after_text_streamed_still_becomes_the_boundary_line(
+    tmp_path, monkeypatch
+):
+    # A prompt-busy retry starts its text over: chunks from the abandoned attempt
+    # reached on_chunk, but the answer it returns is the last attempt's, here empty.
+    state = _make_state(tmp_path)
+    events = _capture_broadcasts(state)
+    slot, mid = _member_slot(state)
+    _arm_turn(state, monkeypatch, answer="")
+
+    async def _retried_to_nothing(provider, message, *, on_chunk=None, **kwargs):
+        on_chunk("Let me look that up")
+        return ""
+
+    monkeypatch.setattr(chat_threads, "stream_and_collect", _retried_to_nothing)
+    await _run_thread_turn(
+        state, slot, mid, "run-1", "hi", _parent(), [], f"{slot.key}:{mid}", _identity(state, slot)
+    )
+    final = _finals(events)[-1]
+    assert "read-only" in final["content"]
     assert "is_error" not in final
     stored = _threads(state, slot)[mid]
     assert stored[-1]["role"] == "assistant" and stored[-1]["content"] == final["content"]

@@ -40,6 +40,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.secrets import (
     get_secret,
     has_secrets,
 )
+from kiro_crew.webhook_sources import SOURCE_OPS_MISSION_CONTROL, source_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,21 @@ def verify_signature(raw_body: bytes, provided: str) -> bool:
     if not secret or not provided:
         return False
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, provided.strip().lower())
+    # Compared as BYTES, never as ``str``. ``hmac.compare_digest`` rejects a str
+    # holding a non-ASCII character by raising ``TypeError``, and ``provided`` is
+    # the caller-chosen ``X-OMC-Signature`` header: aiohttp decodes a header byte
+    # that is not valid UTF-8 into a lone surrogate. Encoding first gives every
+    # possible header value a verdict — the same 401 ``signature mismatch`` a
+    # wrong hex signature gets — instead of an unhandled ``TypeError`` that
+    # answers 500 with a traceback and skips this refusal entirely.
+    # ``surrogatepass`` because a lone surrogate must still compare rather than
+    # raise on the way in, and it keeps two distinct strings distinct. ``expected``
+    # is a hex digest by construction, so a signature that matched before still
+    # matches. Same shape as ``apps.proxy_auth.verify_proxy_request``.
+    return hmac.compare_digest(
+        expected.encode("utf-8"),
+        provided.strip().lower().encode("utf-8", "surrogatepass"),
+    )
 
 
 #: Cap on label pairs kept from one delivery. Labels reach the model's context and
@@ -328,6 +343,12 @@ def signals_from_payload(payload: dict[str, Any]) -> list[Signal]:
 
 def enqueue(raw_body: bytes, signature: str) -> tuple[bool, str]:
     """Verify and queue a delivery. Returns ``(accepted, detail)``."""
+    # The ``webhooks`` governance scope names the sources that may deliver; in an
+    # enterprise build none may until a policy names one (RFC enterprise edition,
+    # Red "Webhooks by source").
+    refusal = source_refusal(SOURCE_OPS_MISSION_CONTROL)
+    if refusal:
+        return False, refusal
     if not provider_enabled(PROVIDER_ID):
         return False, "webhook source is not enabled"
     if not has_secrets(PROVIDER_ID, _REQUIRED_SECRETS):

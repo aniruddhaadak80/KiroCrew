@@ -14,7 +14,7 @@ import asyncio
 import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro_crew.llm_helpers import background_turn, provider_last_turn_usage
 from kiro_crew.providers.base import LLMProvider
@@ -47,6 +47,8 @@ class _Sessions:
     def __init__(self, client: _Client) -> None:
         self._bg_client = client
         self.acquire_calls: list[tuple[str, dict]] = []
+        self.released_keys: list[str] = []
+        self.recycle_calls: list[dict[str, object]] = []
         self.order: list[str] = []
 
     async def get_or_create(self, key: str, **kw: object):
@@ -54,13 +56,47 @@ class _Sessions:
         return self._bg_client, False, False
 
     def release(self, key: str) -> None:
+        self.released_keys.append(key)
         self.order.append("release")
 
-    async def recycle_background(self) -> None:
+    async def recycle_background(self, **kwargs: object) -> None:
+        self.recycle_calls.append(dict(kwargs))
         self.order.append("recycle")
 
 
 class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
+    async def test_extraction_and_cheap_judge_use_separate_keys(self):
+        from kiro_crew.history_consolidation import HistoryConsolidator
+
+        sessions = _Sessions(_Client())
+        consolidator = HistoryConsolidator.__new__(HistoryConsolidator)
+        consolidator._sessions = sessions
+        with (
+            patch(_USAGE_TARGET),
+            patch(
+                "kiro_crew.history_consolidation._facade_stream_and_collect_json",
+                new_callable=AsyncMock,
+                return_value={"history_entry": "extracted"},
+            ),
+            patch(
+                "kiro_crew.history_consolidation._facade_stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="DUP",
+            ),
+        ):
+            self.assertEqual(
+                await consolidator._call_llm("extract"), {"history_entry": "extracted"}
+            )
+            self.assertEqual(await consolidator._dedupe_judge("judge"), "DUP")
+        self.assertEqual(
+            sessions.acquire_calls,
+            [
+                ("_consolidate", {"agent": "kirocrew-lite"}),
+                ("_bg", {"agent": "kirocrew-lite"}),
+            ],
+        )
+        self.assertEqual(sessions.released_keys, ["_consolidate", "_bg"])
+
     async def test_billed_turn_writes_a_row_tagged_with_its_task(self):
         sessions = _Sessions(_Client())
         with patch(_USAGE_TARGET) as persist:
@@ -204,6 +240,30 @@ class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sessions.acquire_calls[0][1], {})
         self.assertEqual(sessions.acquire_calls[1][1], {"agent": "kirocrew-lite"})
+
+    async def test_dedicated_key_owns_its_session_and_recycle(self):
+        sessions = _Sessions(_Client())
+        with patch(_USAGE_TARGET) as persist:
+            async with background_turn(
+                sessions,
+                task="consolidation",
+                agent="kirocrew-lite",
+                session_key="_consolidate",
+            ) as client:
+                client.begin_turn(1.0)
+
+        self.assertEqual(persist.await_count, 1)
+        self.assertEqual(persist.await_args.args[0], "_consolidate")
+        self.assertEqual(persist.await_args.kwargs["surface"], "bg:consolidation")
+        self.assertEqual(
+            sessions.acquire_calls,
+            [("_consolidate", {"agent": "kirocrew-lite"})],
+        )
+        self.assertEqual(sessions.released_keys, ["_consolidate"])
+        self.assertEqual(
+            sessions.recycle_calls,
+            [{"session_key": "_consolidate", "agent": "kirocrew-lite"}],
+        )
 
 
 class TestBillingStatsReachThroughTheAdapter(unittest.TestCase):
@@ -585,6 +645,44 @@ class TestBilledAttemptsSurviveARetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider_last_turn_usage(provider).credits, 4.0)
         # Cleared even though it was rejected, so a third read cannot see it.
         self.assertFalse(hasattr(provider, _TURN_BILLED_ATTR))
+
+    async def test_a_consolidation_turn_that_checks_its_billing_still_writes_its_row(self):
+        """Consolidation reads an empty reply's billing before ``background_turn``
+        records the turn. Consuming the total there would leave the recording read
+        only the retry's live stats, so the abandoned attempt's spend would never
+        reach the usage store."""
+        from kiro_crew.acp.client import AcpError
+        from kiro_crew.history_consolidation import (
+            HistoryConsolidator,
+            _ConsolidationReplyUnusable,
+        )
+        from kiro_crew.providers.base import EVENT_COMPLETE
+
+        class _RetriedClient(_Client):
+            # A backend in ACP_BACKENDS_REPORT_USAGE, where the billing read decides the charge.
+            reports_turn_usage = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            async def stream(self, message: str, *, allow_image: bool = True):
+                self.calls += 1
+                self.begin_turn(2.0 if self.calls == 1 else 0.0)
+                if self.calls == 1:
+                    raise AcpError("transient error (http 5xx)")
+                yield SimpleNamespace(kind=EVENT_COMPLETE, text="")
+
+        consolidator = HistoryConsolidator.__new__(HistoryConsolidator)
+        consolidator._sessions = _Sessions(_RetriedClient())
+        with (
+            patch(_USAGE_TARGET) as persist,
+            patch("kiro_crew.llm_helpers.transient_retry_delay", return_value=0),
+            self.assertRaises(_ConsolidationReplyUnusable),
+        ):
+            await consolidator._call_llm("extract")
+
+        self.assertEqual([call.args[2].credits for call in persist.await_args_list], [2.0])
 
 
 if __name__ == "__main__":

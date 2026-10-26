@@ -18,6 +18,7 @@
  */
 import { ArrowDown } from 'lucide-react'
 import { i18nT } from '../i18n/t'
+import { Glass } from '../components/Glass'
 
 export function EdgeFade({ side, anchor = 'overlay' }: {
   side: 'top' | 'bottom'
@@ -37,18 +38,31 @@ export function EdgeFade({ side, anchor = 'overlay' }: {
   )
 }
 
-export function JumpToBottomButton({ visible, onClick }: {
+export function JumpToBottomButton({ visible, onClick, unreadCount = 0 }: {
   visible: boolean
   onClick: () => void
+  /** Messages below the reader they have not seen yet (the host's unread run).
+   *  Above zero the pill widens to say so -- "N new · Jump to latest" -- and
+   *  the same click still lands at the live end. Zero keeps the bare arrow. */
+  unreadCount?: number
 }) {
   if (!visible) return null
+  const label = unreadCount > 0 ? i18nT('pages.chatPage.jump_to_new', { count: unreadCount }) : null
   return (
     <div className="absolute -top-10 inset-x-0 z-10 pointer-events-none flex justify-center">
-      <button
-        className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer pointer-events-auto transition-all duration-200 bg-bg-elevated border border-border-strong text-text hover:bg-bg-hover hover:border-accent active:scale-95 active:duration-75 shadow-md"
+      {/* A glass pill (components/Glass.tsx, chip variant) rendered as the
+          button: the same material as the composer it floats above. One
+          element in both states: the label joins the arrow, it does not
+          replace the button. */}
+      <Glass
+        as="button"
+        variant="chip"
+        radius={16}
+        className={`${label ? 'h-8 pl-2.5 pr-3 gap-1.5 text-[12px] font-medium whitespace-nowrap' : 'w-8 h-8'} rounded-full flex items-center justify-center cursor-pointer pointer-events-auto transition-all duration-200 glass-hover text-text active:scale-95 active:duration-75 shadow-md`}
         onClick={onClick}
-        aria-label={i18nT('pages.chatPage.scroll_to_bottom')}
-      ><ArrowDown size={14} strokeWidth={2.5} /></button>
+        aria-label={label ?? i18nT('pages.chatPage.scroll_to_bottom')}
+        data-testid="jump-to-bottom"
+      ><ArrowDown size={14} strokeWidth={2.5} />{label && <span>{label}</span>}</Glass>
     </div>
   )
 }

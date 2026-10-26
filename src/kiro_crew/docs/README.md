@@ -2,7 +2,7 @@
 
 **These docs ship inside the Python package.** They are the end-user documentation:
 in-app reading, dashboard Settings links, and the feature-tips catalog all resolve
-here. Contributor and architecture docs live in [`../../../docs/`](../../../docs/README.md).
+here. Contributor and architecture docs live in [`docs/`](https://github.com/kirodotdev/KiroCrew/blob/main/docs/README.md).
 
 [index.md](index.md) is the in-app entry point. This README is the same set,
 organized for someone browsing the repository.
@@ -22,7 +22,7 @@ organized for someone browsing the repository.
 | Doc | Covers |
 |---|---|
 | [agents.md](agents.md) | Switching between specialized agents per conversation, thread, or cron job. |
-| [crew-members.md](crew-members.md) | Named crewmates, their standing DM threads, and routing work to one with `select_crew` / `route_crew`. |
+| [crew-members.md](crew-members.md) | Named mates, their standing DM threads, and routing work to one with `select_crew` / `route_crew`. |
 | [remote-crew.md](remote-crew.md) | Reaching other machines running their own Kiro Crew gateway: the transports, the pane switcher, sessions that run on one, and federated history search. Formerly [remote-instances.md](remote-instances.md), which now points here. |
 | [agent-spec-fields.md](agent-spec-fields.md) | Every agent-spec field, what it does, and how that differs per ACP backend. |
 | [skills.md](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows. |
@@ -30,7 +30,7 @@ organized for someone browsing the repository.
 | [monitoring.md](monitoring.md) | Token-efficient pull-request monitoring and finite legacy fallbacks. |
 | [cron-and-scheduling.md](cron-and-scheduling.md) | Scheduling recurring tasks. |
 | [subagents.md](subagents.md) | Spawning parallel background workers for fan-out work. |
-| [dynamic-subagent-sizing.md](dynamic-subagent-sizing.md) | How the concurrent sub-agent cap is sized from host memory and CPU. |
+| [dynamic-subagent-sizing.md](dynamic-subagent-sizing.md) | How a free-memory floor, not a count, bounds concurrent sub-agents, with a fixed count ceiling above it. |
 | [task-runner.md](task-runner.md) | Autonomous multi-step execution from a spec file. |
 | [research-lab.md](research-lab.md) | Multi-cycle research campaigns with exportable reports. |
 | [memory-and-learning.md](memory-and-learning.md) | Persistent preferences, project context, and learned corrections. |
@@ -101,7 +101,7 @@ Three constraints make this tree different from `docs/`:
 
 Because every doc here reaches every user, keep the content task-oriented and free
 of internal design narration. An engineering note belongs in
-[`../../../docs/`](../../../docs/README.md) instead — for example
-[how the model's context is assembled](../../../docs/architecture/context-management.md),
+[`docs/`](https://github.com/kirodotdev/KiroCrew/blob/main/docs/README.md) instead — for example
+[how the model's context is assembled](https://github.com/kirodotdev/KiroCrew/blob/main/docs/architecture/context-management.md),
 which cites private symbols and so lives there rather than here. Each doc's first paragraph is
 read verbatim as a feature description, so write it to stand alone.

@@ -1,8 +1,9 @@
 """Parity guard for the JWT credential patterns copied out of `security.py`.
 
 `security.py` owns the two JWT alternatives. Two other files carry hand-written
-copies because neither can import it: `pr_findings.py` is documented as portable
-and stdlib-only, and `sanitize.ts` runs in the browser. That is the exact setup
+copies because neither can import it: `_review_contract.py`, the prepare-pr
+scripts' shared module, is stdlib-only and portable, and `sanitize.ts` runs in
+the browser. That is the exact setup
 that already failed once: both copies missed the two-segment dashboard link
 token, so a bare token in CI-log prose and every token in chat rendered
 verbatim while the backend redacted them.
@@ -20,7 +21,8 @@ did". A literal copy in this file would be a fourth copy, free to drift with
 the thing it is supposed to pin.
 
 One mirror is deliberately NOT verbatim. `sanitize.ts` omits the two-segment
-alternative's leading lookbehind because the browser cannot afford it. Vite
+alternative's leading boundary (its lookbehind and the start guard after `.`)
+because the browser cannot afford the lookbehind. Vite
 declares no `build.target`, so the default `'modules'` floor is `safari14`, and
 at that target esbuild rewrites an unsupported lookbehind literal into a
 `new RegExp(...)` call. That defers the error from parse time to run time, but
@@ -62,8 +64,10 @@ BACKEND_PKG = ROOT / "src" / "kiro_crew" / "security"
 # The module that owns the exfil URL classifier today. Named separately so a
 # guard can point at the enforcing site while the sweep stays package-wide.
 BACKEND_EXFIL = BACKEND_PKG / "exfil.py"
+# The owner beside it that declares the URL rule tables the classifier applies.
+BACKEND_EXFIL_RULES = BACKEND_PKG / "exfil_url_rules.py"
 PREPARE_PR = (
-    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "scripts" / "pr_findings.py"
+    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "kirocrew-prepare-pr" / "scripts" / "_review_contract.py"
 )
 FRONTEND = ROOT / "website" / "src" / "utils" / "sanitize.ts"
 TOKEN_MINT = ROOT / "src" / "kiro_crew" / "instances" / "token_mint.py"
@@ -83,18 +87,21 @@ def _jwt_alternatives() -> tuple[str, str]:
     """
     alts = [alt for alt in _CREDENTIAL_PATTERNS.pattern.split("|") if "eyJ" in alt]
     assert len(alts) == 2, f"expected 2 JWT alternatives in _CREDENTIAL_PATTERNS, found {len(alts)}: {alts}"
-    three = [a for a in alts if "(?:" in a]
-    two = [a for a in alts if "(?:" not in a]
+    three = [a for a in alts if "){2,4}" in a]
+    two = [a for a in alts if "){2,4}" not in a]
     assert len(two) == 1 and len(three) == 1, f"cannot tell the alternatives apart: {alts}"
     return three[0], two[0]
 
 
 _LEADING_LOOKBEHIND_RE = re.compile(r"^\(\?<[=!][^)]*\)")
 _ANY_LOOKBEHIND_RE = re.compile(r"\(\?<[=!]")
+#: Where the two-segment body starts: the payload floor. Everything before it is
+#: the start boundary (the lookbehind and the guard after a `.`).
+_TWO_SEGMENT_BODY_START = "eyJ[A-Za-z0-9_-]{"
 
 
 def _two_segment_split() -> tuple[str, str]:
-    """Return (leading_lookbehind, body) of the backend two-segment alternative.
+    """Return (leading_boundary, body) of the backend two-segment alternative.
 
     Both halves are sliced off the enforcing regex rather than restated, so the
     frontend's body assertion tracks a backend edit to the bounds automatically
@@ -107,7 +114,8 @@ def _two_segment_split() -> tuple[str, str]:
         "If the backend dropped it too, the mirrors are back to plain parity and "
         f"the frontend exemption below should be deleted.\ngot: {two_segment}"
     )
-    return match.group(0), two_segment[match.end() :]
+    start = two_segment.index(_TWO_SEGMENT_BODY_START)
+    return two_segment[:start], two_segment[start:]
 
 
 class TestMirrorsMatchTheBackend:
@@ -115,12 +123,12 @@ class TestMirrorsMatchTheBackend:
 
     def test_two_segment_alternative_is_verbatim_in_prepare_pr(self) -> None:
         _, two_segment = _jwt_alternatives()
-        assert PREPARE_PR.is_file(), f"mirror moved or was renamed: {PREPARE_PR}"
+        assert PREPARE_PR.is_file(), f"_review_contract.py mirror moved or was renamed: {PREPARE_PR}"
         assert two_segment in PREPARE_PR.read_text(encoding="utf-8"), (
-            "pr_findings.py no longer carries the two-segment link-token alternative "
+            "_review_contract.py no longer carries the two-segment link-token alternative "
             "from security.py verbatim. It runs under CPython, so it has no reason to "
             "diverge. Copy it across, or delete this assertion and say in "
-            f"pr_findings.py why the mirror is allowed to differ.\nexpected: {two_segment}"
+            f"_review_contract.py why the mirror is allowed to differ.\nexpected: {two_segment}"
         )
 
     def test_two_segment_body_is_verbatim_in_the_frontend_mirror(self) -> None:
@@ -159,11 +167,29 @@ class TestMirrorsMatchTheBackend:
         )
 
 
+class TestBase64BlobMirror:
+    """The base64-blob signal is spelled identically on both halves.
+
+    ``=`` is trailing padding only and counts toward the 40 chars. A drift on one
+    half would redact a ``name=<id>`` link on one surface and not the other, or
+    let a padded 40-char blob through on one of them.
+    """
+
+    SPELLING = r"[A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]{39}=|[A-Za-z0-9+/]{38}=="
+
+    def test_backend_carries_the_spelling(self) -> None:
+        assert f'r"{self.SPELLING}"' in BACKEND_EXFIL_RULES.read_text(encoding="utf-8")
+
+    def test_frontend_carries_the_spelling(self) -> None:
+        text = FRONTEND.read_text(encoding="utf-8")
+        assert f"const EXFIL_B64_RE = /{self.SPELLING}/i" in text
+
+
 class TestDeliberateNonMirrors:
     """Two JWT regexes are intentionally NOT pinned to the backend."""
 
     def test_prepare_pr_keeps_its_own_wider_three_segment_form(self) -> None:
-        """`pr_findings.py` predates the backend form and uses `{8,}` per segment.
+        """`_review_contract.py` predates the backend form and uses `{8,}` per segment.
 
         It is wider on the first segment and narrower on segment count. Only its
         two-segment alternative was added as a mirror; rewriting this one to match
@@ -174,7 +200,7 @@ class TestDeliberateNonMirrors:
         text = PREPARE_PR.read_text(encoding="utf-8")
         assert r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}" in text
         assert three_segment not in text, (
-            "pr_findings.py now also carries the backend three-segment alternative. "
+            "_review_contract.py now also carries the backend three-segment alternative. "
             "If that was deliberate, move the assertion into TestMirrorsMatchTheBackend."
         )
 

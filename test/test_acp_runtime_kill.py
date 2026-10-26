@@ -29,8 +29,11 @@ def _bare_runtime(pid: int = 54321) -> rt.AcpRuntime:
     r._session_queues = {}
     r._stderr_lines = []
     r._pid = pid
+    # No identity read at spawn: these tests pin the prefix-matched fallback.
+    r._spawn_start_token = None
     r._child_pids = {}
     r._reader_task = None
+    r._exit_watch_task = None
     r._stderr_task = None
     r._sandbox_cleanup = None
     r._process_instance = "inst-abc"
@@ -262,14 +265,21 @@ async def test_kill_never_resolves_the_group_from_a_reaped_root(monkeypatch):
     r._process.returncode = -9
     # The number now reads as a different process.
     monkeypatch.setattr(rt.platform_compat, "get_process_start_id", lambda pid: "someone-else")
+    # The pinned call is the only tree kill this teardown makes.
     tree_kill = MagicMock()
-    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", tree_kill)
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree_pinned", tree_kill)
     monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: True)
-    monkeypatch.setattr(rt, "_signal_orphaned_runtime_group", lambda pgid, sig, inst, **k: {})
+    group: list = []
+    monkeypatch.setattr(
+        rt,
+        "_signal_orphaned_runtime_group",
+        lambda pgid, sig, inst, **k: group.append((pgid, sig, inst)) or {},
+    )
 
     await r.kill()
 
     tree_kill.assert_not_called()
+    assert group[0] == (54321, rt.platform_compat.SIGTERM, "inst-abc")
 
 
 @pytest.mark.asyncio
@@ -303,13 +313,19 @@ async def test_kill_does_not_trust_an_unset_returncode(monkeypatch):
     monkeypatch.setattr(rt.platform_compat, "IS_POSIX", True)
     monkeypatch.setattr(rt.platform_compat, "get_process_start_id", lambda pid: "someone-else")
     tree_kill = MagicMock()
-    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", tree_kill)
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree_pinned", tree_kill)
     monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: True)
-    monkeypatch.setattr(rt, "_signal_orphaned_runtime_group", lambda pgid, sig, inst, **k: {})
+    group: list = []
+    monkeypatch.setattr(
+        rt,
+        "_signal_orphaned_runtime_group",
+        lambda pgid, sig, inst, **k: group.append((pgid, sig, inst)) or {},
+    )
 
     await r.kill()
 
     tree_kill.assert_not_called()
+    assert group[0] == (54321, rt.platform_compat.SIGTERM, "inst-abc")
 
 
 @pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
@@ -600,19 +616,22 @@ async def test_kill_treats_a_denied_signal_as_final(monkeypatch):
     group from the pid would be signalling something we were just refused.
     """
     r = _bare_runtime()
+    denied: list = []
 
-    def _denied(pid, sig):
+    def _denied(pid, recorded, sig):
+        denied.append((pid, recorded))
         raise PermissionError
 
     # The root is still ours -- the tree kill is what gets refused.
     monkeypatch.setattr(rt.platform_compat, "get_process_start_id", lambda pid: "root-start")
-    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", _denied)
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree_pinned", _denied)
     monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: True)
     group = MagicMock(return_value={101: "s101"})
     monkeypatch.setattr(rt, "_signal_orphaned_runtime_group", group)
 
     await r.kill()
 
+    assert denied and denied[0] == (54321, "root-start")
     group.assert_not_called()
 
 

@@ -37,13 +37,16 @@ somewhere nobody approved, which on a gateway that can reach an internal network
 is an SSRF. :class:`_SameHostRedirectHandler` refuses any redirect that changes
 the host or leaves https. That is the default for every caller, and the only
 policy for a url that came from a CDN or a signed manifest. A caller MAY pass
-``allow_cross_host_redirects=True`` for exactly one shape of url: one the
-OPERATOR set in the gateway's process environment. Such a url names the
-operator's own mirror, and the common mirror shapes (an artifact store or a
-bucket answering with a redirect to its storage host) legitimately hop hosts;
-the hop stays on https (:class:`_HttpsOnlyRedirectHandler`) and the bytes are
-still sha256-pinned. A url from a config file is NOT that shape — config is
-agent-writable — and keeps the strict policy.
+``allow_cross_host_redirects=True`` for exactly two shapes of url. One is a url
+the OPERATOR set in the gateway's process environment: it names the operator's
+own mirror, and the common mirror shapes (an artifact store or a bucket
+answering with a redirect to its storage host) legitimately hop hosts. The
+other is a url written into the source as a constant, such as a pinned GitHub
+release or ``/archive/`` url, which GitHub answers with a redirect to its
+download host. Nothing at runtime chose either one. The hop stays on https
+(:class:`_HttpsOnlyRedirectHandler`) and the bytes are still sha256-pinned. A
+url from a config file is NOT either shape — config is agent-writable — and
+keeps the strict policy.
 
 **No transfer is unbounded.** The staging file is written as bytes arrive, so a
 body that never ends fills the disk before the end-of-stream digest can reject
@@ -186,9 +189,30 @@ _SAME_HOST_POLICY = (
     " redirects across hosts is honoured only when set through the environment override)"
 )
 _HTTPS_ONLY_POLICY = "the transfer stays on https"
+_CALLER_POLICY = "the caller's policy does not permit the redirect target"
 
 
-class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that also asks the caller's own predicate about each hop.
+
+    ``redirect_allowed`` is ``None`` (no extra rule) unless :func:`build_opener`
+    was given one; a hop it refuses raises :class:`RedirectRefused`.
+    """
+
+    redirect_allowed: "Callable[[str], bool] | None" = None
+
+    def _check_caller_guard(self, req, newurl: str) -> None:  # noqa: ANN001
+        guard = self.redirect_allowed
+        if guard is not None and not guard(newurl):
+            logger.warning(
+                "refusing a redirect the caller's policy does not permit from %s to %s",
+                redact_url(req.full_url),
+                redact_url(newurl),
+            )
+            raise RedirectRefused(req.full_url, newurl, _CALLER_POLICY)
+
+
+class _SameHostRedirectHandler(_GuardedRedirect):
     """Refuse any redirect that leaves https or changes the host.
 
     The authorization to make a request is granted per HOST — a manifest's signed
@@ -226,17 +250,19 @@ class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
                 redact_url(newurl),
             )
             raise RedirectRefused(req.full_url, newurl, _SAME_HOST_POLICY)
+        self._check_caller_guard(req, newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _HttpsOnlyRedirectHandler(_GuardedRedirect):
     """Refuse a redirect that leaves https; allow one that changes the host.
 
     The relaxed policy, reachable only through ``allow_cross_host_redirects``,
-    for a url the operator set in the process environment: their own mirror
-    may hand the transfer to another host (an artifact store fronting a bucket,
-    a bucket answering with a redirect to its regional endpoint), and the sha256
-    pin still decides whether the bytes are installed. What stays refused is the
+    for a url the operator set in the process environment or one written into
+    the source as a constant: an operator's mirror may hand the transfer to
+    another host (an artifact store fronting a bucket, a bucket answering with a
+    redirect to its regional endpoint), and so does a pinned GitHub release url.
+    The sha256 pin still decides whether the bytes are installed. What stays refused is the
     downgrade — a hop to plaintext would let the path be observed and altered in
     transit before the pin ever sees it.
     """
@@ -258,26 +284,39 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
                 redact_url(newurl),
             )
             raise RedirectRefused(req.full_url, newurl, _HTTPS_ONLY_POLICY)
+        self._check_caller_guard(req, newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def build_opener(
-    context: "ssl.SSLContext | None" = None, *, allow_cross_host_redirects: bool = False
+    context: "ssl.SSLContext | None" = None,
+    *,
+    allow_cross_host_redirects: bool = False,
+    redirect_allowed: "Callable[[str], bool] | None" = None,
 ) -> urllib.request.OpenerDirector:
     """An opener that verifies TLS and pins redirects.
 
-    The one way the callers of THIS module — the embedding-model transfer and the
-    feature-video manifest and clip transfers — make an outbound request. A
+    The one way the callers of THIS module — the embedding-model transfer, the
+    feature-video manifest and clip transfers, and the Papyrus (Tectonic) and
+    PPTX Maker (engine archive) app installs — make an outbound request. A
     caller reaching for ``urllib.request.urlopen`` directly gets urllib's default
-    redirect handler back, which is the SSRF this exists to close. (The Papyrus
-    and PPTX engines keep their own openers for now; see the module docstring's
-    account of what this module does not yet own.)
+    redirect handler back, which is the SSRF this exists to close.
 
     *allow_cross_host_redirects* selects :class:`_HttpsOnlyRedirectHandler` in
     place of :class:`_SameHostRedirectHandler`. It is for a url the operator set
-    in the process environment and nothing else — see the module docstring.
+    in the process environment, or one written into the source as a constant,
+    and nothing else — see the module docstring.
+
+    *redirect_allowed*, when given, is asked about every redirect target the
+    handler would otherwise follow; ``False`` refuses that hop. It only narrows.
     """
-    handler = _HttpsOnlyRedirectHandler if allow_cross_host_redirects else _SameHostRedirectHandler
+    handler_cls = (
+        _HttpsOnlyRedirectHandler if allow_cross_host_redirects else _SameHostRedirectHandler
+    )
+    handler: "type[_GuardedRedirect] | _GuardedRedirect" = handler_cls
+    if redirect_allowed is not None:
+        handler = handler_cls()
+        handler.redirect_allowed = redirect_allowed
     return urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=context or make_ssl_context()), handler
     )
@@ -624,7 +663,7 @@ def _remove_stale_staging(target_dir: TargetDir, name: str) -> None:
         raise StagingRefused(f"stale staging path cannot be removed: {staging}") from exc
 
 
-def _open_staging_nofollow(target_dir: TargetDir, name: str) -> "io.BufferedWriter":
+def open_staging_nofollow(target_dir: TargetDir, name: str) -> "io.BufferedWriter":
     """Create staging file *name* for a FRESH transfer, refusing to follow a symlink.
 
     The staging path is derived from the target, so it lives wherever the target
@@ -676,12 +715,12 @@ def _open_staging_nofollow(target_dir: TargetDir, name: str) -> "io.BufferedWrit
     return os.fdopen(fd, "wb")
 
 
-def _identity(st: os.stat_result) -> tuple[int, int]:
+def file_identity(st: os.stat_result) -> tuple[int, int]:
     """The inode a stat result names: ``(device, file index)``, on every platform."""
     return st.st_dev, st.st_ino
 
 
-def _install(
+def install_verified(
     target_dir: TargetDir,
     staging_name: str,
     name: str,
@@ -691,7 +730,7 @@ def _install(
 ) -> None:
     """Move the verified staging file onto *name* atomically, both under *target_dir*.
 
-    *verified* is the identity (:func:`_identity`) of the descriptor the bytes were
+    *verified* is the identity (:func:`file_identity`) of the descriptor the bytes were
     hashed through. The rename is by NAME, and the digest was computed on the bytes
     written to one INODE — so a file swapped in at the staging name between the
     last write and the rename would be installed under a digest it never met.
@@ -725,11 +764,15 @@ def _install(
     try:
         fd = target_dir.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY)
     except OSError as exc:
+        # A link swapped in at the staging name is now AT the final name, and the
+        # no-follow reopen refuses it. Remove it (as a link, never followed) so an
+        # unverified referent is not left where a reader will execute it.
+        _discard(target_dir, name)
         raise StagingRefused(
             f"installed file cannot be re-opened for verification: {target_dir.describe(name)}"
         ) from exc
     try:
-        installed = _identity(os.fstat(fd))
+        installed = file_identity(os.fstat(fd))
     finally:
         os.close(fd)
     if installed != verified:
@@ -803,9 +846,10 @@ def download_to(
       not take the user's link. It bounds THIS transfer only — a caller running
       several at once is doing its own budgeting.
     * *allow_cross_host_redirects* is for a url the OPERATOR set in the process
-      environment, and nothing else: their mirror may redirect to another https
-      host and the pin still decides. A url from a CDN, a signed manifest or a
-      config file keeps the default, which refuses to leave the host.
+      environment, or one written into the source as a constant, and nothing
+      else: a mirror or a pinned GitHub release url may redirect to another
+      https host and the pin still decides. A url from a CDN, a signed manifest
+      or a config file keeps the default, which refuses to leave the host.
     * *target_dir* is the handle every filesystem step goes through. A caller
       that has pinned ``path.parent`` (:func:`pin_target_dir`) passes it and the
       staging file, the install rename and the lockdown all address the directory
@@ -839,8 +883,8 @@ def download_to(
     # the descriptor stays open until the install has been checked against it: an
     # inode with an open descriptor cannot be reused, so a file unlinked and
     # recreated at the staging name is a DIFFERENT inode and the identity
-    # comparison in `_install` sees it. Windows refuses to rename or unlink a file
-    # with an open handle, so there it is closed as soon as the body has been
+    # comparison in `install_verified` sees it. Windows refuses to rename or unlink
+    # a file with an open handle, so there it is closed as soon as the body has been
     # written -- NTFS file ids carry a reuse sequence number, so the identity
     # comparison holds without the hold.
     out: "io.BufferedWriter | None" = None
@@ -881,12 +925,12 @@ def download_to(
             started = time.monotonic()
             overflow = 0
             if out is None:
-                out = _open_staging_nofollow(where, staging_name)
+                out = open_staging_nofollow(where, staging_name)
             staging_file = out
             # The inode every hashed byte lands in. The install compares the
             # final name against THIS, not against whatever the staging name
             # resolves to by then.
-            verified = _identity(os.fstat(staging_file.fileno()))
+            verified = file_identity(os.fstat(staging_file.fileno()))
             while True:
                 chunk = resp.read(chunk_bytes)
                 if not chunk:
@@ -931,7 +975,7 @@ def download_to(
         if min_bytes and downloaded < min_bytes:
             where.unlink(staging_name)
             return False, f"downloaded file too small ({downloaded} bytes)"
-        _install(
+        install_verified(
             where, staging_name, path.name, verified=verified, restrict_to_owner=restrict_to_owner
         )
         return True, ""
@@ -985,8 +1029,12 @@ __all__ = [
     "DEFAULT_PROGRESS_EVERY_BYTES",
     "DEFAULT_TIMEOUT_SECS",
     "PART_SUFFIX",
+    "TargetDir",
     "build_opener",
     "download_to",
+    "file_identity",
+    "install_verified",
     "make_ssl_context",
+    "open_staging_nofollow",
     "redact_url",
 ]

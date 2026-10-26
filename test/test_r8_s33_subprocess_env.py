@@ -55,6 +55,21 @@ _GIT_SUPPRESSION = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_CONFIG_NOSYSTEM": "1",
 }
+
+
+@pytest.fixture(autouse=True)
+def _parent_home(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Give the parent a ``HOME`` so the pass-through assertion measures the allowlist.
+
+    The claim under test is that the allowlist PASSES ``HOME`` through, and a
+    pass-through can only be observed when the parent holds the key. Windows
+    hosts carry ``USERPROFILE`` and not necessarily ``HOME`` (CI runners set it,
+    a plain server session does not), so without this pin the assertion reads
+    the host's environment rather than the scrub.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "r8-regression-home"))
+
+
 # Toolchain configuration an operator may have loaded with a secret: a `-D`
 # password in MAVEN_OPTS, a credential store under GRADLE_USER_HOME, an import
 # tree in PYTHONPATH/NODE_PATH. The general spawn allowlist carries all of them
@@ -179,7 +194,7 @@ def _fake_proc(returncode: int) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# memory.py -- the two pip spawns
+# memory_embeddings.py -- the two pip spawns
 # ---------------------------------------------------------------------------
 def test_pip_bootstrap_spawn_env_is_scrubbed(monkeypatch):
     """``memory._ensure_pip_available`` runs ``python -m ensurepip``."""
@@ -233,7 +248,12 @@ def test_faiss_install_spawn_env_is_scrubbed(monkeypatch):
     monkeypatch.setattr(memory, "create_subprocess_limited", _capture)
 
     request = MagicMock()
-    request.app = {"state": MagicMock(consolidator=None)}
+    request.app = {"state": MagicMock(consolidator=None, owner_id="")}
+    # Setup is owner-gated: carry the local dashboard owner's claims.
+    claims = {"app": "", "user": "local-app"}
+    request.__contains__.side_effect = lambda key: key in claims
+    request.__getitem__.side_effect = lambda key: claims[key]
+    request.get.side_effect = lambda key, *default: claims.get(key, *default)
 
     memory._embedding_setup_status = {"step": "idle", "error": ""}
     try:
@@ -245,7 +265,7 @@ def test_faiss_install_spawn_env_is_scrubbed(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# registry.py -- the two /bin/sh -c detectInstalled probes
+# registry_pipeline/catalog.py + install.py -- the two /bin/sh -c detectInstalled probes
 # ---------------------------------------------------------------------------
 def _stub_registry_probe(monkeypatch, registry, returncode: int) -> tuple[list[dict], list[dict]]:
     """Stub the probe's sandbox chokepoint and spawn.

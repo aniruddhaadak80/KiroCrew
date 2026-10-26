@@ -651,7 +651,11 @@ async def test_load_trusted_helpers_skips_unverifiable_and_counts(monkeypatch, c
     assert helpers is not None
     values = [v for k, v in helpers.items() if k.startswith("GIT_CONFIG_VALUE_")]
     assert values == ["osxkeychain"]
-    assert helpers["GIT_CONFIG_COUNT"] == "5"
+    # Derived from the pinned set the loader starts counting after, not retyped: the
+    # helpers are APPENDED to the neutralizers, so a pin added there shifts this
+    # total and a hardcoded number would fail for a reason that is not a defect.
+    base = int(runtime._GIT_ENV_NEUTRALIZERS["GIT_CONFIG_COUNT"])
+    assert helpers["GIT_CONFIG_COUNT"] == str(base + 1)
     assert "store" not in caplog.text
     assert "credential.helper" in caplog.text
 
@@ -668,7 +672,10 @@ async def test_load_trusted_helpers_caps_at_nine_entries(monkeypatch):
     helpers = runtime._GIT_TRUSTED_HELPERS
     assert helpers is not None
     assert len([k for k in helpers if k.startswith("GIT_CONFIG_KEY_")]) == 9
-    assert helpers["GIT_CONFIG_COUNT"] == "13"
+    # Derived, not retyped: the cap is nine helpers ON TOP of the pinned set, so the
+    # total moves when a pin is added and only the cap itself is the invariant here.
+    base = int(runtime._GIT_ENV_NEUTRALIZERS["GIT_CONFIG_COUNT"])
+    assert helpers["GIT_CONFIG_COUNT"] == str(base + 9)
 
 
 @pytest.mark.asyncio
@@ -1218,7 +1225,6 @@ async def test_sync_refuses_when_task_genuinely_running(monkeypatch):
     never_done = asyncio.get_event_loop().create_future()
     running_task = asyncio.ensure_future(never_done)
 
-    # Mock a subprocess still running
     mock_proc = MagicMock()
     mock_proc.returncode = None  # process still alive
 
@@ -1240,7 +1246,6 @@ async def test_sync_refuses_when_task_genuinely_running(monkeypatch):
     assert "already running" in result["error"]
     assert result["run_id"] == old_rid
 
-    # Cleanup
     never_done.set_result(None)
     await running_task
 
@@ -1303,7 +1308,6 @@ async def test_sync_proc_not_yet_spawned_refuses(monkeypatch):
     assert result["ok"] is False
     assert "already running" in result["error"]
 
-    # Cleanup
     never_done.set_result(None)
     await running_task
 
@@ -1341,7 +1345,6 @@ async def test_sync_refuses_when_worker_cleanup_times_out(monkeypatch):
     assert result["ok"] is False
     assert "already running" in result["error"]
 
-    # Cleanup
     never_done.set_result(None)
     await slow_task
 

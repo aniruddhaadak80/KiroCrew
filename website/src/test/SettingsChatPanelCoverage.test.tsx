@@ -2,7 +2,7 @@
  * Coverage pass over Settings ▸ Chat (`pages/settings/ChatPanel.tsx`).
  *
  * The existing ChatPanel specs pin a handful of rows in depth (default model,
- * About You, link previews, verbosity, knowledge opt-in). What they leave cold
+ * About You, link previews, verbosity). What they leave cold
  * is the long tail: every OTHER row's `onChange`, the per-role model/effort
  * block, the two query-failure banners with their Retry buttons, the save-error
  * banner and its dismiss, and — most importantly — the `onError` arm of each
@@ -18,7 +18,7 @@
 vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-ui/react-select'))
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import React from 'react'
 import { SETTINGS_CARD_STAGGER_MS } from '../components/settings'
@@ -80,6 +80,8 @@ vi.mock('../api/client', () => ({
     dashboardConfig: dashboardConfigMock,
     updateDashboardConfig: updateDashboardConfigMock,
     kirocrewConfig: kirocrewConfigMock,
+    kirocrewAgents: () => Promise.resolve({ agents: [], default_agent: 'default' }),
+    agentResolvedModel: () => Promise.resolve({ model: '', pinned: false }),
     patchConfig: patchConfigMock,
     models: modelsMock,
     voiceConfig: () => Promise.resolve({ enabled: false, voice: 'Ruth', engine: 'neural', rate: '100%', autoSpeak: false, aws_profile: '', region: '' }),
@@ -100,8 +102,11 @@ vi.mock('../api/client', () => ({
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
+import { ApiError } from '../api/apiError'
+import { markModelsAuthRequired, markModelsDegraded } from '../providers/modelListHealth'
 import { resolveDefaultMemoryMode } from '../api/queryClient'
 import { MAX_MESSAGE_FONT_SIZE } from '../pages/chat/ChatSettings'
+import { DURABLE_PREF_KEYS } from '../lib/uiPrefs'
 
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -115,7 +120,7 @@ const LS_KEY = 'mc-chat-config'
 
 function wrap(sub = 'transcript') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const view = render(
     <MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}>
     <Provider store={createTestStore()}>
     <QueryClientProvider client={qc}>
@@ -124,6 +129,7 @@ function wrap(sub = 'transcript') {
     </Provider>
     </MemoryRouter>
   )
+  return Object.assign(view, { qc })
 }
 
 /** The localStorage-backed chat config as the panel last wrote it. */
@@ -188,6 +194,19 @@ beforeEach(() => {
   patchConfigMock.mockReset()
   tipsStatusMock.mockReset()
   tipsFeedbackMock.mockReset()
+  // The model list health store and the models mock are module-global; a test
+  // that drives a degraded / auth-required fetch must not leak that state into
+  // the next. Reset both to the healthy default before each test.
+  modelsMock.mockReset()
+  modelsMock.mockImplementation(() =>
+    Promise.resolve([
+      { model_name: 'auto', description: 'Default' },
+      { model_name: 'claude-opus-4.8', description: 'Opus' },
+      { model_name: 'claude-haiku-4.5', description: 'Haiku' },
+    ]) as never
+  )
+  markModelsAuthRequired('acp', false)
+  markModelsDegraded('acp', false)
   dashboardConfigMock.mockImplementation(() => Promise.resolve({ ...BASE_DASH }) as never)
   updateDashboardConfigMock.mockImplementation(() => Promise.resolve({}) as never)
   patchConfigMock.mockImplementation(() => Promise.resolve({}) as never)
@@ -232,6 +251,35 @@ describe('ChatPanel — load failures', () => {
     await screen.findByText('Failed to load dashboard config.')
     await screen.findByText('Failed to load config.')
     expect(screen.getAllByRole('button', { name: 'Retry' })).toHaveLength(2)
+  })
+
+  it('says to run kiro-cli login when the model list is degraded by expired auth', async () => {
+    // /api/models answers 503 with the sign-in code (expired kiro-cli login).
+    // The acp adapter reads that code where the fetch error forms and flags the
+    // provider auth-required; the banner must then show the one actionable
+    // sign-in message, NOT the generic "Failed to load config."
+    const authErr = new ApiError(
+      503,
+      'model list unavailable',
+      JSON.stringify({ error: 'kiro-cli login', code: 'kiro_prerequisite_required' }),
+    )
+    modelsMock.mockImplementation(() => Promise.reject(authErr) as never)
+    wrap()
+    expect(
+      await screen.findByText(/Run 'kiro-cli login' in your terminal, then click Retry\./i),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Failed to load config.')).not.toBeInTheDocument()
+  })
+
+  it('keeps the generic config banner when /api/models is degraded for a non-auth reason', async () => {
+    // A generic degraded 503 (code model_list_unavailable) is a transient blip,
+    // not an auth wall: the banner stays the generic "Failed to load config." and
+    // never claims a sign-in is needed (fail-safe).
+    const blip = new ApiError(503, 'model list unavailable', JSON.stringify({ error: 'model list timed out', code: 'model_list_unavailable' }))
+    modelsMock.mockImplementation(() => Promise.reject(blip) as never)
+    wrap()
+    expect(await screen.findByText('Failed to load config.')).toBeInTheDocument()
+    expect(screen.queryByText(/kiro-cli login/i)).not.toBeInTheDocument()
   })
 })
 
@@ -368,13 +416,30 @@ describe('ChatPanel — Messages', () => {
 
   it.each([
     ['Show Timestamps', 'showTimestamps', false],
+    ['Double-click to edit your messages', 'doubleClickToEdit', true],
     ['Pin the latest turn', 'pinLastPrompt', false],
     ['Simplified Tool Call Names', 'simplifiedToolNames', false],
+    ['Tool calls start expanded', 'toolCallsStartExpanded', true],
     ['Show Context Percentage', 'showContextPct', true],
   ])('stores %s locally when flipped', async (label, key, expected) => {
     wrap()
     fireEvent.click(await screen.findByRole('switch', { name: label }))
     await waitFor(() => expect(storedChat()[key]).toBe(expected))
+  })
+
+  it('stores Copy on select under its own device-only key, not the synced chat config', async () => {
+    wrap()
+    const sw = await screen.findByRole('switch', { name: 'Copy on select' })
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(sw)
+    await waitFor(() => expect(localStorage.getItem('mc-chat-copy-on-select')).toBe('1'))
+    expect(sw).toHaveAttribute('aria-checked', 'true')
+    expect(JSON.parse(localStorage.getItem('mc-chat-config') || '{}')).not.toHaveProperty('copyOnSelect')
+    // Not backed up to the host, so another browser of the same owner never
+    // inherits a clipboard-overwriting setting.
+    expect(DURABLE_PREF_KEYS).not.toContain('mc-chat-copy-on-select')
+    fireEvent.click(sw)
+    await waitFor(() => expect(localStorage.getItem('mc-chat-copy-on-select')).toBe('0'))
   })
 
   it('inverts the stored collapse flag behind Show Thinking Inline', async () => {
@@ -417,12 +482,66 @@ describe('ChatPanel — Messages', () => {
     )
   })
 
+  it.each([
+    ['Keep Side Panel Open', 'side_panel_always_open'],
+    ['Pin Summary in Side Panel', 'side_panel_pin_summary'],
+  ])('shows %s off by default and persists turning it on', async (label, key) => {
+    wrap('sidepanel')
+    const sw = await settledSwitch(label)
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(sw)
+    await waitFor(() =>
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ [key]: true })
+    )
+  })
+
+  it('names Session summaries on the Pin Summary row while they are off, and drops it once they are on', async () => {
+    const { qc } = wrap('sidepanel')
+    const row = () => document.querySelector('[data-setting-key="dashboard.side_panel_pin_summary"]') as HTMLElement
+    const needs = 'Session summaries are off. Turn them on in Settings → Chat → Sessions to pin Summary.'
+    // BASE_MC carries no session_summary section: summaries are off.
+    await waitFor(() => expect(within(row()).getByText(needs)).toBeInTheDocument())
+    // The toggle stays usable while they are off.
+    fireEvent.click(await settledSwitch('Pin Summary in Side Panel'))
+    await waitFor(() =>
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ side_panel_pin_summary: true })
+    )
+    act(() => { qc.setQueryData(['kirocrewConfig'], { ...BASE_MC, session_summary: { enabled: true } }) })
+    await waitFor(() => expect(within(row()).queryByText(needs)).toBeNull())
+  })
+
+  it('refreshes every chat\'s cached summary state when Session summaries saves', async () => {
+    const { qc } = wrap('sessions')
+    // The side panel's + menu row and Pin Summary read this per-chat query,
+    // which never goes stale on its own.
+    qc.setQueryData(['session-summary', 'chat-1'], { enabled: false })
+    fireEvent.click(await settledSwitch('Session summaries'))
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('session_summary.enabled', true)
+    )
+    await waitFor(() =>
+      expect(qc.getQueryState(['session-summary', 'chat-1'])?.isInvalidated).toBe(true)
+    )
+  })
+
   it('persists the folder-suggestions toggle', async () => {
     wrap('sessions')
     fireEvent.click(await settledSwitch('Folder suggestions'))
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
         folder_suggestions_enabled: false,
+      })
+    )
+  })
+
+  it('shows topic tags off by default and persists turning them on', async () => {
+    wrap('sessions')
+    const sw = await settledSwitch('Topic tags')
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(sw)
+    await waitFor(() =>
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({
+        topic_tags_enabled: true,
       })
     )
   })
@@ -534,11 +653,26 @@ describe('ChatPanel — Sessions', () => {
   it.each([
     ['History Expanded', 'historyExpanded', false],
     ['Confirm Before Closing Session', 'confirmCloseSession', true],
-    ['Default to Autopilot Mode', 'defaultAutopilot', true],
+    ['Open Sidebar Sessions in a Session Tab', 'sidebarClickOpensTab', true],
   ])('stores %s locally when flipped', async (label, key, expected) => {
     wrap('sessions')
     fireEvent.click(await screen.findByRole('switch', { name: label }))
     await waitFor(() => expect(storedChat()[key]).toBe(expected))
+  })
+
+  it('greys out Dim Inactive Panes until split view is on', async () => {
+    wrap('sessions')
+    await settledSwitch('Split View (Session Grid)')
+    expect(screen.getByRole('switch', { name: 'Dim Inactive Panes' })).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  it('stores Dim Inactive Panes locally once split view is on', async () => {
+    dashboardConfigMock.mockImplementation(
+      () => Promise.resolve({ ...BASE_DASH, session_grid: true }) as never
+    )
+    wrap('sessions')
+    fireEvent.click(await settledSwitch('Dim Inactive Panes'))
+    await waitFor(() => expect(storedChat().dimInactivePanes).toBe(false))
   })
 
   it('hides the restore window until session restore is on', async () => {
@@ -612,6 +746,95 @@ describe('ChatPanel — Context', () => {
     wrap('advanced')
     await pickOption('Auto-Compact Threshold', 0)
     expect(await screen.findByText(/Failed to save auto-compact threshold/)).toBeInTheDocument()
+  })
+})
+
+describe('ChatPanel — Compaction Wait Budget', () => {
+  const field = () => screen.findByRole('spinbutton', { name: 'Compaction Time Limit (seconds)' })
+
+  it('shows the stored value, including one off the presets', async () => {
+    seedMc({ session: { compact_wait_secs: 450 } })
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(450))
+  })
+
+  it('PATCHes a typed value on blur and shows no notice when it is kept', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    patchConfigMock.mockImplementationOnce(() => Promise.resolve({}))
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    fireEvent.change(input, { target: { value: '900' } })
+    fireEvent.blur(input)
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('session.compact_wait_secs', 900)
+    )
+    expect(screen.queryByText(/outside the allowed range/)).not.toBeInTheDocument()
+  })
+
+  it('shows the value the server clamped to, with a notice', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    patchConfigMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        clamp_notice: { path: 'session.compact_wait_secs', requested: 20, stored: 60, min: 60, max: 3600 },
+      }) as never
+    )
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    fireEvent.change(input, { target: { value: '20' } })
+    fireEvent.blur(input)
+    expect(await screen.findByRole('status')).toHaveTextContent(/outside the allowed range/)
+    expect(input).toHaveValue(60)
+  })
+
+  it('says the unit and what 0 means without a hover', async () => {
+    wrap('advanced')
+    await field()
+    expect(screen.getByText('Longest a compaction may run. 0 = default (300 s). Otherwise 60 to 3,600 s.')).toBeInTheDocument()
+  })
+
+  it('locks the field while a save is in flight, so its result cannot erase a newer draft', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    let settle: (v: unknown) => void = () => {}
+    patchConfigMock.mockImplementationOnce(() => new Promise(r => { settle = r }) as never)
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    fireEvent.change(input, { target: { value: '20' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(input).toBeDisabled())
+    settle({ clamp_notice: { path: 'session.compact_wait_secs', requested: 20, stored: 60, min: 60, max: 3600 } })
+    await waitFor(() => expect(input).not.toBeDisabled())
+    expect(input).toHaveValue(60)
+  })
+
+  it('never writes an untouched field back over a value saved elsewhere', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    // Another client saves 900; this panel's config query refetches.
+    seedMc({ session: { compact_wait_secs: 900 } })
+    await pickOption('Auto-Compact Threshold', 1)
+    await waitFor(() => expect(input).toHaveValue(900))
+    patchConfigMock.mockClear()
+    fireEvent.focus(input)
+    fireEvent.blur(input)
+    expect(patchConfigMock).not.toHaveBeenCalledWith('session.compact_wait_secs', expect.anything())
+  })
+
+  it('surfaces a failed write and restores the saved value', async () => {
+    seedMc({ session: { compact_wait_secs: 300 } })
+    rejectOnce(patchConfigMock)
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(300))
+    fireEvent.change(input, { target: { value: '600' } })
+    fireEvent.blur(input)
+    expect(await screen.findByText(/Failed to save compaction wait budget/)).toBeInTheDocument()
+    await waitFor(() => expect(input).toHaveValue(300))
   })
 })
 

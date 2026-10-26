@@ -35,7 +35,14 @@ export function TreeSkeleton() {
   )
 }
 
-export function PierreWorkspaceTree({ projectDir, onFileOpen, onAddToContext, searchQuery, mode, selectedPath, persistExpansion }: {
+/** A request to bring one project-relative folder into view. `nonce` makes a
+ *  second request for the same folder a new request. */
+export interface TreeReveal {
+  path: string
+  nonce: number
+}
+
+export function PierreWorkspaceTree({ projectDir, onFileOpen, onAddToContext, searchQuery, mode, selectedPath, persistExpansion, onOpenFolder, reveal, onRevealed, active }: {
   projectDir: string
   onFileOpen?: (absPath: string) => void
   /** Right-click "Add to context" on a row — forwards the ABSOLUTE path and
@@ -50,6 +57,16 @@ export function PierreWorkspaceTree({ projectDir, onFileOpen, onAddToContext, se
   /** Remember and restore expanded directories across remounts (all mode only).
    *  Opt-in per host; hosts that omit it keep collapsed-by-default. */
   persistExpansion?: boolean
+  /** Activating the "not shown: limit reached" row under a folder hands that
+   *  project-relative folder to the host, which opens it in a folder tab. */
+  onOpenFolder?: (folder: string) => void
+  /** Load (if it is past the row cap) and expand one project-relative folder. */
+  reveal?: TreeReveal | null
+  /** The reveal has been acted on; the host clears it. */
+  onRevealed?: () => void
+  /** Whether the user can see the tree. A host that keeps it mounted while
+   *  hidden passes false to pause its polling. Defaults to true. */
+  active?: boolean
 }) {
   // Remount on mode change: initial expansion is fixed at model creation.
   // A persisting host also remounts on an in-place projectDir change — the
@@ -60,7 +77,7 @@ export function PierreWorkspaceTree({ projectDir, onFileOpen, onAddToContext, se
   const key = persistExpansion ? [mode ?? 'all', projectDir].join('\u0000') : (mode ?? 'all')
   return (
     <Suspense fallback={<TreeSkeleton />}>
-      <TreeImpl key={key} projectDir={projectDir} onFileOpen={onFileOpen} onAddToContext={onAddToContext} searchQuery={searchQuery} mode={mode} selectedPath={selectedPath} persistExpansion={persistExpansion} />
+      <TreeImpl key={key} projectDir={projectDir} onFileOpen={onFileOpen} onAddToContext={onAddToContext} searchQuery={searchQuery} mode={mode} selectedPath={selectedPath} persistExpansion={persistExpansion} onOpenFolder={onOpenFolder} reveal={reveal} onRevealed={onRevealed} active={active} />
     </Suspense>
   )
 }

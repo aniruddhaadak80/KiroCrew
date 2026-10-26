@@ -40,6 +40,10 @@ class FakeConversationLog:
     def get_metadata(self, key: str) -> dict:
         return self._metadata.get(key, {})
 
+    def get_metadata_status(self, key: str) -> tuple[dict, bool]:
+        """The read hydration makes: the same metadata, reported readable."""
+        return self.get_metadata(key), True
+
     def update_metadata(self, key: str, fields: dict) -> None:
         self.updates.append((key, fields))
         self._metadata.setdefault(key, {}).update(fields)
@@ -393,7 +397,6 @@ class TestTaCommandPersistence:
         log = FakeConversationLog()
 
         with patch("kiro_crew.slack.handler.Path.home", return_value=tmp_path):
-            # Create .kiro/agents structure
             kiro_agents = tmp_path / ".kiro" / "agents"
             kiro_agents.mkdir(parents=True)
             kiro_file = kiro_agents / "test-agent.json"

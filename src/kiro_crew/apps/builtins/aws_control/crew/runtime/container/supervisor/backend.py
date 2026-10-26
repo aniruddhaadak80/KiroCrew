@@ -2,7 +2,7 @@
 
 The deployed unit is Kiro Crew's own backend, run in *dashboard mode*, on
 loopback, with no interface served (`docs/system-specs/modules/aws-control.md`,
-"Three processes, one task"). Dashboard mode is
+"Four processes, one task"). Dashboard mode is
 required and `--no-dashboard` is wrong: the smaller ``_init_api_server`` it
 starts has neither the chat endpoints nor the slot registry this design calls,
 and it quiets nothing, so headless here means "no interface exposed", not
@@ -99,9 +99,10 @@ APPROVAL_MODE: str = "yolo"
 # vault stores.
 ENV_KIRO_IDENTITY: str = "KIRO_IDENTITY"
 
-# kiro-cli's own API-key credential (loader.py:366 CRED_KIRO_API_KEY). Nothing
-# delivers it and the backend must not receive it: it is re-injected into the
-# kiro-cli child (loader.py:1167/1182) and is not denied by the sandbox env filter
+# kiro-cli's own API-key credential (``config/loader_credentials.py``
+# ``CRED_KIRO_API_KEY``). Nothing delivers it and the backend must not receive it:
+# it is re-injected into the kiro-cli child (``config/loader_credentials.py``
+# ``inject_kiro_cli_api_key``) and is not denied by the sandbox env filter
 # (runtime.py:1251), so a value arriving here by any route would land in the
 # auto-approved worker's environment. It is withheld explicitly (below) rather than
 # left to the absence of a delivery path, because the backend env starts as a
@@ -111,6 +112,14 @@ ENV_KIRO_API_KEY: str = "KIRO_API_KEY"
 # Environment variable names the backend reads. VERIFIED against the installed
 # source (paths cited), replacing the earlier laptop guesses.
 ENV_HOME: str = "KIROCREW_HOME"  # config/paths.py:265 config_dir() honours it
+# kiro-cli's own user directory, and the one variable that moves the agent-spec
+# directory Kiro Crew reads and writes (``config/paths.py`` ``kiro_home`` ->
+# ``kiro_agents_dir``). Set to ``<data home>/kiro`` so the specs land in a directory
+# this task owns rather than in the process HOME's shared ``~/.kiro/agents``, which a
+# non-default-data-home backend REFUSES to rewrite: without this the default spec is
+# never written and every turn dies at ``DerivedSpecStale``. See
+# ``Settings.kiro_home`` for why the ``kiro`` segment is exact rather than arbitrary.
+ENV_KIRO_HOME: str = "KIRO_HOME"
 ENV_PORT: str = "KIROCREW_PORT"  # dashboard/urls.py:116 overrides the port
 # Pin the bind ADDRESS. dashboard/urls.py:208 reads KIROCREW_BIND; the OFFICIAL
 # image sets it to 0.0.0.0 (urls.py:218), which would put the backend on the
@@ -127,6 +136,15 @@ ENV_TELEMETRY_DISABLED: str = "KIROCREW_TELEMETRY_DISABLED"
 #: The front's control-plane secret. Named here so the strip below is a named
 #: constant rather than a bare string, and so a reader can find every use of it.
 ENV_CONTROL_SECRET: str = "SMC_CONTROL_SECRET"
+
+#: Set to ``"1"`` on the backend's environment when the task restored its
+#: authority pair from a remote committed snapshot. The transcripts are NOT
+#: restored with it (they load lazily, per turn), so the backend's open-slot
+#: restore keeps a listed slot whose transcript is absent from local disk as a
+#: reopen seed rather than pruning it -- see
+#: ``dashboard.chat_persistence._transcripts_may_be_remote_only``. Unset on an
+#: ordinary (non-container) boot, where an absent transcript is a genuine answer.
+ENV_AUTHORITY_RESTORED: str = "KIROCREW_CONTAINER_AUTHORITY_RESTORED"
 
 #: Every messaging transport the gateway can start, by the name of its config
 #: section. ``write_backend_config`` turns each one OFF in a file the container owns.
@@ -265,7 +283,8 @@ def build_backend_argv(settings: Settings) -> list[str]:
 #:
 #: `acp_backend` selects the KAS harness, which is what keeps the model credential out
 #: of the worker's environment. `acp/harness/kas.KasHarness.apply_spawn_env` strips the
-#: API key from the relay's environment and the relay asks the host for a token
+#: API key from a Crew-owned relay's environment -- the vault `seed_model_identity`
+#: fills makes every relay here Crew-owned -- and the relay asks the host for a token
 #: instead, which `acp/kas_host_auth.answer_get_access_token` answers from the vault.
 #: Leaving this to the default would make the credential's location a property of
 #: whatever `config.json` the task was given, and `build_backend_env` withholding the
@@ -301,8 +320,39 @@ FORCED_AGENT_SETTINGS: Mapping[str, object] = {
     "sandbox_allow_unsandboxed_exec": False,
 }
 
+#: What the INTERNAL-ONLY boundary loosens, applied over the baseline above and only
+#: when the deployment claims that boundary (``SMC_INTERNAL_ONLY``).
+#:
+#: A separate constant rather than a conditional value inside
+#: :data:`FORCED_AGENT_SETTINGS`, because the two answer different questions and the
+#: ratchet over them must not be one rule. The baseline is what EVERY container gets
+#: and stays universally protective -- ``test_no_sandbox_setting_is_forced_to_a_permissive_value``
+#: still reads it and still requires every boolean to be ``False``, so loosening a
+#: setting there reds exactly as it did before this constant existed. This one is a
+#: named, reviewable exception whose own tests assert it is reachable ONLY through the
+#: flag. Folding the exception into the baseline would have made the ratchet's
+#: universal assertion impossible to state at all, which is how a security test becomes
+#: an allowlist.
+#:
+#: ``sandbox_allow_unsandboxed_exec`` is a FAIL-OPEN switch, not a sandbox-off switch:
+#: ``wrap_argv`` still sandboxes the subprocess wherever a backend exists, and this only
+#: decides what happens where none does. So a host that CAN sandbox is unaffected by
+#: this entry, and the one behaviour it buys is the one the boundary accepts -- a task
+#: that starts and serves turns on Fargate instead of refusing.
+#:
+#: ``sandbox`` stays ``auto`` and ``sandbox_allow_no_isolation`` stays ``False``
+#: deliberately. Neither is needed for a Fargate start: ``auto`` already uses whatever
+#: isolation the host offers, and the second only widens which absences are tolerated
+#: quietly. A boundary that accepts one consequence does not license every loosening
+#: that shares its file.
+INTERNAL_ONLY_AGENT_SETTINGS: Mapping[str, object] = {
+    "sandbox_allow_unsandboxed_exec": True,
+}
 
-def build_backend_config(existing: Mapping[str, object] | None = None) -> dict[str, object]:
+
+def build_backend_config(
+    existing: Mapping[str, object] | None = None, *, internal_only: bool = False
+) -> dict[str, object]:
     """The config the backend boots with: no messaging transport, a stated agent posture.
 
     Merges over *existing* rather than replacing it, so a crew bundle that ships
@@ -314,6 +364,12 @@ def build_backend_config(existing: Mapping[str, object] | None = None) -> dict[s
 
     A non-dict where a section should be is REPLACED, not merged. The gateway coerces
     such a section to defaults, and defaults are not what this function is for.
+
+    *internal_only* is the deployment's own claim that this task runs the operator's
+    crews and that the operator bears the risk of what those crews read, and it is the
+    ONLY way :data:`INTERNAL_ONLY_AGENT_SETTINGS` is applied. It defaults to ``False`` so
+    a caller that says nothing gets the protective baseline -- which is what every
+    existing call site and every other lane gets, unchanged.
     """
     config: dict[str, object] = dict(existing or {})
     for section in CHANNEL_SECTIONS:
@@ -324,6 +380,8 @@ def build_backend_config(existing: Mapping[str, object] | None = None) -> dict[s
     agent = config.get("agent")
     agent_merged = dict(agent) if isinstance(agent, dict) else {}
     agent_merged.update(FORCED_AGENT_SETTINGS)
+    if internal_only:
+        agent_merged.update(INTERNAL_ONLY_AGENT_SETTINGS)
     config["agent"] = agent_merged
     return config
 
@@ -335,7 +393,7 @@ def write_backend_config(settings: Settings) -> Path:
     a transport it starts there is already connected by the time anything else could
     object.
 
-    ``config_dir`` equals ``data_home`` (see the spec's "Three processes, one task").
+    ``config_dir`` equals ``data_home`` (see the spec's "Four processes, one task").
 
     Written through a sibling temp and one atomic replace, because the failure this
     file has is in the FUTURE: nothing reads it during this write, and a truncated
@@ -365,12 +423,24 @@ def write_backend_config(settings: Settings) -> Path:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             existing = raw
-    payload = json.dumps(build_backend_config(existing), indent=2, sort_keys=True) + "\n"
+    payload = (
+        json.dumps(
+            build_backend_config(existing, internal_only=settings.internal_only),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     _atomic_write_nofollow(path, payload.encode("utf-8"))
     log.info(
-        "backend config: %d messaging transports disabled, %d agent settings forced",
+        "backend config: %d messaging transports disabled, %d agent settings forced%s",
         len(CHANNEL_SECTIONS),
         len(FORCED_AGENT_SETTINGS),
+        (
+            f", {len(INTERNAL_ONLY_AGENT_SETTINGS)} loosened under the internal-only boundary"
+            if settings.internal_only
+            else ""
+        ),
     )
     return path
 
@@ -423,14 +493,23 @@ def _atomic_write_nofollow(dst: Path, data: bytes) -> None:
 def build_backend_env(settings: Settings, base: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment the backend is launched with.
 
-    Points the backend at the shared data home and loopback port, pins the bind
-    address to loopback (overriding any inherited ``KIROCREW_BIND=0.0.0.0`` from
-    the base image), disables the beacon, and removes every credential: the
-    channel ones, the task role's, the front's control secret, and the model
-    identity in both of its shapes.
+    Points the backend at the shared data home, the task-owned kiro home and the
+    loopback port, pins the bind address to loopback (overriding any inherited
+    ``KIROCREW_BIND=0.0.0.0`` from the base image), disables the beacon, and removes
+    every credential: the channel ones, the task role's, the front's control secret,
+    and the model identity in both of its shapes.
     """
     env = dict(os.environ if base is None else base)
     env[ENV_HOME] = str(settings.data_home)
+    # Set from the SETTINGS rather than inherited, even though ``export_kiro_home`` has
+    # already put the same value in this process's environment. The two writers are
+    # deliberate: the export is what the bundle installer reads (it resolves the agents
+    # dir from ``os.environ``), and this assignment is what makes the backend's value a
+    # function of ``settings.data_home`` alone -- so a base mapping that carries a stale
+    # or absent ``KIRO_HOME`` cannot hand the backend a different agents dir from the one
+    # the crew spec was installed into. Disagreement there is not an error the backend
+    # reports; it is a backend that reads an agents dir the crew is not in.
+    env[ENV_KIRO_HOME] = str(settings.kiro_home)
     env[ENV_PORT] = str(settings.backend_port)
     env[ENV_BIND] = common.BACKEND_HOST
     env[ENV_TELEMETRY_DISABLED] = "1"
@@ -461,7 +540,8 @@ def build_backend_env(settings: Settings, base: Mapping[str, str] | None = None)
     # therefore reachable by prompt content whatever the sandbox is doing.
     #
     # The worker does not need one. ``acp/harness/kas.KasHarness.apply_spawn_env``
-    # strips the API key from the relay's environment, and the relay asks the HOST
+    # strips the API key from a Crew-owned relay's environment (the seeded vault
+    # makes it one), and the relay asks the HOST
     # for a token over ``_kiro/auth/getAccessToken``, which
     # ``acp/kas_host_auth.answer_get_access_token`` answers from the vault inside the
     # backend process.

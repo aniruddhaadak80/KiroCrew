@@ -129,6 +129,38 @@ describe('AskLayer an existing annotation', () => {
     expect(screen.queryByText(/Thinking/i)).not.toBeInTheDocument()
   })
 
+  it('says the composer below is the retry, beside the unchanged failure text', () => {
+    const failed = ask({
+      turns: [{ t: 1, q: 'zzz q', a: 'zzz it broke', pending: false, failed: true }],
+    })
+    mount({ asks: [failed], openAskId: 'zzz-ask-1' })
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('Answer failed — ask again below')
+    // The message stays the raw failure text: it is the error journal's key.
+    expect(alert).toHaveTextContent('zzz it broke')
+  })
+
+  it('names the composer a retry only while the latest turn is the failed one', () => {
+    const failedLast = ask({
+      turns: [
+        { t: 1, q: 'zzz q1', a: 'zzz a1', pending: false },
+        { t: 2, q: 'zzz q2', a: 'zzz it broke', pending: false, failed: true },
+      ],
+    })
+    const { unmount } = mount({ asks: [failedLast], openAskId: 'zzz-ask-1' })
+    expect(screen.getByPlaceholderText('Ask again…')).toBeInTheDocument()
+    unmount()
+
+    const recovered = ask({
+      turns: [
+        { t: 1, q: 'zzz q1', a: 'zzz it broke', pending: false, failed: true },
+        { t: 2, q: 'zzz q2', a: 'zzz a2', pending: false },
+      ],
+    })
+    mount({ asks: [recovered], openAskId: 'zzz-ask-1' })
+    expect(screen.getByPlaceholderText('Ask a follow-up…')).toBeInTheDocument()
+  })
+
   it('sends a follow-up rather than a new annotation', async () => {
     const { props } = mount({
       asks: [ask({ turns: [{ t: 1, q: 'zzz q', a: 'zzz a', pending: false }] })],

@@ -16,6 +16,9 @@ import os
 import time
 from unittest.mock import patch
 
+import pytest
+
+from conftest import make_dir_link
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway.spill import (
     cleanup_old_spill_files,
@@ -36,6 +39,13 @@ class TestUnderThresholdPassthrough:
     def test_empty_line_passthrough(self):
         """An empty or whitespace line passes through."""
         assert maybe_spill_response(b"\n", "test-server", 100) == b"\n"
+
+    def test_a_line_nested_past_the_decoder_passes_through(self):
+        """Over the threshold but unparseable: forwarded as it came, not raised."""
+        from stray_line_helpers import too_deep_result_line
+
+        line = too_deep_result_line()
+        assert maybe_spill_response(line, "test-server", 100) is line
 
 
 # --- (d) Over spill threshold -> spill file with full content ---
@@ -246,33 +256,25 @@ class TestConfigOverrides:
             val = pool._resolve_read_buffer_limit()
         assert val == 8388608
 
-    def test_read_limit_env_invalid_uses_default(self):
-        """Invalid KIROCREW_MCP_READ_LIMIT falls back to default."""
+    @pytest.mark.parametrize(
+        "raw", ["not_a_number", "100"], ids=["invalid", "below-1024"]
+    )
+    def test_read_limit_env_unusable_uses_default(self, raw):
+        """An unparseable or below-1024 KIROCREW_MCP_READ_LIMIT falls back to default."""
         from kiro_crew.mcp_gateway import pool
-        with patch.dict(os.environ, {"KIROCREW_MCP_READ_LIMIT": "not_a_number"}):
+        with patch.dict(os.environ, {"KIROCREW_MCP_READ_LIMIT": raw}):
             val = pool._resolve_read_buffer_limit()
         assert val == pool._DEFAULT_READ_BUFFER_LIMIT
 
-    def test_read_limit_env_too_small_uses_default(self):
-        """KIROCREW_MCP_READ_LIMIT below 1024 falls back to default."""
+    @pytest.mark.parametrize(
+        "raw,expected", [("1048576", 1048576), ("0", 0)], ids=["override", "zero-disables"]
+    )
+    def test_spill_threshold_env_is_honoured(self, raw, expected):
+        """KIROCREW_MCP_SPILL_THRESHOLD overrides the default; 0 disables spilling."""
         from kiro_crew.mcp_gateway import pool
-        with patch.dict(os.environ, {"KIROCREW_MCP_READ_LIMIT": "100"}):
-            val = pool._resolve_read_buffer_limit()
-        assert val == pool._DEFAULT_READ_BUFFER_LIMIT
-
-    def test_spill_threshold_env_override(self):
-        """KIROCREW_MCP_SPILL_THRESHOLD env var overrides the default."""
-        from kiro_crew.mcp_gateway import pool
-        with patch.dict(os.environ, {"KIROCREW_MCP_SPILL_THRESHOLD": "1048576"}):
+        with patch.dict(os.environ, {"KIROCREW_MCP_SPILL_THRESHOLD": raw}):
             val = pool._resolve_spill_threshold()
-        assert val == 1048576
-
-    def test_spill_threshold_zero_disables(self):
-        """KIROCREW_MCP_SPILL_THRESHOLD=0 disables spilling."""
-        from kiro_crew.mcp_gateway import pool
-        with patch.dict(os.environ, {"KIROCREW_MCP_SPILL_THRESHOLD": "0"}):
-            val = pool._resolve_spill_threshold()
-        assert val == 0
+        assert val == expected
 
     # The read-buffer/spill config keys are parsed into McpGatewayConfig and
     # documented as settable in config.json, but the runtime globals in
@@ -361,3 +363,30 @@ class TestSpillCleanup:
 
         assert deleted == 0
         assert fresh_file.exists()
+
+    def test_cleanup_refuses_a_junction_at_the_spill_dir(self, tmp_path):
+        """A directory JUNCTION at the spill dir name must not be swept THROUGH.
+
+        A junction answers ``is_dir()`` True and ``is_symlink()`` False, so an
+        ``is_symlink()`` guard let it past and the sweep deleted 24h-old files
+        under the junction's target -- a confused-deputy delete outside the data
+        home. ``is_link_or_junction`` refuses it. ``make_dir_link`` plants a real
+        junction on Windows and a directory symlink on POSIX, so the refusal is
+        pinned on every shard.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        old_file = outside / "old-response.json"
+        old_file.write_text("not ours to delete")
+        old_time = time.time() - (25 * 3600)
+        os.utime(old_file, (old_time, old_time))
+
+        # KIROCREW_HOME/mcp_spill IS the junction, aimed at ``outside``.
+        make_dir_link(tmp_path / "mcp_spill", outside)
+
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            deleted = cleanup_old_spill_files()
+
+        assert deleted == 0
+        # The sweep never followed the junction: the target's old file survives.
+        assert old_file.exists()

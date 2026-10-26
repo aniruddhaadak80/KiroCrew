@@ -46,7 +46,7 @@ from __future__ import annotations
 import ast
 import collections
 
-from .test_producer import BUILD_PY
+from .test_producer import builder_trees, called_name
 
 # ---------------------------------------------------------------------------
 # what counts as touching the filesystem
@@ -257,9 +257,9 @@ class _Walk(ast.NodeVisitor):
         self._try(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        func = node.func
-        if isinstance(func, ast.Name) and func.id in REPORT_WRITERS:
-            self.report_writes.append((self.scope[-1], func.id, node.lineno))
+        writer = called_name(node)
+        if writer in REPORT_WRITERS:
+            self.report_writes.append((self.scope[-1], writer, node.lineno))
         label = _call_label(node)
         if label is not None:
             self.sites.append((self.scope[-1], label, any(self.covered), node.lineno))
@@ -267,8 +267,10 @@ class _Walk(ast.NodeVisitor):
 
 
 def _walk() -> _Walk:
+    """One walk over every builder file; a site keeps its function name as its key."""
     walk = _Walk()
-    walk.visit(ast.parse(BUILD_PY.read_text(encoding="utf-8")))
+    for _path, tree in builder_trees():
+        walk.visit(tree)
     return walk
 
 
@@ -327,7 +329,6 @@ UNCONVERTED: dict[str, dict[str, int]] = {
     "_staged_tree_hash": {".is_dir": 1, ".is_file": 3, ".is_symlink": 1},
     "_tree_hash": {".is_file": 1, ".is_symlink": 1},
     "_write_bytes_nofollow": {".exists": 1, ".is_dir": 2, ".is_file": 1, ".write_bytes": 1},
-    "_write_guarded": {".mkdir": 1},
     "build_bundle": {
         ".exists": 3,
         ".is_dir": 3,
@@ -336,7 +337,6 @@ UNCONVERTED: dict[str, dict[str, int]] = {
     },
     "build_bundle.<lambda>": {"os.rename": 1},
     "skill_candidates": {".exists": 1, ".is_dir": 1, ".is_file": 3, ".is_symlink": 1},
-    "write_plan": {".mkdir": 1},
 }
 
 VERDICTS: dict[str, str] = {
@@ -396,10 +396,6 @@ VERDICTS: dict[str, str] = {
         "crash: the parent predicates and the fallback write escape; the plain no-follow "
         "write calls it without converting them"
     ),
-    "_write_guarded": (
-        "crash: mkdir on the destination parent escapes, and the skill copy calls it without "
-        "converting it"
-    ),
     "build_bundle": (
         "crash: the post-marker report/plan reads now sit inside an OSError-to-ExportRefused "
         "boundary that releases this run's staging and marker, so those no longer strand; the "
@@ -413,10 +409,6 @@ VERDICTS: dict[str, str] = {
     "skill_candidates": (
         "collapse: the root and asset predicates answer False for an absent and an invalid "
         "path and raise for an unreadable one, so a selected asset can be dropped in silence"
-    ),
-    "write_plan": (
-        "crash: mkdir on the plan's parent escapes, so a plan run ends with a traceback "
-        "instead of a reason"
     ),
 }
 

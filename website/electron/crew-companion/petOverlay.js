@@ -108,15 +108,19 @@ let dragOffsetY = 0;
 
 let baseUrl = "";
 let credential = "";
+// True when the accepted credential rides the shared session cookie rather than
+// the page URL, so an empty `credential` still means "the probe was answered".
+let cookieAuth = false;
 let log = () => {};
 
 function setOverlayLogger(fn) {
   if (typeof fn === "function") log = fn;
 }
 
-function setOverlayTarget(url, token) {
+function setOverlayTarget(url, token, viaCookie = false) {
   baseUrl = url || "";
   credential = token || "";
+  cookieAuth = Boolean(viaCookie);
 }
 
 // ── Error-document latch ─────────────────────────────────────────────────────
@@ -171,7 +175,7 @@ function hasBlankedOverlay() {
  * @returns {number} how many windows were reloaded
  */
 function rearmBlankedCompanionWindows() {
-  if (!baseUrl || !credential) return 0;
+  if (!baseUrl || (!credential && !cookieAuth)) return 0;
   const pageUrl = companionPageUrl(baseUrl, "pet.html", credential);
   const reload = (win) => win.loadURL(pageUrl);
   let rearmed = overlayErrorLatch.rearm(overlays.values(), reload);
@@ -509,6 +513,22 @@ function sendBubbleToActive(playReaction = false) {
   }
 }
 
+/**
+ * Whether the overlay may be made non-activatable (`setFocusable(false)`).
+ *
+ * Not on Windows: there `setFocusable(false)` marks the window unable to activate,
+ * and Chromium answers the `WM_MOUSEACTIVATE` sent for every button press on an
+ * inactive window with `MA_NOACTIVATEANDEAT`, discarding the button-down. The
+ * overlay then gets no `mousedown` at all, so no left click, drag or menu item
+ * works, and the full-display menu hitbox can never be dismissed. `acceptFirstMouse`
+ * is the macOS fix for the same class and does nothing on Windows. The cost is that
+ * a click on the companion activates the overlay; `showInactive()` still keeps it
+ * from taking focus when it appears.
+ */
+function overlayMayBeNonActivatable(platform = process.platform) {
+  return platform !== "win32";
+}
+
 function createOverlayFor(display) {
   const win = new BrowserWindow({
     x: display.bounds.x,
@@ -551,7 +571,7 @@ function createOverlayFor(display) {
     },
   });
 
-  win.setFocusable(false);
+  if (overlayMayBeNonActivatable()) win.setFocusable(false);
   // Refuse input by default; the renderer re-enables it over the sprite alone.
   win.setIgnoreMouseEvents(true, { forward: true });
   // INVISIBLE TO SCREEN CAPTURE (macOS NSWindowSharingNone, Windows
@@ -1034,6 +1054,7 @@ module.exports = {
   assertHostStaysInDock,
   broadcastToPets,
   isPetWindow,
+  overlayMayBeNonActivatable,
   openPetWindow,
   closePetWindow,
   petWindowCount,

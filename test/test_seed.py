@@ -256,7 +256,7 @@ def test_seed_cmd_emits_sel_audit_on_success(
     assert kw["source"] == "cli"
     assert "fixture='empty'" in kw["resources"]
     # ``target_set=True`` proves we log the presence-flag, not the raw
-    # ``$KIROCREW_HOME`` value (per pre-review finding on leakage).
+    # ``$KIROCREW_HOME`` value, so the log never leaks the path.
     assert "target_set=True" in kw["resources"]
     # Regression guard: the raw target path must NEVER appear in the
     # audit resources string. A future refactor adding
@@ -427,14 +427,17 @@ def test_seed_main_home_rail_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyP
     """``$KIROCREW_HOME=~/.kirocrew`` exits 2 with 'refusing to seed main
     gateway home' message, even when the path doesn't exist yet.
 
-    PRD acceptance test 4. Monkeypatches ``$HOME`` so ``Path.home() /
-    '.kirocrew'`` points into ``tmp_path`` — catching developers who set
+    PRD acceptance test 4. Patches ``Path.home()`` directly and ``$HOME`` so
+    ``~/.kirocrew`` points into ``tmp_path`` — catching developers who set
     ``KIROCREW_HOME`` to their real main home would be the worst possible
     test failure mode.
     """
     fake_home = tmp_path / "fake_home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    # Path.home() ignores $HOME on Windows, so patch it directly; $HOME
+    # stays for the POSIX expanduser paths.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     target = fake_home / ".kirocrew"
     monkeypatch.setenv("KIROCREW_HOME", str(target))
 
@@ -455,6 +458,7 @@ def test_seed_new_home_rail_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     fake_home = tmp_path / "fake_home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     target = fake_home / ".kiro" / "crew"
     monkeypatch.setenv("KIROCREW_HOME", str(target))
 
@@ -481,6 +485,7 @@ def test_seed_main_home_rail_refuses_even_with_replace(
     target.mkdir()
     (target / "real_user_data.txt").write_text("don't delete me")
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("KIROCREW_HOME", str(target))
 
     with pytest.raises(seed_mod.SeedError) as excinfo:
@@ -510,8 +515,9 @@ def test_seed_main_home_rail_catches_symlink(
     real_main.mkdir()
     (real_main / "user_data.txt").write_text("preserved")
     symlinked_target = fake_home / "dev-home"
-    symlinked_target.symlink_to(real_main)
+    make_dir_link(symlinked_target, real_main)
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("KIROCREW_HOME", str(symlinked_target))
 
     with pytest.raises(seed_mod.SeedError) as excinfo:
@@ -831,6 +837,9 @@ def test_seed_audit_uses_rail_tag_not_raw_path(
             target = fake_home / ".kirocrew"
             target.mkdir()
             monkeypatch.setenv("HOME", str(fake_home))
+            # Path.home() ignores $HOME on Windows, so patch it directly; $HOME
+            # stays for the POSIX expanduser paths.
+            monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
             monkeypatch.setenv("KIROCREW_HOME", str(target))
         elif setup == "non_empty":
             target = tmp_path / "stuffed"

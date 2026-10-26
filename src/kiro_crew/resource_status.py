@@ -15,15 +15,17 @@ The advisory surfaces carry no enforcement, no lease, no cross-session
 coordination. Two sessions can both read "ample" and both launch heavy work —
 the tradeoff of a cheap, zero-tuning guard. One narrow enforcement point sits
 on top: :func:`admission_check` gates *background* work admission (scheduled
-cron firings, new subagent spawns) while posture is CRITICAL, so the scheduler
-stops piling work onto a host that is about to freeze. Direct user chat turns
+cron firings, task-runner steps) while posture is CRITICAL, so the scheduler
+stops piling work onto a host that is about to freeze. Subagent spawns are not
+gated here: they admit on their own memory floor (``agent.spawn_min_memory_gb``). Direct user chat turns
 and the gateway's own operation are never gated, and the gate fails open on an
 unknown posture. (A hard, cross-session admission lease is a separate, heavier
 design.)
 
 The memory figure reuses :func:`kiro_crew.subagent._available_memory_gb`, the
-same cgroup-clamped, container-aware probe that auto-sizes the sub-agent cap, so
-the two never disagree. It is imported lazily to keep this module import-cheap
+same cgroup-clamped, container-aware probe behind the sub-agent cap's
+memory-readability check and the TaskRunner's memory-sized auto value, so the
+two never disagree. It is imported lazily to keep this module import-cheap
 and free of any import cycle (``context`` imports this; ``subagent`` is heavy).
 
 Alongside memory the probe reads one more ceiling: the agent slice's TASK count
@@ -35,6 +37,12 @@ readable only from ``/sys/fs/cgroup`` by hand. It reaches the pull tool's report
 the injected line, and the diagnostics bundle. It is REPORTED, never gated: the
 posture stays a single memory scalar, so :func:`admission_check` and
 :func:`prewarm_allowance` behave exactly as before at any task count.
+
+On macOS the probe also reads the kernel's memory-pressure level
+(:func:`read_memory_pressure_level`). The level does not change the posture,
+which stays figure-based, and gates nothing here: it is reported on the same
+surfaces. The subagent gate's pressure hold reads it fresh through the same
+reader (``docs/system-specs/modules/subagent.md``).
 """
 
 from __future__ import annotations
@@ -44,11 +52,14 @@ import os
 import sys
 import threading
 import time
-from collections.abc import MutableMapping
+from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.cpu_affinity import affinity_cpu_count
+from kiro_crew.subagent_wait_reasons import MEMORY_PRESSURE_PHRASE
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +92,46 @@ def _read_available_gb() -> float:
         return -1.0
 
 
+#: What a kernel memory-pressure reading means for the user, said the same way
+#: on every surface that reports it. "May": the hold's other conditions are in
+#: subagent.md (*macOS: the kernel memory-pressure hold*).
+PRESSURE_QUEUE_NOTE = (
+    "new subagents may queue until it eases or this gateway's dedicated subagents finish"
+)
+
+
+#: Whether this process has already said the macOS pressure level is unreadable.
+_pressure_unreadable_reported = False
+
+
+def read_memory_pressure_level() -> int | None:
+    """The kernel memory-pressure level, saying ONCE when macOS cannot read it.
+
+    ``None`` fails open everywhere it is read, so a sysctl that macOS stopped
+    answering (or answers with an unexpected value) would silently turn the
+    subagent pressure hold off. One WARNING per process
+    makes that visible without repeating on every probe.
+    """
+    global _pressure_unreadable_reported
+    level = platform_compat.memory_pressure_level()
+    if level is None and platform_compat.IS_MACOS and not _pressure_unreadable_reported:
+        _pressure_unreadable_reported = True
+        logger.warning(
+            "macOS kernel memory-pressure level is unreadable "
+            "(kern.memorystatus_vm_pressure_level); the subagent pressure hold is off"
+        )
+    return level
+
+
+def pressure_level_held(level: int | None) -> bool:
+    """Whether *level* is a kernel memory-pressure reading of WARN or worse.
+
+    The one definition of "held": the subagent gate and every advisory surface
+    read it through this (or the property over it).
+    """
+    return level is not None and level >= platform_compat.MEMORY_PRESSURE_WARN
+
+
 def _read_load_per_cpu(cpu_count: int) -> float | None:
     """1-minute load average normalized per CPU, or ``None`` if unavailable.
 
@@ -107,6 +158,147 @@ _SLICE_TASKS_TIGHT_RATIO = 0.90
 #: cgroup v2 files holding a cgroup's live task count and its task ceiling.
 _PIDS_CURRENT = "pids.current"
 _PIDS_MAX = "pids.max"
+
+#: cgroup v2 file listing a cgroup's member PROCESS ids (one per line). Unlike
+#: ``pids.current`` (tasks, i.e. threads) these are the pids an ownership
+#: question can be asked about.
+_CGROUP_PROCS = "cgroup.procs"
+
+
+@dataclass(frozen=True)
+class SliceOwnership:
+    """Whether every agent process in the slice has a live owner, and vice versa.
+
+    Two independent failures, each an alarm at any value above zero:
+
+    - ``unowned_alive`` — a process is running in the agent slice and NOTHING
+      claims it. It is leaked: no teardown path will reach it, it holds its
+      memory against the slice's ceiling until the host is rebooted or a sweep
+      guesses right about it, and it is invisible to every per-session view.
+    - ``owned_dead`` — something claims a pid that is not running. The claim is
+      stale, so a reader asking "is my session's process up" gets yes from a
+      record rather than from the kernel, and a signal aimed at that pid lands on
+      whatever the OS has since given the number to.
+
+    ``owned_alive`` is the healthy population, published so the two faults can be
+    read as a rate rather than as bare counts.
+
+    ``readable`` is False where the slice's membership cannot be enumerated (not
+    Linux, no cgroup v2 delegation, the slice not materialized). Then every count
+    is ``-1``: a host whose slice cannot be read has NOT been shown to be clean,
+    and publishing 0 there would be an all-clear nothing measured.
+    """
+
+    unowned_alive: int
+    owned_dead: int
+    owned_alive: int
+    readable: bool
+
+    @property
+    def healthy(self) -> bool:
+        """True only when the slice was readable AND both faults are zero."""
+        return self.readable and self.unowned_alive == 0 and self.owned_dead == 0
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "unowned_alive": self.unowned_alive,
+            "owned_dead": self.owned_dead,
+            "owned_alive": self.owned_alive,
+            "readable": self.readable,
+            "healthy": self.healthy,
+        }
+
+
+UNREADABLE_SLICE_OWNERSHIP = SliceOwnership(
+    unowned_alive=-1, owned_dead=-1, owned_alive=-1, readable=False
+)
+
+
+def _read_agent_slice_pids() -> set[int] | None:
+    """Every pid in the agent slice, or None when membership is unreadable.
+
+    Reads ``cgroup.procs`` from the shared slice AND every descendant cgroup:
+    each agent runs in its own ``run-*.scope`` under the slice, and a parent
+    cgroup's own ``cgroup.procs`` lists only processes attached directly to it,
+    which for a slice with children is usually none. Walking the subtree is what
+    makes the count the slice's real population rather than zero.
+
+    Reading the SHARED parent is sound here for the reason the task probe gives:
+    a count attributes nothing to anyone, where a kill would need an owner.
+    """
+    try:
+        from kiro_crew import sandbox
+
+        slice_dir = sandbox._agents_slice_cgroup_dir()
+        if slice_dir is None:
+            return None
+        pids: set[int] = set()
+        seen_any = False
+        for procs_file in [slice_dir / _CGROUP_PROCS, *slice_dir.rglob(_CGROUP_PROCS)]:
+            try:
+                text = procs_file.read_text(encoding="utf-8")
+            except OSError:
+                # A scope released between the walk and the read is ordinary, not
+                # a failure: the pids it held are gone too.
+                continue
+            seen_any = True
+            for line in text.split():
+                try:
+                    pids.add(int(line))
+                except ValueError:
+                    continue
+        return pids if seen_any else None
+    except Exception:  # pragma: no cover - defensive; the probe must never raise
+        logger.debug("agent-slice pid enumeration failed", exc_info=True)
+        return None
+
+
+def slice_ownership(
+    claimed_pids: Iterable[int],
+    *,
+    slice_pids: Iterable[int] | None = None,
+    pid_alive: Callable[[int], bool] | None = None,
+) -> SliceOwnership:
+    """Ownership health of the agent slice. Never raises.
+
+    *claimed_pids* is the caller's union of every source that claims a runtime.
+    It is injected rather than read because the claim records live in the
+    gateway's session manager, not on disk — the same reason
+    :func:`kiro_crew.diag.procs.scan` takes its owner map.
+
+    *slice_pids* and *pid_alive* are seams: the defaults are the real probes, and
+    a test replaces them to run the whole computation against a fixture with no
+    cgroup and no processes.
+
+    The two faults are measured over different populations on purpose.
+    ``unowned_alive`` is asked of the SLICE, because a leak is a process nobody
+    recorded and only the kernel knows about it. ``owned_dead`` is asked of the
+    CLAIMS, because a stale claim can name a pid that was never in the slice, or
+    one whose scope is already gone — so intersecting it with the slice first
+    would hide exactly the claims that have outlived their process.
+
+    A pid that is claimed and alive but OUTSIDE the slice counts as
+    ``owned_alive``: it is owned and running, which is what the field says.
+    """
+    try:
+        claimed = {int(pid) for pid in claimed_pids}
+        members = _read_agent_slice_pids() if slice_pids is None else {int(p) for p in slice_pids}
+        if members is None:
+            return UNREADABLE_SLICE_OWNERSHIP
+        alive = pid_alive
+        if alive is None:
+            from kiro_crew import platform_compat
+
+            alive = platform_compat.pid_exists
+        return SliceOwnership(
+            unowned_alive=sum(1 for pid in members if pid not in claimed),
+            owned_dead=sum(1 for pid in claimed if not alive(pid)),
+            owned_alive=sum(1 for pid in claimed if alive(pid)),
+            readable=True,
+        )
+    except Exception:  # pragma: no cover - defensive; the probe must never raise
+        logger.debug("slice ownership probe failed", exc_info=True)
+        return UNREADABLE_SLICE_OWNERSHIP
 
 
 def _read_pids_max(path: Path) -> int:
@@ -198,10 +390,31 @@ class ResourceStatus:
     slice_tasks: int = -1  # slice pids.current; -1 when unreadable
     slice_tasks_limit: int = -1  # slice pids.max; 0 = no ceiling, -1 unreadable
     slice_tasks_own: int = -1  # this instance's share; -1 when unattributable
+    # The macOS kernel's memory-pressure level (platform_compat.MEMORY_PRESSURE_*),
+    # None off macOS or when unreadable. Reported beside the posture, never
+    # folded into it.
+    memory_pressure_level: int | None = None
+
+    @property
+    def memory_pressure_held(self) -> bool:
+        """True while the macOS kernel reports memory pressure of WARN or worse."""
+        return pressure_level_held(self.memory_pressure_level)
+
+    def _pressure_clause(self) -> str:
+        """Sentence for an advisory line while the kernel reports pressure."""
+        if not self.memory_pressure_held:
+            return ""
+        name = platform_compat.memory_pressure_name(self.memory_pressure_level)
+        return f" {MEMORY_PRESSURE_PHRASE} ({name}): {PRESSURE_QUEUE_NOTE}."
 
     @property
     def under_pressure(self) -> bool:
-        """True only for tight/critical — the gate for injecting the context line."""
+        """True only for tight/critical: the posture half of the context line's gate.
+
+        The line is also raised by a slice near its task ceiling and by a macOS
+        kernel pressure level of WARN or worse (:meth:`context_line`); neither
+        moves this figure-based answer.
+        """
         return self.posture in (POSTURE_TIGHT, POSTURE_CRITICAL)
 
     @property
@@ -247,8 +460,12 @@ class ResourceStatus:
     def _load_suffix(self) -> str:
         return f", load {self.load_per_cpu}/core" if self.load_per_cpu is not None else ""
 
-    def context_line(self) -> str:
+    def context_line(self, *, remote: bool = False) -> str:
         """The compact ``[RESOURCES]`` advisory injected on a pressured turn.
+
+        ``remote`` is set for a session whose workspace is a remote session
+        environment: the line then scopes the reading to the gateway machine and
+        says the workspace is not measured, instead of advising lighter builds.
 
         Returns ``""`` when the line is disabled (``pressure_gb <= 0`` — the
         documented off switch), or when neither ceiling is near: memory is ample
@@ -258,16 +475,22 @@ class ResourceStatus:
         pull tool. Kept short on purpose — it costs tokens every pressured turn.
 
         The task ceiling can raise the line by itself, because a host one fork
-        from its ``pids.max`` is not observable in the memory figure at all. It
-        does NOT touch ``posture``, so nothing that gates on the posture tier
-        changes behaviour with it.
+        from its ``pids.max`` is not observable in the memory figure at all, and
+        so can a macOS kernel pressure level of WARN or worse, whatever the figure
+        reads (an unreadable figure included). Neither touches ``posture``, so
+        nothing that gates on the posture tier changes behaviour with them.
         """
         if self.pressure_gb <= 0:
             return ""  # off switch: disables the line regardless of critical tier
+        if remote:
+            return self._remote_line()
         if not self.under_pressure:
+            if self.memory_pressure_held:
+                return self._kernel_pressure_line()
             return self._tasks_only_line()
         gb = f"{self.available_gb:.1f}"
         load = self._load_suffix()
+        suffix = self._pressure_clause() + self._tasks_clause()
         if self.posture == POSTURE_CRITICAL:
             return (
                 f"[RESOURCES] Host memory is CRITICALLY low (~{gb} GB free{load}). "
@@ -275,14 +498,63 @@ class ResourceStatus:
                 "parallel sub-agent waves) — it may fail or destabilize other "
                 "sessions on this host. Run only the lightest necessary steps, or "
                 "wait for memory to free. Call the resource_status tool to re-check."
-            ) + self._tasks_clause()
+            ) + suffix
         return (
             f"[RESOURCES] Host memory is tight (~{gb} GB free{load}). Before heavy "
             "work, prefer the lighter path: run targeted tests instead of the full "
             "suite, avoid large parallel sub-agent waves, and serialize or defer "
             "memory-heavy builds/test runs. Call the resource_status tool to "
             "re-check before a heavy step."
+        ) + suffix
+
+    def _kernel_pressure_line(self) -> str:
+        """The advisory while the figure looks fine but the macOS kernel does not.
+
+        The posture stays figure-based, so without this line a Mac at WARN with
+        gigabytes reclaimable would inject nothing while new subagent starts
+        may queue.
+        """
+        free = (
+            f"~{self.available_gb:.1f} GB free"
+            if self.available_gb >= 0
+            else "an unreadable figure"
+        )
+        return (
+            f"[RESOURCES] Host memory reads {free}{self._load_suffix()}, but"
+            f"{self._pressure_clause()} Prefer the lighter path for heavy work, and call "
+            "the resource_status tool to re-check."
         ) + self._tasks_clause()
+
+    def _remote_line(self) -> str:
+        """The line for a session whose workspace is a remote machine.
+
+        Only the gateway (engine and subagents) is measured, so the advice is
+        about sub-agent waves, never builds or tests; silent when it is clear.
+        """
+        # The macOS kernel pressure level describes the gateway, like the figure.
+        if not (self.under_pressure or self.memory_pressure_held):
+            if self.slice_tasks_tight:
+                tasks_line = self._tasks_only_line().removeprefix("[RESOURCES] ")
+                return "[RESOURCES] (gateway machine) " + tasks_line
+            return ""
+        if self.under_pressure:
+            level = "CRITICALLY low" if self.posture == POSTURE_CRITICAL else "tight"
+            gateway = (
+                f"The gateway machine (where this session's engine and subagents run) "
+                f"is {level} on memory (~{self.available_gb:.1f} GB free"
+                f"{self._load_suffix()}), so keep sub-agent waves small." + self._pressure_clause()
+            )
+        else:
+            gateway = (
+                "The gateway machine (where this session's engine and subagents run) "
+                "is under kernel memory pressure, so keep sub-agent waves small."
+                + self._pressure_clause()
+            )
+        workspace = (
+            "Your workspace is a separate remote machine this does not measure, so "
+            "do not narrow builds, tests or shells there for it."
+        )
+        return "[RESOURCES] " + gateway + " " + workspace + self._tasks_clause()
 
     def _tasks_clause(self) -> str:
         """Sentence appended to a memory advisory when tasks are ALSO near the cap."""
@@ -328,6 +600,11 @@ class ResourceStatus:
         load = f"{self.load_per_cpu}/core" if self.load_per_cpu is not None else "unknown"
         lines.append(f"  CPU cores: {self.cpu_count}   1-min load: {load}")
         lines.append(f"  Posture: {self.posture.upper()}")
+        if self.memory_pressure_level is not None:
+            # macOS only: omitted elsewhere, like the slice task line below.
+            name = platform_compat.memory_pressure_name(self.memory_pressure_level)
+            held = f" — {PRESSURE_QUEUE_NOTE}" if self.memory_pressure_held else ""
+            lines.append(f"  Kernel memory pressure: {name}{held}")
         tasks = self.slice_tasks_text()
         if tasks:
             # Omitted, not reported as "unknown", where there is no cgroup task
@@ -360,13 +637,14 @@ def adaptive_exec_cap() -> int:
     """The execution cap IN FORCE in this process, or ``0`` when unknown.
 
     The number a caller sizing a fan-out needs: ``agent.max_subagents`` is a
-    ceiling the adaptive controller may be dispatching 1 at a time under. The
-    same registry read as :func:`adaptive_state` -- a dict lookup, no request --
-    so it is safe on every session-assembly path; outside the gateway it is 0
-    and the caller falls back to the configured ceiling, LABELLED as one. A
-    disabled controller leaves the user's max as the cap in force, so that is
-    what it reports; a paused dispatch (cap 0) reads as unknown, because "up to
-    0" is no fan-out guidance at all.
+    ceiling the adaptive controller may have cut after admitted work kept
+    failing. The same registry read as :func:`adaptive_state` -- a dict lookup,
+    no request -- so it is safe on every session-assembly path; outside the
+    gateway it is 0 and the caller falls back to the configured ceiling,
+    LABELLED as one. A disabled controller leaves the user's max as the cap in
+    force, so that is what it reports; a cap of 0 (which the controller no
+    longer produces) reads as unknown, because "up to 0" is no fan-out guidance
+    at all.
     """
     state = adaptive_state()
     if not state:
@@ -380,7 +658,7 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
     """Effective caps and controller state, for the ``resource_status`` tool.
 
     Empty when no controller runs here. Otherwise: the live execution cap
-    against the user's ceiling, the spawn-gate capacity, whether dispatch is
+    against the user's ceiling, the spawn-gate capacity and whether the gate is
     paused or probing, and the last decision's action and reason -- what the
     dashboard's resources popover and ``kirocrew doctor`` show as "effective
     concurrency vs user max and the current pressure reason". When the state
@@ -406,9 +684,10 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
     status = "paused" if state.get("paused") else "active"
     if state.get("probing"):
         status = "probing"
+    # The pause is the spawn gate's: the execution cap is never paused.
     lines.append(
         f"  Mode: {mode}   Execution cap: {exec_cap}/{ceiling}   "
-        f"MCP spawn gate: {gate_cap}/{gate_ceiling}   Dispatch: {status}"
+        f"MCP spawn gate: {gate_cap}/{gate_ceiling} ({status})"
     )
     # The growth regime: without it "4/64" reads as an unexplained throttle.
     # The cap climbs toward the user's ceiling on clean samples; a low one is
@@ -416,6 +695,20 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
     if state.get("enabled", True) and "slow_start" in state:
         growth = "slow start (x2/window)" if state.get("slow_start") else "+1 per window"
         lines.append(f"  Growth toward ceiling: {growth}")
+    # The last cut behind a cap below the ceiling: it outlives both the last
+    # decision (usually a hold) and the five-entry history below. Named as the
+    # LAST cut, not as the cause: a cap recovered to its fresh-start value is
+    # still below the ceiling, and the cut is then history, not the bound.
+    cut = state.get("last_cut")
+    if isinstance(cut, dict) and isinstance(exec_cap, int) and isinstance(ceiling, int):
+        if exec_cap < ceiling:
+            age = cut.get("age_secs")
+            age_text = f" {age:.0f}s ago" if isinstance(age, (int, float)) else ""
+            cut_signals = ",".join(cut.get("signals") or []) or "none"
+            lines.append(
+                f"  Last pressure cut: {cut.get('action')}{age_text} ({cut.get('reason')}); "
+                f"signals: {cut_signals}"
+            )
     last = state.get("last") or {}
     if last:
         signals = ",".join(last.get("signals") or []) or "none"
@@ -525,6 +818,7 @@ def probe(cfg: object | None = None) -> ResourceStatus:
         slice_tasks=slice_tasks,
         slice_tasks_limit=slice_tasks_limit,
         slice_tasks_own=slice_tasks_own,
+        memory_pressure_level=read_memory_pressure_level(),
     )
 
 
@@ -635,7 +929,7 @@ def inject_xdist_auto_cap(env: MutableMapping[str, str]) -> None:
     available_gb = _read_available_gb()
     if available_gb < 0:
         return  # probe unavailable — fail open to xdist's default
-    env[XDIST_AUTO_ENV] = str(compute_xdist_auto_workers(available_gb, os.cpu_count() or 1))
+    env[XDIST_AUTO_ENV] = str(compute_xdist_auto_workers(available_gb, affinity_cpu_count() or 1))
 
 
 @dataclass(frozen=True)
@@ -665,8 +959,8 @@ def admission_check(cfg: object | None = None) -> AdmissionDecision:
 
     The single enforcement point layered on the advisory posture tier: a
     CRITICAL posture refuses; every other posture — ample, tight, and unknown —
-    admits. Callers on the two gated paths (scheduled cron firings, new
-    subagent spawns) consult this once per admission decision; it reuses the
+    admits. Callers on the gated paths (scheduled cron firings, task-runner
+    steps) consult this once per admission decision; it reuses the
     same cheap :func:`probe` the advisory surfaces use (fingerprint-cached
     config, one memory read, and a handful of single-value cgroup reads for the
     slice's task figure) and never scans processes. The task figure is reported,
@@ -727,6 +1021,20 @@ def admission_check(cfg: object | None = None) -> AdmissionDecision:
 # the posture rather than on a second, disagreeing scale. ``unknown`` (an
 # unreadable probe) keeps the fixed cap: a host the probe cannot measure is
 # never made worse by it.
+#
+# SESSION = PROCESS is a premise here, not an accident of wording. It holds
+# today because every pre-warm spawns its own runtime. Where a session can join
+# an existing runtime instead, a pre-warm claim costs a lease rather than a
+# process, and this allowance then over-charges: it holds back pre-warms the
+# host could afford, so the host is UNDER-used, never over-committed. That is
+# the safe direction to be wrong in, which is why the number is left alone and
+# the premise is written down instead. The fix when sharing lands is to size on
+# the runtimes a pre-warm will actually SPAWN, not on the sessions it will serve.
+#
+# The macOS kernel memory-pressure hold is NOT applied here: it is the subagent
+# gate's rule, and the eager-spawn ADMISSION reads it from the manager
+# (``chat_runner._admit_prefetch``'s caller), never the re-probe after a
+# pre-warm registered.
 PREWARM_MAX_LIVE = 3
 _PREWARM_BY_POSTURE: dict[str, int] = {
     POSTURE_CRITICAL: 0,
@@ -760,9 +1068,9 @@ def prewarm_allowance(available_gb: float | None = None, cfg: object | None = No
         return PREWARM_MAX_LIVE
 
 
-# Cached-verdict layer for callers that must never block: the sync spawn path
-# runs on the gateway event loop, so it reads the last off-thread verdict
-# instead of probing inline. Freshness window sized to the posture's own rate
+# Cached-verdict layer for callers that must never block: an admission decided
+# on the gateway event loop reads the last off-thread verdict instead of
+# probing inline. Freshness window sized to the posture's own rate
 # of change (memory exhaustion develops over tens of seconds, not millis).
 _CACHED_TTL_SECS = 5.0
 _cached_decision: AdmissionDecision | None = None
@@ -786,7 +1094,7 @@ def cached_admission_check() -> AdmissionDecision:
     one background refresh (non-blocking dedupe) and returns the previous
     verdict — or a fail-open admit before the first refresh completes. The
     caller's thread never performs config or procfs I/O, which is what keeps
-    the sync spawn path safe to call from the gateway event loop. The
+    it safe to call from the gateway event loop. The
     trade-off is bounded staleness (:data:`_CACHED_TTL_SECS` plus one refresh
     latency), acceptable because the gate is advisory pressure-shedding, not
     a correctness barrier.

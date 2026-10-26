@@ -551,7 +551,7 @@ async def _ensure_repo() -> tuple[bool, str]:
 
     await asyncio.to_thread(_sync_gitignore)
 
-    if not (root / ".git").is_dir():
+    if not await asyncio.to_thread((root / ".git").is_dir):
         rc, _, err = await _git("init", "-q")
         if rc != 0:
             return False, f"git init failed: {err.strip()[:200]}"
@@ -728,9 +728,14 @@ def resolve_conflict() -> int:
     lock was introduced to fix in ``hygiene``, in a function added afterwards, which is the
     argument for the lock living at the read-modify-write span rather than inside the writer.
     Found in review.
+
+    Reads through ``read_entries_for_update``, so a failed OPEN raises ``OSError`` instead
+    of reading as an empty ledger. The lenient ``read_entries`` answers ``[]`` there, and
+    rewriting from that would truncate the team's shared ledger, which ``push`` then
+    publishes. The error reaches ``sync_safely``, which logs it and skips the sync step.
     """
     with ledger._LedgerLock():
-        entries = ledger.read_entries()
+        entries = ledger.read_entries_for_update()
         ledger._write_all(entries)  # same writer upsert/hygiene use, so format cannot drift
     sel().log_api_access(
         caller="core:ops-mission-control",
@@ -748,7 +753,8 @@ async def pull() -> tuple[bool, str]:
     fingerprint lookup. Returns ``(ok, detail)`` and never raises: sync is a
     convenience, and a dispatch cycle must not fail because a remote was unreachable.
     """
-    if not configured():
+    # Off the loop: each policy_store.get re-reads the keystone policy file.
+    if not await asyncio.to_thread(configured):
         return False, "ledger sync is not configured"
     ok, err = await _ensure_repo()
     if not ok:
@@ -847,6 +853,12 @@ async def pull() -> tuple[bool, str]:
 TRACKED_FILES: tuple[str, ...] = ("ledger.jsonl", "rotation.yaml", ".gitignore")
 
 
+def _present_tracked_files() -> list[str]:
+    """The tracked files that exist on disk, in ``TRACKED_FILES`` order. Blocking."""
+    root = _repo_root()
+    return [name for name in TRACKED_FILES if (root / name).exists()]
+
+
 async def _stage_and_commit(message: str, *, allow_empty_message_only: bool = False) -> bool:
     """Stage every tracked file and commit if anything changed.
 
@@ -855,9 +867,10 @@ async def _stage_and_commit(message: str, *, allow_empty_message_only: bool = Fa
     push that only ever ran ``git add ledger.jsonl`` would leave the schedule committed
     nowhere and silently never reach teammates.
     """
-    for name in TRACKED_FILES:
-        if (_repo_root() / name).exists():
-            await _git("add", "--", name)
+    # Off the loop, like the rest of this module's file work: `push` and `pull` await this
+    # directly on the event loop. One worker hop for the whole set, not one per file.
+    for name in await asyncio.to_thread(_present_tracked_files):
+        await _git("add", "--", name)
     rc, out, _ = await _git("status", "--porcelain")
     if rc == 0 and not out.strip() and not allow_empty_message_only:
         return False
@@ -875,7 +888,8 @@ async def _stage_and_commit(message: str, *, allow_empty_message_only: bool = Fa
 
 async def push(*, message: str = "update ops ledger") -> tuple[bool, str]:
     """Commit and push the local ledger. Call AFTER recording a lesson."""
-    if not configured():
+    # Off the loop for the reason given in `pull`.
+    if not await asyncio.to_thread(configured):
         return False, "ledger sync is not configured"
     ok, err = await _ensure_repo()
     if not ok:
@@ -1017,7 +1031,9 @@ async def sync_safely(*, direction: str = "pull") -> str:
     that resolves in milliseconds. The retry is bounded at one and only re-runs an
     idempotent git step, so it cannot mask a genuine fault.
     """
-    if not configured():
+    # Off the loop: `run_cycle` awaits this on every heartbeat, and the check re-reads the
+    # keystone policy file each time.
+    if not await asyncio.to_thread(configured):
         return ""
     last = ""
     for attempt in (1, 2):

@@ -47,7 +47,7 @@ _ARGV = ["/opt/kirocrew/bin/kirocrew", "mcp-core"]
 def clean_state(monkeypatch):
     """Reset cached backend, one-shot latches, and host-specific interference.
 
-    Mirrors ``test_sandbox_argv.clean_backend``: neutralize the host's real
+    Mirrors ``sandbox_argv_helpers.clean_backend``: neutralize the host's real
     kiro internal-sandbox setting (so the darwin delegation branch never
     preempts the code under test), clear the in-sandbox marker, and reset every
     per-process warning sentinel these tests assert on.
@@ -232,7 +232,7 @@ class TestGovernanceFloorOverridesTheOptIn:
         )
 
     def test_governed_host_raises_even_though_the_opt_in_is_set(self, governed):
-        """THE FIX. Before this, these exact conditions returned bare argv."""
+        """A governance floor overrides the opt-in: no bare argv under these conditions."""
         with patch("kiro_crew.sel.sel", return_value=MagicMock()):
             with pytest.raises(SandboxUnavailableError) as exc_info:
                 wrap_argv(_ARGV, mode="strict")

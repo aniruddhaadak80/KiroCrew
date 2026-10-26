@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -45,6 +46,16 @@ def _request(state) -> object:
         def __init__(self, app):
             super().__init__(user="local-app", app="")
             self.app = app
+            self._claims = {"user": "local-app", "app": ""}
+
+        def get(self, key, default=None):
+            return self._claims.get(key, default)
+
+        def __contains__(self, key):
+            return key in self._claims
+
+        def __getitem__(self, key):
+            return self._claims[key]
 
     app = _App()
     app["state"] = state
@@ -54,6 +65,7 @@ def _request(state) -> object:
 class _State:
     def __init__(self) -> None:
         self._background_tasks: set = set()
+        self.sessions = SimpleNamespace(final_drain_started=False)
 
 
 def _arrange(monkeypatch, tmp_path, servers, cache):

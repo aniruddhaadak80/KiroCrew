@@ -343,6 +343,59 @@ class TestASubordinateMayOnlyTighten:
         )
         assert not resolve(ceiling, None, "tools", "execute_bash").permitted
 
+    @staticmethod
+    def _channels(**posture: dict) -> dict:
+        """A ``channels`` scope admitting ``slack`` with the given ``slack`` posture."""
+        body: dict = {"members": {"mode": "allow", "allow": ["slack"]}}
+        if posture:
+            body["posture"] = {"slack": posture}
+        return {"channels": body}
+
+    def test_a_subordinate_posture_folds_as_an_intersection(self, monkeypatch, tmp_path, central):
+        ceiling = self._compose(
+            monkeypatch,
+            tmp_path,
+            central,
+            authority=self._channels(
+                allowed_enterprise_ids={"mode": "allow", "allow": ["E1", "E2"]}
+            ),
+            subordinate=self._channels(
+                allowed_enterprise_ids={"mode": "allow", "allow": ["E1"]},
+                allowed_team_ids={"mode": "allow", "allow": ["T1"]},
+            ),
+        )
+        # A leaf both tiers set: an id must be allowed by both.
+        assert resolve(ceiling, None, "channels", "slack/allowed_enterprise_ids:E1").permitted
+        assert not resolve(ceiling, None, "channels", "slack/allowed_enterprise_ids:E2").permitted
+        # A leaf only the subordinate sets is added as a further restriction.
+        assert resolve(ceiling, None, "channels", "slack/allowed_team_ids:T1").permitted
+        assert not resolve(ceiling, None, "channels", "slack/allowed_team_ids:T2").permitted
+
+    def test_a_subordinate_posture_cannot_widen_the_authority(self, monkeypatch, tmp_path, central):
+        ceiling = self._compose(
+            monkeypatch,
+            tmp_path,
+            central,
+            authority=self._channels(allowed_enterprise_ids={"mode": "allow", "allow": ["E1"]}),
+            subordinate=self._channels(
+                allowed_enterprise_ids={"mode": "allow", "allow": ["E1", "E2"]}
+            ),
+        )
+        assert resolve(ceiling, None, "channels", "slack/allowed_enterprise_ids:E1").permitted
+        assert not resolve(ceiling, None, "channels", "slack/allowed_enterprise_ids:E2").permitted
+
+    def test_a_subordinate_cannot_repeal_the_authority_posture_by_omission(
+        self, monkeypatch, tmp_path, central
+    ):
+        ceiling = self._compose(
+            monkeypatch,
+            tmp_path,
+            central,
+            authority=self._channels(allowed_enterprise_ids={"mode": "allow", "allow": ["E1"]}),
+            subordinate=self._channels(),
+        )
+        assert not resolve(ceiling, None, "channels", "slack/allowed_enterprise_ids:E2").permitted
+
     def test_composition_is_the_same_for_the_env_tier(self, monkeypatch, tmp_path, central):
         # The subordinate's identity does not change the algebra: whichever of
         # tiers 2-4 is present composes the same way.
@@ -1181,3 +1234,79 @@ class TestAnUnreadableHomeFileBeneathAnAuthorityIsSkipped:
         _point_home(monkeypatch, _write_policy(tmp_path / "home.json", "operator"))
         with pytest.raises(RuntimeError, match="unanticipated"):
             load_security_policy()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# An unexpected exception while loading refuses boot, never boots ungoverned
+# ──────────────────────────────────────────────────────────────────────────
+class TestAnUnexpectedLoaderErrorRefusesBoot:
+    """Any non-composition exception from the loader is raised as a composition error.
+
+    Boot (``cli.main``, ``mcp_entry``) and ``safe_context_call`` re-raise a
+    ``PlatformCompositionError`` and DEGRADE anything else to the ungoverned default
+    context. A raw ``ValueError`` / ``KeyError`` escaping the env or central parse
+    path would therefore boot a fleet host with no ceiling at all.
+    """
+
+    @pytest.fixture(
+        params=[ValueError("bad shape"), KeyError("missing")], ids=["ValueError", "KeyError"]
+    )
+    def boom(self, request):
+        exc = request.param
+
+        def _raise(*_a, **_kw):
+            raise exc
+
+        return _raise
+
+    @staticmethod
+    def _refusal(call) -> str:
+        """Run *call*; assert it raised a composition error, and return its text.
+
+        Catches every exception rather than only the expected class, so a raw
+        ``ValueError`` escaping (the bug) fails an ASSERTION here instead of
+        erroring out of the test body.
+        """
+        from kiro_crew.platform.context import PlatformCompositionError
+
+        with pytest.raises(Exception) as info:
+            call()
+        assert isinstance(info.value, PlatformCompositionError), (
+            f"raw {type(info.value).__name__} escaped the loader; boot would degrade "
+            "to the ungoverned default context"
+        )
+        assert "refusing to boot ungoverned" in str(info.value)
+        return str(info.value)
+
+    def test_env_path_parse_error_refuses(self, monkeypatch, tmp_path, boom):
+        env_file = _write_policy(tmp_path / "env.json", "env")
+        monkeypatch.setenv(_POLICY_ENV, str(env_file))
+        monkeypatch.setattr(governance, "parse_policy", boom)
+        text = self._refusal(load_security_policy)
+        assert str(env_file) in text
+        assert _POLICY_ENV in text
+
+    def test_central_path_error_refuses(self, monkeypatch, boom):
+        monkeypatch.setenv("KIROCREW_POLICY_URL", _TEST_SOURCE)
+        monkeypatch.setattr(pd, "load_distributed_policy", boom)
+        assert "central policy" in self._refusal(load_security_policy)
+
+    def test_boot_composition_refuses_rather_than_defaulting(self, monkeypatch, tmp_path, boom):
+        # ``build_default_context`` is the chokepoint both a real boot and the lazy
+        # ``current_context`` default go through; its refusal is what boot re-raises.
+        from kiro_crew.platform.bootstrap import build_default_context
+
+        env_file = _write_policy(tmp_path / "env.json", "env")
+        monkeypatch.setenv(_POLICY_ENV, str(env_file))
+        monkeypatch.setattr(governance, "parse_policy", boom)
+        self._refusal(lambda: build_default_context(object()))  # type: ignore[arg-type]
+
+    def test_a_composition_error_passes_through_unwrapped(self, monkeypatch, tmp_path):
+        from kiro_crew.platform.context import PlatformCompositionError
+
+        env_file = tmp_path / "env.json"
+        env_file.write_text("{ not json", encoding="utf-8")
+        monkeypatch.setenv(_POLICY_ENV, str(env_file))
+        with pytest.raises(PlatformCompositionError, match="is unreadable") as info:
+            load_security_policy()
+        assert "refusing to boot ungoverned" not in str(info.value)

@@ -6,6 +6,7 @@ JSONL, memory.db, lessons, or preferences. Lifecycle: open → turn(s) → close
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,8 +27,8 @@ STEER_PENDING = "pending"
 STEER_CONSUMED = "consumed"
 STEER_REQUEUED = "requeued"
 
-#: Ledger ceiling. Terminal entries are pruned when a new turn starts, so this
-#: only bounds a pathological single turn.
+#: Ledger ceiling. Terminal entries are not pruned at turn start; ``steer_register``
+#: evicts the oldest terminal entry only once the ledger holds this many.
 MAX_STEER_LEDGER = 100
 
 
@@ -43,8 +44,10 @@ class SideState:
     ``_run_side_turn`` finally block.
 
     ``queue`` holds messages submitted while a turn is in flight, as
-    ``{"id", "content", "ts"}`` dicts. It is drained one entry per turn by
-    ``_run_side_turn``'s finally block.
+    ``{"id", "content", "ts", "rev"}`` dicts. It is drained one entry per turn by
+    ``_run_side_turn``'s finally block. ``rev`` counts the entry's edits: the read
+    and the edit frame both carry it, so a tab holding two copies of an entry can
+    tell which is newer.
     """
 
     open: bool = False
@@ -52,7 +55,7 @@ class SideState:
     last_run_id: str = ""
     is_complete: bool = True
     created_at: str = field(default_factory=_now_iso)
-    queue: list[dict[str, str]] = field(default_factory=list)
+    queue: list[dict[str, Any]] = field(default_factory=list)
     #: Ledger of steers handed to the backend, as
     #: ``{"id", "text", "state"}`` where state is one of
     #: :data:`STEER_PENDING` / :data:`STEER_CONSUMED` / :data:`STEER_REQUEUED`.
@@ -76,27 +79,75 @@ class SideState:
     #: the old agent, in the old cwd, with the old grants. ``None`` = no live
     #: session has been bound through this sidecar yet.
     binding: tuple[str, str, str] | None = None
+    #: The asyncio task driving the in-flight turn, so a stop request can cancel
+    #: it by lookup. The turn's own handle is otherwise only in
+    #: ``state._background_tasks`` (a set with no per-slot key), which a stop
+    #: endpoint cannot address. Set when the turn is dispatched, cleared in the
+    #: turn's ``finally`` once it is the sidecar's current run. ``None`` = no
+    #: turn is running (or the running turn belongs to a superseded sidecar).
+    task: asyncio.Task[None] | None = None
+    #: True while ``api_side_stop`` is cancelling this turn and has not yet
+    #: recorded its terminal ``(side response stopped)`` row. The turn's own
+    #: ``finally`` flips ``is_complete`` True synchronously as it unwinds, which
+    #: lands DURING the stop handler's bounded await of the task cleanup — before
+    #: the handler resumes to settle. For that window ``is_complete`` alone would
+    #: read the turn as idle, so a concurrent ``POST /side/turn`` that finished
+    #: parsing its body in those few event-loop ticks would pass the busy gate,
+    #: dispatch a successor, and make the stop handler see a replacement and skip
+    #: settlement — leaving the cancelled question in the next turn's history with
+    #: no stopped row (a security-class gap). ``is_stopping`` keeps the
+    #: deliberately-cancelled turn BUSY through cleanup: the busy gate and the
+    #: queue drain both honour it, so no successor is admitted until the stop
+    #: handler clears it after recording and broadcasting the terminal row.
+    is_stopping: bool = False
 
-    def append_user(self, content: str, ts: str = "", *, steer: bool = False) -> None:
-        """Append a user turn. ``steer`` marks it as injected mid-turn, which the
-        panel renders as a distinct bubble rather than a normal question."""
-        entry: dict[str, Any] = {
-            "role": "user",
-            "content": content,
-            "ts": ts or _now_iso(),
-        }
+    @property
+    def turn_in_flight(self) -> bool:
+        """True while a submit would steer or queue rather than start a turn: a run
+        has begun and has not completed, or a stop is still settling it
+        (``is_stopping``). ``POST /side/turn`` gates on it, and ``GET .../side``
+        reports it as ``running``, so a restored panel offers steer and queue
+        exactly when a submit would get them."""
+        return bool(self.last_run_id) and (not self.is_complete or self.is_stopping)
+
+    def append_user(
+        self, content: str, ts: str = "", *, steer: bool = False, run_id: str = ""
+    ) -> str:
+        """Append a user turn and return its id. ``steer`` marks it as injected
+        mid-turn, which the panel renders as a distinct bubble rather than a
+        normal question.
+
+        The id rides the frame that announces the row, so a panel that restored
+        this transcript (``GET .../side``) recognises a frame for a row it already
+        holds instead of drawing it twice."""
+        entry = self._entry("user", content, ts, run_id)
         if steer:
             entry["steer"] = True
         self.messages.append(entry)
+        return str(entry["id"])
 
-    def append_assistant(self, content: str, ts: str = "") -> None:
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "ts": ts or _now_iso(),
-            }
-        )
+    def append_assistant(
+        self, content: str, ts: str = "", *, run_id: str = "", is_error: bool = False
+    ) -> str:
+        """Append an assistant turn and return its id. ``is_error`` marks a row the
+        panel draws as a notice, the way the frame that announced it did."""
+        entry = self._entry("assistant", content, ts, run_id)
+        if is_error:
+            entry["is_error"] = True
+        self.messages.append(entry)
+        return str(entry["id"])
+
+    @staticmethod
+    def _entry(role: str, content: str, ts: str, run_id: str) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "id": uuid.uuid4().hex[:12],
+            "role": role,
+            "content": content,
+            "ts": ts or _now_iso(),
+        }
+        if run_id:
+            entry["run_id"] = run_id
+        return entry
 
     def clear(self) -> None:
         self.messages.clear()
@@ -104,6 +155,8 @@ class SideState:
         self.is_complete = True
         self.queue.clear()
         self.steers.clear()
+        self.task = None
+        self.is_stopping = False
 
     # ── Queue helpers ──
 
@@ -121,7 +174,7 @@ class SideState:
         if len(self.queue) + len(self.steer_pending()) >= MAX_SIDE_QUEUE:
             return None
         qid = uuid.uuid4().hex[:12]
-        self.queue.append({"id": qid, "content": content, "ts": _now_iso()})
+        self.queue.append({"id": qid, "content": content, "ts": _now_iso(), "rev": 0})
         return qid
 
     def queue_headroom(self) -> int:
@@ -145,7 +198,7 @@ class SideState:
         if len(self.queue) >= MAX_SIDE_QUEUE:
             return None
         qid = uuid.uuid4().hex[:12]
-        self.queue.insert(0, {"id": qid, "content": content, "ts": _now_iso()})
+        self.queue.insert(0, {"id": qid, "content": content, "ts": _now_iso(), "rev": 0})
         return qid
 
     def steer_can_accept(self) -> bool:
@@ -159,7 +212,7 @@ class SideState:
         """
         return len(self.queue) + len(self.steer_pending()) < MAX_SIDE_QUEUE
 
-    def queue_pop(self) -> dict[str, str] | None:
+    def queue_pop(self) -> dict[str, Any] | None:
         """Pop the oldest queued entry, or None when the queue is empty."""
         if not self.queue:
             return None
@@ -173,13 +226,15 @@ class SideState:
                 return item["content"]
         return None
 
-    def queue_edit(self, queue_id: str, content: str) -> bool:
-        """Replace one entry's content by ID, preserving order. True if found."""
+    def queue_edit(self, queue_id: str, content: str) -> int | None:
+        """Replace one entry's content by ID, preserving order. Returns the entry's
+        new ``rev``, or None if not found."""
         for item in self.queue:
             if item["id"] == queue_id:
                 item["content"] = content
-                return True
-        return False
+                item["rev"] = int(item.get("rev", 0)) + 1
+                return int(item["rev"])
+        return None
 
     # ── Steer ledger ──
 

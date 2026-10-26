@@ -9,32 +9,44 @@ live, so an atomic replace of that name by a host-side writer -- a Dev Fleet
 cutover, a config save -- puts a fresh, writable object at a protected name while
 the mask hangs off the object that was there at spawn.
 
-These tests enumerate the protected names FROM SOURCE for every tier and pin
-which of the two holds each name has. They are static: no namespace, no mount,
-no privilege.
+These tests enumerate the protected names for every tier from the namespace
+plan -- the mask, file and seal lists the launcher is handed -- and pin which of
+the two holds each name has. They are static: no namespace, no mount, no
+privilege.
 
 POSIX only, and the reason is the legitimate one rather than convenience: the
 launcher mask mechanism does not exist on Windows, where the wrap is skipped
 entirely, so the invariant asserted here has no subject on that platform. The
 skip would be hollow the other way round -- if Windows were itself the behaviour
 under test -- but here running on Windows would assert nothing and crash doing
-it, because the launcher builder reads ``os.getuid``.
+it, because the namespace plan reads ``os.getuid``.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 
 import pytest
 
-from kiro_crew import sandbox
+from kiro_crew import sandbox, sandbox_plan
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
-    reason="_build_launcher_script uses POSIX-only os.getuid; Windows skips the wrap",
+    reason="the namespace plan uses POSIX-only os.getuid; Windows skips the wrap",
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """A namespace plan asks the HOST's ``ssh -V`` for accept-new support.
+
+    The protected-name populations read out of the plan do not depend on that
+    answer, and a real ssh spawned from the test process is a host dependency this
+    module is not about. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+
 
 TIERS = ("standard", "cc", "strict")
 
@@ -51,10 +63,10 @@ HELD_BY_ENCLOSING_MASK: frozenset[str] = frozenset()
 def _launcher_sets(tier: str) -> tuple[list[str], list[str]]:
     """The protected names this tier's launcher actually loops over.
 
-    Read back out of the generated script rather than recomputed from the
-    constants, so the pin follows what the child is really handed: every entry
-    goes into both the directory list and the file list and the child classifies
-    by kind, so the union is the masked population.
+    Read from the tier's namespace plan rather than recomputed from the constants,
+    so the pin follows what the child is really handed: every masked tree goes into
+    both the directory list and the file list and the child classifies by kind, so
+    the union is the masked population.
 
     Returned as two lists because the two kinds of mount hold differently, and
     collapsing them is the mistake this whole file exists to prevent:
@@ -65,16 +77,9 @@ def _launcher_sets(tier: str) -> tuple[list[str], list[str]]:
       directory entries in place. It withholds write access; it does not change
       which object a name reaches, so it holds nothing for the names beneath it.
     """
-    script = sandbox._build_launcher_script(tier)
-    found: dict[str, list[str]] = {}
-    for line in script.splitlines():
-        for key in ("SENSITIVE_DIRS", "SENSITIVE_FILES", "READONLY_DIRS"):
-            if line.startswith(key + " = "):
-                found[key] = json.loads(line.split(" = ", 1)[1])
-    missing = {"SENSITIVE_DIRS", "SENSITIVE_FILES", "READONLY_DIRS"} - set(found)
-    assert not missing, f"launcher script does not emit {sorted(missing)}"
-    masked = list(dict.fromkeys(found["SENSITIVE_DIRS"] + found["SENSITIVE_FILES"]))
-    return masked, list(dict.fromkeys(found["READONLY_DIRS"]))
+    plan = sandbox._spawn_plan(sandbox_plan.BACKEND_NAMESPACE, tier)
+    masked = list(dict.fromkeys(plan.sensitive_dirs + plan.sensitive_files))
+    return masked, list(dict.fromkeys(plan.readonly))
 
 
 def _protected(tier: str) -> list[str]:
@@ -117,7 +122,7 @@ def _split(tier: str) -> tuple[dict[str, str], list[str]]:
 
 
 class TestProtectedNamesAreEnumerable:
-    """The population has to be readable from source before anything can pin it."""
+    """The population has to be readable from the plan before anything can pin it."""
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_every_tier_protects_a_nonempty_population(self, tier: str) -> None:
@@ -131,11 +136,11 @@ class TestProtectedNamesAreEnumerable:
     def test_every_crew_home_leaf_reaches_the_launcher_payload(self, tier: str) -> None:
         """Two independent derivations of the masked set have to agree.
 
-        The constants say which crew-home leaves are masked; the generated script
+        The constants say which crew-home leaves are masked; the namespace plan
         says which paths the child will actually mount over. Comparing one
         against the other can fail: a leaf added to the constants that the
-        builder stops emitting is a mask silently dropped, which no assertion
-        computed from the script alone could see.
+        planner stops emitting is a mask silently dropped, which no assertion
+        computed from the plan alone could see.
         """
         masked, _readonly = _launcher_sets(tier)
         missing = sorted(
@@ -274,7 +279,121 @@ class TestLeafOnlyPopulationIsRecorded:
 
     #: Measured per tier. Not a target -- a debt. Today it is the WHOLE
     #: population: nothing is durably held.
-    EXPECTED: dict[str, int] = {"standard": 235, "cc": 242, "strict": 243}
+    #:
+    #: The launcher spells every data-home leaf once per spelling of the crew
+    #: home it protects (the two ``$HOME``-joined ``_CREW_HOME_PREFIXES`` plus
+    #: the resolved ``config_dir()`` when it is a third place, as the relocated
+    #: ``KIROCREW_HOME`` the conftest pins always is), so one new root-level
+    #: leaf is three entries in every tier. Seven landed after the first
+    #: measurement, all at the data-home root, whose parent no stand-in can
+    #: hold, so leaf-only is the only hold available to them:
+    #:
+    #: * ``credential_redaction.json`` -- the owner's credential-redaction
+    #:   switch, on the same read-only floor as ``file_delivery_consent.json``;
+    #: * ``auth-store-staging`` -- the masked directory the two gateway auth
+    #:   stores publish through, so the temp holding a full signing key or
+    #:   refresh-chain state is never listable from inside the namespace;
+    #: * ``redaction-allow`` -- the reader's allowed link hosts, sealed read-only
+    #:   so an agent cannot allow the host it wants to send conversation data to.
+    #: * ``panel-dismissals`` -- the operator's subagent-panel dismissals. An
+    #:   owner decision about what the panel HIDES, so it sits at the root beside
+    #:   ``crew-panels`` and ``crew-teams`` rather than under ``trust/``, which
+    #:   stays sandbox read-write for SEL and would leave the record forgeable by
+    #:   a runtime-built path. Same hold as those two, and the same reason it can
+    #:   only be leaf-only.
+    #: * ``config.json`` / ``config.local.json`` -- the owner's settings files,
+    #:   sealed read-only so an agent cannot loosen its own settings. Both sit
+    #:   at the data-home root, so two leaves are six entries per tier.
+    #: * ``vouched-executions`` -- the gateway's restart-surviving vouches for
+    #:   member-store admission. A forged file would admit a session to a peer
+    #:   member's private memory, so it sits at the root, masked, rather than
+    #:   under the sandbox read-write ``trust/``. Leaf-only for the same reason.
+    #: * ``pinned-order`` -- the person's pinned-session order, person-only by
+    #:   route, masked so an agent cannot rewrite it on disk.
+    #:
+    #: One more root-level leaf landed since, three more entries per tier:
+    #:
+    #: * ``registry_trust.json`` -- the operator's grants of ``owner`` trust to a
+    #:   hand-configured app registry, on the same read+write floor as
+    #:   ``denied_commands.json``, so a writable grant cannot clone a registry the
+    #:   agent controls with the machine's git identity.
+    #:
+    #: Two directories hold what the MCP gateway launches outside the sandbox,
+    #: six entries per tier. ``mcp-launch-approvals`` holds the owner's approved
+    #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
+    #: approved launch. Each sits beside writable siblings, so no parent stand-in
+    #: can hold it.
+    #:
+    #: One more root-level leaf, three more entries per tier:
+    #:
+    #: * ``gateway_id`` -- the id the Remote Crew cycle guard compares, sealed
+    #:   read-only so an agent cannot choose whether a chaining loop is detected.
+    #:   The spawn mints it before sealing and it never changes after that, so no
+    #:   later host-side replace lands on the bound name.
+    #: * ``microvm_crews.json`` -- the microvm lane's crew records. Each row
+    #:   carries the ``microvm_id`` that ``teardown`` hands to
+    #:   ``launcher.terminate``, with no tag to disagree with it and no
+    #:   describe-and-confirm step in front of it, so a writable copy lets a
+    #:   sandboxed process choose which of the owner's VMs the next delete
+    #:   destroys. It sits at the data-home root beside ``cloud.json`` and
+    #:   ``cloud_launch_state.json``, which the gateway writes and which the root
+    #:   itself must stay writable for, so no enclosing directory mask can hold
+    #:   it and leaf-only is the only hold available -- the same reason those two
+    #:   are leaf-only.
+    #:
+    #: One entry per tier for the secret vault at a relocated data home. The
+    #: tier lists hold ``.vault`` only at the two ``$HOME``-joined spellings,
+    #: so the resolved ``config_dir()`` spelling is a third, leaf-only name,
+    #: the same hold ``kas`` gets there.
+    #:
+    #: ``models`` holds downloaded weights and the speech decoder, sealed read-only
+    #: so a sandboxed shell cannot swap the bytes between a loader's digest check
+    #: and its reopen. A data-home root leaf, three entries per tier, held by its
+    #: own name for the same reason as the root leaves above.
+    #:
+    #: ``skill-projection`` holds the skill projection's side files: the ownership
+    #: sidecars and view ledger a stored ``kirocrew-skill-view-*`` name is mapped
+    #: back through to the agent a resumed conversation runs as, plus its leases and
+    #: lock. Sealed read-only so a sandboxed shell cannot forge that mapping (the
+    #: agents tree it moved out of was already sealed). A data-home root leaf,
+    #: three entries per tier, leaf-only for the same reason as the root leaves above.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``engines`` -- the KAS engine bundles ``kirocrew kas install`` lays down
+    #:   (``acp/kas_bundle.py``), sealed read-only like ``playwright-cli`` so a
+    #:   sandboxed session cannot rewrite the engine code and Node runtime its
+    #:   next session runs. At the data-home root beside writable siblings, so
+    #:   leaf-only is the only hold available.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``seed-provenance`` -- the settings-seed record, moved out of the root-level
+    #:   ``settings_seeds.json`` file into its own directory so the gateway's
+    #:   ``atomic_write`` of the record renames INSIDE the sealed name rather than
+    #:   over it. That is the move this module asks for: the directory's own inode
+    #:   stays the same on a republish. It sits at the data-home root beside
+    #:   writable siblings, so it is counted leaf-only like ``skill-projection``.
+    #: * ``app-agent-launch`` -- the empty directory kiro-cli runs an app agent's
+    #:   launch copy from (``apps.agent_launch.launch_process_cwd``), sealed read-only
+    #:   so no sandboxed writer can plant the spec kiro-cli reads there. At the
+    #:   data-home root beside writable siblings, so leaf-only is the only hold.
+    #:   Three more entries per tier.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``member-records`` -- each crewmate's permanent rules, goals and DM
+    #:   binding, which the gateway writes on a person's action. Masked at the
+    #:   data-home root beside ``crew-teams`` rather than under the sandbox
+    #:   read-write ``trust/``, so leaf-only for the same reason.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``web-push`` -- the Web Push VAPID key and device subscription secrets
+    #:   (``notifications/push_store.py``), masked as a whole directory so the
+    #:   ``atomic_write`` temps they publish through are hidden too. At the data-home
+    #:   root beside writable siblings, so leaf-only is the only hold.
+    EXPECTED: dict[str, int] = {"standard": 296, "cc": 303, "strict": 304}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

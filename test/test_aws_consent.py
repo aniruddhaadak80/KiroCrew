@@ -998,7 +998,11 @@ class TestThereIsNoCliGrantSurface:
 
         import kiro_crew.cli as cli_mod
 
-        source = _pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
+        # cli.py and every module split out of it.
+        family = [_pathlib.Path(cli_mod.__file__)]
+        family += [family[0].with_name(f"{name.rsplit('.', 1)[1]}.py") for name in cli_mod._OWNERS]
+        family += sorted(family[0].parent.glob("cli_parser_*.py"))
+        source = "\n".join(path.read_text(encoding="utf-8") for path in family)
         assert "aws-consent" not in source
         assert "aws_consent_yes" not in source
 
@@ -1007,7 +1011,10 @@ class TestThereIsNoCliGrantSurface:
 
         import kiro_crew.cli_commands as cc
 
-        source = _pathlib.Path(cc.__file__).read_text(encoding="utf-8")
+        # cli_commands.py and every module split out of it.
+        family = [_pathlib.Path(cc.__file__)]
+        family += [family[0].with_name(f"{name.rsplit('.', 1)[1]}.py") for name in cc._OWNERS]
+        source = "\n".join(path.read_text(encoding="utf-8") for path in family)
         for dead in ("_aws_consent", "_consent_target", "_print_consent_status"):
             assert dead not in source, dead
 
@@ -1090,11 +1097,11 @@ class TestDescribeVoicesEndpoint:
 
     def test_non_polly_provider_returns_empty_without_calling_aws(self, home):
         from kiro_crew.dashboard import chat_voice
-        from kiro_crew.voice_reply import PROVIDER_PIPER
+        from kiro_crew.voice_reply import PROVIDER_SYSTEM
 
         chat_voice._voices_cache = None
         with (
-            patch.object(chat_voice._vc, "provider", PROVIDER_PIPER),
+            patch.object(chat_voice._vc, "provider", PROVIDER_SYSTEM),
             patch("asyncio.create_subprocess_exec") as spawn,
         ):
             resp = asyncio.run(chat_voice.api_voice_voices(self._request()))

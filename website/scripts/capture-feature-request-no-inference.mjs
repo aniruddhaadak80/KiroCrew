@@ -21,8 +21,10 @@
  * pill's explanation is real copy a hover paints (linked by aria-describedby,
  * opened under the pill, no "inference"), the row carries the form link with
  * its plain-words explanation and no Resume, and the composer beneath offers
- * no Resume either. Every frame is asserted from the live DOM before it is
- * written, so a shot cannot show a state the assertions did not see.
+ * no Resume either, then narrows the viewport on the German catalog and proves
+ * the long label wraps inside the card rather than overflowing it. Every frame
+ * is asserted from the live DOM before it is written, so a shot cannot show a
+ * state the assertions did not see.
  */
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -33,7 +35,7 @@ import { fileURLToPath } from 'node:url'
 delete process.env.LD_LIBRARY_PATH
 
 const { openTranscriptHarness } = await import('./lib/transcript-harness.mjs')
-const { json } = await import('./lib/boot-api.mjs')
+const { routeFeatureRequestSlot, sceneChecks } = await import('./lib/feature-request-scene.mjs')
 
 const args = process.argv.slice(2)
 const FLAGS = new Set(['--expect', '--dist'])
@@ -85,44 +87,10 @@ async function main() {
   })
   const { page } = h
 
-  // Registered AFTER the harness's catch-all, so it is consulted first: the
-  // pill's three requests get real receipts, everything else falls through.
-  // The new slot's detail tracks what the gateway would have PERSISTED by then
-  // (the user row on send, the error row once the turn fails): the app re-reads
-  // the slot when the turn ends, and that read replaces the transcript.
-  let created = false
-  const frRows = []
-  await page.route('**/api/**', async route => {
-    const req = route.request()
-    const path = new URL(req.url()).pathname
-    if (path === '/api/chat/slots' && req.method() === 'POST') { created = true; return json(route, featureRequestSlot) }
-    if (path === '/api/chat/slots' && req.method() === 'GET') return json(route, created ? [featureRequestSlot, existingSlot] : [existingSlot])
-    if (path === `/api/chat/slots/${FR_SLOT}/context`) return json(route, { ok: true })
-    if (path.startsWith(`/api/chat/slots/${FR_SLOT}`)) return json(route, { ...emptyDetail, total: frRows.length, messages: frRows })
-    // The send: a 2xx JSON receipt with `ok`, which is what "the server accepted
-    // the turn" looks like on the wire. The refusal comes later, in the turn.
-    // The persisted row keeps the send's `meta` verbatim (`sendId` and the
-    // flow's `featureRequest` stamp included), as `chat_handlers.py` does: the
-    // stamp is how the transcript recognises the feature-request turn after the
-    // chat_done refresh replaces the optimistic bubble, and after a reload.
-    if (path === '/api/chat' && req.method() === 'POST') {
-      const body = req.postDataJSON()
-      frRows.push({ role: 'user', ts: Date.now() / 1000, content: body.message, meta: { ...(body.meta || {}), mid: 'u-1' } })
-      return json(route, { ok: true })
-    }
-    return route.fallback()
-  })
-
-  let failures = 0
-  const assert = (label, ok) => {
-    console.log(`${ok ? 'PASS' : 'FAIL'}: ${label}`)
-    if (!ok) failures += 1
-  }
-  const shot = async name => {
-    const file = `${OUT}/${EXPECT}-${name}.png`
-    await page.screenshot({ path: file })
-    console.log('wrote', file)
-  }
+  // The pill's three requests get real receipts (see the helper for what the
+  // persisted rows track and why the send's `meta` is kept verbatim).
+  const frRows = await routeFeatureRequestSlot(page, { existingSlot, featureRequestSlot, detail: emptyDetail })
+  const { assert, shot, failures } = sceneChecks(page, OUT, EXPECT)
 
   await h.load('dark', { selector: 'textarea[data-composer-input]', settle: 900 })
 
@@ -143,6 +111,8 @@ async function main() {
     assert('it opens under the pill, not off the top of the screen', await page.locator('[role="tooltip"]').first().getAttribute('data-placement') === 'below')
     assert('it names the cost in plain words (monthly usage)', /monthly usage/i.test(copy))
     assert('it names where the request lands (GitHub), not just that it is filed', /files it on GitHub/.test(copy))
+    // The magnitude anchor: one chat turn's worth, not a vague "uses your plan".
+    assert('it ends by sizing the cost against a chat turn', /like any chat turn\.\s*$/.test(copy))
     assert('it does not say "inference" (the jargon the blind reader could not parse)', !/inference/i.test(copy))
     assert('no hover-only title remains on the button', (await pill.getAttribute('title')) === null)
   } else {
@@ -181,6 +151,12 @@ async function main() {
     assert('it points at the feature_request template', await link.getAttribute('href') === FORM_URL)
     assert('it opens in a new tab', await link.getAttribute('target') === '_blank')
     assert('it carries noopener noreferrer', /noopener/.test(await link.getAttribute('rel') || '') && /noreferrer/.test(await link.getAttribute('rel') || ''))
+    // The pill reads "Request a Feature"; the button must not read as the same
+    // route -- its label alone names the destination and that it costs nothing.
+    const label = await link.innerText()
+    console.log('form button:', JSON.stringify(label))
+    assert('the button label names GitHub, not a generic "feature request form"', /GitHub form/.test(label) && !/feature request form/i.test(label))
+    assert('the button label says it uses no monthly usage', /uses no monthly usage/i.test(label))
     assert('the one-line explanation is beside it', await page.locator('[data-testid="error-card-feature-request-hint"]').count() === 1)
     const hint = await page.locator('[data-testid="error-card-feature-request-hint"]').innerText()
     console.log('hint:', JSON.stringify(hint))
@@ -238,11 +214,53 @@ async function main() {
     assert('after the reload the row still withholds Resume', await page.locator('[data-testid="error-card-continue"]').count() === 0)
     assert('after the reload the composer still offers no Resume', await page.locator('[data-testid="composer-continue"]').count() === 0)
     await shot('04-usage-limit-row-after-reload-dark')
+
+    // 6. German, narrow. The form button's label is long by design -- it names
+    //    the destination and the cost -- and longest in German (62 chars to
+    //    English's 44). On a transcript narrower than that label the action
+    //    must break into lines inside the card, not run past its edge (Opus,
+    //    first head of #13708: the shared action class pinned every button at
+    //    its one-line width). The language is seeded the way the app mirrors
+    //    its own choice (`mc-lang`, written after the harness's clear); the slot
+    //    stays selected through the URL. The one-line width is measured at the
+    //    wide viewport first, then the viewport is narrowed until the action
+    //    row is narrower than it, so the assertion is about the geometry that
+    //    forces a wrap and not about one screen size.
+    await page.addInitScript(() => { localStorage.setItem('mc-lang', 'de') })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.waitForSelector('[data-testid="error-card-feature-request-form"]', { timeout: 20000 })
+    await page.waitForTimeout(900)
+    const measure = () => page.evaluate(() => {
+      const link = document.querySelector('[data-testid="error-card-feature-request-form"]')
+      const row = link.parentElement
+      const l = link.getBoundingClientRect(), r = row.getBoundingClientRect()
+      return { linkWidth: l.width, linkHeight: l.height, linkRight: l.right, rowWidth: r.width, rowRight: r.right, lineHeight: parseFloat(getComputedStyle(link).lineHeight) }
+    })
+    assert('the reloaded page is in German', await page.evaluate(() => document.documentElement.lang) === 'de')
+    const deLabel = await page.locator('[data-testid="error-card-feature-request-form"]').innerText()
+    console.log('de form button:', JSON.stringify(deLabel))
+    assert('the German label names GitHub and the cost', /GitHub-Formular/.test(deLabel) && /Kontingent/.test(deLabel))
+    const wide = await measure()
+    assert('at the wide viewport the German label sits on one line', wide.linkHeight < wide.lineHeight * 1.5)
+    let narrow = wide
+    for (const width of [1100, 1000, 900, 800, 700, 600, 520]) {
+      await page.setViewportSize({ width, height: 950 })
+      await page.waitForTimeout(300)
+      narrow = await measure()
+      if (narrow.rowWidth < wide.linkWidth) { console.log(`narrowed to ${width}px: row ${Math.round(narrow.rowWidth)}px < one-line label ${Math.round(wide.linkWidth)}px`); break }
+    }
+    console.log('de geometry:', JSON.stringify(narrow))
+    assert('the viewport got the action row narrower than the one-line label', narrow.rowWidth < wide.linkWidth)
+    assert('the action stays inside the card (its right edge is not past the row\'s)', narrow.linkRight <= narrow.rowRight + 0.5)
+    assert('the label breaks into more than one line rather than shrinking the card\'s content', narrow.linkHeight > narrow.lineHeight * 1.5)
+    await page.mouse.move(8, 8)
+    await page.waitForTimeout(200)
+    await shot('05-usage-limit-row-de-narrow-dark')
   }
 
   await h.close()
-  console.log(failures === 0 ? 'ALL ASSERTIONS PASSED' : `${failures} ASSERTION(S) FAILED`)
-  process.exit(failures === 0 ? 0 : 1)
+  console.log(failures() === 0 ? 'ALL ASSERTIONS PASSED' : `${failures()} ASSERTION(S) FAILED`)
+  process.exit(failures() === 0 ? 0 : 1)
 }
 
 main().catch(err => { console.error(err); process.exit(1) })

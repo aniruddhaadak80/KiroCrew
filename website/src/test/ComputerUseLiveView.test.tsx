@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { screen, act } from '@testing-library/react'
+import i18next from 'i18next'
+import '../i18n/all'
 
 import ComputerUseLiveView, {
   applyGrip,
@@ -57,6 +59,17 @@ describe('ComputerUseLiveView', () => {
     expect(panel.style.height).toBe('210px')
   })
 
+  it('marks its dialog data-escape-passthrough so it never blocks Escape-to-stop in the composer', async () => {
+    // This panel coexists alongside a focused composer rather than in front
+    // of it and never claims Escape itself, so chat-input/stopKey.ts's
+    // generic role="dialog" probe must skip it specifically (issue #22315,
+    // HOLD item 4) rather than deferring to it like every other dialog.
+    renderWithProviders(<ComputerUseLiveView />)
+    await act(async () => { pushFrame('QUJD') })
+    const panel = screen.getByRole('dialog') as HTMLElement
+    expect(panel.hasAttribute('data-escape-passthrough')).toBe(true)
+  })
+
   it('shows the empty-state explanation (including the secure-field carve-out) until a frame lands', async () => {
     renderWithProviders(<ComputerUseLiveView />)
     await act(async () => { pushToggle() })
@@ -84,6 +97,35 @@ describe('ComputerUseLiveView', () => {
     await act(async () => { pushFrame('QUJD', { session_key: 'sess-9' }) })
     await screen.findByRole('dialog')
     expect(screen.getByText('· Desktop triage')).toBeInTheDocument()
+  })
+
+  it('labels an untitled driving session "Untitled session", never its key (#23084)', async () => {
+    // The stored title of an untitled session can equal its key.
+    const store = createTestStore()
+    store.dispatch(sseSlots([{ key: 'chat-9-1785440411', title: 'chat-9-1785440411' }] as never))
+    renderWithProviders(<ComputerUseLiveView />, { store })
+    await act(async () => { pushFrame('QUJD', { session_key: 'chat-9-1785440411' }) })
+    await screen.findByRole('dialog')
+    expect(screen.getByText('· Untitled session')).toBeInTheDocument()
+    expect(screen.queryByText(/chat-9-1785440411/)).toBeNull()
+  })
+
+  it('re-names an untitled driving session on a language switch with the slot list unchanged', async () => {
+    const store = createTestStore()
+    store.dispatch(sseSlots([{ key: 'chat-9-1785440411', title: 'chat-9-1785440411' }] as never))
+    const view = renderWithProviders(<ComputerUseLiveView />, { store })
+    await act(async () => { pushFrame('QUJD', { session_key: 'chat-9-1785440411' }) })
+    await screen.findByRole('dialog')
+    expect(screen.getByText('· Untitled session')).toBeInTheDocument()
+    try {
+      await act(async () => { await i18next.changeLanguage('zh-CN') })
+      // The harness has no LanguageProvider; a rerender stands in for its repaint.
+      view.rerender(<ComputerUseLiveView />)
+      expect(screen.getByText('· 未命名会话')).toBeInTheDocument()
+      expect(screen.queryByText('· Untitled session')).toBeNull()
+    } finally {
+      await act(async () => { await i18next.changeLanguage('en') })
+    }
   })
 
   it('omits the session label for an unknown session key', async () => {

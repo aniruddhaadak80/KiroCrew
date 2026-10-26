@@ -1,13 +1,13 @@
 ---
 title: Redaction that explains itself
-status: accepted
+status: partial
 author: rayrayxu
 created: 2026-09-21
-last-audited: 2026-09-24
-audited-at: 61d5bb577
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr:
-implementation-prs: []
-tracking-issues: []
+implementation-prs: [12684, 13685]
+tracking-issues: [13741]
 supersedes: []
 superseded-by: []
 ---
@@ -67,7 +67,10 @@ worked correctly.
    cannot recover it from the conversation. The replacement also keeps the
    value out of Slack, artifacts, memory, sub-agents, and backups — although
    the source file, tool logs, model provider, or screenshots may still
-   contain it. There is no setting to turn this off.
+   contain it. There is no setting to turn this off. (The one owner switch
+   that exists, described under *What does not change*, does not reach the
+   saved conversation: it applies only to files the owner opens in their own
+   dashboard.)
 2. **The value usually remains at its source.** Removing it from the saved
    conversation does not usually remove it from the file, command output, or
    environment variable where it came from. Because the user can already read
@@ -190,9 +193,13 @@ select. The tag opens one shared type of card, which leads with three facts:
 Keep less common information closed until the user asks for it. *Technical
 details* explains which rule matched and exactly what the system protected.
 *More ways* offers *Copy path* and a pre-filled chat request that saves the
-value in a mode-0600 file, which only the owner's account can read; because
-this creates another secret copy on disk, the card must say so. A
-false-positive report sends only the rule name and session id, and the card
+value in a mode-0600 file, which only the owner's account can read, and
+the owner can then open that file in the dashboard with the file-view switch
+off (#13685); because this creates another secret copy on disk, the card must
+say so. A
+false-positive report is a prefilled GitHub issue the reader reviews before
+sending; it carries only the rule name and the card kind, with no session id,
+value or URL. The card
 clearly says when the source is gone. Each placeholder stores the rule and
 source for that specific removed value.
 
@@ -217,8 +224,8 @@ execution and a prompt-injected agent could pre-fill an attack disguised as a
 
 Show this guidance once, after the first answer that contains a removed value.
 It explains that the values were replaced before saving, so no saved
-conversation copy contains them, the product cannot show them, and no setting
-can change this behavior. It also explains that each lock tag names the likely
+conversation copy contains them, the conversation cannot show them, and no
+setting changes this for the conversation. It also explains that each lock tag names the likely
 source and tells the user how to view it. End with: "Keep secrets at their
 source. Your messages are saved exactly as typed." Keep extra details under
 *Learn more*; after the user selects *Got it*, show only the small lock tag.
@@ -226,8 +233,8 @@ source. Your messages are saved exactly as typed." Keep extra details under
 ### 3 · Suspicious links: blocked, but visible
 
 Keep a suspicious URL visible as a **Link blocked** chip, but never make it
-an anchor. Show the site name and path immediately, and the length of the
-query. *See link* opens a details card that explains why the link was blocked
+an anchor. Show the site name immediately, and nothing else (see the chip
+rule below). *See link* opens a details card that explains why the link was blocked
 and shows the full URL as text, with *Open once* and *Copy link* beside it.
 That card is the confirmation: nothing opens until the reader has the whole
 destination in front of them and clicks *Open once*, which opens it in a new
@@ -261,12 +268,41 @@ in the saved conversation instead of being destroyed, and anyone who can read
 that conversation can read the link.
 
 What is shown on the chip itself, before anyone asks, follows a stricter rule:
-**the chip shows only what the removers themselves would pass.** It would be
-wrong to assume the query is the dangerous part and the path is safe — a link
-can carry smuggled data in its path just as easily — so the path appears on
-the chip only when it passes the same checks that blocked the link; otherwise
-the chip shows the site name and the length of the query. The full address is
-shown only inside the details card, after the reader asks for it. There is one
+**the chip shows only what is proven about that chip, which is the site
+name.** The saved placeholder names the site and nothing else, so nothing ties
+a chip to one kept record. A placeholder can have no record of its own (a
+presigned link split at its query leaves a placeholder the removers never
+recorded), and the rendered text can hold more chips than the saved text has
+placeholders (an entity-encoded or backslash-escaped bracket renders to
+placeholder text), so neither a record count nor a single record proves which
+record a chip stands for. The chip therefore never shows a path or a query
+length, even when the host has exactly one record. The details card lists
+each record of the host under its own address, with its reason and actions,
+and a kept full address is shown only there, after the reader asks for it. A
+lone record is listed the same way as several: the card's title speaks of the
+host's blocked links in the reply ("Blocked links to this host in this reply")
+and never says "this link", because one record on the host does not prove it
+is the link clicked. Pairing placeholders with records is not a goal: proving
+that order cannot be made sound on the production redaction pipeline. The
+path a record carries (kept only when it passes the same checks that blocked
+the link, since a link can carry smuggled data in its path as easily as in its
+query) therefore appears only in that list, where no entry is presented as
+the link clicked.
+
+A link removed in parts can leave the rest of its query glued to the
+placeholder: a presigned link split at `&X-Amz-Date` is redacted up to the
+split, and `&X-Amz-Date=…&X-Amz-Signature=…` follows the placeholder as text.
+That tail is the rest of the removed link, not prose, so the renderer takes it
+into the chip: text that starts right after a placeholder with `?` or `&`, a
+parameter name and `=`, up to whitespace, an angle bracket, a quote or a
+square bracket, without the punctuation that closes a sentence. It is not
+shown beside the chip, it is never an anchor, and the card does not show it
+either. Anything else after a placeholder stays as written, and when the host
+has no record the placeholder and its tail stay as written text. The fold is
+display only and redacts nothing: the saved reply, a copied message and channel
+posts still carry the tail exactly as they do without it, and the redaction and
+the credential checks are unchanged. Removing the tail from the saved text is
+redactor work, tracked separately. There is one
 precedent for keeping a URL in meta: the consent link for a connected server
 (`oauth_url`) is preserved only when it passes two checks. Anything kept is
 still text an agent wrote, so the chip escapes it and never makes it an
@@ -383,8 +419,8 @@ copied code blocks, and copying should turn each marker into `<REDACTED>`. Use
 the same blocked-link chip in every version. Keep the existing placeholder tag
 and store that value's rule and source in its metadata. Only the session owner
 sees actions; Slack and other shared pages show explanatory text without
-actions. On phones the cards open as bottom sheets; on desktop they open
-beside the message.
+actions. On phones and desktop alike, a card opens inline, below the block it
+explains.
 
 ## What does not change
 
@@ -394,13 +430,52 @@ beside the message.
 - Secrets found in agent replies are never saved in the conversation, which
   means there cannot be a "show original" button.
 - Known credential formats such as `AKIA`, PEM, `xoxb-`, and `ghp_` remain
-  hidden everywhere, including inside links. Remove only the credential from a
-  URL rather than deleting the whole URL, and never let the "Allow" list
-  weaken credential rules.
+  hidden everywhere the agent's output reaches another person or service —
+  chat, every messaging channel, artifacts, logs, backups — including inside
+  links. Remove only the credential from a URL rather than deleting the whole
+  URL, and never let the "Allow" list weaken credential rules.
+- **One exception, decided with [#13685](https://github.com/kirodotdev/KiroCrew/pull/13685):
+  the dashboard owner can turn the credential pass off for the files their own
+  dashboard opens for them** (the chat side panel's Files tab, and the Library
+  and Artifacts previews that read through the same route). This is the
+  completion of the *save it to a mode-0600 file* remedy above: without it the
+  Files view ran the same pass over the saved file and hid the value again.
+  Its fences are the reason it is allowed to exist. It is **on by default**;
+  only the owner can turn it off (a non-owner or an app token is refused); it
+  lives on the keystone floor beside `file_delivery_consent.json`, which the
+  agent's file tools refuse and its sandbox mounts read-only, so a
+  prompt-injected agent cannot flip it through the filesystem (the owner gate
+  is an identity check, so an agent driving the owner's already-authenticated
+  browser through computer use could reach the PUT; what that buys is bounded
+  to the owner's own file views, and the flip leaves an audit record); every
+  change is written to the security event log *before* the switch moves, and
+  a *disable* that cannot be audited does not happen — turning redaction back
+  on is the fail-safe direction and proceeds even when the log is unavailable;
+  it reaches the credential pass only — the
+  exfiltration-URL pass, every request-blocking gate, the chat and every
+  channel keep the unconditional pass — and the two file handlers that feed
+  the viewer take one verdict per request, so neither side of a diff is raw
+  while the other is masked. When the owner turns it back on, every open
+  dashboard document drops the file bodies it holds — cached reads, diffs and
+  clean open tabs; a tab with unsaved edits keeps the owner's own typing — and
+  re-reads them under the pass now in force. Settings → Security shows the
+  state with a warning
+  and the time it was switched off. An in-viewer indicator and an auto-revert
+  window were considered and are open decisions
+  ([#13741](https://github.com/kirodotdev/KiroCrew/issues/13741) tracks the
+  exfiltration-URL carve-out for the same owner view on a companionless
+  build).
 - Logs, audits, and backups continue to use full redaction, and they do not
   receive any tools for viewing the source.
 
 ## Rollout
+
+Status: [#12684](https://github.com/kirodotdev/KiroCrew/pull/12684) shipped
+steps 1, 2 and 3, including the per-workspace allowed-hosts list and its revoke
+control in Settings → Security; #13685 shipped step 6's file-view switch. The
+percent-decode fix of step 5 and step 6's read-only rules and hosts view are not
+built. [security.md](../system-specs/modules/security.md) owns the shipped
+contract.
 
 1. Add the three display rules first, because they stop web requests that
    would otherwise happen without a click.
@@ -417,9 +492,14 @@ beside the message.
    are at least 44×44 points.
 5. Decode percent-encoded text before checking it, then extend the internal
    list of exact hosts that can bypass only the long-query and base64 checks.
-6. Add a read-only Redaction section under Settings → Security that shows
-   groups of rules, recent match counts, and allowed hosts, while clearly
-   stating that redaction cannot be turned off.
+6. Add a Redaction section under Settings → Security that shows groups of
+   rules, recent match counts, and allowed hosts, and states which surfaces
+   redaction cannot be turned off for (everything the agent's output reaches
+   another person or service through). The one control it carries is the
+   owner's credential-redaction switch for their own file views, shipped in
+   [#13685](https://github.com/kirodotdev/KiroCrew/pull/13685) as *Credential
+   redaction in file views* with the fences listed under *What does not
+   change*; the rules and hosts view remains read-only.
 
 Each step can be released or rolled back without requiring the later steps.
 Steps 1 and 3 ship together in one implementation PR: the renderer rules
@@ -429,8 +509,8 @@ they have today.
 
 ### Step 1 design
 
-What step 1 ships, and the invariants review should hold it to (nothing
-here is on main yet except the widget-frame CSP):
+What step 1 ships, and the invariants review should hold it to (shipped in
+#12684; the widget-frame CSP predates it):
 
 - **Widget frame CSP** was already on main: `buildSrcdoc`
   (`website/src/lib/widgetSrcdoc.ts`, `cspFor`) sets `default-src 'none'` with

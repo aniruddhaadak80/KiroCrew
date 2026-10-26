@@ -1,0 +1,8 @@
+# Short fixed waits per test file when the wait-discipline gate landed.
+# Read by test/test_wait_discipline_ratchet.py; one "<count> <path under test/>" per line.
+# RATCHET: a count may only go down (delete the line at zero); never raise or add one.
+# A renamed file keeps its line under the new path, count unchanged; a split file
+# splits its line, the parts summing to the old count.
+# `python test/test_wait_discipline_ratchet.py --write-baseline` lowers every line to
+# its real count and drops files that are gone; it never raises or adds an entry.
+# `... --move OLD NEW` carries a line to a renamed file's path.

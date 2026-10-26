@@ -19,18 +19,23 @@
  * own guarantee. Both are pinned below.
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReactElement } from 'react'
 import type { ChatMessage } from '../types'
 import { mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
-import { createTranscriptRenderers, featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../pages/chat/transcriptRenderers'
+import { appAgentRefusalIsNewest, contextOverflowIsNewest, createTranscriptRenderers, featureRequestRefusalIsNewest, newestErrorOwnsRecovery, sessionStartRepeatIsNewest } from '../pages/chat/transcriptRenderers'
+import { ErrorCard } from '../pages/chat/ErrorCard'
+import NoticeCard from '../pages/chat/NoticeCard'
+import { i18nT } from '../i18n/t'
 import { FEATURE_REQUEST_FORM_URL, FEATURE_REQUEST_ROW_META_KEY } from '../prompts/featureRequest'
 import { isWorkflowRunTool } from '../pages/chat/WorkflowRunCard'
 import { isSpawnRunTool } from '../pages/chat/SubagentRunCard'
 import { isWorkflowCompletionMessage } from '../pages/chat/WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
+import CrewmateMessage from '../pages/chat/CrewmateMessage'
+import { CARD_ROLE } from '../cards/ConversationCard'
 
 const msg = (role: string, over: Partial<ChatMessage> = {}): ChatMessage =>
   ({ role, content: '', cls: '', ...over }) as ChatMessage
@@ -139,6 +144,14 @@ describe('narrow rows win over the broad row they refine', () => {
       content: 'run the backend gates on the changed modules',
       meta: { injectKind: 'user_replay' },
     }))).toBe('inject')
+
+    // A re-routed automation refusal is model-only machinery: the notice bar
+    // already shows the person the same text, so the Sessions page suppresses
+    // the inject row (renders nothing) rather than drawing a duplicate.
+    expect(idFor(msg('inject', {
+      content: '[Automation notice] ⚠️ Automation loop NOT updated — it kept its previous instruction.',
+      meta: { injectKind: 'automation_notice' },
+    }))).toBe('automation_notice_inject')
   })
 
   it('routes a workflow completion to its card and leaves a plain reply alone', () => {
@@ -198,6 +211,19 @@ describe('shape still beats role after the defaults are replaced', () => {
 describe('the error row offers Continue only where the single-chat surface does', () => {
   const errs = [msg('error', { content: 'first' }), msg('assistant', { content: 'x' }), msg('error', { content: 'last' })]
   const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('renders a restored-answer notice as a warn NoticeCard, not a red error', () => {
+    // The row the restore sites append: role 'notice' with NoticeCard's warn glyph.
+    const notice = msg('notice', {
+      content: '\u26A0\uFE0F ' + i18nT('components.pendingQuestionCard.answer_restored'),
+      cls: '',
+    })
+    expect(idFor(notice)).toBe('notice')
+    const el = render(notice, { slot: 's1' }, { messages: [notice] }) as ReactElement
+    expect(el.type).toBe(NoticeCard)
+    expect(el.type).not.toBe(ErrorCard)
+    expect(el.props.content).toContain(i18nT('components.pendingQuestionCard.answer_restored'))
+  })
 
   it('offers it on the last error only', () => {
     const last = render(errs[2], recoverable, { index: 2, messages: errs }) as ReactElement
@@ -370,6 +396,50 @@ describe('a usage-limit error row that refuses the seeded feature-request turn o
   })
 })
 
+describe('a missing kiro-cli under the seeded feature-request turn offers the issue form too', () => {
+  // "Request a Feature" is an agent turn, so a host with no kiro-cli refuses it
+  // at session start. The backend tags that refusal `kiro_cli_missing`, and the
+  // row offers the same form the usage-limit refusal does.
+  const seedRow = msg('user', { content: 'I’d like to request a feature!', meta: { sendId: 's-fr-seed', mid: 'u-1', [FEATURE_REQUEST_ROW_META_KEY]: true } })
+  const missingRow = msg('error', {
+    content: '❌ kiro-cli not found (searched 3 directories: /a, /b, /c). Install it from https://kiro.dev/cli/, or point KIROCREW_KIRO_BIN at the binary.',
+    meta: { kind: 'kiro_cli_missing' },
+  })
+  const rows = [seedRow, missingRow]
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('hands the card the form route with the kiro-cli copy and withholds Continue', () => {
+    const el = render(missingRow, recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+    expect(el.props.kiroCliMissing).toBe(true)
+    expect(el.props.onContinue).toBeUndefined()
+    expect(featureRequestRefusalIsNewest(rows)).toBe(true)
+    expect(newestErrorOwnsRecovery(rows)).toBe(true)
+  })
+
+  it('reads the kind from the rebuilt carrier too', () => {
+    const rebuilt = msg('error', { content: missingRow.content, kind: 'kiro_cli_missing' })
+    const el = render(rebuilt, { slot: 's1' }, { index: 1, messages: [seedRow, rebuilt] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+  })
+
+  it('keeps the usage-limit copy on a usage-limit row', () => {
+    const limitRow = msg('error', { content: '❌ The monthly usage limit has been reached.', meta: { kind: 'usage_limit' } })
+    const el = render(limitRow, recoverable, { index: 1, messages: [seedRow, limitRow] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+    expect(el.props.kiroCliMissing).toBe(false)
+  })
+
+  it('leaves the row of an ordinary chat alone: no form, Resume kept', () => {
+    const typed = msg('user', { content: 'hello', meta: { sendId: 's-typed', mid: 'u-1' } })
+    const el = render(missingRow, recoverable, { index: 1, messages: [typed, missingRow] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBeUndefined()
+    expect(el.props.kiroCliMissing).toBeUndefined()
+    expect(el.props.onContinue).toBeTypeOf('function')
+    expect(newestErrorOwnsRecovery([typed, missingRow])).toBe(false)
+  })
+})
+
 describe('a session start that failed twice in a row swaps Resume for the restart remedy', () => {
   const TIMEOUT = 'Request session/new timed out after 90s (4/4 session-injected MCP server(s) reported)'
   const failed = () => msg('error', { content: TIMEOUT, meta: { kind: 'session_start_failed' } })
@@ -421,6 +491,22 @@ describe('a session start that failed twice in a row swaps Resume for the restar
     expect(el.props.onContinue).toBeUndefined()
   })
 
+  it('hands the restart action to the repeat row only (#13791)', () => {
+    const onRestartGateway = () => Promise.resolve()
+    const opts = { ...recoverable, onRestartGateway }
+    const rows = [msg('user', { content: 'hi' }), failed(), resumed(), failed()]
+    const repeat = render(rows[3], opts, { index: 3, messages: rows }) as ReactElement
+    expect(repeat.props.onRestartGateway).toBe(onRestartGateway)
+    // The older row is settled, and a single failure still has Resume: neither
+    // may offer a restart that stops every running chat.
+    const older = render(rows[1], opts, { index: 1, messages: rows }) as ReactElement
+    expect(older.props.onRestartGateway).toBeUndefined()
+    const first = [msg('user', { content: 'hi' }), failed()]
+    const single = render(first[1], opts, { index: 1, messages: first }) as ReactElement
+    expect(single.props.onRestartGateway).toBeUndefined()
+  })
+
+
   describe('sessionStartRepeatIsNewest — the composer stands down with the card', () => {
     it('is true exactly when the newest card withholds Resume', () => {
       expect(sessionStartRepeatIsNewest([msg('user', { content: 'hi' }), failed()])).toBe(false)
@@ -439,6 +525,161 @@ describe('a session start that failed twice in a row swaps Resume for the restar
       expect(sessionStartRepeatIsNewest([msg('user', { content: 'hi' }), untagged(), resumed(), untagged()])).toBe(false)
     })
   })
+})
+
+describe('a context overflow swaps Resume for a fresh session', () => {
+  const TOO_LONG = 'Input is too long: this conversation does not fit in one request to the model.'
+  const overflow = () => msg('error', { content: TOO_LONG, meta: { kind: 'context_overflow' } })
+  const onFreshSession = () => undefined
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined, onFreshSession }
+
+  it('offers the fresh session and never Resume on the newest overflow row', () => {
+    const rows = [msg('user', { content: 'hi' }), overflow()]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.onFreshSession).toBe(onFreshSession)
+  })
+
+  it('leaves an older overflow row as settled prose', () => {
+    const rows = [msg('user', { content: 'hi' }), overflow(), msg('user', { content: 'again' }), overflow()]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onFreshSession).toBeUndefined()
+    expect(el.props.onContinue).toBeUndefined()
+  })
+
+  it('stops offering it once a later turn answered past the row', () => {
+    const rows = [msg('user', { content: 'hi' }), overflow(), msg('user', { content: 'again' }), msg('assistant', { content: 'ok' })]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onFreshSession).toBeUndefined()
+  })
+
+  it('reads the kind from the rebuilt carrier too, and never from the prose', () => {
+    const rebuilt = msg('error', { content: TOO_LONG, kind: 'context_overflow' })
+    const rows = [msg('user', { content: 'hi' }), rebuilt]
+    expect((render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement).props.onFreshSession).toBe(onFreshSession)
+    const untagged = [msg('user', { content: 'hi' }), msg('error', { content: TOO_LONG })]
+    const el = render(untagged[1], recoverable, { index: 1, messages: untagged }) as ReactElement
+    expect(el.props.onFreshSession).toBeUndefined()
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('contextOverflowIsNewest: the composer stands down until a later turn opens', () => {
+    const base = [msg('user', { content: 'hi' }), overflow()]
+    expect(contextOverflowIsNewest(base)).toBe(true)
+    expect(contextOverflowIsNewest([...base, msg('user', { content: 'again' })])).toBe(false)
+    expect(contextOverflowIsNewest([...base, msg('assistant', { content: 'ok' })])).toBe(false)
+    expect(contextOverflowIsNewest([msg('user', { content: 'hi' }), msg('error', { content: TOO_LONG })])).toBe(false)
+  })
+})
+
+describe('a refused app-owned agent turn offers no Resume', () => {
+  const REFUSAL = "Release Notes can't run: its agent \"notes-writer\" isn't installed. Re-enable Release Notes in Apps › Library, then run the command again from the command palette."
+  const refused = () => msg('error', { content: REFUSAL, meta: { kind: 'app_agent_refused' } })
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('withholds Resume on the refusal row, from either carrier', () => {
+    for (const row of [refused(), msg('error', { content: REFUSAL, kind: 'app_agent_refused' })]) {
+      const rows = [msg('user', { content: 'hi' }), row]
+      const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+      expect(el.props.onContinue).toBeUndefined()
+    }
+  })
+
+  it('an untagged error row keeps Resume -- the kind decides, not the prose', () => {
+    const rows = [msg('user', { content: 'hi' }), msg('error', { content: REFUSAL })]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('appAgentRefusalIsNewest stands the composer down until a new turn opens', () => {
+    const base = [msg('user', { content: 'hi' }), refused()]
+    expect(appAgentRefusalIsNewest(base)).toBe(true)
+    expect(appAgentRefusalIsNewest([...base, msg('user', { content: 'again' })])).toBe(false)
+    expect(appAgentRefusalIsNewest([...base, msg('assistant', { content: 'ok' })])).toBe(false)
+    expect(appAgentRefusalIsNewest([msg('user', { content: 'hi' }), msg('error', { content: REFUSAL })])).toBe(false)
+  })
+})
+
+describe('a changed member agent file routes to Capabilities, never Resume', () => {
+  const row = msg('error', { content: 'materialization_changed: changed', meta: { code: 'materialization_changed', member: 'reviewer' } })
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('opens the named member and withholds Continue', () => {
+    const opened: string[] = []
+    const el = render(row, { ...recoverable, onOpenCapabilities: name => { opened.push(name) } }, { index: 0, messages: [row] }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    el.props.onOpenCapabilities()
+    expect(opened).toEqual(['reviewer'])
+  })
+
+  it('still offers Capabilities when the member name is empty', () => {
+    const emptyMemberRow = msg('error', {
+      content: 'materialization_changed: changed',
+      meta: { code: 'materialization_changed', member: '' },
+    })
+    const opened: string[] = []
+    const el = render(
+      emptyMemberRow,
+      { ...recoverable, onOpenCapabilities: name => { opened.push(name) } },
+      { index: 0, messages: [emptyMemberRow] },
+    ) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.onOpenCapabilities).toBeTypeOf('function')
+    el.props.onOpenCapabilities()
+    expect(opened).toEqual([''])
+  })
+
+  it('still withholds Continue on a surface with no crew editor', () => {
+    const el = render(row, recoverable, { index: 0, messages: [row] }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.onOpenCapabilities).toBeUndefined()
+  })
+})
+
+describe('a capability refusal as the newest state owns recovery', () => {
+  for (const code of ['materialization_changed', 'parent_identity_changed', 'foreign_private_copy', 'project_identity_changed', 'private_template_shadowed']) {
+    it(`${code}: the composer withholds Resume until a new turn opens`, () => {
+      const row = msg('error', { content: `${code}: x`, meta: { code, member: 'reviewer' } })
+      expect(newestErrorOwnsRecovery([msg('user'), row])).toBe(true)
+      expect(newestErrorOwnsRecovery([msg('user'), row, msg('assistant')])).toBe(false)
+    })
+  }
+  it('leaves an ordinary error row to Resume', () => {
+    expect(newestErrorOwnsRecovery([msg('user'), msg('error', { content: 'boom' })])).toBe(false)
+  })
+})
+
+describe('the crewmate-editor fix needs a crewmate to open', () => {
+  it('offers no button when the row names no member', () => {
+    const row = msg('error', { content: 'foreign_private_copy: x', meta: { code: 'foreign_private_copy', member: '' } })
+    const el = render(row, { slot: 's1', onOpenCapabilities: () => undefined }, { index: 0, messages: [row] }) as ReactElement
+    expect(el.props.onOpenCapabilities).toBeUndefined()
+  })
+})
+
+describe('each sibling capability refusal routes to its own fix, never Resume', () => {
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+  const cases = [
+    ['parent_identity_changed', 'member'],
+    ['foreign_private_copy', 'member'],
+    ['project_identity_changed', null],
+    ['private_template_shadowed', null],
+  ] as const
+
+  for (const [code, fix] of cases) {
+    it(`${code}: ${fix ?? 'no in-app fix'}`, () => {
+      const row = msg('error', { content: `${code}: x`, meta: { code, member: 'reviewer' } })
+      const opened: [string, string][] = []
+      const el = render(row, { ...recoverable, onOpenCapabilities: (name, f) => { opened.push([name, f]) } }, { index: 0, messages: [row] }) as ReactElement
+      expect(el.props.onContinue).toBeUndefined()
+      if (fix) {
+        el.props.onOpenCapabilities()
+        expect(opened).toEqual([['reviewer', fix]])
+      } else {
+        expect(el.props.onOpenCapabilities).toBeUndefined()
+      }
+    })
+  }
 })
 
 describe('rows the defaults already draw correctly are left to them', () => {
@@ -464,10 +705,17 @@ describe('the single-chat surface renders from THIS row set', () => {
   // a row added here reaches the page and every pane at once, and a page-only
   // row is an explicit entry AFTER the spread. What can still drift is the
   // spread itself -- so pin that, not the roles.
-  const chatPageSrc = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+  // The page composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const PAGES = join(__dirname, '..', 'pages')
+  const OWNERS = join(PAGES, 'chat', 'page')
+  const chatPageSrc = [
+    readFileSync(join(PAGES, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(OWNERS).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(OWNERS, f), 'utf8')),
+    ...readdirSync(PAGES).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(PAGES, f), 'utf8')),
+  ].join('\n')
 
   it('ChatPage spreads createTranscriptRenderers into its host list, ahead of its page-only rows', () => {
-    expect(chatPageSrc).toMatch(/import \{ createTranscriptRenderers \} from '\.\/chat\/transcriptRenderers'/)
+    expect(chatPageSrc).toMatch(/import \{ createTranscriptRenderers \} from '\.\.\/transcriptRenderers'/)
     const list = chatPageSrc.indexOf('const renderers = mergeRenderers([')
     const spread = chatPageSrc.indexOf('...shared,', list)
     const bubble = chatPageSrc.indexOf('\n      bubble,\n    ])', list)
@@ -488,5 +736,94 @@ describe('the single-chat surface renders from THIS row set', () => {
     const shared = createTranscriptRenderers({ slot: 's1' }).map(r => r.id)
     const duplicated = pageIds.filter(id => shared.includes(id))
     expect(duplicated).toEqual([])
+  })
+
+  // A note's author is shown through the SAME app-label pill an app inject row
+  // uses: the backend stamps the authenticated caller (`request_app`) onto
+  // `meta.appLabel`, and the ChatPage inject branch renders it via
+  // `components.mcpApp.from_app` — there is no note-only `noteSource` meta key
+  // or `from_note` pill. The trust fix is backend-side (the handler stamps
+  // `request_app`, not `body.source`), so the frontend guard is that the inject
+  // branch derives no client-side note author and reuses the app-label pill.
+  it('ChatPage note attribution rides the appLabel pill, with no noteSource/from_note', () => {
+    expect(chatPageSrc).toMatch(/i18nT\('components\.mcpApp\.from_app', \{ app: appLabel\.split\('\/'\)\[0\] \}\)/)
+    expect(chatPageSrc).not.toMatch(/noteSource/)
+    expect(chatPageSrc).not.toMatch(/from_note/)
+  })
+})
+
+describe("a change card in a mate's chat", () => {
+  const mate = { name: 'mate', label: 'Mate' }
+  const card = msg(CARD_ROLE, { meta: { card_id: 'c1' } })
+
+  it("is the mate's own message, opening the run when it comes first", () => {
+    const messages = [msg('user', { content: 'hi' }), card, msg('assistant', { content: 'Press Apply change.' })]
+    const el = render(card, { slot: 's1', crewmate: mate }, { index: 1, messages }) as ReactElement<{ pos: string }>
+    expect(el.type).toBe(CrewmateMessage)
+    // The author line belongs to the card: it is the first bubble of the run.
+    expect(el.props.pos).toBe('start')
+  })
+
+  it("continues the run its acknowledgement opened, so there is one author line", () => {
+    const messages = [msg('user', { content: 'hi' }), msg('assistant', { content: 'Checking.' }), card, msg('assistant', { content: 'Ready.' })]
+    const el = render(card, { slot: 's1', crewmate: mate }, { index: 2, messages }) as ReactElement<{ pos: string }>
+    expect(el.type).toBe(CrewmateMessage)
+    expect(el.props.pos).toBe('cont')
+  })
+
+  it('stays a plain card outside a mate chat', () => {
+    const el = render(card, { slot: 's1' }, { index: 0, messages: [card] }) as ReactElement
+    expect(el.type).not.toBe(CrewmateMessage)
+  })
+})
+
+describe('a turn that hit its time limit links to the setting', () => {
+  const onOpenTurnLimit = () => undefined
+  const opts = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined, onOpenTurnLimit }
+
+  it('hands the settings link to a turn_timeout row, and keeps Resume', () => {
+    const live = msg('error', { content: '⏱️ This turn hit the 4-hour limit.', kind: 'turn_timeout' } as Partial<ChatMessage>)
+    const el = render(live, opts, { index: 0, messages: [live] }) as ReactElement
+    expect(el.type).toBe(ErrorCard)
+    expect(el.props.onOpenTurnLimit).toBe(onOpenTurnLimit)
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('reads the kind from a rebuilt transcript row too', () => {
+    const restored = msg('error', { content: '⏱️ limit', meta: { kind: 'turn_timeout' } })
+    const el = render(restored, opts, { index: 0, messages: [restored] }) as ReactElement
+    expect(el.props.onOpenTurnLimit).toBe(onOpenTurnLimit)
+  })
+
+  it('withholds the link from every other error row', () => {
+    const other = msg('error', { content: '⏱️ This turn hit the 4-hour limit.' })
+    const el = render(other, opts, { index: 0, messages: [other] }) as ReactElement
+    expect(el.props.onOpenTurnLimit).toBeUndefined()
+  })
+})
+
+describe('newestErrorOwnsRecovery -- one rule for the composer beneath the four remedy cards', () => {
+  const user = () => msg('user', { content: 'hi' })
+  const failed = () => msg('error', { content: 'Request session/new timed out after 90s', meta: { kind: 'session_start_failed' } })
+  const resumed = () => msg('inject', { content: '[Continue -- requested by the user]', meta: { injectKind: 'recovery' } })
+  const owners: Array<[string, ChatMessage[]]> = [
+    ['a refused feature request', [
+      msg('user', { content: 'I would like to request a feature!', meta: { sendId: 's-fr-seed', [FEATURE_REQUEST_ROW_META_KEY]: true } }),
+      msg('error', { content: 'The monthly usage limit has been reached.', meta: { kind: 'usage_limit' } }),
+    ]],
+    ['a session start that failed twice', [user(), failed(), resumed(), failed()]],
+    ['a context overflow', [user(), msg('error', { content: 'Input is too long.', meta: { kind: 'context_overflow' } })]],
+    ['a refused app agent', [user(), msg('error', { content: 'Release Notes cannot run.', meta: { kind: 'app_agent_refused' } })]],
+  ]
+
+  it.each(owners)('holds under %s, and lets go once a later turn opens', (_label, rows) => {
+    expect(newestErrorOwnsRecovery(rows)).toBe(true)
+    expect(newestErrorOwnsRecovery([...rows, msg('user', { content: 'again' })])).toBe(false)
+  })
+
+  it('does not hold for an error with no remedy of its own, such as a throttle, nor for no error', () => {
+    expect(newestErrorOwnsRecovery([user(), msg('error', { content: 'Bedrock is throttling requests.' })])).toBe(false)
+    expect(newestErrorOwnsRecovery([user(), failed()])).toBe(false)
+    expect(newestErrorOwnsRecovery([user(), msg('assistant', { content: 'ok' })])).toBe(false)
   })
 })

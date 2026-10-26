@@ -1,9 +1,9 @@
 """The Chat_Runner resolves folder steering LIVE and hands it to ``build_message``.
 
-The unit under test is one block in ``chat_runner._run_chat``: on a turn that
-carries session-start context (a fresh provider session, or a reinjection after
-compaction) it reads the COMMITTED folder tree, resolves the slot's accumulated
-steering directories off-loop, and passes them to ``build_message`` as
+The unit under test is one block in ``_turn_build_prompt`` (``chat_turn/prompt_assembly.py``):
+on a turn that carries session-start context (a fresh provider session, or a reinjection after
+compaction) it reads the COMMITTED folder tree, resolves the slot's accumulated steering
+directories off-loop, and passes them to ``build_message`` as
 ``steering_dirs``. Nothing is cached on the slot, so a folder edit reaches the
 chats already filed inside it (Req 5.1, 5.3); a slot with no folder passes ``()``
 (Req 5.4); a resolver error degrades to ``()`` plus a warning naming the slot
@@ -31,6 +31,7 @@ from kiro_crew.dashboard import chat_runner
 from kiro_crew.memory import MemoryStore
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.testing.wait import finished
 
 SLOT_NAME = "standards-chat"
 
@@ -79,7 +80,7 @@ def _slot(state, *, folder_id=""):
 async def _turn(state, slot, message="Follow the standards."):
     slot.append("user", message)
     await asyncio.wait_for(chat_runner._run_chat(state, slot, message), 30)
-    await asyncio.wait_for(drain_background_tasks(state), 10)
+    await finished(drain_background_tasks(state), "draining the background tasks", timeout=10)
 
 
 def _passed_dirs(state) -> Any:

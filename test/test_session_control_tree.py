@@ -23,6 +23,7 @@ from kiro_crew.crew_log import session_tree_projection as stp
 from kiro_crew.crew_log.session_tree import EdgeRecord, OpenedRecord
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard.chat_utils import slot_history_key
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 @pytest.fixture(autouse=True)
@@ -49,18 +50,30 @@ def _tree_on(tmp_path, monkeypatch):
     stp.reset_for_tests()
     stp.projection().ensure_seeded()
     _SIDS.clear()
+    _STORE_HEADS.clear()
+    monkeypatch.setattr(
+        emit,
+        "slot_previous_store",
+        lambda slot: _STORE_HEADS.get(slot, ("", True, True)),
+    )
     sc._tree_pending_slots.clear()
+    sc._tree_pending_edges.clear()
     yield
     stp.reset_for_tests()
     _SIDS.clear()
+    _STORE_HEADS.clear()
     # The fence is keyed by slot and lives for the life of an unsettled append, so a test
     # whose stub never settles (the wedged-writer case) leaves one standing on purpose.
     # Cleared on both sides so that is contained to the test that wants it.
     sc._tree_pending_slots.clear()
+    sc._tree_pending_edges.clear()
 
 
 #: Session ids per harness state, cleared between tests by the fixture above.
 _SIDS: dict[int, dict[str, str]] = {}
+
+#: Packaged store-reader answers per slot, also cleared between tests.
+_STORE_HEADS: dict[str, tuple[str, bool, bool]] = {}
 
 
 def _slot(state, name: str, **kwargs):
@@ -72,30 +85,42 @@ def _key(slot) -> str:
 
 
 def _live(state, slot, sid: str):
-    """Map *slot* to an ACP session id, which is the log the entry is written into.
+    """Make *slot* live in the mapping, tree projection, and store-reader view.
 
-    Through the session map, because that is where the verb reads it: the slot's in-turn
-    ACP client is cleared between turns, and the sessions a takeover is aimed at are the
-    idle ones. The harness's ``state.sessions`` is a mock, so the lookup is given a real
-    dictionary to answer from -- a bare mock returns a mock, which the verb correctly
-    refuses as "no session id", and every test here would then pass for the wrong
-    reason.
+    The mapping names the target log, the projection makes the slot visible to tree
+    checks, and the packaged store-reader answer names the log for cross-slot citations.
+    ``provider_switch_replay_pending`` and ``has_session`` are both stubbed because the
+    harness session store is a mock whose unstubbed answer is truthy -- and for
+    ``has_session`` that truthiness is the wrong default twice over: it would report a
+    live session for every slot ever named, including ones a test never made live.
+    A slot is live here exactly when it is mapped, which is what the real registry's
+    fold answers for these keys.
     """
     mapping = _SIDS.setdefault(id(state), {})
     mapping[f"dashboard:{slot.key}"] = sid
-    # Assigned on EVERY call, never behind a "has it been set yet" probe: reading an
-    # attribute off a mock creates it, so such a probe never answers None and the stub
-    # would never be installed at all.
     state.sessions._session_map.mapped_sid.side_effect = lambda key: mapping.get(key, "")
+    state.sessions.provider_switch_replay_pending.side_effect = lambda key: False
+    state.sessions.has_session.side_effect = lambda key: key in mapping
+    _STORE_HEADS[slot.key] = (sid, True, True)
+    stp.projection().apply(OpenedRecord(sid=sid, slot=slot.key, created_at=1))
     return slot
 
 
-def _hold(slot: str, parent: str, *, at: int = 100, sid: str = "") -> None:
-    """Put *slot* under *parent* in the fold, as a prior adoption would have."""
+def _hold(state, slot: str, parent: str, *, at: int = 100, sid: str = "") -> None:
+    """Put *slot* under *parent* in the fold, as a prior adoption would have.
+
+    Each side's record carries the id the test declared live for that slot, so the store
+    and the session map name one log per slot -- see :func:`_live` for why that matters.
+    A slot no test declared live falls back to a derived id, which is the shape of a slot
+    whose log this process never mapped.
+    """
+    mapping = _SIDS.setdefault(id(state), {})
+    child_sid = sid or mapping.get(f"dashboard:{slot}") or f"sid-{slot}"
+    parent_sid = mapping.get(f"dashboard:{parent}") or f"sid-{parent}"
     proj = stp.projection()
-    proj.apply(OpenedRecord(sid=sid or f"sid-{slot}", slot=slot, created_at=1))
-    proj.apply(OpenedRecord(sid=f"sid-{parent}", slot=parent, created_at=2))
-    proj.apply_edge(EdgeRecord(slot=slot, parent_slot=parent, at=at, sid=sid or f"sid-{slot}"))
+    proj.apply(OpenedRecord(sid=child_sid, slot=slot, created_at=1))
+    proj.apply(OpenedRecord(sid=parent_sid, slot=parent, created_at=2))
+    proj.apply_edge(EdgeRecord(slot=slot, parent_slot=parent, at=at, sid=child_sid))
 
 
 def _run(coro):
@@ -176,7 +201,7 @@ def test_a_takeover_records_the_parent_it_replaced(tmp_path, monkeypatch):
     caller = _live(state, _slot(state, "chat-new"), "sid-new")
     _live(state, _slot(state, "chat-worker"), "sid-worker")
     _live(state, _slot(state, "chat-old"), "sid-old")
-    _hold("chat-worker", "chat-old", sid="sid-worker")
+    _hold(state, "chat-worker", "chat-old", sid="sid-worker")
     result = _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
     assert result["previous_parent"] == "chat-old"
     assert calls[0]["previous_parent_slot"] == "chat-old"
@@ -197,7 +222,7 @@ def test_a_refused_takeover_is_recorded_as_a_denial(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     _live(state, _slot(state, "chat-top"), "sid-top")
     caller = _live(state, _slot(state, "chat-mid"), "sid-mid")
-    _hold("chat-mid", "chat-top", sid="sid-mid")
+    _hold(state, "chat-mid", "chat-top", sid="sid-mid")
     with pytest.raises(sc.SessionControlError) as excinfo:
         _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-top"))
     assert excinfo.value.code == "would_cycle"
@@ -216,7 +241,7 @@ def test_a_refused_release_is_recorded_as_a_denial(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     target = _live(state, _slot(state, "chat-2"), "sid-2")
     caller = _live(state, _slot(state, "chat-1"), "sid-caller")
-    _hold("chat-2", "chat-other", sid="sid-2")
+    _hold(state, "chat-2", "chat-other", sid="sid-2")
     with pytest.raises(sc.SessionControlError) as excinfo:
         _run(sc.release_target(state, caller_session_key=_key(caller), target=target.key))
     assert excinfo.value.code == "not_parent"
@@ -236,7 +261,7 @@ def test_adopting_a_session_already_above_the_caller_is_refused(tmp_path, monkey
     state = _make_state(tmp_path)
     _live(state, _slot(state, "chat-top"), "sid-top")
     caller = _live(state, _slot(state, "chat-mid"), "sid-mid")
-    _hold("chat-mid", "chat-top", sid="sid-mid")
+    _hold(state, "chat-mid", "chat-top", sid="sid-mid")
     with pytest.raises(sc.SessionControlError) as excinfo:
         _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-top"))
     assert excinfo.value.code == "would_cycle"
@@ -321,7 +346,7 @@ def test_a_parent_can_release_what_it_holds(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     caller = _live(state, _slot(state, "chat-1"), "sid-caller")
     _live(state, _slot(state, "chat-2"), "sid-target")
-    _hold("chat-2", "chat-1", sid="sid-target")
+    _hold(state, "chat-2", "chat-1", sid="sid-target")
     result = _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-2"))
     assert result["previous_parent"] == "chat-1"
     assert calls == [
@@ -342,7 +367,7 @@ def test_a_session_can_release_itself(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     _live(state, _slot(state, "chat-parent"), "sid-parent")
     caller = _live(state, _slot(state, "chat-child"), "sid-child")
-    _hold("chat-child", "chat-parent", sid="sid-child")
+    _hold(state, "chat-child", "chat-parent", sid="sid-child")
     result = _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-child"))
     assert result["previous_parent"] == "chat-parent"
     assert calls[0]["slot"] == "chat-child"
@@ -357,7 +382,7 @@ def test_an_agent_created_session_can_still_release_itself(tmp_path, monkeypatch
     _live(state, _slot(state, "chat-parent"), "sid-parent")
     caller = _live(state, _slot(state, "chat-child"), "sid-child")
     caller._created_by = "chat-parent"
-    _hold("chat-child", "chat-parent", sid="sid-child")
+    _hold(state, "chat-child", "chat-parent", sid="sid-child")
     result = _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-child"))
     assert result["target"] == "chat-child"
     assert calls[0]["op"] == "release"
@@ -371,7 +396,7 @@ def test_a_third_session_cannot_release_someone_elses_child(tmp_path, monkeypatc
     caller = _live(state, _slot(state, "chat-bystander"), "sid-bystander")
     _live(state, _slot(state, "chat-parent"), "sid-parent")
     _live(state, _slot(state, "chat-child"), "sid-child")
-    _hold("chat-child", "chat-parent", sid="sid-child")
+    _hold(state, "chat-child", "chat-parent", sid="sid-child")
     with pytest.raises(sc.SessionControlError) as excinfo:
         _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-child"))
     assert excinfo.value.code == "not_parent"
@@ -396,7 +421,7 @@ def test_releasing_refuses_when_the_tree_is_not_being_recorded(tmp_path, monkeyp
     state = _make_state(tmp_path)
     caller = _live(state, _slot(state, "chat-1"), "sid-caller")
     _live(state, _slot(state, "chat-2"), "sid-target")
-    _hold("chat-2", "chat-1", sid="sid-target")
+    _hold(state, "chat-2", "chat-1", sid="sid-target")
     monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     with pytest.raises(sc.SessionControlError) as excinfo:
         _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-2"))
@@ -435,7 +460,7 @@ def test_releasing_refuses_while_the_tree_cannot_be_read(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     caller = _live(state, _slot(state, "chat-1"), "sid-caller")
     _live(state, _slot(state, "chat-2"), "sid-target")
-    _hold("chat-2", "chat-1", sid="sid-target")
+    _hold(state, "chat-2", "chat-1", sid="sid-target")
     monkeypatch.setattr(
         "kiro_crew.crew_log.session_tree_projection.SessionTreeProjection."
         "seeded_for_current_store",
@@ -477,7 +502,7 @@ def test_a_release_the_writer_gave_up_on_is_refused_not_reported(tmp_path, monke
     state = _make_state(tmp_path)
     caller = _live(state, _slot(state, "chat-1"), "sid-caller")
     _live(state, _slot(state, "chat-2"), "sid-target")
-    _hold("chat-2", "chat-1", sid="sid-target")
+    _hold(state, "chat-2", "chat-1", sid="sid-target")
     with pytest.raises(sc.SessionControlError) as refused:
         _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-2"))
     assert refused.value.code == "tree_write_failed"
@@ -552,6 +577,246 @@ def test_two_takeovers_of_one_session_serialize(tmp_path, monkeypatch):
     # went first is the scheduler's business, so the assertion is on the PAIR.
     assert sorted(applied) == ["chat-a", "none"] or sorted(applied) == ["chat-b", "none"]
     assert {r["previous_parent"] or "none" for r in results} == set(applied)
+
+
+def test_a_spawn_edge_in_flight_is_seen_by_an_overlapping_adoptions_loop_guard(
+    tmp_path, monkeypatch
+):
+    """A spawn queues ``child -> creator``; an overlapping adoption of the creator under
+    the child must be refused.
+
+    Spawn-time parenting records its edge through the creator's log the same way a
+    takeover does, and the two can race: the spawn queues ``child -> creator`` and, while
+    that append is still in flight, an adoption of the creator under the child would add
+    ``creator -> child``. Neither edge is in the settled fold yet, so a loop guard reading
+    only the settled tree would wave the adoption through and the pair would close
+    ``child -> creator -> child`` -- a cycle the fold cannot present, flattening the
+    branch. The spawn registers its queued edge for exactly the in-flight window, so the
+    adoption's guard sees it and refuses.
+    """
+    from kiro_crew.dashboard.session_control_parts import session_create as scc
+
+    state = _make_state(tmp_path)
+    creator = _live(state, _slot(state, "chat-creator"), "sid-creator")
+    child = _live(state, _slot(state, "chat-child"), "sid-child")
+
+    # Hold the spawn append unsettled: capture its on_settled, do not call it, so the
+    # queued edge is still in flight when the adoption runs.
+    held: dict = {}
+
+    def _hold_spawn(sid, **kw):
+        held["on_settled"] = kw.get("on_settled")
+
+    monkeypatch.setattr(emit, "on_session_spawned", _hold_spawn)
+
+    # The adoption, if it were wrongly allowed, would settle into the tree -- stubbed the
+    # same way the two-takeover test stubs it, so the folded result is realistic.
+    def _settle_adopt(sid, **kw):
+        settle = kw.pop("on_settled", None)
+        stp.projection().apply_edge(
+            EdgeRecord(slot=kw["slot"], parent_slot=kw["parent_slot"], at=200, sid=sid, seq=9)
+        )
+        if settle is not None:
+            settle(True)
+
+    monkeypatch.setattr(emit, "on_session_adopted", _settle_adopt)
+
+    # A minimal child carrying what _record_spawn reads: a minted lineage whose creator is
+    # the creator slot. _created_by is a SLOT key (session_create sets it to caller_key),
+    # the same namespace the loop guard and the edge store use.
+    child_obj = type(
+        "_Child",
+        (),
+        {
+            "_lineage_minted": True,
+            "_created_by": creator.key,
+            "_created_by_sid": "sid-creator",
+            "key": child.key,
+        },
+    )()
+
+    async def _race():
+        spawn = asyncio.create_task(scc._record_spawn(creator.key, child_obj))
+        await asyncio.sleep(0)  # let the spawn hand its append over and register the edge
+        try:
+            await sc.adopt_target(state, caller_session_key=_key(child), target=creator.key)
+            refused = None
+        except sc.SessionControlError as exc:
+            refused = exc.code
+        # Settle the held spawn so its task completes and the edge is dropped.
+        if held.get("on_settled") is not None:
+            held["on_settled"](True)
+        await spawn
+        return refused
+
+    refused = _run(_race())
+    assert refused == "would_cycle"
+    # The edge is dropped once the spawn settles, so it leaves nothing behind.
+    assert sc._tree_pending_edges == {}
+
+
+def test_a_spawn_settle_from_the_writer_thread_resolves_the_fence_on_the_loop(
+    tmp_path, monkeypatch
+):
+    """The append settles on the crew-log writer thread, not the loop; the fence must be
+    resolved back on the loop and the queued edge dropped.
+
+    ``on_session_spawned`` runs ``on_settled`` from whatever thread drains the writer, so
+    ``_record_spawn`` resolves its fence through ``call_soon_threadsafe`` rather than
+    touching the Future off-loop. This drives the settle from a real worker thread, with
+    asyncio debug on so a cross-thread Future mutation would be flagged, and asserts the
+    spawn returns the settled value and the edge is cleared.
+    """
+    import threading
+
+    from kiro_crew.dashboard.session_control_parts import session_create as scc
+
+    state = _make_state(tmp_path)
+    creator = _live(state, _slot(state, "chat-creator"), "sid-creator")
+    child = _live(state, _slot(state, "chat-child"), "sid-child")
+
+    # Capture the settle callback and fire it from a NON-loop thread, as the writer does.
+    held: dict = {}
+
+    def _hold_spawn(sid, **kw):
+        held["on_settled"] = kw.get("on_settled")
+
+    monkeypatch.setattr(emit, "on_session_spawned", _hold_spawn)
+
+    child_obj = type(
+        "_Child",
+        (),
+        {
+            "_lineage_minted": True,
+            "_created_by": creator.key,
+            "_created_by_sid": "sid-creator",
+            "key": child.key,
+        },
+    )()
+
+    async def _drive():
+        spawn = asyncio.create_task(scc._record_spawn(creator.key, child_obj))
+        # Let the spawn register its edge and hand its append over.
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if held.get("on_settled") is not None:
+                break
+        assert held.get("on_settled") is not None, "spawn never handed its append over"
+        # The queued edge is visible while the append is in flight.
+        assert sc._tree_pending_edges.get(child.key) == (child.key, creator.key)
+        # Settle from a worker thread, the way the crew-log writer does. A direct
+        # fence.set_result here (without the threadsafe hop) would be an off-loop Future
+        # mutation; debug mode makes that a failure instead of a silent hazard. The whole
+        # settle+drain is bounded, so the broken resolver (which never schedules the drop
+        # on the loop) FAILS the wait fast rather than hanging the test and CI.
+        done = threading.Event()
+
+        def _settle_off_loop():
+            held["on_settled"](True)
+            done.set()
+
+        threading.Thread(target=_settle_off_loop).start()
+
+        async def _await_drop():
+            await async_wait_until(
+                lambda: done.is_set() and not sc._tree_pending_edges,
+                describe=lambda: "the off-loop settle never dropped the edge on the loop",
+            )
+            return await await_until(spawn, what="the spawn append")
+
+        return await _await_drop()
+
+    landed = asyncio.run(_drive(), debug=True)
+    # The spawn reported the settled value, and the edge was dropped on the loop.
+    assert landed is True
+    assert sc._tree_pending_edges == {}
+
+
+def test_a_spawn_whose_commit_times_out_keeps_its_edge_until_the_write_settles(
+    tmp_path, monkeypatch
+):
+    """awaiting_commit returning False on a timeout does NOT withdraw the append -- the
+    write is still queued -- so the edge must stand until the real settle, and an
+    overlapping adopt(child -> creator) stays refused in the meantime.
+
+    The hazard the fix closes: a slow writer makes awaiting_commit time out and return
+    False, but on_session_spawned has not settled yet. If the spawn dropped its edge on
+    that False, an adoption of the creator under the child would pass its loop guard and
+    commit creator -> child, closing child -> creator -> child once the slow spawn append
+    finally lands. So the edge is held until on_settled fires -- mirroring how adopt leaves
+    its fence standing on a timeout.
+    """
+    from kiro_crew.dashboard.session_control_parts import session_create as scc
+
+    state = _make_state(tmp_path)
+    creator = _live(state, _slot(state, "chat-creator"), "sid-creator")
+    child = _live(state, _slot(state, "chat-child"), "sid-child")
+
+    # The spawn emitter captures its on_settled but does NOT call it (the writer is held).
+    held: dict = {}
+
+    def _hold_spawn(sid, **kw):
+        held["on_settled"] = kw.get("on_settled")
+
+    monkeypatch.setattr(emit, "on_session_spawned", _hold_spawn)
+
+    # awaiting_commit queues the append (so the edge registers and on_settled is captured)
+    # and then returns False WITHOUT settling -- exactly the timeout outcome: job queued,
+    # settle still to come.
+    async def _commit_times_out(emit_one, *, what, timeout=None):
+        emit_one(lambda wrote: None)  # a throwaway settle; the held emitter ignores it
+        return False
+
+    monkeypatch.setattr(emit, "awaiting_commit", _commit_times_out)
+
+    # The adoption would settle into the tree if it were wrongly allowed, so it is stubbed
+    # realistically (same as the other spawn-guard test).
+    def _settle_adopt(sid, **kw):
+        settle = kw.pop("on_settled", None)
+        stp.projection().apply_edge(
+            EdgeRecord(slot=kw["slot"], parent_slot=kw["parent_slot"], at=200, sid=sid, seq=9)
+        )
+        if settle is not None:
+            settle(True)
+
+    monkeypatch.setattr(emit, "on_session_adopted", _settle_adopt)
+
+    child_obj = type(
+        "_Child",
+        (),
+        {
+            "_lineage_minted": True,
+            "_created_by": creator.key,
+            "_created_by_sid": "sid-creator",
+            "key": child.key,
+        },
+    )()
+
+    async def _drive():
+        # The spawn "times out" (awaiting_commit returns False) but its edge is still held.
+        landed = await scc._record_spawn(creator.key, child_obj)
+        assert landed is False, "the stubbed commit timed out"
+        assert held.get("on_settled") is not None, "the append was queued"
+        # The edge survived the False: the write is still in flight.
+        assert sc._tree_pending_edges.get(child.key) == (child.key, creator.key)
+        # So an overlapping adopt(child -> creator) is refused -- the cycle is caught.
+        try:
+            await sc.adopt_target(state, caller_session_key=_key(child), target=creator.key)
+            refused = None
+        except sc.SessionControlError as exc:
+            refused = exc.code
+        # Now the slow write settles for real; the edge clears on the loop.
+        held["on_settled"](True)
+
+        await async_wait_until(
+            lambda: not sc._tree_pending_edges,
+            describe=lambda: "the settled spawn never cleared its pending edge",
+        )
+        return refused
+
+    refused = asyncio.run(_drive())
+    assert refused == "would_cycle"
+    assert sc._tree_pending_edges == {}
 
 
 # ── the tool surface ─────────────────────────────────────────────────────────
@@ -642,6 +907,159 @@ def test_an_authorization_that_lapsed_during_the_lock_wait_does_not_write(tmp_pa
     assert calls == []
 
 
+def test_adopting_refuses_when_the_target_closes_during_id_resolution(tmp_path, monkeypatch):
+    """A close during the resolver's thread hop invalidates the final authorization."""
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-a"), "sid-a")
+    target = _live(state, _slot(state, "chat-t"), "sid-target")
+    reader = emit.slot_previous_store
+
+    def _close_then_read(slot_key: str):
+        state._slots.pop(target.key, None)
+        return reader(slot_key)
+
+    monkeypatch.setattr(emit, "slot_previous_store", _close_then_read)
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(sc.adopt_target(state, caller_session_key=_key(caller), target=target.key))
+    assert excinfo.value.code == "target_not_found"
+    assert calls == []
+
+
+def test_releasing_refuses_when_the_target_closes_during_id_resolution(tmp_path, monkeypatch):
+    """Release revalidates after resolving its previous parent's id."""
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-a"), "sid-a")
+    target = _live(state, _slot(state, "chat-t"), "sid-target")
+    _hold(state, target.key, caller.key, sid="sid-target")
+    reader = emit.slot_previous_store
+
+    def _close_then_read(slot_key: str):
+        state._slots.pop(target.key, None)
+        return reader(slot_key)
+
+    monkeypatch.setattr(emit, "slot_previous_store", _close_then_read)
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(sc.release_target(state, caller_session_key=_key(caller), target=target.key))
+    assert excinfo.value.code == "target_not_found"
+    assert calls == []
+
+
+def test_adopting_refuses_a_same_key_replacement_target_after_the_final_gate(tmp_path, monkeypatch):
+    """A key is not an identity: a close plus a same-key reopen must not be adopted.
+
+    The gate re-resolves BY KEY and ``_live_sid_of`` reads the mapping BY KEY, so a target
+    that closes and reopens a NEW session under the same slot key inside the final gate's
+    thread hop passes every key-only check: the replacement is open, fences the same, and
+    the mapping now names its log. Without the identity capture the adoption is appended
+    naming a session that was never adopted. The capture makes the verb refuse instead,
+    and -- because the record IS the edge -- NOTHING is handed to the writer.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-a"), "sid-a")
+    target = _live(state, _slot(state, "chat-t"), "sid-target")
+    warms: list[int] = []
+
+    async def _replace_on_final_warm():
+        warms.append(1)
+        if len(warms) == 2:
+            # Same key, different session: closed and reopened while the verb is off the
+            # loop on the final gate's hop, with a log of its own already mapped.
+            state._slots.pop(target.key, None)
+            _live(state, _slot(state, "chat-t"), "sid-impostor")
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _replace_on_final_warm)
+
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(sc.adopt_target(state, caller_session_key=_key(caller), target=target.key))
+    assert len(warms) == 2
+    assert excinfo.value.code == "target_replaced"
+    assert calls == []
+
+
+def test_releasing_refuses_a_same_key_replacement_target_after_the_final_gate(
+    tmp_path, monkeypatch
+):
+    """The mirror of the adoption case: a same-key reopen must not be released either.
+
+    A release appended against the replacement would record a change to a session that was
+    never under this parent. The identity capture refuses, and no entry is written.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-a"), "sid-a")
+    target = _live(state, _slot(state, "chat-t"), "sid-target")
+    _hold(state, target.key, caller.key, sid="sid-target")
+    warms: list[int] = []
+
+    async def _replace_on_final_warm():
+        warms.append(1)
+        if len(warms) == 2:
+            state._slots.pop(target.key, None)
+            _live(state, _slot(state, "chat-t"), "sid-impostor")
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _replace_on_final_warm)
+
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(sc.release_target(state, caller_session_key=_key(caller), target=target.key))
+    assert len(warms) == 2
+    assert excinfo.value.code == "target_replaced"
+    assert calls == []
+
+
+def test_adopting_an_unreplaced_target_still_succeeds_across_the_final_gates_hop(
+    tmp_path, monkeypatch
+):
+    """The control for the refusal above: the SAME object across the hop is adopted.
+
+    The gate's hop runs (two warms, same as the replacement case) but the target slot
+    object does not change, so the identity capture matches and the adoption is appended.
+    A refusal that fired on an unreplaced target would make the verb unusable.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-a"), "sid-a")
+    target = _live(state, _slot(state, "chat-t"), "sid-target")
+    warms: list[int] = []
+
+    async def _just_warm():
+        warms.append(1)
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _just_warm)
+
+    result = _run(sc.adopt_target(state, caller_session_key=_key(caller), target=target.key))
+    assert len(warms) == 2
+    assert result["target"] == target.key
+    assert calls[0]["op"] == "adopt"
+    assert calls[0]["sid"] == "sid-target"
+    assert calls[0]["slot"] == target.key
+
+
+def test_releasing_an_unreplaced_target_still_succeeds_across_the_final_gates_hop(
+    tmp_path, monkeypatch
+):
+    """The control for the release refusal: an unchanged target is released as before."""
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-a"), "sid-a")
+    target = _live(state, _slot(state, "chat-t"), "sid-target")
+    _hold(state, target.key, caller.key, sid="sid-target")
+    warms: list[int] = []
+
+    async def _just_warm():
+        warms.append(1)
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _just_warm)
+
+    result = _run(sc.release_target(state, caller_session_key=_key(caller), target=target.key))
+    assert len(warms) == 2
+    assert result["previous_parent"] == caller.key
+    assert calls[0]["op"] == "release"
+    assert calls[0]["slot"] == target.key
+
+
 def test_adopting_refuses_on_a_fold_that_could_not_read_every_unit(tmp_path, monkeypatch):
     """An INCOMPLETE fold is treated as no tree, because this guard DECIDES on an edge.
 
@@ -691,7 +1109,7 @@ def test_both_verbs_warm_the_config_read_off_the_loop_before_every_gate(tmp_path
     _live(state, _slot(state, "chat-2"), "sid-target")
     _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-2"))
     assert len(warms) == 2
-    _hold("chat-2", "chat-1", sid="sid-target")
+    _hold(state, "chat-2", "chat-1", sid="sid-target")
     warms.clear()
     _run(sc.release_target(state, caller_session_key=_key(caller), target="chat-2"))
     assert len(warms) == 2
@@ -759,3 +1177,771 @@ def test_the_fence_clears_when_the_append_settles(tmp_path, monkeypatch):
     # A second verb on the same slot is not refused by a fence that should have cleared.
     _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-t"))
     assert [c["op"] for c in calls] == ["adopt", "adopt"]
+
+
+# ── the id recorded for a slot the caller is not holding ─────────────────────
+#
+# Three of these verbs' resolutions name a slot OTHER than the one being acted on --
+# the adoption's ``parent`` and ``previous_parent``, and the release's
+# ``previous_parent``. Those ids land in an append-only entry, and for a slot the
+# caller does not hold nothing downstream can notice a wrong one. So each of the three
+# is pinned against a store and a session map that DISAGREE: the store holds the log
+# the slot is really writing, the map holds a generation the slot has left behind.
+
+
+def _stale_map(state, slot: str, sid: str) -> None:
+    """Point the session map at *sid* for *slot*, leaving the store where it is.
+
+    The shape a real gateway reaches two ways: the replay-pending deferral keeps the
+    prior resumable id mapped on purpose, and ``clear_sid`` stashes the id it drops so
+    the map keeps answering it. Either way the map names a log the slot has replaced.
+    """
+    mapping = _SIDS.setdefault(id(state), {})
+    mapping[f"dashboard:{slot}"] = sid
+    state.sessions._session_map.mapped_sid.side_effect = lambda key: mapping.get(key, "")
+
+
+def _opened(slot, sid: str):
+    """Record the store the real slot says it opened."""
+    slot._crew_log_opened_sid = sid
+    return slot
+
+
+def test_the_slots_opened_store_leads_a_prior_store_generation(tmp_path):
+    """The writer's live record leads while its new unit is still queued."""
+    state = _make_state(tmp_path)
+    slot = _opened(_slot(state, "chat-boss"), "sid-boss-now")
+    _STORE_HEADS[slot.key] = ("sid-boss-before", True, True)
+
+    assert _run(sc._recorded_sid_of(state, slot.key)) == "sid-boss-now"
+
+
+def test_the_store_is_consulted_when_the_slot_has_no_opened_record(tmp_path):
+    """An absent live record leaves the durable store as the next source."""
+    state = _make_state(tmp_path)
+    slot = _slot(state, "chat-boss")
+    _STORE_HEADS[slot.key] = ("sid-boss-store", True, True)
+    _stale_map(state, slot.key, "sid-boss-mapped")
+
+    assert _run(sc._recorded_sid_of(state, slot.key)) == "sid-boss-store"
+
+
+def test_the_adoptions_parent_sid_is_the_callers_store_not_the_mapping(tmp_path, monkeypatch):
+    """Call site 1 of 3: ``parent``.
+
+    The caller is a slot the verb is not acting on, so its mapping being a generation
+    behind is invisible here -- and the entry that records who took the session over
+    would name the conductor's previous conversation forever.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-boss"), "sid-boss-now")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    _stale_map(state, "chat-boss", "sid-boss-before")
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert calls[0]["parent_slot"] == "chat-boss"
+    assert calls[0]["parent_sid"] == "sid-boss-now"
+
+
+def test_the_adoptions_previous_parent_sid_is_that_slots_store(tmp_path, monkeypatch):
+    """Call site 2 of 3: the adoption's ``previous_parent``.
+
+    The replaced parent is the slot furthest from the caller's own context -- it is
+    neither the target nor the adopter -- so a stale id here is the least likely to be
+    noticed and the most likely to be the only record of who held the session.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-new"), "sid-new")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    _live(state, _slot(state, "chat-old"), "sid-old-now")
+    _hold(state, "chat-worker", "chat-old", sid="sid-worker")
+    _stale_map(state, "chat-old", "sid-old-before")
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert calls[0]["previous_parent_slot"] == "chat-old"
+    assert calls[0]["previous_parent_sid"] == "sid-old-now"
+
+
+def test_the_releases_previous_parent_sid_is_that_slots_store(tmp_path, monkeypatch):
+    """Call site 3 of 3: the release's ``previous_parent``.
+
+    Reached when a session releases ITSELF, where the parent being named is a slot the
+    caller is not and never was.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    _live(state, _slot(state, "chat-holder"), "sid-holder-now")
+    child = _live(state, _slot(state, "chat-child"), "sid-child")
+    _hold(state, "chat-child", "chat-holder", sid="sid-child")
+    _stale_map(state, "chat-holder", "sid-holder-before")
+
+    _run(sc.release_target(state, caller_session_key=_key(child), target="chat-child"))
+    assert calls[0]["op"] == "release"
+    assert calls[0]["previous_parent_slot"] == "chat-holder"
+    assert calls[0]["previous_parent_sid"] == "sid-holder-now"
+
+
+def _advance_on_final_warm(monkeypatch, slot, sid: str) -> "list[int]":
+    """Have *slot* open store *sid* inside the FINAL gate's own suspension.
+
+    The real window this reproduces: a verb resolves its ids before that gate because
+    nothing may suspend after it, the gate's config warm hops to a thread, and a slot
+    that starts its next turn while the verb is off the loop advances its own
+    ``_crew_log_opened_sid`` there. Driven on the SECOND warm, which is the in-lock one
+    -- the gate the append actually follows.
+
+    Returns the warm counter so a caller can assert the hop really happened; an
+    assertion about a stale id proves nothing if the store never advanced.
+    """
+    warms: list[int] = []
+
+    async def _warm():
+        warms.append(1)
+        if len(warms) == 2:
+            slot._crew_log_opened_sid = sid
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _warm)
+    return warms
+
+
+def test_the_adoptions_parent_sid_is_refreshed_across_the_final_gates_hop(tmp_path, monkeypatch):
+    """The adopter opening its next store during the gate must not be recorded stale.
+
+    Ordinary behaviour on the adopter's side: a conductor takes a worker over and its own
+    next turn opens a new log in the same instant. The entry would otherwise name the
+    conversation the conductor has just left, permanently.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _opened(_slot(state, "chat-boss"), "sid-boss-before"), "sid-boss")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    warms = _advance_on_final_warm(monkeypatch, caller, "sid-boss-after")
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert len(warms) == 2
+    assert calls[0]["parent_sid"] == "sid-boss-after"
+
+
+def test_the_adoptions_previous_parent_sid_is_refreshed_across_the_final_gates_hop(
+    tmp_path, monkeypatch
+):
+    """Same window on the REPLACED parent, which no party to the verb is watching."""
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-new"), "sid-new")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    old = _live(state, _opened(_slot(state, "chat-old"), "sid-old-before"), "sid-old")
+    _hold(state, "chat-worker", "chat-old", sid="sid-worker")
+    warms = _advance_on_final_warm(monkeypatch, old, "sid-old-after")
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert len(warms) == 2
+    assert calls[0]["previous_parent_sid"] == "sid-old-after"
+
+
+def test_the_releases_previous_parent_sid_is_refreshed_across_the_final_gates_hop(
+    tmp_path, monkeypatch
+):
+    """Same window in the release verb, whose single resolution sits before the same gate."""
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    holder = _live(state, _opened(_slot(state, "chat-holder"), "sid-holder-before"), "sid-holder")
+    child = _live(state, _slot(state, "chat-child"), "sid-child")
+    _hold(state, "chat-child", "chat-holder", sid="sid-child")
+    warms = _advance_on_final_warm(monkeypatch, holder, "sid-holder-after")
+
+    _run(sc.release_target(state, caller_session_key=_key(child), target="chat-child"))
+    assert len(warms) == 2
+    assert calls[0]["previous_parent_sid"] == "sid-holder-after"
+
+
+def test_a_parent_that_closes_during_the_hop_keeps_the_id_already_resolved(tmp_path, monkeypatch):
+    """The refresh may only ever REPLACE an id, never erase one.
+
+    A slot gone from ``_slots`` has no opened record to read, and that absence is not
+    news about which log it was on -- the durable store answered that before the hop.
+    Falling back to ``""`` there would turn a named parent into a parent whose log is
+    unnamed, which is a different claim and an equally permanent one. This is the control
+    on the three tests above: a refresh written as an unconditional overwrite passes all
+    of them and fails this.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-new"), "sid-new")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    _live(state, _slot(state, "chat-old"), "sid-old")
+    _hold(state, "chat-worker", "chat-old", sid="sid-worker")
+    _STORE_HEADS["chat-old"] = ("sid-old-store", True, True)
+    warms: list[int] = []
+
+    async def _close_on_final_warm():
+        warms.append(1)
+        if len(warms) == 2:
+            state._slots.pop("chat-old", None)
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _close_on_final_warm)
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert len(warms) == 2
+    assert calls[0]["previous_parent_sid"] == "sid-old-store"
+
+
+def test_a_same_key_reopen_during_the_hop_does_not_move_the_id(tmp_path, monkeypatch):
+    """A key is not an identity, and the refresh must not follow a replacement object.
+
+    The hazard the refresh itself could introduce: close the parent and reopen a new
+    session under the SAME slot key inside the hop, and every key-only read now answers
+    for a session that never held the target. Refreshing from its opened-store record
+    would replace a right answer with a confident wrong one -- in an append-only entry.
+
+    So the refresh is conditional on the slot object being the one the id was resolved
+    against. With the empty-record rule, that makes it never worse than not refreshing.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-new"), "sid-new")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    _live(state, _opened(_slot(state, "chat-old"), "sid-old-real"), "sid-old-real")
+    _hold(state, "chat-worker", "chat-old", sid="sid-worker")
+    warms: list[int] = []
+
+    async def _replace_on_final_warm():
+        warms.append(1)
+        if len(warms) == 2:
+            # Same key, different session: closed and reopened while the verb is off the
+            # loop, with the replacement already writing a log of its own.
+            state._slots.pop("chat-old", None)
+            _opened(_slot(state, "chat-old"), "sid-someone-else")
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _replace_on_final_warm)
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert len(warms) == 2
+    assert state._slots["chat-old"]._crew_log_opened_sid == "sid-someone-else"
+    assert calls[0]["previous_parent_sid"] == "sid-old-real"
+
+
+def test_a_slot_appearing_during_the_hop_does_not_supply_the_id(tmp_path, monkeypatch):
+    """The other half of "a key is not an identity": nothing there, then something is.
+
+    The store named the parent's log for a slot this process holds no object for -- a
+    restart's view of a session it did not open. A slot appearing under that key inside
+    the hop is a NEW session, not the one the store answered about, so its opened-store
+    record must not replace the store's answer.
+
+    Distinct from the reopen case above because the capture is ``None`` rather than an
+    object, and a guard that only compares two objects lets this one through.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-new"), "sid-new")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    # ``chat-old`` holds the worker in the fold, and the STORE can name its log, but this
+    # process has no slot object for it.
+    stp.projection().apply_edge(
+        EdgeRecord(slot="chat-worker", parent_slot="chat-old", at=100, sid="sid-worker")
+    )
+    _STORE_HEADS["chat-old"] = ("sid-old-store", True, True)
+    warms: list[int] = []
+
+    async def _appear_on_final_warm():
+        warms.append(1)
+        if len(warms) == 2:
+            _opened(_slot(state, "chat-old"), "sid-brand-new")
+
+    monkeypatch.setattr(sc, "prewarm_enabled_check", _appear_on_final_warm)
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert len(warms) == 2
+    assert state._slots["chat-old"]._crew_log_opened_sid == "sid-brand-new"
+    assert calls[0]["previous_parent_slot"] == "chat-old"
+    assert calls[0]["previous_parent_sid"] == "sid-old-store"
+
+
+@pytest.mark.parametrize(
+    ("verb", "emitter"),
+    [("adopt_target", "on_session_adopted"), ("release_target", "on_session_released")],
+)
+def test_the_sid_refresh_sits_after_the_final_authorization(verb: str, emitter: str):
+    """Structural, because placing this refresh EARLIER leaves the window it closes open.
+
+    The refresh is only worth anything after the last suspension before the append, and
+    the gate itself suspends -- so a refresh moved up to sit beside the resolutions reads
+    as a fix while changing nothing. Synchronous for the same reason, which the sibling
+    no-suspension test enforces from the other side.
+    """
+    import ast
+    import inspect
+
+    fn = next(
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(inspect.getmodule(getattr(sc, verb)))))
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == verb
+    )
+
+    def called_at(name: str) -> list[int]:
+        return sorted(
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == name
+        )
+
+    emit_line = min(called_at(emitter))
+    final_gate = max(line for line in called_at("authorize_target") if line < emit_line)
+    refreshes = called_at("_freshest_sid")
+    assert refreshes, f"{verb} no longer refreshes any resolved sid"
+    early = [line for line in refreshes if line < final_gate]
+    assert early == [], (
+        f"{verb} refreshes at {early}, before its final authorization (line {final_gate}), "
+        "so the gate's own suspension can still stale the id"
+    )
+    assert max(refreshes) < emit_line, f"{verb} refreshes after {emitter} has been handed the id"
+
+
+@pytest.mark.parametrize(
+    ("verb", "resolver"),
+    [("adopt_target", "_recorded_sid_of"), ("release_target", "_recorded_sid_of")],
+)
+def test_the_slot_capture_precedes_the_resolutions_own_suspension(verb: str, resolver: str):
+    """The identity capture has to be older than every suspension the id crosses.
+
+    ``_recorded_sid_of`` reads the durable store, so it suspends too -- a capture taken
+    after it would leave the replacement window open across that read while still looking
+    like an identity check. Structural because the gap is an ordering, and the behaviour
+    test drives only the gate's hop.
+    """
+    import ast
+    import inspect
+
+    fn = next(
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(inspect.getmodule(getattr(sc, verb)))))
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == verb
+    )
+
+    def called_at(name: str) -> list[int]:
+        return sorted(
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == name
+        )
+
+    captures = called_at("_slot_object")
+    resolutions = called_at(resolver)
+    assert captures, f"{verb} captures no slot identity"
+    assert resolutions, f"{verb} resolves no recorded sid"
+    assert max(captures) < min(resolutions), (
+        f"{verb} captures slot identity at {captures}, after its first resolution at "
+        f"{min(resolutions)} -- the store read suspends, so the capture must precede it"
+    )
+
+
+def test_the_mapping_is_refused_inside_the_replay_pending_window(tmp_path, monkeypatch):
+    """The window where the map deliberately names the generation BEFORE the store.
+
+    Allocation leaves the prior resumable id mapped for a replay-pending ACP session on
+    purpose, so a restart can still resume it. With no store record to lead, the map is
+    the only source left -- and inside this window its answer is a real id belonging to a
+    real log, which is exactly what makes reading it worse than answering nothing: an
+    absent field is visibly absent, while the prior generation's id reads as a finding.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-boss"), "sid-boss")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    # The caller's own log is not in the store yet, so the store has no id to answer.
+    _STORE_HEADS.pop("chat-boss")
+    stp.reset_for_tests()
+    stp.projection().ensure_seeded()
+    stp.projection().apply(OpenedRecord(sid="sid-worker", slot="chat-worker", created_at=1))
+    _stale_map(state, "chat-boss", "sid-boss-before")
+    state.sessions.provider_switch_replay_pending.side_effect = (
+        lambda key: key == "dashboard:chat-boss"
+    )
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert calls[0]["parent_slot"] == "chat-boss"
+    assert calls[0]["parent_sid"] == ""
+    # And outside the window the same map IS read, so the refusal is the window's and
+    # not a resolver that simply stopped reading the map.
+    calls.clear()
+    state.sessions.provider_switch_replay_pending.side_effect = lambda key: False
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert calls[0]["parent_sid"] == "sid-boss-before"
+
+
+def test_a_slot_with_no_live_session_does_not_license_the_mapping(tmp_path, monkeypatch):
+    """Having no session to ask is not the same as being owed no replay.
+
+    Only the second licenses the map.
+
+    ``provider_switch_replay_pending`` is ``bool(session is not None and
+    session.provider_switch_replay)``, so a closed slot and a live one that owes nothing
+    both answer ``False``. Reading the map on that answer is worst precisely here: the
+    map keeps answering an id after a session closes, so the shape this admits is a
+    dropped generation written into an append-only entry as the parent's log.
+
+    The second half is the control -- the same slot with a live session and no replay
+    owed DOES read the map -- so this pins a tri-state rather than a resolver that
+    stopped reading the map at all.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-boss"), "sid-boss")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    # No store record for the caller, so the map is the only source left to consult.
+    _STORE_HEADS.pop("chat-boss")
+    stp.reset_for_tests()
+    stp.projection().ensure_seeded()
+    stp.projection().apply(OpenedRecord(sid="sid-worker", slot="chat-worker", created_at=1))
+    _stale_map(state, "chat-boss", "sid-boss-dropped")
+    state.sessions.has_session.side_effect = lambda key: key != "dashboard:chat-boss"
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert calls[0]["parent_slot"] == "chat-boss"
+    assert calls[0]["parent_sid"] == ""
+
+    calls.clear()
+    state.sessions.has_session.side_effect = lambda key: True
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    assert calls[0]["parent_sid"] == "sid-boss-dropped"
+
+
+def test_the_replay_read_is_unknown_when_the_registry_cannot_be_asked(tmp_path):
+    """Every way of failing to ASK answers ``None``, not ``False``.
+
+    Three of them, because they arrive by different routes and a fix that covers one
+    leaves the licence open on the others: no registry at all, a registry that says the
+    slot has no session, and a registry that raises. ``False`` is reserved for the one
+    state in which the map is trustworthy -- a live session that owes no replay.
+    """
+    state = _make_state(tmp_path)
+    slot = _live(state, _slot(state, "chat-boss"), "sid-boss")
+
+    assert sc._replay_pending(state, slot.key) is False
+
+    state.sessions.has_session.side_effect = lambda key: False
+    assert sc._replay_pending(state, slot.key) is None
+
+    state.sessions.has_session.side_effect = RuntimeError("registry unreadable")
+    assert sc._replay_pending(state, slot.key) is None
+
+    sessions = state.sessions
+    try:
+        state.sessions = None
+        assert sc._replay_pending(state, slot.key) is None
+    finally:
+        state.sessions = sessions
+
+
+def test_an_undetermined_parent_is_not_recorded_as_no_parent(tmp_path, monkeypatch):
+    """A parent whose log could not be named is not recorded as no parent at all.
+
+    The two must not reach a reader as the same entry, and they differ in the SLOT
+    half rather than the id half. A parent whose log could not be named still writes
+    its slot, so the citation is present and incomplete; a session with no parent
+    writes no citation at all. A reader walking lineage can act on the first -- the
+    edge exists and one end is unnamed -- and must not read it as the second.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    caller = _live(state, _slot(state, "chat-new"), "sid-new")
+    _live(state, _slot(state, "chat-worker"), "sid-worker")
+    # The edge is seeded WITHOUT a record for the parent, which ``_hold`` would supply:
+    # ``chat-gone`` holds the session and this gateway can name neither its log nor its
+    # replay state -- no store record, no mapping, no session.
+    stp.projection().apply_edge(
+        EdgeRecord(slot="chat-worker", parent_slot="chat-gone", at=100, sid="sid-worker")
+    )
+    state.sessions.provider_switch_replay_pending.side_effect = lambda key: (
+        key == "dashboard:chat-gone"
+    )
+
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-worker"))
+    undetermined = calls[0]
+    assert undetermined["previous_parent_slot"] == "chat-gone"
+    assert undetermined["previous_parent_sid"] == ""
+
+    # The same verb on a session that genuinely has no parent, for contrast.
+    calls.clear()
+    _live(state, _slot(state, "chat-root"), "sid-root")
+    _run(sc.adopt_target(state, caller_session_key=_key(caller), target="chat-root"))
+    no_parent = calls[0]
+    assert no_parent["previous_parent_slot"] == ""
+    assert no_parent["previous_parent_sid"] == ""
+    # The two are DIFFERENT records, which is the whole point: the slot half carries it.
+    assert undetermined["previous_parent_slot"] != no_parent["previous_parent_slot"]
+
+
+def test_the_resolver_separates_no_log_from_could_not_determine(tmp_path, monkeypatch):
+    """The store wins while uncertain and replay-window answers stay unnamed."""
+    state = _make_state(tmp_path)
+    _live(state, _slot(state, "chat-known"), "sid-known")
+    _STORE_HEADS["chat-undetermined"] = ("", False, False)
+
+    # The durable store's id wins when it has one.
+    assert _run(sc._recorded_sid_of(state, "chat-known")) == "sid-known"
+    assert _run(sc._recorded_sid_of(state, "chat-absent")) == ""
+    assert _run(sc._recorded_sid_of(state, "chat-undetermined")) == ""
+    assert _run(sc._recorded_sid_of(state, "")) == ""
+
+    # An undecided store is never a licence to guess from a populated mapping.
+    _stale_map(state, "chat-undetermined", "sid-undetermined-guess")
+    assert _run(sc._recorded_sid_of(state, "chat-undetermined")) == ""
+
+    # A replay-pending slot withholds the mapping until that window closes.
+    _stale_map(state, "chat-absent", "sid-absent-before")
+    state.sessions.provider_switch_replay_pending.side_effect = lambda key: True
+    assert _run(sc._recorded_sid_of(state, "chat-absent")) == ""
+    state.sessions.provider_switch_replay_pending.side_effect = lambda key: False
+    assert _run(sc._recorded_sid_of(state, "chat-absent")) == "sid-absent-before"
+
+
+def _boom(_key: str) -> bool:
+    raise RuntimeError("the session store cannot answer")
+
+
+# ── nothing suspends between the final authorization and the append ──────────
+
+
+@pytest.mark.parametrize(
+    ("verb", "emitter"),
+    [("adopt_target", "on_session_adopted"), ("release_target", "on_session_released")],
+)
+def test_no_suspension_between_the_final_authorization_and_the_append(verb: str, emitter: str):
+    """Structural, because the hazard is an ORDERING no behaviour test fully covers.
+
+    A close takes no tree-mutation lock, so it runs inside any suspension these verbs
+    take. Once the last ``authorize_target`` has said yes, a suspension before the append
+    lets the target stop being addressable while the entry is still written -- and the
+    entry is append-only, so nothing later corrects it. The same rule is why
+    ``_close_slot``'s pre-pop check is synchronous.
+
+    Read off the AST rather than asserted through a scenario: a behaviour test proves one
+    interleaving is refused, while this proves there is no window for any of them. The
+    resolutions are still REQUIRED to suspend somewhere earlier in the verb, which the
+    control below pins -- otherwise deleting them outright would satisfy this test.
+    """
+    import ast
+    import inspect
+
+    fn = next(
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(inspect.getmodule(getattr(sc, verb)))))
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == verb
+    )
+
+    def called_at(name: str) -> list[int]:
+        return sorted(
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == name
+        )
+
+    emit_line = min(called_at(emitter))
+    gates = [line for line in called_at("authorize_target") if line < emit_line]
+    assert gates, f"{verb} appends without authorizing first"
+    final_gate = max(gates)
+
+    suspensions = sorted(
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Await) and final_gate < node.lineno < emit_line
+    )
+    assert suspensions == [], (
+        f"{verb} suspends at {suspensions}, between its final authorization "
+        f"(line {final_gate}) and {emitter} (line {emit_line})"
+    )
+
+    # Control: the id resolution must still happen, and still suspend, BEFORE that gate.
+    # Without this an empty result above would also describe a verb that resolves nothing.
+    resolutions = [line for line in called_at("_recorded_sid_of") if line < final_gate]
+    assert resolutions, f"{verb} no longer resolves any recorded sid before its final gate"
+    earlier = [
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Await) and node.lineno <= final_gate
+    ]
+    assert earlier, f"{verb} takes no suspension at all, so this ordering proves nothing"
+
+
+# ── a cycle closed through a queued, unsettled reparent edge ─────────────────
+#
+# A reparent hands its edge to the writer and then WAITS, bounded, for it to land.
+# During that wait the edge is not yet in the settled fold. A second adoption decided in
+# that window must not be able to close a cycle through the queued edge: the loop guard
+# reads the queued-but-unsettled edges ADDITIVELY on top of the settled tree, following a
+# slot's settled parent AND its queued parent, so it refuses a loop that closes anywhere
+# along the chain -- not only on the one slot its own append fences.
+
+
+def _pending_adopt(child: str, parent: str) -> None:
+    """Stand in for an ADOPTION whose append is queued but has NOT settled.
+
+    Registers the target fence and the queued edge exactly as the production path does
+    (``_tree_append_waiter(child)`` plus ``_note_pending_edge``), with the future
+    deliberately never resolved -- the append is handed to the writer and still in
+    flight. The edge is NOT folded into the settled tree, which is the window the hazard
+    lives in. The fixture clears the registry between tests.
+    """
+    loop = asyncio.get_event_loop()
+    future: "asyncio.Future[bool]" = loop.create_future()
+    sc._tree_pending_slots[child] = future
+    sc._note_pending_edge(child, parent, future)
+
+
+def test_a_second_adopt_cannot_close_a_cycle_through_a_queued_edge(tmp_path, monkeypatch):
+    """Two overlapping adoptions must not persist a cycle.
+
+    ``chat-t`` is being adopted under ``chat-a`` (edge t->a), handed to the writer and
+    not yet settled. A second adoption of ``chat-a`` under ``chat-t`` (edge a->t) decided
+    in that window would close the cycle t->a->t: the settled fold has neither edge, so a
+    settled-only walk does not see that ``chat-t`` is about to be ``chat-a``'s parent. The
+    loop guard follows the queued t->a edge and refuses it.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    _live(state, _slot(state, "chat-a"), "sid-a")
+    t = _live(state, _slot(state, "chat-t"), "sid-t")
+    proj = stp.projection()
+    proj.apply(OpenedRecord(sid="sid-a", slot="chat-a", created_at=1))
+    proj.apply(OpenedRecord(sid="sid-t", slot="chat-t", created_at=2))
+
+    # chat-t is being adopted under chat-a: edge t->a queued, not settled. chat-a (the
+    # target of the reverse adoption) is not the fenced slot, so the call reaches the
+    # loop guard rather than the fence.
+    _pending_adopt("chat-t", "chat-a")
+
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(sc.adopt_target(state, caller_session_key=_key(t), target="chat-a"))
+    assert excinfo.value.code == "would_cycle"
+    # Nothing was handed to the writer: the cycle-closing edge was never queued.
+    assert calls == []
+
+
+def test_a_longer_cycle_through_a_queued_edge_is_refused_with_no_fence_in_the_way(
+    tmp_path, monkeypatch
+):
+    """The overlay alone refuses a loop whose closing adoption fences no endpoint.
+
+    Settled ``chat-a -> chat-x`` and ``chat-y -> chat-t``; ``chat-t -> chat-a`` queued,
+    not settled. Adopting ``chat-x`` under ``chat-y`` (edge x->y) would close
+    x->y->t->a->x. Only ``chat-t`` is fenced by the pending append, and neither endpoint
+    of this adoption is ``chat-t``, so no fence catches the call -- the loop guard, reading
+    the settled parents AND the queued t->a edge, is the only thing that can refuse it, and
+    it must.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    _live(state, _slot(state, "chat-a"), "sid-a")
+    _live(state, _slot(state, "chat-x"), "sid-x")
+    _live(state, _slot(state, "chat-y"), "sid-y")
+    _live(state, _slot(state, "chat-t"), "sid-t")
+    _hold(state, "chat-a", "chat-x", sid="sid-a")
+    _hold(state, "chat-y", "chat-t", sid="sid-y")
+
+    _pending_adopt("chat-t", "chat-a")
+
+    x = state.get_or_create_slot("chat-x")
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(
+            sc.adopt_target(state, caller_session_key=_key(_slot(state, "chat-y")), target="chat-x")
+        )
+    assert excinfo.value.code == "would_cycle"
+    assert calls == []
+    assert x is not None
+
+
+def test_a_queued_edge_does_not_hide_a_slots_settled_ancestry(tmp_path, monkeypatch):
+    """A pending edge is ADDED to a slot's settled parent, never substituted for it.
+
+    Settled ``chat-z -> chat-x``, ``chat-x -> chat-b``, ``chat-b -> chat-y``; a slow
+    ``chat-x -> chat-a`` adoption is queued. Adopting ``chat-y`` under ``chat-z`` (edge
+    y->z) would close y->z->x->b->y, which stays durable if the queued chat-x append then
+    fails after its retries while this one lands. Reading the queued x->a edge INSTEAD of
+    the settled x->b would hide chat-x's real ancestry and admit the adoption; reading it
+    in ADDITION keeps x->b in view, so the loop is seen and refused.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    for name, sid in (
+        ("chat-z", "sid-z"),
+        ("chat-x", "sid-x"),
+        ("chat-b", "sid-b"),
+        ("chat-y", "sid-y"),
+        ("chat-a", "sid-a"),
+    ):
+        _live(state, _slot(state, name), sid)
+    _hold(state, "chat-z", "chat-x", sid="sid-z")
+    _hold(state, "chat-x", "chat-b", sid="sid-x")
+    _hold(state, "chat-b", "chat-y", sid="sid-b")
+
+    # chat-x is being adopted under chat-a: edge x->a queued, not settled. chat-x stays
+    # fenced, but neither endpoint of the adoption below is chat-x.
+    _pending_adopt("chat-x", "chat-a")
+
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(
+            sc.adopt_target(state, caller_session_key=_key(_slot(state, "chat-z")), target="chat-y")
+        )
+    assert excinfo.value.code == "would_cycle"
+    assert calls == []
+
+
+def test_a_release_is_refused_while_the_target_has_a_pending_append(tmp_path, monkeypatch):
+    """A release decided against a slot with a queued reparent is refused.
+
+    ``chat-c`` is being adopted under ``chat-p`` (edge c->p), queued and not settled.
+    A release of ``chat-c`` from its CURRENT parent ``chat-old`` decided in that window
+    reads a tree the writer is about to replace: the queued adoption moves ``chat-c``'s
+    parent, and committing a release under the old parent races it. ``chat-c`` is the
+    fenced slot, so the release is refused rather than decided against a stale tree.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    old = _live(state, _slot(state, "chat-old"), "sid-old")
+    _live(state, _slot(state, "chat-c"), "sid-c")
+    _live(state, _slot(state, "chat-p"), "sid-p")
+    _hold(state, "chat-c", "chat-old", sid="sid-c")
+
+    # chat-c is being adopted under chat-p: edge c->p queued, not settled.
+    _pending_adopt("chat-c", "chat-p")
+
+    with pytest.raises(sc.SessionControlError) as excinfo:
+        _run(sc.release_target(state, caller_session_key=_key(old), target="chat-c"))
+    assert excinfo.value.code == "tree_write_pending"
+    assert calls == []
+
+
+def test_a_manager_can_adopt_a_second_child_while_the_first_is_in_flight(tmp_path, monkeypatch):
+    """Gaining a child does not fence a parent: parallel sibling adoptions are allowed.
+
+    ``chat-c1`` is being adopted under ``chat-mgr`` (edge c1->mgr), queued and not
+    settled. ``chat-mgr`` adopting a second child ``chat-c2`` forms no cycle -- a parent's
+    ancestry does not change by gaining a child -- so it must NOT be refused. This is the
+    case a new-parent fence would wrongly block.
+    """
+    calls = _emitted(monkeypatch)
+    state = _make_state(tmp_path)
+    mgr = _live(state, _slot(state, "chat-mgr"), "sid-mgr")
+    _live(state, _slot(state, "chat-c1"), "sid-c1")
+    _live(state, _slot(state, "chat-c2"), "sid-c2")
+    proj = stp.projection()
+    for slot, sid, created in (
+        ("chat-mgr", "sid-mgr", 1),
+        ("chat-c1", "sid-c1", 2),
+        ("chat-c2", "sid-c2", 3),
+    ):
+        proj.apply(OpenedRecord(sid=sid, slot=slot, created_at=created))
+
+    # chat-c1 under chat-mgr is in flight; chat-mgr is NOT fenced by it.
+    _pending_adopt("chat-c1", "chat-mgr")
+
+    result = _run(sc.adopt_target(state, caller_session_key=_key(mgr), target="chat-c2"))
+    assert result == {"target": "chat-c2", "parent": "chat-mgr", "previous_parent": ""}
+    assert [c["op"] for c in calls] == ["adopt"]

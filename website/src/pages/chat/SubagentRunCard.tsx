@@ -15,16 +15,17 @@
  */
 import { memo } from 'react'
 import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square, Hand } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { openActivityToTab, selectSubagent, switchSlot, isAwaitingSpawnApproval } from '../../store/chatSlice'
+import { openActivityToTab, selectSubagent, switchSlot, isActiveSubagent, isAwaitingSpawnApproval, isSpawnApprovalGone, isSpawnApprovalRetired } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { ChatMessage, SubagentActivity } from '../../types'
 import { SPAWN_LAUNCH_MARKER } from './types'
-import { queuedWaitText } from './subagentQueuedReason'
+import { neverStartedKind, queuedWaitText } from './subagentQueuedReason'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import ErrorNotice from '../../components/ErrorNotice'
 /** The `spawn_run` tool result opens with "Spawned N subagent(s)." followed by
  *  one indented "  <id> (<agent>): <task>" line per accepted agent (see the
  *  spawn_run handler in mcp_core.py). Matching the header identifies the call
@@ -144,22 +145,33 @@ const EMPTY_SUBAGENTS: Record<string, SubagentActivity> = {}
 
 /** Terminal statuses, tallied across the launch's own ids only. */
 function tally(agents: (SubagentActivity | undefined)[]) {
-  let running = 0, awaiting = 0, done = 0, failed = 0, stopped = 0, unknown = 0
+  let running = 0, awaiting = 0, done = 0, failed = 0, stopped = 0, unknown = 0, neverStarted = 0, neverStartedPressure = 0
   for (const a of agents) {
     if (!a) { unknown++; continue }
+    if (isSpawnApprovalRetired(a)) { unknown++; continue }
     // A run parked on an unanswered spawn approval launched no process, so it
     // is not running — it used to be counted here, which is what made this card
     // claim "1 agent running" for a wave that was in fact blocked on the user
     // (#7318). A `'pending'` entry with no approval_id keeps the old treatment:
     // it is active but not attributable to an approval.
     if (isAwaitingSpawnApproval(a)) awaiting++
-    else if (a.status === 'running' || a.status === 'tool' || a.status === 'pending') running++
+    // Its approval proved gone: decided or expired unseen, so it is not owed to
+    // the user and liveness is not yet known. Outcome unknown, like a dropped id.
+    else if (isSpawnApprovalGone(a)) unknown++
+    else if (isActiveSubagent(a)) running++
     else if (a.status === 'done') done++
-    else if (a.status === 'error') failed++
+    else if (a.status === 'error') {
+      failed++
+      // A run the gate ended before it launched anything: the header must not
+      // call it "finished", which the blind reader read as success.
+      const kind = neverStartedKind(a.error)
+      if (kind) neverStarted++
+      if (kind === 'memory_pressure') neverStartedPressure++
+    }
     else if (a.status === 'stopped') stopped++
     else unknown++
   }
-  return { running, awaiting, done, failed, stopped, unknown }
+  return { running, awaiting, done, failed, stopped, unknown, neverStarted, neverStartedPressure }
 }
 
 const SubagentRunCard = memo(function SubagentRunCard({
@@ -220,7 +232,16 @@ const SubagentRunCard = memo(function SubagentRunCard({
       // "1 of 3 agents finished" would pin a permanently false statement in
       // scrollback, since the unobservable members can never be tallied.
       ? settled >= total && fullyObservable
-        ? i18nT('pages.chat.subagentRunCard.agent_finished', { count: total })
+        ? counts.neverStarted >= total
+          ? i18nT('pages.chat.subagentRunCard.agent_never_started', { count: total })
+          // A mixed wave says how many actually ran: "3 agents finished" over
+          // one that never started read as if all three had.
+          : counts.neverStarted > 0
+            ? i18nT('pages.chat.subagentRunCard.agent_ran_of_total', {
+              count: total - counts.neverStarted,
+              total,
+            })
+            : i18nT('pages.chat.subagentRunCard.agent_finished', { count: total })
         : i18nT('pages.chat.subagentRunCard.agent_launched', { count: total })
       : queued > 0
         // Whole wave still behind the cap: "0 agents running" is technically
@@ -247,11 +268,28 @@ const SubagentRunCard = memo(function SubagentRunCard({
   const idPreview = sanitizeLlmOutput(launch.ids.slice(0, 4).join(' · '))
 
   // Row geometry -- the px-4 gutter and the --mc-content-width clamp -- belongs to
-  // the HOST row wrapper, never to this card. ChatPage wraps every renderMessage
+  // the HOST row wrapper, never to this card. ChatTranscriptView wraps every renderMessage
   // result, and the shared registries wrap this card through ctx.row. Re-applying
   // it here nested one clamp inside another and inset the card by a second full
   // gutter, so it sat 20px right of every sibling row and 40px narrower.
-  return (
+  // A member a memory wait ended is a failure the card states in full, whether
+  // or not the rest of its wave ran: a mixed wave's header still says
+  // "finished", and without this the one member that never started would read
+  // as success. Each note names the reason those members actually ended with:
+  // the macOS pressure hold, or the low-memory wait running past its bound. It
+  // renders through the shared error surface, as a sibling AFTER the card's
+  // button, never inside it.
+  const neverStartedLowMemory = counts.neverStarted - counts.neverStartedPressure
+  const neverStartedNotes = [
+    counts.neverStartedPressure > 0
+      ? i18nT('pages.chat.subagentRunCard.never_started_memory_pressure', { count: counts.neverStartedPressure })
+      : null,
+    neverStartedLowMemory > 0
+      ? i18nT('pages.chat.subagentRunCard.never_started_low_memory', { count: neverStartedLowMemory })
+      : null,
+  ].filter((note): note is string => note !== null)
+
+  const card = (
     <button
       type="button"
       onClick={open}
@@ -290,7 +328,7 @@ const SubagentRunCard = memo(function SubagentRunCard({
           )}
           {counts.awaiting > 0 && (
             <span
-              className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-warn-subtle border border-warn/20 text-warn"
+              className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-warn-subtle border border-warn/20 text-warn-text"
               data-testid="subagent-card-awaiting"
               title={i18nT('pages.chat.subagentRunCard.waiting_for_your_approval_to_start')}
             >
@@ -298,12 +336,12 @@ const SubagentRunCard = memo(function SubagentRunCard({
             </span>
           )}
           {counts.done > 0 && (
-            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-ok-subtle border border-ok/20 text-ok">
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-ok-subtle border border-ok/20 text-ok-text">
               <CheckCircle2 size={10} aria-hidden /> {counts.done}
             </span>
           )}
           {counts.failed > 0 && (
-            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-danger-subtle border border-danger/20 text-danger">
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-danger-subtle border border-danger/20 text-danger-text">
               <AlertCircle size={10} aria-hidden /> {counts.failed}
             </span>
           )}
@@ -329,11 +367,30 @@ const SubagentRunCard = memo(function SubagentRunCard({
           {i18nT('pages.chat.subagentRunCard.open_subagents_panel')}
         </div>
       </div>
-      <PanelRightSolid
+      <SidePanelGlyph
         size={14}
         className="text-muted shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity"
       />
     </button>
+  )
+
+  if (neverStartedNotes.length === 0) return card
+  return (
+    <div className="w-full">
+      {card}
+      {/* No hand-off: the chat composer beside this card may hold an unsent
+          draft, which the hand-off's navigation to a new chat would discard;
+          the Subagents panel's own error rows carry the hand-off. */}
+      {neverStartedNotes.map(note => (
+        <ErrorNotice
+          key={note}
+          variant="inline"
+          className="mt-1 px-3"
+          testId="subagent-card-never-started-reason"
+          message={note}
+        />
+      ))}
+    </div>
   )
 })
 

@@ -1,4 +1,4 @@
-name: Opus 5 Review
+name: Opus 5.5 Review
 
 # Semantic AI review layer. Checks AUTOSDE rules that cannot be expressed as
 # a grep, PLUS correctness, resource/lifecycle, and other semantic defects
@@ -50,13 +50,13 @@ concurrency:
 jobs:
   claude-review:
     # Model-NAMED check on purpose: this repo names reviewers by their model
-    # ("Opus 5 Review", "GPT 5.6 Review") rather than by vendor/harness. Branch
+    # ("Opus 5.5 Review", "GPT 6.1 Review") rather than by vendor/harness. Branch
     # protection keys its required status check on this job name, so if the
     # --model below is bumped and this name changes with it, the required-check
     # list AND the `workflow_run.workflows:` array in pr-readiness.yml must be
     # updated in the same change.
     # BRANCH-PROTECTION NAME COLLISION -- keep this conditional. Two workflows
-    # publish the protected check name "Opus 5 Review": this same-repo lane and the
+    # publish the protected check name "Opus 5.5 Review": this same-repo lane and the
     # privileged Stage-2 fork-opus-review.yml. GitHub resolves a required status
     # check to the NEWEST check-run carrying that name, so on a fork PR -- where
     # this lane reviews nothing -- any `pull_request` event firing AFTER the fork
@@ -74,10 +74,10 @@ jobs:
     # skipped job's `name:` expression, so while the guard was a job-level `if:`
     # every fork PR published the raw expression source as its check name.
     # Letting the job start with all steps gated costs seconds of runner time and
-    # reports the intended name instead. `test_ai_review_workflows.py` asserts
+    # reports the intended name instead. `test_ai_review_workflows_fork_stage2.py` asserts
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
-    name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'Opus 5 Review' || 'Opus 5 Review (same-repo lane, not applicable to forks)' }}"
+    name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'Opus 5.5 Review' || 'Opus 5.5 Review (same-repo lane, not applicable to forks)' }}"
     runs-on: ubuntu-latest
     # Runaway/hang backstop only, NOT a per-review budget: a healthy review
     # self-terminates at --max-turns 180 per stage (two stages; see below)
@@ -95,8 +95,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.head.repo.full_name == github.repository
         with:
-          fetch-depth: 0
+          # The merge ref plus its two parents (the base tip and the PR head),
+          # not the whole history: the next step fetches the one other commit
+          # the diffs need.
+          fetch-depth: 2
           persist-credentials: false
+
+      # The checkout is shallow, so a three-dot `base...head` range has no
+      # history to find its merge-base in. GitHub's compare API names the
+      # merge-base; that one commit is fetched at depth 1, and every diff below
+      # is the two-dot `<merge-base>..<head>`. A two-dot diff compares two
+      # trees and needs no history, and it is the same diff the three-dot
+      # range gave on a full clone.
+      - name: Fetch the merge-base commit (shallow history)
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        id: merge_base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # need SHA / merge_base X Y -- see the script's header.
+          . "$GITHUB_WORKSPACE/.github/scripts/review-merge-base.sh"
+          need "$BASE_SHA"
+          need "$HEAD_SHA"
+          pr="$(merge_base "$BASE_SHA" "$HEAD_SHA")"
+          need "$pr"
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "merge-base of $BASE_SHA and $HEAD_SHA: $pr"
 
       # Non-blocking size signal: raise a concern when the REVIEWABLE diff is
       # large enough that a single review pass may not cover it reliably. Only
@@ -104,11 +132,11 @@ jobs:
       - name: Flag oversized reviewable diff (non-blocking)
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.pr }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MAX_REVIEWABLE_LINES: "15000"
         run: |
-          changed=$(git diff --numstat "$BASE_SHA...$HEAD_SHA" -- . ':(exclude)src/kiro_crew/_vendor' 2>/dev/null \
+          changed=$(git diff --numstat "$MERGE_BASE..$HEAD_SHA" -- . ':(exclude)src/kiro_crew/_vendor' 2>/dev/null \
             | awk '{ a += $1; d += $2 } END { print a + d + 0 }')
           echo "reviewable changed lines (excluding src/kiro_crew/_vendor): ${changed}"
           if [ "${changed:-0}" -gt "$MAX_REVIEWABLE_LINES" ]; then
@@ -202,7 +230,7 @@ jobs:
       # secrets / OIDC, so the AWS role assumption can never succeed. Skip the
       # credential + review steps and let the gate pass; dependency bumps stay
       # covered by Semgrep, CodeQL, the nightly/release Dependency Audit and the build/tests.
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -226,11 +254,11 @@ jobs:
       - name: Prefetch the reviewable diff (data only)
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.pr }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PATCH: ${{ runner.temp }}/pr.diff
         run: |
-          git diff --no-color "$BASE_SHA...$HEAD_SHA" > "$PATCH"
+          git diff --no-color "$MERGE_BASE..$HEAD_SHA" > "$PATCH"
           if [ ! -s "$PATCH" ]; then
             echo "::error::Prefetched diff for $HEAD_SHA is empty; refusing to review nothing."
             exit 1
@@ -254,14 +282,14 @@ jobs:
       # stage 1 and live in stage 2, applied to candidates that already exist.
       # This mirrors Anthropic's own code-review plugin (parallel discovery
       # agents, then a per-candidate validation agent with a confidence floor).
-      - name: Opus 5 discovery
+      - name: Opus 5.5 discovery
         id: discover
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
           )
-        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -270,8 +298,8 @@ jobs:
           # comment threads are attacker-controllable on a public repo and must
           # never enter an agentic reviewer's context.
           claude_args: |
-            --model us.anthropic.claude-opus-5
-            --fallback-model us.anthropic.claude-opus-4-8
+            --model us.anthropic.claude-opus-5-5
+            --fallback-model us.anthropic.claude-sonnet-5-5
             --max-turns 180
             --allowedTools "Read,Grep,Glob"
           prompt: |
@@ -287,6 +315,33 @@ jobs:
             Obtain the diff by reading this pre-fetched file:
             ${{ runner.temp }}/pr.diff
 
+      # The outbound scrub is `scripts/scope_redact.py`, staged from the BASE
+      # commit. A redactor taken from the change under review could
+      # rewrite the scrub of its own published output. Every model step after
+      # this one is read-only, so nothing can rewrite the staged copy.
+      - name: Stage the base-owned redactor
+        id: redactor
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          )
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          dir="${RUNNER_TEMP:-/tmp}/scope-redact"
+          # Remove before creating: a symlink at this path would redirect the write.
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          dest="$dir/scope_redact.py"
+          git show "$BASE_SHA:scripts/scope_redact.py" > "$dest" 2>/dev/null || true
+          if [ ! -s "$dest" ]; then
+            echo "::error::scripts/scope_redact.py is missing or empty on the base commit ($BASE_SHA). Refusing to publish text no base-owned scrubber could redact."
+            exit 1
+          fi
+          echo "redactor=$dest" >> "$GITHUB_OUTPUT"
+
       # Hand stage 1's candidates to stage 2 through a FILE rather than string
       # interpolation: model output must never be spliced into YAML or a shell
       # argument, and a file has no arg-length ceiling.
@@ -297,6 +352,7 @@ jobs:
           steps.discover.outcome == 'success'
           )
         env:
+          REDACTOR: ${{ steps.redactor.outputs.redactor }}
           EXEC_FILE: ${{ steps.discover.outputs.execution_file }}
           HEAD: ${{ github.event.pull_request.head.sha }}
           MAX_CANDIDATE_BYTES: "200000"
@@ -315,7 +371,14 @@ jobs:
             fi
             printf '%s\n' "$out" > .review-candidates.md
           fi
-          perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g' .review-candidates.md
+          # No redactor, or a scrub that fails, is a refusal: the file is removed so
+          # no later `always()` step can publish it raw.
+          if [ -z "${REDACTOR:-}" ] || [ ! -s "$REDACTOR" ] \
+            || ! python3 "$REDACTOR" --mode text .review-candidates.md; then
+            echo "::error::the base-owned redactor could not scrub .review-candidates.md. Refusing to publish it raw."
+            rm -f .review-candidates.md
+            exit 1
+          fi
           if ! grep -Fq "[OPUS-DISCOVERY] $HEAD" .review-candidates.md; then
             echo "::error::Discovery produced no [OPUS-DISCOVERY] marker for $HEAD, so its output cannot be trusted as a complete candidate list. Failing closed: validation against a truncated or empty list would emit a clean [OPUS-REVIEWED] verdict and pass the gate on a review that never happened."
             # PAYLOAD-FREE diagnostics for exactly this branch, printed AFTER the
@@ -421,7 +484,7 @@ jobs:
       # failed closed with no verdict and no way to tell a real hang from a
       # spent session. Each stage now starts on a fresh session, leaving the
       # job timeout as the only wall. Keep in sync with codex-review.yml.
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -437,20 +500,20 @@ jobs:
       # itself, keeps only those it scores >= 80, and applies the closed blocking
       # list to the survivors. Keeps `id: review` so the existing capture, post
       # and fail-closed gate steps below are unchanged.
-      - name: Opus 5 validation
+      - name: Opus 5.5 validation
         id: review
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
           )
-        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
-            --model us.anthropic.claude-opus-5
-            --fallback-model us.anthropic.claude-opus-4-8
+            --model us.anthropic.claude-opus-5-5
+            --fallback-model us.anthropic.claude-sonnet-5-5
             --max-turns 180
             --allowedTools "Read,Grep,Glob"
           prompt: |
@@ -476,7 +539,9 @@ jobs:
           always()
           )
         env:
+          REDACTOR: ${{ steps.redactor.outputs.redactor }}
           EXEC_FILE: ${{ steps.review.outputs.execution_file }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           : > claude-review-output.md
           if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
@@ -486,7 +551,69 @@ jobs:
             fi
             printf '%s\n' "$summary" > claude-review-output.md
           fi
-          perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g' claude-review-output.md
+          # No redactor, or a scrub that fails, is a refusal: the file is removed so
+          # no later `always()` step can publish it raw.
+          if [ -z "${REDACTOR:-}" ] || [ ! -s "$REDACTOR" ] \
+            || ! python3 "$REDACTOR" --mode text claude-review-output.md; then
+            echo "::error::the base-owned redactor could not scrub claude-review-output.md. Refusing to publish it raw."
+            rm -f claude-review-output.md
+            exit 1
+          fi
+          # A BLOCK states a trigger and an observable wrong outcome, or it is a
+          # PASS. Dropped here, before the comment and the gate read the marker,
+          # so both and the local loop see the same verdict.
+          # --- block substantiation (copied into every lane; pinned by test_block_substantiation.py) ---
+          block_substantiated() {
+            local text
+            text="$(cat)"
+            grep -Eiq '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Trigger:(\*\*)?[[:space:]]*[^[:space:]*]' <<< "$text" \
+              && grep -Eiq '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Outcome:(\*\*)?[[:space:]]*[^[:space:]*]' <<< "$text"
+          }
+          drop_unsubstantiated_block_marker() {
+            local file="$1" head="$2" kept
+            grep -Fq "[BLOCK-MERGE] $head" "$file" || return 0
+            block_substantiated < "$file" && return 0
+            kept="$(mktemp)"
+            grep -Fv "[BLOCK-MERGE] $head" "$file" > "$kept" || true
+            cat "$kept" > "$file"
+            rm -f "$kept"
+            echo dropped
+          }
+          # --- end block substantiation ---
+          if [ -n "$(drop_unsubstantiated_block_marker claude-review-output.md "$HEAD")" ]; then
+            echo "::warning title=Unsubstantiated BLOCK::Opus 5.5 emitted [BLOCK-MERGE] for $HEAD without a Trigger: line and an Outcome: line, so the BLOCK is treated as PASS."
+          fi
+
+      # Turn-budget exhaustion is its own outcome (#13296). A stage stopped at
+      # --max-turns writes a `result` message with subtype `error_max_turns`
+      # and no verdict stamp, so it used to land as the same generic failure as
+      # a hang, a bootstrap fault or a credential error. Read it from each
+      # stage's transcript and hand the steps below one fixed-enum value. It
+      # can only make the lane STRICTER: a spent stage is never a pass, even
+      # beside a stamp. Keep in sync with fork-opus-review.yml.
+      - name: Detect turn-budget exhaustion
+        id: budget
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          )
+        env:
+          DISCOVER_EXEC: ${{ steps.discover.outputs.execution_file }}
+          REVIEW_EXEC: ${{ steps.review.outputs.execution_file }}
+        run: |
+          spent=""
+          check_stage() {
+            [ -n "$2" ] && [ -f "$2" ] || return 0
+            hit="$(jq -rs '[ .[] | (if type=="array" then .[] else . end) | select(type=="object" and .type=="result" and .subtype=="error_max_turns") ] | length > 0' "$2" 2>/dev/null)" || hit=""
+            if [ "$hit" = "true" ]; then spent="${spent:+$spent,}$1"; fi
+          }
+          check_stage discovery "${DISCOVER_EXEC:-}"
+          check_stage validation "${REVIEW_EXEC:-}"
+          echo "spent=$spent" >> "$GITHUB_OUTPUT"
+          if [ -n "$spent" ]; then
+            echo "::notice::turn budget spent (error_max_turns) in stage(s): $spent"
+          fi
 
       # Post the review summary for humans (best-effort, NON-gating). Reads the
       # captured review text. UPSERTs a single marker-keyed comment per PR so
@@ -494,7 +621,7 @@ jobs:
       # [OPUS-REVIEWED] marker parsed for THIS head — an errored or partial
       # transcript posts NOTHING (see the incomplete early-out below), so no raw
       # model/error text can leak.
-      - name: Post Opus 5 review summary
+      - name: Post Opus 5.5 review summary
         id: post
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
@@ -510,6 +637,7 @@ jobs:
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           OVERRIDE_SOURCE: ${{ steps.human_override.outputs.source }}
           ACTOR: ${{ github.actor }}
+          BUDGET_SPENT: ${{ steps.budget.outputs.spent }}
         run: |
           if [ "$ACTOR" = "dependabot[bot]" ] && [ "$HUMAN_OVERRIDE" != "true" ]; then
             echo "Dependabot PR: no review ran; nothing to post."
@@ -530,6 +658,12 @@ jobs:
               kind="clear"
               verdict="✅ no blocking findings"
             fi
+          fi
+          # A stage that spent its turn budget never reached a whole review, so
+          # a clean stamp beside it is not a pass (#13296): post nothing, and the
+          # gate below names the budget.
+          if [ "$kind" = "clear" ] && [ -n "${BUDGET_SPENT:-}" ]; then
+            kind="incomplete"
           fi
           # Incomplete review: post NOTHING (mirrors the old empty-structured-
           # output early-out). A $HEAD-bearing placeholder would masquerade as a
@@ -561,13 +695,13 @@ jobs:
           MARKER="<!-- claude-ai-review -->"
           {
             echo "$MARKER"
-            echo "## Opus 5 Review — $verdict"
+            echo "## Opus 5.5 Review — $verdict"
             echo
             echo "_Reviewed \`$HEAD\` — this comment is updated in place on each push._"
             echo
             case "$kind" in
               override)
-                echo "Human judgment by @$OVERRIDE_ACTOR overrides the Opus 5 finding for \`$HEAD\`; [the recorded reason]($source_url) is authoritative for this commit."
+                echo "Human judgment by @$OVERRIDE_ACTOR overrides the Opus 5.5 finding for \`$HEAD\`; [the recorded reason]($source_url) is authoritative for this commit."
                 echo
                 # What makes this body findable as an override for this head. No
                 # reader keys on it -- the freshness readers want the review
@@ -595,16 +729,16 @@ jobs:
             fi
             echo
             echo "False positive or not applicable? A repository writer can comment:"
-            echo "\`/ai-review override fable $HEAD: <one-sentence reason>\`"
+            echo "\`/ai-review override fable $HEAD false-positive: <reason, 20 to 500 characters>\`"
           } > /tmp/claude-summary.md
           # ONE publication primitive for every marker-comment write in this
-          # lane; test_ai_review_workflows.py pins it byte-identical across all
+          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
           # of them, the way it already pins guarded_comment_upsert, so neither
           # the budget nor the honesty below can drift lane by lane.
           #
           # A marker comment is the ONLY thing a freshness verifier reads. A
           # write that does not land therefore leaves the PR indistinguishable
-          # from one no lane ever reviewed: prepare-pr's pr_status.py refuses a
+          # from one no lane ever reviewed: kirocrew-prepare-pr's pr_status.py refuses a
           # PR whose check-runs, readiness status and mergeable state all pass,
           # and the only way out is manufacturing a new head -- which re-rolls
           # the non-deterministic review lanes and discards the verdicts they
@@ -846,7 +980,7 @@ jobs:
             # would invent a BLOCK nobody judged out of an infrastructure fault.
             # The annotation is what says so: the required readiness status reads
             # check-run CONCLUSIONS and has no stamp-freshness read, so the reader
-            # that catches a head with no verdict is prepare-pr's own marker
+            # that catches a head with no verdict is kirocrew-prepare-pr's own marker
             # evaluation, run before a PR is called ready.
             if [ -n "$slot" ]; then
               occupied=""
@@ -1045,13 +1179,13 @@ jobs:
               existing="$(printf '%s\n' "$matches" | awk 'NR == 1')"
               break
             fi
-            echo "Reading this PR's comments to find the Opus 5 comment failed on attempt $attempt."
+            echo "Reading this PR's comments to find the Opus 5.5 comment failed on attempt $attempt."
             if [ "$attempt" -lt 6 ]; then
               sleep "$(( attempt * 5 ))"
             fi
           done
           if [ "$verdict_read_rc" -ne 0 ]; then
-            note_read_failure "$verdict_read_rc" "reading this PR's comments to find the Opus 5 comment" "$READ_ERR_FILE"
+            note_read_failure "$verdict_read_rc" "reading this PR's comments to find the Opus 5.5 comment" "$READ_ERR_FILE"
           fi
           # This lane is FAIL-CLOSED, and its gate reads the captured review
           # text rather than the PR, so an outcome that leaves this head's
@@ -1072,13 +1206,13 @@ jobs:
               "repos/$REPO/issues/comments/$existing" \
               --field body="$(cat /tmp/claude-summary.md)" || write_rc=$?
             if [ "$write_rc" -eq 0 ]; then
-              echo "Updated existing Opus 5 summary comment #$existing"
+              echo "Updated existing Opus 5.5 summary comment #$existing"
             elif [ "$write_rc" -eq 4 ]; then
-              echo "Opus 5 Review stopped publishing its $HEAD verdict to comment #$existing because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
+              echo "Opus 5.5 Review stopped publishing its $HEAD verdict to comment #$existing because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
             elif [ "$write_rc" -eq 5 ]; then
-              echo "Opus 5 Review left comment #$existing alone because it carries an accepted human override for this lane; the override stands and this run's verdict is not published."
+              echo "Opus 5.5 Review left comment #$existing alone because it carries an accepted human override for this lane; the override stands and this run's verdict is not published."
             else
-              echo "::error::Opus 5 Review produced a verdict for $HEAD but could not publish it to comment #$existing. That comment still carries an older head, so every marker-freshness check reads this PR as unreviewed for $HEAD.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              echo "::error::Opus 5.5 Review produced a verdict for $HEAD but could not publish it to comment #$existing. That comment still carries an older head, so every marker-freshness check reads this PR as unreviewed for $HEAD.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               exit 1
             fi
           else
@@ -1086,17 +1220,17 @@ jobs:
             retry_comment_write "$MARKER" "$head_needle" /tmp/claude-summary.md "" \
               gh pr comment "$PR" --body-file /tmp/claude-summary.md || write_rc=$?
             if [ "$write_rc" -eq 0 ]; then
-              echo "Published Opus 5 summary comment for $HEAD"
+              echo "Published Opus 5.5 summary comment for $HEAD"
             elif [ "$write_rc" -eq 3 ]; then
-              echo "::error::Opus 5 Review produced a verdict for $HEAD, but this lane's slot already holds one for $HEAD from an earlier run, so this run's verdict was not published and the PR presents that earlier sample instead -- including whatever it says about blocking. Re-run this lane to publish this run's verdict."
+              echo "::error::Opus 5.5 Review produced a verdict for $HEAD, but this lane's slot already holds one for $HEAD from an earlier run, so this run's verdict was not published and the PR presents that earlier sample instead -- including whatever it says about blocking. Re-run this lane to publish this run's verdict."
               exit 1
             elif [ "$write_rc" -eq 4 ]; then
-              echo "Opus 5 Review stopped publishing its $HEAD body because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
+              echo "Opus 5.5 Review stopped publishing its $HEAD body because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
             elif [ "$write_rc" -eq 2 ]; then
-              echo "::error::Opus 5 produced a verdict for $HEAD but this lane's slot is already taken, so nothing was written and nothing was overwritten. The PR carries no verdict for this head; re-run this lane once that comment is not the current one.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              echo "::error::Opus 5.5 produced a verdict for $HEAD but this lane's slot is already taken, so nothing was written and nothing was overwritten. The PR carries no verdict for this head; re-run this lane once that comment is not the current one.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               exit 1
             else
-              echo "::error::Opus 5 Review produced a verdict for $HEAD but could not publish it, so this run's verdict is not in the slot.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              echo "::error::Opus 5.5 Review produced a verdict for $HEAD but could not publish it, so this run's verdict is not in the slot.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               exit 1
             fi
           fi
@@ -1105,7 +1239,7 @@ jobs:
       # review text (same contract as codex-review.yml):
       #   - [OPUS-REVIEWED] <sha> — the review ran and produced a verdict for
       #     THIS commit. Absent => fail rather than silently pass.
-      #   - [BLOCK-MERGE] <sha>   — it additionally found a WHAT-BLOCKS issue.
+      #   - [BLOCK-MERGE] <sha>   — it additionally found a complete BLOCKING item.
       #     This is the ONLY thing that blocks the merge. There is deliberately
       #     no label-scanning backstop, so a label the model chooses can never
       #     override the contract.
@@ -1132,7 +1266,7 @@ jobs:
           && steps.post.outputs.retained_verdict_artifact != ''
           )
         # NEVER fatal. A lane's conclusion is read by pr-readiness.yml, and for
-        # the three advisory labels ANY non-success conclusion is reported as
+        # the three whole-design labels ANY non-success conclusion is reported as
         # `<label> (BLOCK)` -- a judged-wrong verdict. So a transport flake here,
         # or an `if-no-files-found: error` on a directory that did not survive,
         # would invent a verdict nobody reached. Retention is evidence ABOUT a
@@ -1154,7 +1288,7 @@ jobs:
           # pull request is still open restores exactly the ambiguity it was
           # added to remove -- and leaves the republisher nothing to read.
           retention-days: 90
-      - name: Gate on Opus 5 review
+      - name: Gate on Opus 5.5 review
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -1166,39 +1300,56 @@ jobs:
           ACTOR: ${{ github.actor }}
           HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
+          BUDGET_SPENT: ${{ steps.budget.outputs.spent }}
         run: |
           if [ "$HUMAN_OVERRIDE" = "true" ]; then
-            echo "Human judgment by $OVERRIDE_ACTOR overrides Opus 5 for $HEAD. Passing gate."
+            echo "Human judgment by $OVERRIDE_ACTOR overrides Opus 5.5 for $HEAD. Passing gate."
             exit 0
           fi
           if [ "$ACTOR" = "dependabot[bot]" ]; then
-            echo "Dependabot PR ($ACTOR): Opus 5 AI review skipped (no Bedrock secrets/OIDC). Passing gate."
+            echo "Dependabot PR ($ACTOR): Opus 5.5 AI review skipped (no Bedrock secrets/OIDC). Passing gate."
             exit 0
           fi
+          # Its own outcome, checked before every verdict read (#13296): a stage
+          # stopped at --max-turns reached no whole review, so it fails whatever
+          # the transcript holds, and says so instead of the generic incomplete.
+          if [ -n "${BUDGET_SPENT:-}" ]; then
+            case "$BUDGET_SPENT" in
+              discovery | validation | discovery,validation) stage="$BUDGET_SPENT" ;;
+              *) stage="unknown" ;;
+            esac
+            echo "::error::Opus 5.5 review: turn budget spent, needs human review. The $stage stage stopped at --max-turns (error_max_turns) for $HEAD, so no verdict was reached. A re-run walks into the same cap; a human reviews this diff, or splits the PR."
+            {
+              echo "### Opus 5.5 Review — turn budget spent, needs human review"
+              echo
+              echo "Stage: \`$stage\` stopped at \`--max-turns\` for \`$HEAD\`. No verdict was reached, so the gate fails."
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          fi
           if [ "$REVIEW_OUTCOME" != "success" ]; then
-            echo "::error::Opus 5 review step did not succeed (outcome=$REVIEW_OUTCOME) for $HEAD. Failing closed."
+            echo "::error::Opus 5.5 review step did not succeed (outcome=$REVIEW_OUTCOME) for $HEAD. Failing closed."
             exit 1
           fi
           if [ ! -s claude-review-output.md ]; then
-            echo "::error::Opus 5 review produced no output for $HEAD (empty transcript capture). Failing closed — re-run or inspect the Opus 5 review step logs."
+            echo "::error::Opus 5.5 review produced no output for $HEAD (empty transcript capture). Failing closed — re-run or inspect the Opus 5.5 review step logs."
             exit 1
           fi
           # Positive proof the review ran for THIS commit (fail closed).
           if ! grep -Fq "[OPUS-REVIEWED] $HEAD" claude-review-output.md; then
-            echo "::error::Opus 5 review did not complete for $HEAD (no [OPUS-REVIEWED] marker). Failing closed — re-run the workflow or inspect the Opus 5 review step logs."
+            echo "::error::Opus 5.5 review did not complete for $HEAD (no [OPUS-REVIEWED] marker). Failing closed — re-run the workflow or inspect the Opus 5.5 review step logs."
             echo "--- review output ---"
             cat claude-review-output.md
             exit 1
           fi
           # Block ONLY on the contract-gated marker.
           if grep -Fq "[BLOCK-MERGE] $HEAD" claude-review-output.md; then
-            echo "::error::Opus 5 review flagged a blocking issue on $HEAD — see the posted review summary."
+            echo "::error::Opus 5.5 review flagged a blocking issue on $HEAD — see the posted review summary."
             exit 1
           fi
-          # Advisory coherence signal (never fails the build): a BLOCKING-labelled
+          # Coherence signal (never fails the build): a BLOCKING-labelled
           # finding without the marker means the model's label and its verdict
           # disagree. Worth tuning the prompt over; not worth blocking a merge.
           if grep -qE '^[[:space:]]*[-*]?[[:space:]]*(\*\*)?BLOCKING\b' claude-review-output.md; then
-            echo "::warning::Opus 5 emitted a BLOCKING-labelled finding for $HEAD without the [BLOCK-MERGE] marker. Gate passes on the marker; review the prompt if this recurs."
+            echo "::warning::Opus 5.5 emitted a BLOCKING-labelled finding for $HEAD without the [BLOCK-MERGE] marker. Gate passes on the marker; review the prompt if this recurs."
           fi
-          echo "Opus 5 review completed for $HEAD with no blocking findings."
+          echo "Opus 5.5 review completed for $HEAD with no blocking findings."

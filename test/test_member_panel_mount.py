@@ -31,6 +31,7 @@ from kiro_crew.acp.kas_agents import to_client_custom_agent
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -306,6 +307,16 @@ class _ClientStub:
     _withhold_is_the_only_deny_channel = AcpClient._withhold_is_the_only_deny_channel
     _member_mount_withheld = AcpClient._member_mount_withheld
 
+    _claude_settings_shared = False
+    _permission_surface_share_validated = False
+
+    @property
+    def _permission_surface_governed(self):
+        # The real governed-surface derivation (authored OR share-validated),
+        # reached at call time through the live class so the stub cannot drift
+        # from what production actually reads.
+        return AcpClient._permission_surface_governed.fget(self)
+
 
 @pytest.fixture
 def panel_granted(monkeypatch):
@@ -351,6 +362,24 @@ class TestClaudePanelAppend:
         stub._claude_settings_authored = False
         assert self._run(stub) == _base_servers()
 
+    def test_a_shared_permission_surface_mounts(self, panel_granted):
+        """A sharer's surface is governed too: the file on disk is a sibling's
+        byte-identical Crew seed, so the panel rides the same permission file
+        it would have under ownership."""
+        stub = _ClientStub()
+        stub._claude_settings_authored = False
+        stub._claude_settings_shared = True
+        stub._permission_surface_share_validated = True
+        assert [e["name"] for e in self._run(stub)][-1] == MEMBER_PANEL_SERVER
+
+    def test_a_retained_lease_alone_does_not_mount(self, panel_granted):
+        """The lease survives a failed re-validation to keep the file pinned; it
+        is not trust in the current bytes, so it alone mounts nothing."""
+        stub = _ClientStub()
+        stub._claude_settings_authored = False
+        stub._claude_settings_shared = True
+        assert self._run(stub) == _base_servers()
+
     def test_kiro_backend_is_untouched(self, panel_granted):
         stub = _ClientStub()
         stub.backend = ACP_BACKEND_KIRO
@@ -376,12 +405,22 @@ class TestClaudePanelAppend:
         stub.backend = backend
         assert self._run(stub, disabled=frozenset({MEMBER_PANEL_SERVER})) == _base_servers()
 
+    def test_a_whole_server_deny_backend_withholds_a_restricted_server(self, panel_granted):
+        stub = _ClientStub()
+        stub.backend = ACP_BACKEND_GOOSE
+        assert self._run(stub, restricted=frozenset({MEMBER_PANEL_SERVER})) == _base_servers()
+
+    def test_a_per_tool_deny_backend_keeps_its_mount(self, panel_granted):
+        stub = _ClientStub()
+        stub.backend = ACP_BACKEND_OPENCODE
+        out = self._run(stub, restricted=frozenset({MEMBER_PANEL_SERVER}))
+        assert [e["name"] for e in out][-1] == MEMBER_PANEL_SERVER
+
     @pytest.mark.parametrize("backend", [ACP_BACKEND_OPENCODE, ACP_BACKEND_GOOSE])
-    def test_a_whole_server_deny_backend_withholds_a_restricted_server(
-        self, backend, panel_granted
-    ):
+    def test_an_unhonoured_server_is_withheld(self, backend, panel_granted):
         stub = _ClientStub()
         stub.backend = backend
+        stub._session_mcp_unhonoured = frozenset({MEMBER_PANEL_SERVER})
         assert self._run(stub, restricted=frozenset({MEMBER_PANEL_SERVER})) == _base_servers()
 
     @pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE])
@@ -438,7 +477,13 @@ class TestPanelBackendSetIsItsOwnDecision:
 
     @pytest.mark.parametrize(
         "backend",
-        [ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE],
+        [
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_KAS,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_OPENCODE,
+            ACP_BACKEND_DEEPSEEK,
+        ],
     )
     def test_the_argued_members_are_present(self, backend):
         from kiro_crew.acp.types import ACP_BACKENDS_MEMBER_PANEL

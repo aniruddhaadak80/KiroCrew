@@ -24,7 +24,7 @@ from kiro_crew.apps.bridges import (
     disarm_app_crons_for_execution,
     register_app_crons_with_service,
 )
-from kiro_crew.apps.context import AppContext, build_app_context
+from kiro_crew.apps.context import AppContext, build_app_context, http_app_for_manifest
 from kiro_crew.apps.execution import (
     app_execution_denied,
     shipped_builtin_app_root,
@@ -32,7 +32,7 @@ from kiro_crew.apps.execution import (
 from kiro_crew.apps.job_routes import register_job_routes
 from kiro_crew.apps.job_sdk import forget_sdk, get_sdk, reconcile_all, register_sdk
 from kiro_crew.apps.lifecycle import LifecycleDispatcher
-from kiro_crew.apps.manager import app_dir, list_apps
+from kiro_crew.apps.manager import app_dir, approved_manifest_permissions, list_apps
 from kiro_crew.apps.module_loader import clear_all_shutdown_callables
 from kiro_crew.apps.route_registry import RouteRegistry
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
@@ -78,8 +78,10 @@ def hook_signature(app_info: dict[str, Any]) -> tuple[Any, ...]:
 
     Folds ONLY hook-relevant inputs so a metadata write that does not touch hook
     code never forces a reload: the app version, a digest of the declared hook
-    source files' (path, mtime, size), and the ``.app_secret`` mtime (a reinstall
-    rotates it, and the live module must pick up the new secret). Deliberately
+    source files' (path, mtime, size), the ``.app_secret`` mtime (a reinstall
+    rotates it, and the live module must pick up the new secret), and the
+    approved events in ``approvedGrants`` (approving them changes what the hook context's
+    event bus may publish, and the bus is built once per load). Deliberately
     EXCLUDES two things:
 
     * ``installed.json`` mtime -- a dashboard permissions/config edit rewrites
@@ -130,6 +132,21 @@ def hook_signature(app_info: dict[str, Any]) -> tuple[Any, ...]:
         str(app_info.get("version", "")),
         digest,
         secret_mtime,
+        # The approved event set the hook context's EventBus is built from: an
+        # owner approving held-back events (``installed.json`` only, no code
+        # change) must reload the hooks, or the bus keeps refusing them.
+        _approved_events_marker(app_info),
+    )
+
+
+def _approved_events_marker(app_info: dict[str, Any]) -> tuple[str, ...] | None:
+    """``None`` for a record without an approved set, else its events, sorted."""
+    record = app_info.get("approvedGrants")
+    if record is None:
+        return None
+    events = record.get("events") if isinstance(record, dict) else None
+    return (
+        tuple(sorted(e for e in events if isinstance(e, str))) if isinstance(events, list) else ()
     )
 
 
@@ -287,6 +304,7 @@ def init_hooks_system(
         cron_service=cron_service,
         broadcast_fn=broadcast_fn,
         spawn_impl=spawn_impl,
+        http_app=app,
     )
 
     logger.info("Hooks system initialized")
@@ -327,9 +345,23 @@ def _build_app_context_from_info(
     """Build an AppContext from app info dict — shared helper for consistent context."""
     name = app_info.get("name", "")
     manifest = app_info.get("manifest", {})
-    permissions = manifest.get("permissions", {})
+    permissions = approved_manifest_permissions(app_info)
+    # Created by ``_prepare_app_context_from_info`` off the loop before this runs.
     data_path = app_dir(name) / "data"
-    data_path.mkdir(parents=True, exist_ok=True)
+
+    # Only an app that declares a ``routes`` hook is handed the gateway's
+    # Application, and only because it already has it: the registry dispatches
+    # the real ``web.Request`` into that app's handlers, so ``request.app`` is
+    # this same object on every call. Reading it from the registry rather than a
+    # parameter keeps the two in step by construction -- the object an app can
+    # reach through its requests is the object it is given here, or nothing.
+    #
+    # The gate itself lives in ``http_app_for_manifest`` and is shared with the
+    # lifecycle dispatcher's builder, so a startup context and a shutdown context
+    # for the same app cannot disagree about whether the handle is present.
+    http_app = http_app_for_manifest(
+        manifest, _route_registry.http_app if _route_registry else None
+    )
     ctx = build_app_context(
         app_name=name,
         data_dir=data_path,
@@ -338,6 +370,8 @@ def _build_app_context_from_info(
         broadcast_fn=broadcast_fn,
         spawn_impl=spawn_impl,
         app_config=manifest.get("extra", {}),
+        http_app=http_app,
+        crewmate_host=_route_registry.http_app if _route_registry else None,
     )
     # The shared _jobs routes are mounted once for every app and resolve the app
     # from the URL, so they need a name -> SDK lookup. Publishing happens here,
@@ -346,6 +380,22 @@ def _build_app_context_from_info(
     if ctx.job is not None:
         register_sdk(ctx.job)
     return ctx
+
+
+async def _prepare_app_context_from_info(
+    app_info: dict[str, Any],
+    cron_service: Any = None,
+    broadcast_fn: Any = None,
+    spawn_impl: Any = None,
+) -> Any:
+    """Create the app's data dir off the loop, then build its context on it.
+
+    The ``mkdir`` is blocking disk I/O on the enable and boot paths, so it takes
+    a ``to_thread`` hop; the context is built back on the loop that owns it.
+    """
+    data_path = app_dir(app_info.get("name", "")) / "data"
+    await asyncio.to_thread(data_path.mkdir, parents=True, exist_ok=True)
+    return _build_app_context_from_info(app_info, cron_service, broadcast_fn, spawn_impl)
 
 
 async def on_app_enable(
@@ -432,7 +482,7 @@ async def on_app_enable(
     )
 
     # Build AppContext for this app (shared helper ensures consistency)
-    ctx = _build_app_context_from_info(app_info, cron_service, broadcast_fn, spawn_impl)
+    ctx = await _prepare_app_context_from_info(app_info, cron_service, broadcast_fn, spawn_impl)
 
     # Register routes if declared
     routes_hook = hooks.get("routes", "")
@@ -695,7 +745,7 @@ async def on_app_disable(
         success = await _lifecycle_dispatcher._invoke(
             app_name,
             shutdown_hook,
-            _lifecycle_dispatcher._build_context(app_info),
+            await _lifecycle_dispatcher._prepare_context(app_info, phase="shutdown"),
             phase="shutdown",
         )
         result["hooks_shutdown"] = "ok" if success else "failed"
@@ -769,7 +819,17 @@ async def on_gateway_startup(
                 denied,
             )
             if cron_service is not None:
-                await disarm_app_crons_for_execution(name, cron_service)
+                try:
+                    await disarm_app_crons_for_execution(name, cron_service)
+                except (CronStoreUnreadable, CronStoreBusy, OSError) as exc:
+                    # The gateway's boot reconcile already disarmed this app's
+                    # jobs, or failed on the same store and left the scheduler
+                    # unarmed. Raising here would abort the dashboard startup.
+                    logger.warning(
+                        "Startup: could not disarm crons for denied app %s (%s)",
+                        name,
+                        type(exc).__name__,
+                    )
             if _route_registry:
                 _route_registry.deregister_app_routes(name)
             # Same anti-churn record as on_app_enable's denied path: a hook-
@@ -817,7 +877,7 @@ async def on_gateway_startup(
         if not hooks:
             continue
 
-        ctx = _build_app_context_from_info(app_info, cron_service, broadcast_fn, spawn_impl)
+        ctx = await _prepare_app_context_from_info(app_info, cron_service, broadcast_fn, spawn_impl)
 
         # Register routes (if declared)
         routes_hook = hooks.get("routes", "")

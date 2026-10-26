@@ -13,12 +13,13 @@ which harnesses have run.
 from __future__ import annotations
 
 import ast
-import inspect
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from source_corpus import parsed_candidates, src_root
 
 from kiro_crew import model_registry as mr
 from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_KIRO
@@ -168,8 +169,11 @@ class TestTheFactorySelection:
 class TestTheDisplayResolver:
     """The model chip must name the model the next turn will actually run."""
 
-    def test_the_resolver_has_no_unused_backend_override(self) -> None:
-        assert "backend" not in inspect.signature(resolve_effective_model).parameters
+    def test_a_named_backend_scopes_the_tiers_to_that_harness(self, both_warm: None) -> None:
+        """The session layer names the per-session backend; the chip names none."""
+        cfg = _cfg(ACP_BACKEND_CODEX, CLAUDE_PIN)
+        assert resolve_effective_model(cfg, None, backend=ACP_BACKEND_CLAUDE) == CLAUDE_PIN
+        assert resolve_effective_model(cfg, None) == ""
 
     def test_the_chip_drops_a_pin_the_active_harness_cannot_claim(self, both_warm: None) -> None:
         cfg = _cfg(ACP_BACKEND_CODEX, CLAUDE_PIN)
@@ -582,15 +586,25 @@ class _TranslatedPinVisitor(ast.NodeVisitor):
         return found
 
 
-def _translated_pin_sites(source_root: Path) -> list[tuple[str, str, str]]:
-    """Every scope call in *source_root* handed a value translated nearby."""
+def _translated_pin_sites(
+    source_root: Path, trees: Iterable[tuple[Path, ast.Module]] | None = None
+) -> list[tuple[str, str, str]]:
+    """Every scope call in *source_root* handed a value translated nearby.
+
+    *trees* defaults to every module under *source_root*.
+    """
     repository_root = source_root.parents[1]
+    if trees is None:
+        trees = (
+            (path, ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+            for path in sorted(source_root.rglob("*.py"))
+        )
     offenders: list[tuple[str, str, str]] = []
-    for path in sorted(source_root.rglob("*.py")):
+    for path, tree in trees:
         if path.name == "model_scope.py":
             continue
         visitor = _TranslatedPinVisitor(path.relative_to(repository_root).as_posix())
-        visitor.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        visitor.visit(tree)
         offenders.extend(visitor.offenders)
     return offenders
 
@@ -607,8 +621,12 @@ class TestScopeSeesTheUntranslatedPin:
     """
 
     def test_no_scope_site_is_handed_a_translated_value(self) -> None:
-        source_root = Path(__file__).parents[1] / "src" / "kiro_crew"
-        offenders = _translated_pin_sites(source_root)
+        # A flagged call spells a scope entry point as its attribute, so only the
+        # files whose text holds one are parsed.
+        candidates = parsed_candidates(require_any=sorted(_SCOPE_CALLS), skip_syntax_errors=False)
+        offenders = _translated_pin_sites(
+            src_root(), ((path, tree) for path, _text, tree in candidates)
+        )
         assert offenders == [], (
             "a model scope call is judging a translated id instead of the stored pin; "
             "pass the pre-translation value (see acp_effective_model, which scopes "

@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from kiro_crew.monitoring.models import (
@@ -57,6 +57,43 @@ def opaque_provider_check_identity(namespace: str, raw_identity: object) -> str:
     return f"{namespace}:{digest}"
 
 
+def comment_body_fingerprint(body: str) -> str:
+    """A FIXED-LENGTH stand-in for one externally-authored comment body.
+
+    This is where the bound lives. A comment body is unbounded third-party text
+    and a paged read accumulates one entry per comment, so retaining the body
+    itself would let a single large comment, or many of them, size the probe's
+    own memory. Hashing at the moment of retention makes what is kept 64
+    characters wide whatever arrives, and nothing downstream ever sees the body
+    again -- neither the aggregate digest nor the condition key.
+
+    Only the digest of the body is ever needed: the conditions built from these
+    answer "did this change", never "what does it say". Shared by every provider
+    that digests comment bodies, so one body produces the same fingerprint
+    whichever adapter read it.
+    """
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def comment_body_digest(fingerprints: Sequence[str]) -> str:
+    """A stable digest over a pull request's comment-body fingerprints.
+
+    Takes per-comment FINGERPRINTS, never bodies, so nothing on the path from
+    read to condition key scales with how much a reviewer wrote.
+
+    Empty when no readable non-empty body was seen, so a pull request with no
+    comments emits no condition. Fingerprints are SORTED before hashing so the
+    page order they arrived in cannot move the digest, mirroring the thread
+    digest. Shared across providers so the digest's shape is defined in one
+    place.
+    """
+    kept = sorted(fingerprints)
+    if not kept:
+        return ""
+    encoded = json.dumps(kept, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class PullRequestProviderError(Exception):
     """A provider failure carrying only its safe retry category."""
 
@@ -66,10 +103,26 @@ class PullRequestProviderError(Exception):
 
 
 def classify_provider_error_text(raw: str) -> ProviderErrorKind:
-    """Classify CLI diagnostics without retaining or returning their text."""
+    """Classify CLI diagnostics without retaining or returning their text.
+
+    One marker set per category, for every reader of every provider CLI. Two sets
+    for one binary is two answers to the same question: they drift in both
+    directions, and the reader holding the shorter list waits where the other
+    retries. ``secondary rate`` and ``abuse detection`` are GitHub's own wording for
+    a budget refusal and live here rather than beside one caller; a provider that
+    never emits them is unaffected, and one that starts to is classified correctly.
+    """
     lowered = raw.lower()
     if any(
-        marker in lowered for marker in ("http 429", "rate limit", "too many requests", "throttled")
+        marker in lowered
+        for marker in (
+            "http 429",
+            "rate limit",
+            "secondary rate",
+            "abuse detection",
+            "too many requests",
+            "throttled",
+        )
     ):
         return ProviderErrorKind.RATE_LIMITED
     if any(
@@ -147,11 +200,13 @@ class PullRequestFacts:
     unresolved_review_threads: int
     review_threads_complete: bool
     checks_complete: bool = True
-    #: A stable digest over the pull request's PR-level (issue) comment bodies,
-    #: or "" when there are none. Provider-specific: only the GitHub adapter reads
-    #: them today. This is the surface a review bot's verdict comment actually
-    #: lives on -- created_at frozen at PR open, body rewritten in place -- so it
-    #: is the digest that catches the four bot verdicts a thread digest cannot see.
+    #: A stable digest over the pull request's comment bodies, or "" when there
+    #: are none or the read was incomplete. Set by the GitHub adapter (PR-level
+    #: issue comments) and the Azure DevOps adapter (the comments nested inside
+    #: its PR threads); other adapters leave it "". This is the surface a review
+    #: bot's verdict comment actually lives on -- created_at frozen at PR open,
+    #: body rewritten in place -- so it is the digest that catches a verdict a
+    #: thread or status digest cannot see.
     pr_comment_body_digest: str = ""
 
     def __post_init__(self) -> None:

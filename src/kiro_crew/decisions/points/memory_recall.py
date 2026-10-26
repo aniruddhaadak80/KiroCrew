@@ -155,9 +155,9 @@ MAX_MESSAGE_CHARS = 2000
 #: fragment is what answers it. Applied AFTER redaction — see :func:`scrubbed`.
 MAX_SNIPPET_CHARS = 200
 
-#: The two answers one candidate may carry. A Choice rather than a score because
-#: ``Choice`` is the only question type ``impl_jev`` speaks; the probability the
-#: threshold is applied to is the one the provider reports for the chosen option.
+#: The two answers one candidate may carry, as one two-option ``Choice``; the
+#: probability the threshold is applied to is the one the provider reports for
+#: the chosen option.
 KEEP_OPTION = "keep"
 DROP_OPTION = "drop"
 KEEP_OPTIONS = [KEEP_OPTION, DROP_OPTION]
@@ -425,7 +425,9 @@ async def keep_decision(
     if still_watched is not None and not still_watched():
         logger.debug("memory.recall: the surface went away before the call")
         return None
-    answers = await core.decide(POINT, state, questions, session_key=session_key, extra=extra)
+    answers = await core.decide(
+        POINT, state, questions, session_key=session_key, extra=extra, unclipped=text
+    )
     keys = read_answer(answers, rows)
     if keys is None:
         return None
@@ -483,10 +485,9 @@ def scrubbed(text: object, limit: int) -> str:
     if not raw or limit <= 0:
         return ""
     try:
-        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+        from kiro_crew.security import redact
 
-        cleaned, _ = redact_credentials(raw)
-        cleaned, _ = redact_exfiltration_urls(cleaned)
+        cleaned = redact(raw)
     except Exception:
         # A scan that did not complete cannot clear text for the wire. Dropping
         # the snippet is a worse question, not a worse outcome: the gate would

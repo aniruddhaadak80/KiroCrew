@@ -15,9 +15,12 @@ ENFORCED (see ``test/test_capability_ledger.py``) and pinned per channel by
 the cross-channel contract test in ``test/test_options_cap_contract.py`` —
 a widget-capable renderer that skips the helper fails that test.
 Channels declaring ``max_buttons=0`` render no widget and route the whole
-trailer through :func:`render_options_as_text`, which reaches the same helper
-with zero widget slots: every choice becomes a numbered line the user answers by
-typing, rather than being deleted along with the trailer. Four channels deliver the
+trailer through :func:`render_options_as_text`, which numbers every choice
+through the same :func:`format_overflow` sink: each becomes a numbered line the
+user answers by typing, rather than being deleted along with the trailer. The
+proactive sends (``dashboard/messaging_api/channel_delivery.py``) and the
+cross-surface reply mirror call it on EVERY channel, because
+``transport.send_message`` takes no choices and so builds no widget. Four channels deliver the
 numbered list -- Weixin, iMessage and Feishu through this function, WeCom through
 its own streaming-aware copy (see below) -- and
 ``test/test_options_cap_contract.py`` drives each one. WhatsApp declares ``max_buttons=0`` and does NOT: its renderer strips a
@@ -46,6 +49,7 @@ from kiro_crew.constants import (
     MARKER_CLOSERS,
     OPTIONS_RE_TRAILER,
     _leading_wrapper_start,
+    relocate_glued_tail_marker,
     strip_control_comments,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -62,13 +66,14 @@ from kiro_crew.security import (
 TEXT_CHUNK = "text_chunk"
 THINKING = "thinking"
 TOOL_CALL = "tool_call"
+TOOL_RESULT = "tool_result"  # a tool call reached a terminal outcome (see tool_status)
 PROMPT_CHOICE = "prompt_choice"
 COMPACTION = "compaction"
 DONE = "done"
 STEER_CONSUMED = "steer_consumed"  # kiro-cli folded a mid-turn steer at a boundary
 
 OUTPUT_KINDS = frozenset(
-    {TEXT_CHUNK, THINKING, TOOL_CALL, PROMPT_CHOICE, COMPACTION, DONE, STEER_CONSUMED}
+    {TEXT_CHUNK, THINKING, TOOL_CALL, TOOL_RESULT, PROMPT_CHOICE, COMPACTION, DONE, STEER_CONSUMED}
 )
 
 
@@ -93,6 +98,12 @@ class OutputEvent:
     tool_name: str = ""
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
     tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
+    # tool_result: the call's TERMINAL outcome as the ACP layer reported it, one
+    # of ``acp.types.TERMINAL_TOOL_STATUSES`` ("completed" / "failed" /
+    # "cancelled" / "canceled" / "refused"). A renderer reads it to finalize that
+    # call's card honestly instead of marking every call complete; anything other
+    # than "completed" is a call that did NOT succeed. Empty on every other kind.
+    tool_status: str = ""
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
     request_id: str | int = ""  # prompt_choice correlation
     # prompt_choice: the tool's own arguments, redacted, so a renderer can show
@@ -115,6 +126,7 @@ class OutputEvent:
             "title": self.title,
             "tool_kind": self.tool_kind,
             "tool_purpose": self.tool_purpose,
+            "tool_status": self.tool_status,
             "options": [dict(o) for o in self.options],
             "tool_input": self.tool_input,
             "request_id": self.request_id,
@@ -138,7 +150,12 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
 
-def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[str]:
+def chunk_for_transport(
+    text: str,
+    capabilities: TransportCapabilities,
+    *,
+    redactor: Callable[[str], str] | None = None,
+) -> list[str]:
     """Split *text* into parts the transport will accept, in ITS unit.
 
     Prefers ``max_message_bytes`` when the platform declares one, because a
@@ -156,10 +173,23 @@ def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[
     rewrites the ``**``/``#``/``- `` INSIDE the code -- and a sub-agent diff or
     cron log dump is exactly that shape. Callers that want a raw fixed-width cut
     reach for :func:`chunk_text` directly.
+
+    ``redactor`` is the credential grader threaded into the seam checks on both
+    paths. It defaults to ``_default_redactor``, but a COMPOSED host (a session
+    carrying companion-contributed credential patterns) must pass its own
+    ``redact_via_context``: the default pair does not know the companion patterns,
+    so a companion-only credential split across a seam would be graded by the
+    narrower pair and delivered whole across two adjacent messages. The Slack and
+    dashboard sinks already redact their DISPLAY text with ``redact_via_context``;
+    passing the same grader here keeps the seam check as wide as the display pass.
     """
     # Local imports: split.py is a heavier pure-Python module and only these
     # paths need it, so the renderer contract stays cheap to import.
     #
+    # ``redactor`` defaults to ``_default_redactor`` (resolved here, not as a def
+    # default, because that helper is defined below this function).
+    if redactor is None:
+        redactor = _default_redactor
     # ``getattr`` with the field's own ``0`` default, not attribute access: the
     # real ``TransportCapabilities`` always carries ``max_message_bytes``, but a
     # capabilities-shaped object from before the field existed must degrade to the
@@ -167,12 +197,82 @@ def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[
     # default the dataclass declares.
     max_bytes = getattr(capabilities, "max_message_bytes", 0)
     if max_bytes > 0:
-        from kiro_crew.messaging.split import split_markdown_bytes
+        from kiro_crew.messaging.split import (
+            _made_collapse_clean,
+            bounded_for_delivery,
+            chunk_utf8_bytes,
+            repaired_for_delivery,
+            split_markdown_bytes,
+        )
 
-        return split_markdown_bytes(text, max_bytes)
-    from kiro_crew.messaging.split import split_markdown_safe
+        # Graded after the split rather than during it: every caller of this helper
+        # sends each unit as its own message, so a boundary here is a seam between
+        # two messages a reader reads in order, and a key written across a line
+        # break is invisible to a per-message scan yet whole on screen once the
+        # break is gone. The byte splitter takes no redactor -- it reaches its
+        # budget by shrinking a CHARACTER limit and retrying, which a cut that may
+        # decline to cut would not terminate on -- so the guarantee is established
+        # on the sequence it produced. ``bounded_for_delivery`` grades only the
+        # slices IT cuts inside a chunk, never the splitter's own inter-chunk seams,
+        # so those seams are graded here with ``repaired_for_delivery``.
+        #
+        # The repaired body is RE-SPLIT and RE-GRADED, not trusted after one pass:
+        # ``repaired_for_delivery`` can answer with the source UNCHANGED (no literal
+        # span collapses to a key and the whole-text canonical collapse reads clean),
+        # and a position-dependent rule like the ``^``-anchored heading marker can
+        # still rejoin a key once a byte cut makes a ``#`` piece-leading -- so a
+        # single re-split can reproduce the exact unsafe sequence.
+        # Shrink the byte budget and re-split until the delivered sequence rejoins
+        # no key (``repaired_for_delivery`` returns ``None``). The budget is halved
+        # all the way to the 1-byte floor -- a small ``max`` tries would stop far
+        # above it (eight halvings of a 7 KiB cap lands at ~58, not 1), returning a
+        # still-unsafe sequence. If even the floor cannot separate the halves (a
+        # run wider than one byte between them), fall back to the splitter's own
+        # fail-closed answer, ``_made_collapse_clean``, which gives up the rejoining
+        # whitespace rather than the key. The final ``bounded_for_delivery`` then
+        # caps each chunk with the byte cutter.
+        body = text
+        budget = max_bytes
 
-    return split_markdown_safe(text, capabilities.max_message_chars)
+        def _cut_bytes(repaired: str) -> list[str]:
+            # The rule the byte path will cut a repair by, threaded into the grade
+            # so the repair is judged by the same reading that refused the pieces.
+            return split_markdown_bytes(repaired, budget)
+
+        pieces = split_markdown_bytes(body, budget)
+        while True:
+            repaired = repaired_for_delivery(body, pieces, redactor, _cut_bytes)
+            if repaired is None:
+                break  # the current sequence rejoins no key -- deliver it.
+            # ``repaired`` is a collapse fixed point; re-split and re-grade it at the
+            # same budget first.
+            body = repaired
+            pieces = split_markdown_bytes(body, budget)
+            if repaired_for_delivery(body, pieces, redactor, _cut_bytes) is None:
+                break
+            if budget <= 1:
+                # The 1-byte floor still rejoins (a run wider than one byte between
+                # the halves): give up the whitespace, not the key. ``_made_collapse
+                # _clean`` returns a body safe to cut at any budget.
+                body = _made_collapse_clean(body, redactor)
+                pieces = split_markdown_bytes(body, max_bytes)
+                break
+            budget = max(1, budget // 2)
+            pieces = split_markdown_bytes(body, budget)
+        return bounded_for_delivery(pieces, max_bytes, redactor, chunk_utf8_bytes)
+    from kiro_crew.messaging.split import bounded_for_delivery, split_markdown_safe
+
+    units = split_markdown_safe(text, capabilities.max_message_chars, redactor=redactor)
+    # Bounded for the same reason every capped caller does it: the credential-aware
+    # cut is fail-closed and can answer with the text whole, and a transport that
+    # caps by slicing would drop that answer's tail after every scan has run. Pass
+    # ``chunk_text`` as the LAST-RESORT cutter rather than defaulting to
+    # ``split_markdown_safe``: that default is documented to return a chunk OVER the
+    # budget by its fence scaffolding (a long opener/info string), which every caller
+    # then delivers as one message and the transport truncates with no signal.
+    # ``chunk_text`` is the hard character cut that guarantees the budget, and the
+    # grade covers the boundaries it creates.
+    return bounded_for_delivery(units, capabilities.max_message_chars, redactor, chunk_text)
 
 
 def cap_choices(
@@ -250,6 +350,32 @@ def new_approval_nonce() -> str:
     64-BYTE ``callback_data`` cap alongside the request id and the decision.
     """
     return secrets.token_urlsafe(8)
+
+
+def nonce_eq(minted: str, candidate: str) -> bool:
+    """Whether *candidate* is the *minted* nonce — total over every ``str``.
+
+    The press side of the mint: every channel resolves its widget press through
+    this one compare, just as every channel mints through
+    :func:`new_approval_nonce`. ``secrets.compare_digest`` raises ``TypeError``
+    when either side is a ``str`` holding a non-ASCII character, and *candidate*
+    arrives from a press payload the platform echoes back — so a bare str/str
+    compare turns the fail-closed refusal the callers document into an exception
+    that escapes before the caller's audit line runs.
+
+    Both sides go through the injective UTF-8 ``surrogatepass`` mapping instead,
+    which every plaintext platform payload survives (UTF-8 round-trips it) and a
+    lone surrogate that ``json.loads`` accepted survives as well: equal strings
+    keep matching, unequal strings keep refusing, and a malformed press answers
+    False — the same mismatch an ordinary wrong nonce gets — rather than raising.
+    Empty sides deny: an unarmed nonce must never match a press that carries none.
+    """
+    if not minted or not candidate:
+        return False
+    return secrets.compare_digest(
+        minted.encode("utf-8", "surrogatepass"),
+        candidate.encode("utf-8", "surrogatepass"),
+    )
 
 
 def _default_redactor(text: str) -> str:
@@ -535,13 +661,18 @@ def apply_options_cap(
     if not overflow:
         return body, kept
     lines = format_overflow(overflow, start=len(kept), capabilities=capabilities)
+    return _append_block(body, lines), kept
+
+
+def _append_block(body: str, lines: str) -> str:
+    """*lines* after *body* with one blank line between, or *lines* alone."""
     if not body:
         sep = ""
     elif body.endswith("\n"):
         sep = "\n"
     else:
         sep = "\n\n"
-    return f"{body}{sep}{lines}", kept
+    return f"{body}{sep}{lines}"
 
 
 def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str, list[str]]:
@@ -592,6 +723,7 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     Stripping a genuine steering frame is ``TurnDriver``'s job and happens before
     a renderer sees the text.
     """
+    text = relocate_glued_tail_marker(text)
     match = OPTIONS_RE_TRAILER.search(text)
     if match:
         choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]
@@ -647,32 +779,42 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
 def render_options_as_text(text: str, capabilities: TransportCapabilities) -> str:
     """Rewrite a trailing ``[OPTIONS:]`` trailer in *text* as numbered text.
 
-    The whole trailer handling for a channel that renders no widget, so a channel
-    that renders none shares one implementation instead of keeping a copy each.
-    Returns the body only; the widget half of :func:`apply_options_cap` has
-    nothing to keep at ``max_buttons == 0``.
+    The whole trailer handling for a send that attaches no widget, so every such
+    send shares one implementation instead of keeping a copy each. Two kinds of
+    caller reach it:
 
-    Three of the five zero-widget channels call it: Weixin, iMessage and Feishu.
-    WeCom reaches the same outcome through its own ``_render_options_as_text``, for
-    the ``hide_partial`` reason below, so it does not call this one. WhatsApp is the
-    channel that reaches the outcome NOWHERE: its renderer strips the trailer
-    instead, so its choices never arrive here or anywhere.
+    * a channel that renders no widget at all: Weixin, iMessage and Feishu. WeCom
+      reaches the same outcome through its own ``_render_options_as_text``, for
+      the ``hide_partial`` reason below. WhatsApp's reply renderer does not call
+      it: it strips the trailer instead, so a reply's choices are lost (a
+      proactive WhatsApp send does reach it through the legs below).
+    * a send that builds no widget even on a channel that could show one: the
+      proactive legs in ``dashboard/messaging_api/channel_delivery.py``, the
+      cross-surface reply mirror and its backfill of past answers
+      (``dashboard/chat_mirror.py``). ``transport.send_message`` takes no choices,
+      so there is no button for a choice to go on.
 
-    Parsing is :func:`split_options_trailer`, at its buffered default: this path's
-    callers do not stream — they buffer a whole turn and send once — so an
-    unfinished ``[OPTIONS`` tail is the assistant's prose here and is kept. The one
+    Every choice is numbered, whatever ``capabilities.max_buttons`` says. Keeping
+    the first ``max_buttons`` for a widget, as :func:`apply_options_cap` does,
+    would drop them here, because this function returns the body only. The
+    numbering and the join are :func:`format_overflow` and the same separator
+    rule the widget path uses, so the sanitising cannot drift between the two.
+
+    Parsing is :func:`split_options_trailer`, at its buffered default: these
+    callers do not stream, they send whole text once, so an unfinished
+    ``[OPTIONS`` tail is the assistant's prose here and is kept. The one
     zero-widget channel that DOES stream (WeCom) asks for ``hide_partial=True`` in
     its own ``wecom.renderer._render_options_as_text``, where the cost is a
     transient flash whose next frame replaces the bubble anyway.
 
-    ``apply_options_cap`` is reached unconditionally rather than behind an
-    ``if not choices`` guard, which would NOT be equivalent: a matched-but-EMPTY
-    trailer (``[OPTIONS: ]``) must still have the marker stripped. With no match
-    ``split_options_trailer`` hands back the text unchanged, and the cap is the
-    identity on an empty choice list, so one call covers all three cases.
+    A matched-but-EMPTY trailer (``[OPTIONS: ]``) still has the marker stripped:
+    ``split_options_trailer`` returns the body without it and no choices. With no
+    match it hands back the text unchanged.
     """
     body, choices = split_options_trailer(text)
-    return apply_options_cap(body, choices, capabilities)[0]
+    if not choices:
+        return body
+    return _append_block(body, format_overflow(choices, start=0, capabilities=capabilities))
 
 
 class Renderer(ABC):
@@ -822,6 +964,22 @@ class Renderer(ABC):
         marks the previous task complete and starts a new in-progress task.
         """
 
+    async def on_tool_result(self, tool_call_id: str, tool_status: str) -> None:
+        """Record a tool call's TERMINAL outcome, so its card is honest.
+
+        ``tool_status`` is one of ``acp.types.TERMINAL_TOOL_STATUSES``;
+        "completed" is success and anything else ("failed" / "cancelled" /
+        "canceled" / "refused") is a call that did not succeed. The default is a
+        no-op: ``on_tool_call`` already marks the PREVIOUS task complete when the
+        next call starts, so a renderer that does not distinguish outcomes keeps
+        its existing behaviour. A renderer that wants per-call accounting (a
+        failed card, an "N succeeded · M failed" summary) overrides this and
+        keys the open call's finalization on the status instead of marking every
+        card complete. Not abstract, for the same reason ``on_steer_consumed``
+        is not: a channel that has nowhere to show an outcome owes nothing here.
+        """
+        return None
+
     @abstractmethod
     async def on_prompt_choice(
         self,
@@ -879,6 +1037,8 @@ class Renderer(ABC):
             await self.on_tool_call(
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
+        elif event.kind == TOOL_RESULT:
+            await self.on_tool_result(event.tool_call_id, event.tool_status)
         elif event.kind == PROMPT_CHOICE:
             await self.on_prompt_choice(
                 event.options,

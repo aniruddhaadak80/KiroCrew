@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import math
-import time
+import re
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -38,6 +38,19 @@ MAX_DEFERRED_NOTE_CHARS = 4000
 # evicting a retained entry, because every retained entry is the only durable
 # copy of a 200-acknowledged note.
 _MAX_DURABLE_HOLD_ENTRIES = 2 * MAX_DEFERRED_NOTES
+
+
+# The source label's single bound, defined here and imported by the writer in
+# chat_handlers the way ``MAX_DEFERRED_NOTE_CHARS`` already is, so the admit
+# bound and the restore bound cannot drift. The label is the AUTHENTICATED
+# caller identity (an app slug, or "" for a dashboard user), not caller-
+# controlled free text, so it needs no credential redaction. On the restore
+# trust boundary the sanitizer validates it structurally: a non-string, a value
+# past this length, or one carrying a control character collapses to "" — so a
+# tampered persisted entry never retains, broadcasts, or re-persists a malformed
+# or oversized label.
+MAX_SOURCE_LABEL_LEN = 64
+SOURCE_LABEL_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class NoteEvidence(NamedTuple):
@@ -139,6 +152,9 @@ def serialize_deferred_notes(notes: list[dict[str, Any]]) -> list[dict[str, Any]
         session = note.get("session")
         if isinstance(session, str):
             entry["session"] = session
+        source = note.get("source")
+        if isinstance(source, str):
+            entry["source"] = source
         out.append(entry)
     return out
 
@@ -311,7 +327,7 @@ def _sanitize_restored_context(raw: object) -> dict[str, Any] | None:
     ephemeral = raw.get("ephemeral", True)
     if not isinstance(content, str) or not content or len(content) > MAX_DEFERRED_NOTE_CHARS:
         return None
-    if not isinstance(source, str) or not source or len(source) > 64:
+    if not isinstance(source, str) or not source or len(source) > MAX_SOURCE_LABEL_LEN:
         return None
     if isinstance(injected_at, bool) or not isinstance(injected_at, (int, float)):
         return None
@@ -377,10 +393,32 @@ def sanitize_restored_deferred_notes(raw: object) -> list[dict[str, Any]]:
         session = item.get("session")
         if not isinstance(content, str) or not content or len(content) > MAX_DEFERRED_NOTE_CHARS:
             continue
+        # Attribution scope: the restored CONTENT is NOT rewritten here. It was
+        # already redacted on the admit path before it was persisted, and the
+        # restore path adds no content rewriting — that would re-normalize every
+        # legitimate note body on every boot. Only the type/length bound is
+        # enforced on the restored copy.
         if not isinstance(session, str) or not session:
             continue
         cls = item.get("cls")
         note_id = item.get("id")
+        # On-disk metadata is a trust boundary, so the source label is
+        # re-sanitized the SAME way the admit path produces it: the shared
+        # The stored source is the AUTHENTICATED caller identity stamped at
+        # admit time (an app's registered slug, or "" for a dashboard user) —
+        # not caller-controlled free text — so it carries no credential/exfil
+        # redaction on the way back in. On-disk metadata is still a trust
+        # boundary, so a tampered entry is validated STRUCTURALLY: a non-string,
+        # a value past the length bound, or one carrying a control character
+        # collapses to "", which renders no "from ..." pill.
+        raw_source = item.get("source")
+        source = (
+            raw_source
+            if isinstance(raw_source, str)
+            and len(raw_source) <= MAX_SOURCE_LABEL_LEN
+            and not SOURCE_LABEL_CTRL_RE.search(raw_source)
+            else ""
+        )
         notes.append(
             {
                 # A missing or invalid id gets a fresh one so the entry stays
@@ -390,6 +428,7 @@ def sanitize_restored_deferred_notes(raw: object) -> list[dict[str, Any]]:
                 "cls": cls if isinstance(cls, str) and cls else "reconcile-note",
                 "context": _sanitize_restored_context(item.get("context")),
                 "session": session,
+                "source": source,
             }
         )
     return notes
@@ -642,24 +681,6 @@ class SlotBufferCoordinator:
         return slot.release_pending_chunks()
 
     @staticmethod
-    def append_pending_context(
-        slot: Any,
-        entry: dict[str, Any],
-        *,
-        max_pending_context: int,
-        entry_expired: Callable[[dict[str, Any], float], bool],
-    ) -> None:
-        now = time.time()
-        if entry_expired(entry, now):
-            return
-        slot._pending_context[:] = [
-            current for current in slot._pending_context if not entry_expired(current, now)
-        ]
-        while len(slot._pending_context) >= max_pending_context:
-            slot._pending_context.pop(0)
-        slot._pending_context.append(entry)
-
-    @staticmethod
     def drop_foreign_authorized_notes(
         slot: Any,
         *,
@@ -720,8 +741,8 @@ class SlotBufferCoordinator:
         flush/save/enqueue interleaving is. A note dropped at the rebind
         seam records its id in ``slot._dropped_note_ids`` instead, and the
         next save retires it from there. A crash before the save re-delivers
-        the note on restore: at-least-once, the correct failure direction for
-        a delivery promise.
+        the note on restore: at-least-once, the correct failure direction
+        for a delivery promise.
         """
         if not slot._deferred_notes:
             return 0
@@ -758,21 +779,35 @@ class SlotBufferCoordinator:
                     slot._dropped_note_ids.add(dropped_id)
                 continue
 
-            # Pop is a retry marker: if the visible row fails after the context
-            # was queued, the restored note must not enqueue that context twice.
+            # Pop context as a retry-idempotency marker. The except arm below
+            # restores it when ``slot.append`` raises, ensuring context is never
+            # promoted into ``_pending_context`` without its visible row.
             context = note.pop("context", None)
             note_id = note.get("id")
             row_meta: dict[str, Any] = {"noteSession": live_session}
+            note_source = note.get("source")
+            if isinstance(note_source, str) and note_source:
+                # Mirror the immediate path's `appLabel` stamp so a held note,
+                # once flushed, is attributed through the same "Sent by app {X}"
+                # pill an app inject row uses -- just like one written outside a
+                # running turn.
+                row_meta["appLabel"] = note_source
             if isinstance(note_id, str) and note_id:
                 # The delivered row carries its note id, and the full save
                 # retires a durable entry exactly when the window it writes
-                # contains that id — row and retirement land in one atomic
+                # contains that id -- row and retirement land in one atomic
                 # file write, whatever the flush/save interleaving was.
                 row_meta["noteId"] = note_id
+            # Track the window length so we can tell whether slot.append adds
+            # a row before its callbacks raise (state.py: messages.append runs
+            # before _on_card_event / _on_message). A row that landed despite a
+            # callback exception is treated as written: context is promoted and
+            # the note is not retried.
+            _pre_inject_len = len(slot.messages)
             try:
-                if context is not None:
-                    context["noteSession"] = live_session
-                    slot.append_pending_context(context)
+                # Visible row first: context is never promoted before the row
+                # that gives it meaning lands, so a raise here cannot leave an
+                # orphaned context entry in the pending queue.
                 slot.append(
                     role="inject",
                     content=note["content"],
@@ -781,13 +816,49 @@ class SlotBufferCoordinator:
                     meta=row_meta,
                 )
             except Exception:
-                # New arrivals stay after this older, unwritten suffix. The
-                # durable copy still holds every note (delivered rows
-                # included) and the next full save trues it up against live
-                # state; see the docstring for why no metadata write happens
-                # here.
-                slot._deferred_notes[:0] = held[index:]
-                raise
+                if len(slot.messages) > _pre_inject_len:
+                    # Row landed before its callback raised. Treat as written:
+                    # do not restore the note. Execution falls through to
+                    # context promotion.
+                    logger.warning(
+                        "Slot %s: inject row callbacks raised after row landed; "
+                        "treating row as written and promoting context",
+                        slot.key,
+                        exc_info=True,
+                    )
+                else:
+                    # Row failed. Restore context so the retry can promote it
+                    # after the row eventually lands.
+                    if context is not None:
+                        note["context"] = context
+                    # New arrivals stay after this older, unwritten suffix.
+                    slot._deferred_notes[:0] = held[index:]
+                    raise
+
+            # Row landed; now promote the context half. A failure here is
+            # non-fatal: the visible row is already written and is not replayed,
+            # so the context is dropped with a warning rather than retried
+            # (which would duplicate the row).
+            if context is not None:
+                context["noteSession"] = live_session
+                try:
+                    if not slot.append_pending_context(context):
+                        # The pop above already retired the retry marker. The
+                        # warning is the loss signal; the normal full-queue case
+                        # is refused earlier, at /note admission, so this fires
+                        # only on a race (an unexpiring /context takes the seat
+                        # between admission and flush) or a restart edge.
+                        logger.warning(
+                            "Slot %s delivered a held note without its context: "
+                            "the pending-context queue had no seat",
+                            slot.key,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Slot %s: context add raised after note row landed; context dropped",
+                        slot.key,
+                        exc_info=True,
+                    )
             written += 1
         return written
 

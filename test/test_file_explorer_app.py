@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from kiro_crew.apps.builtins.file_explorer import server
+from kiro_crew.sandbox import SandboxUnavailableError
 
 
 @pytest.fixture
@@ -314,11 +315,9 @@ class TestGitStatus:
     def test_git_status_parsing(self, tmp_tree):
         """Test _git_status with a mocked spawn wrapper."""
         with patch.object(server, "run_limited") as mock_run:
-            # Mock branch
             branch_result = MagicMock()
             branch_result.returncode = 0
             branch_result.stdout = "main\n"
-            # Mock status
             status_result = MagicMock()
             status_result.returncode = 0
             status_result.stdout = " M file.txt\x00?? new.py\x00"
@@ -373,6 +372,26 @@ class TestSearch:
     def test_search_empty_query(self, tmp_tree):
         results = server._search(tmp_tree, "", "", "")
         assert results == []
+
+    def test_search_falls_back_to_python_when_sandbox_unavailable(self, tmp_tree):
+        """Same host condition as the git-status 503: the rg spawn cannot be
+        sandboxed, so _search must degrade to the python engine -- the same
+        degradation it already applies to OSError -- instead of letting
+        SandboxUnavailableError (a RuntimeError) escape and 500 the route."""
+
+        def _no_backend(argv, mode="auto"):
+            raise SandboxUnavailableError(
+                "Sandbox backend unavailable and allow_unsandboxed_exec is not set.",
+                kind="no_backend",
+                detail="unshare(CLONE_NEWUSER) failed with errno 1 (EPERM)",
+                remedy="enable_user_namespaces",
+            )
+
+        with patch.object(server, "wrap_argv", _no_backend):
+            results = server._search(tmp_tree, "hello", "", "")
+        assert len(results) == 1
+        assert results[0]["file"].endswith("file.txt")
+        assert results[0]["line"] == 1
 
 
 class TestSearchTccPruning:
@@ -533,6 +552,33 @@ class TestHTTPHandler:
     def test_read_sensitive_blocked(self, tmp_tree):
         responses = self._make_request(f"/read?path={tmp_tree}/.ssh/id_rsa")
         assert responses[0][0] == 403
+
+    def test_git_status_sandbox_unavailable(self, tmp_tree):
+        """No sandbox backend (``unshare`` EPERM) and
+        ``agent.sandbox_allow_unsandboxed_exec`` unset: wrap_argv raises
+        SandboxUnavailableError, which subclasses RuntimeError -- neither of
+        _git_status's ``except (OSError, subprocess.TimeoutExpired)`` clauses
+        catches it, so the route died as a bare 500 and the Files view showed
+        "Failed to load". Answer the typed 503 the chat path already renders
+        for this exact condition: a machine-readable code plus the probe
+        detail and remedy the exception itself carries."""
+
+        def _no_backend(argv, mode="auto"):
+            raise SandboxUnavailableError(
+                "Sandbox backend unavailable and allow_unsandboxed_exec is not set.",
+                kind="no_backend",
+                detail="unshare(CLONE_NEWUSER) failed with errno 1 (EPERM)",
+                remedy="enable_user_namespaces",
+            )
+
+        with patch.object(server, "wrap_argv", _no_backend):
+            responses = self._make_request(f"/git-status?path={tmp_tree}")
+        assert len(responses) == 1
+        code, body = responses[0]
+        assert code == 503
+        assert body["code"] == "sandbox_unavailable"
+        assert "unshare(CLONE_NEWUSER)" in body["detail"]
+        assert body["remedy"] == "enable_user_namespaces"
 
     def test_search_endpoint(self, tmp_tree):
         responses = self._make_request(f"/search?path={tmp_tree}&q=hello")

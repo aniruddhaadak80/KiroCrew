@@ -148,6 +148,44 @@ def test_scrub_env_extra_prefixes_strips_python_env():
     assert out == {"PATH": "/usr/bin"}
 
 
+def test_without_python_env_drops_only_python_settings():
+    """without_python_env drops every _PYTHON_ENV_PREFIXES key, any case, and keeps
+    the credentials scrub_env would remove."""
+    env = {
+        "PATH": "/usr/bin",
+        "PYTHONPATH": "/site",
+        "PYTHONHOME": "/py",
+        "PYTHONPYCACHEPREFIX": "/cache",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "pythonpath": "/lower",
+        "PYTHONUNBUFFERED": "1",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "AWS_PROFILE": "dev",
+        "AWS_SECRET_ACCESS_KEY": "sk",
+        "GNUPGHOME": "/home/x/.gnupg",
+        "GIT_ASKPASS": "/usr/bin/askpass",
+    }
+    out = sb.without_python_env(env)
+    assert out == {
+        "PATH": "/usr/bin",
+        "PYTHONUNBUFFERED": "1",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "AWS_PROFILE": "dev",
+        "AWS_SECRET_ACCESS_KEY": "sk",
+        "GNUPGHOME": "/home/x/.gnupg",
+        "GIT_ASKPASS": "/usr/bin/askpass",
+    }
+    assert "PYTHONPATH" in env, "the input mapping is not mutated"
+
+
+def test_without_python_env_defaults_to_os_environ(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/site")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    out = sb.without_python_env()
+    assert "PYTHONPATH" not in out
+    assert out["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+
+
 def test_strip_python_env_covers_pycache_prefix(monkeypatch):
     """PYTHONPYCACHEPREFIX is scrubbed on the agent spawn path (strip_python_env)
     and kept otherwise.
@@ -186,7 +224,7 @@ def test_strip_python_env_covers_dont_write_bytecode(monkeypatch):
 def test_strip_python_env_holds_on_fail_open_path(monkeypatch):
     """On the opted-in no-backend path wrap_argv returns argv unmodified (no
     launcher strips PYTHONPATH), so sandboxed_spawn_argv MUST strip the Python
-    env vars from the returned env itself (review-bot finding on security-review 92e24570)."""
+    env vars from the returned env itself."""
     _reset_warned()
     _neutralize_passthrough(monkeypatch)
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")

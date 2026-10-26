@@ -20,6 +20,7 @@ where the process has that capability, including privileged Windows CI runners.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import threading
@@ -34,6 +35,7 @@ from aiohttp.test_utils import make_mocked_request
 import kiro_crew.platform.governance_profiles as gov_mod
 from conftest import requires_symlinks
 from kiro_crew import platform_compat
+from kiro_crew.dashboard.conditional_get import bare_etag_value, weak_content_etag
 from kiro_crew.dashboard.handlers import themes as th
 
 # _validate_theme_data only *requires* --bg/--text/--accent per mode.
@@ -175,6 +177,31 @@ class TestListThemesSync:
     def test_directory_with_corrupt_manifest_is_skipped(self, themes_dir: Path) -> None:
         _write_text(themes_dir / "bad" / "theme.json", "{{{")
         assert th._list_themes_sync() == []
+
+    @staticmethod
+    def _slugs_despite_bad_encoding() -> list[str]:
+        """List the slugs; a decode error escaping the list is the bug under test."""
+        try:
+            rows = th._list_themes_sync()
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"one non-UTF-8 theme file failed the whole list: {exc}")
+        return [r["slug"] for r in rows]
+
+    def test_non_utf8_custom_record_is_skipped(self, themes_dir: Path) -> None:
+        # A latin-1 file is not UTF-8: reading it raises UnicodeDecodeError,
+        # which must skip that one theme rather than fail the whole list.
+        (themes_dir / "latin1.json").write_bytes('{"name": "Café"}'.encode("latin-1"))
+        _write_json(themes_dir / "ok.json", {"name": "Ok"})
+        assert self._slugs_despite_bad_encoding() == ["ok"]
+
+    def test_non_utf8_installed_manifest_is_skipped(self, themes_dir: Path) -> None:
+        # Install validation rejects a non-UTF-8 manifest, but the list scans
+        # whatever sits in the themes directory, including hand-copied packs.
+        bad = themes_dir / "copied" / "theme.json"
+        bad.parent.mkdir()
+        bad.write_bytes('{"name": "Café"}'.encode("latin-1"))
+        _write_json(themes_dir / "lcars" / "theme.json", {"name": "LCARS"})
+        assert self._slugs_despite_bad_encoding() == ["lcars"]
 
     def test_dot_prefixed_staging_and_backup_dirs_are_never_listed(
         self, themes_dir: Path
@@ -1149,6 +1176,18 @@ class TestApiThemeDetailPut:
         assert _body(resp)["theme"]["created_at"]
 
     @pytest.mark.asyncio
+    async def test_non_utf8_existing_record_gets_a_fresh_created_at(
+        self, themes_dir: Path
+    ) -> None:
+        (themes_dir / "sunset.json").write_bytes('{"name": "Café"}'.encode("latin-1"))
+        try:
+            resp = await th.api_theme_detail(_detail("PUT", "sunset", body=_theme_body()))
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"a non-UTF-8 record failed the update: {exc}")
+        assert resp.status == 200
+        assert _body(resp)["theme"]["created_at"]
+
+    @pytest.mark.asyncio
     async def test_blank_emoji_falls_back_to_the_default(self, themes_dir: Path) -> None:
         _write_json(themes_dir / "sunset.json", {"name": "Sunset"})
         resp = await th.api_theme_detail(
@@ -1170,6 +1209,16 @@ class TestApiThemeDetailGet:
     async def test_corrupt_record_is_500(self, themes_dir: Path) -> None:
         _write_text(themes_dir / "sunset.json", "{{{")
         resp = await th.api_theme_detail(_detail("GET", "sunset"))
+        assert resp.status == 500
+        assert _body(resp)["error"] == "failed to read theme"
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_record_is_500(self, themes_dir: Path) -> None:
+        (themes_dir / "sunset.json").write_bytes('{"name": "Café"}'.encode("latin-1"))
+        try:
+            resp = await th.api_theme_detail(_detail("GET", "sunset"))
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"a non-UTF-8 record escaped the read error handling: {exc}")
         assert resp.status == 500
         assert _body(resp)["error"] == "failed to read theme"
 
@@ -1341,7 +1390,7 @@ class TestApiThemeAsset:
         _make_pack(themes_dir / "lcars")
         _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
         first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
-        tag = th._theme_asset_etag(b"a{}")
+        tag = bare_etag_value(weak_content_etag(b"a{}"))
         assert first.headers["ETag"] == f'W/"{tag}"'
         again = await th.api_theme_asset(
             _asset_request(
@@ -1423,7 +1472,7 @@ class TestApiThemeOverlay:
         assert resp.charset == "utf-8"
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
         assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
-        assert resp.headers["ETag"] == 'W/"' + th._theme_asset_etag(b"<div>scan</div>") + '"'
+        assert resp.headers["ETag"] == weak_content_etag(b"<div>scan</div>")
         assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
 
     @pytest.mark.asyncio
@@ -1503,7 +1552,7 @@ class TestApiThemeTopbar:
         assert resp.charset == "utf-8"
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
         assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
-        assert resp.headers["ETag"] == 'W/"' + th._theme_asset_etag(b"<div>bar</div>") + '"'
+        assert resp.headers["ETag"] == weak_content_etag(b"<div>bar</div>")
         assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
 
     @pytest.mark.asyncio
@@ -1534,11 +1583,18 @@ class TestResolveLocalSourceAncestorLinks:
     `is_link_or_junction` check tests only the final component. The first
     `is_dir()` is what resolves the chain -- and on Windows resolving it is
     what authenticates to the attacker's host. These tests pin the ancestor
-    screen that has to run before that call.
+    screen that has to run before that call. The link's own reparse target is
+    stubbed to a UNC share so the refusal is the same on every host: a LOCAL
+    target is admitted on Windows (see ``TestRealLocalJunctionAncestor``).
     """
 
+    @staticmethod
+    def _aim_links_at_unc(monkeypatch):
+        """Every readlink answers a UNC share; set AFTER the links exist."""
+        monkeypatch.setattr(os, "readlink", lambda _p: r"\\evil-host\share")
+
     @requires_symlinks
-    def test_a_local_path_beneath_a_linked_ancestor_is_refused(
+    def test_a_local_path_beneath_an_ancestor_aimed_at_unc_is_refused(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(th, "IS_WINDOWS", True)
@@ -1547,6 +1603,7 @@ class TestResolveLocalSourceAncestorLinks:
         (real / "theme").mkdir()
         link = tmp_path / "via"
         link.symlink_to(real, target_is_directory=True)
+        self._aim_links_at_unc(monkeypatch)
 
         # Entirely local-looking, and the LEAF is a real directory: neither the
         # UNC screen nor the leaf link check fires. Only the ancestor walk does.
@@ -1565,6 +1622,7 @@ class TestResolveLocalSourceAncestorLinks:
         (real / "theme").mkdir()
         link = tmp_path / "secretname"
         link.symlink_to(real, target_is_directory=True)
+        self._aim_links_at_unc(monkeypatch)
 
         _src, err = th._resolve_local_source(str(link / "theme"))
 
@@ -1586,13 +1644,14 @@ class TestResolveLocalSourceAncestorLinks:
         (real / "theme").mkdir()
         link = tmp_path / "via"
         link.symlink_to(real, target_is_directory=True)
+        self._aim_links_at_unc(monkeypatch)
 
         monkeypatch.setattr(th, "IS_WINDOWS", True)
 
         def _boom(_path):
             raise AssertionError("leaf probe ran before the ancestor walk")
 
-        # Patches themes' own binding only; `first_linked_ancestor` resolves the
+        # Patches themes' own binding only; the shared screen resolves the
         # predicate through platform_compat, so the walk itself still works.
         monkeypatch.setattr(th, "is_link_or_junction", _boom)
 
@@ -1637,6 +1696,39 @@ class TestResolveLocalSourceAncestorLinks:
 
         assert err is None
         assert src == nested.resolve()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("_winapi") is None, reason="directory junctions are Windows-only"
+)
+class TestRealLocalJunctionAncestor:
+    """No stubs: a junction made with ``_winapi.CreateJunction`` on this host."""
+
+    def test_a_pack_below_a_local_junction_is_accepted(self, tmp_path):
+        import _winapi
+
+        target = tmp_path / "workflow-takeover-themes"
+        (target / "theme").mkdir(parents=True)
+        junction = tmp_path / "Themes"
+        _winapi.CreateJunction(str(target), str(junction))
+
+        src, err = th._resolve_local_source(str(junction / "theme"))
+
+        assert err is None
+        assert src == (target / "theme").resolve()
+
+    def test_a_junction_as_the_pack_root_is_still_refused(self, tmp_path):
+        import _winapi
+
+        target = tmp_path / "theme-real"
+        target.mkdir()
+        junction = tmp_path / "theme"
+        _winapi.CreateJunction(str(target), str(junction))
+
+        src, err = th._resolve_local_source(str(junction))
+
+        assert src is None
+        assert err == "local path must not be a symlink"
 
 
 class TestFirstLinkedAncestor:

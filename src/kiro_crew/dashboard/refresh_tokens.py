@@ -31,7 +31,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import Iterable, Mapping
 
 from kiro_crew.atomic_write import atomic_write, fsync_dir, replace_with_retry
 from kiro_crew.config.loader import config_dir
@@ -41,9 +41,6 @@ from kiro_crew.dashboard.revocation_gen import (
     current_revocation_gen_or_none,
 )
 from kiro_crew.dashboard.token_secret import _get_secret, auth_store_staging_dir
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -922,7 +919,10 @@ def validate_refresh_token(token: str) -> tuple[bool, str, str, str, str, float]
     except (ValueError, TypeError):
         return False, "", "malformed token", "", "", 0.0
     expected = _sign(payload_bytes)
-    if not hmac.compare_digest(sig, expected):
+    # Compared as BYTES: the signature comes off a request cookie, and
+    # ``hmac.compare_digest`` raises TypeError on a str holding a non-ASCII
+    # character, which turned a forged cookie into a 500 instead of a denial.
+    if not hmac.compare_digest(expected.encode(), sig.encode("utf-8", "surrogatepass")):
         return False, "", "bad signature", "", "", 0.0
     try:
         payload = json.loads(payload_bytes)

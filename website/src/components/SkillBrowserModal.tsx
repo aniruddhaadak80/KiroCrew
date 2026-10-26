@@ -18,7 +18,7 @@ import { safeHttpUrl } from '../lib/safeUrl'
 import { DiscoverySearchBar, DiscoveryStates } from './DiscoverySearchBar'
 import { SkillMetaStrip } from './SkillDirectoryBrowser'
 import { parseFrontmatter } from './SkillForm'
-import type { DiscoveredSkill } from '../types'
+import type { DiscoveredSkill, SkillProviderOutcome } from '../types'
 
 import { i18nT } from '../i18n/t'
 import { fmtCompact } from '../i18n/format'
@@ -32,6 +32,19 @@ interface Props {
  *  in zh — the threshold and suffix are the locale's, via `fmtCompact`. */
 export function formatInstalls(n: number): string {
   return fmtCompact(n)
+}
+
+/** One line per provider that could not search, naming it and, when it said, why.
+ *  A provider that answered with zero rows is not here: that is an empty result. */
+export function providerFailureLines(outcomes: SkillProviderOutcome[]): string[] {
+  return outcomes
+    .filter(o => o.status !== 'ok')
+    .map(o => {
+      const provider = o.display_name || o.name
+      return o.message
+        ? i18nT('components.skillBrowserModal.provider_could_not_search', { provider, reason: o.message })
+        : i18nT('components.skillBrowserModal.provider_did_not_answer', { provider })
+    })
 }
 
 /** Per-skill install lifecycle for UI feedback. */
@@ -101,6 +114,11 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
 
   const results = useMemo(() => data?.results ?? [], [data])
   const providers = data?.providers ?? []
+  const failureLines = providerFailureLines(data?.provider_outcomes ?? [])
+  // Every provider failed and nothing came back: "no skills found" would claim we
+  // looked, so the reasons replace it.
+  const nothingAnswered = results.length === 0 && failureLines.length > 0 &&
+    failureLines.length === (data?.provider_outcomes ?? []).length
 
   const skillKey = (s: DiscoveredSkill) => `${s.provider}:${s.id}`
   const selectedSkill = results.find(s => skillKey(s) === selectedKey) ?? null
@@ -201,7 +219,24 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
           inputProps={ime.bindComposition()}
         />
 
-        <DiscoveryStates debouncedQuery={debouncedQuery} isLoading={isLoading} resultCount={results.length} noun="skills" />
+        {!isLoading && debouncedQuery.length >= 2 && failureLines.length > 0 && (
+          <div className="mb-3 space-y-2">
+            {failureLines.map(line => (
+              <ErrorNotice
+                key={line}
+                variant={nothingAnswered ? 'block' : 'inline'}
+                message={line}
+                askAgent
+                onHandoff={onClose}
+                testId="skill-browser-provider-error"
+              />
+            ))}
+          </div>
+        )}
+
+        {!nothingAnswered && (
+          <DiscoveryStates debouncedQuery={debouncedQuery} isLoading={isLoading} resultCount={results.length} noun="skills" />
+        )}
 
         {/* Two-pane on md+: results list (left) + detail preview (right).
             Single-pane below md: the list fills the modal; clicking a row
@@ -213,7 +248,7 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
               id="skill-results-list"
               role="listbox"
               aria-label={i18nT('components.skillBrowserModal.skill_search_results')}
-              className={`${selectedSkill && mobileDetail ? 'hidden md:block' : 'block'} w-full md:w-[40%] md:shrink-0 overflow-y-auto scrollbar-overlay space-y-1.5 pr-1`}
+              className={`${selectedSkill && mobileDetail ? 'hidden md:block' : 'block'} w-full md:w-[40%] md:shrink-0 overflow-y-auto space-y-1.5 pr-1`}
             >
               {results.map(skill => {
                 const key = skillKey(skill)
@@ -288,7 +323,7 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
                       <ArrowLeft size={14} aria-hidden="true" /> {i18nT('components.skillBrowserModal.back_to_results')}
                     </Btn>
                   </div>
-                  <div className="flex-1 min-h-0 overflow-y-auto scrollbar-overlay">
+                  <div className="flex-1 min-h-0 overflow-y-auto">
                     <SkillDetailPanel
                       skill={selectedSkill}
                       installed={isInstalled(selectedSkill)}
@@ -466,9 +501,14 @@ function SkillDetailPanel({
           </div>
         </>
       ) : (
-        <p className="text-sm text-muted">
-          {stripDescription || i18nT('components.skillBrowserModal.no_preview_available')}
-        </p>
+        <>
+          {preview?.error && (
+            <ErrorNotice variant="inline" message={preview.error} askAgent onHandoff={onHandoff} className="mb-2" testId="skill-preview-error" />
+          )}
+          <p className="text-sm text-muted">
+            {stripDescription || i18nT('components.skillBrowserModal.no_preview_available')}
+          </p>
+        </>
       )}
 
       {(preview?.files?.length ?? 0) > 1 && (
@@ -476,7 +516,7 @@ function SkillDetailPanel({
           <summary className="text-xs text-muted cursor-pointer hover:text-text">
             {i18nT('components.skillBrowserModal.bundle_contents_count', { count: preview!.file_count })}
           </summary>
-          <ul className="mt-1.5 text-xs text-muted font-mono space-y-0.5 max-h-40 overflow-y-auto scrollbar-overlay">
+          <ul className="mt-1.5 text-xs text-muted font-mono space-y-0.5 max-h-40 overflow-y-auto">
             {preview!.files!.map(f => <li key={f}>{f}</li>)}
           </ul>
         </details>

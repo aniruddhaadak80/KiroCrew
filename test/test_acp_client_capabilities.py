@@ -7,23 +7,48 @@ agent assumed the all-false default.
 
 from pathlib import Path
 
-from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES
+from kiro_crew.acp._dispatch import classify_notification
+from kiro_crew.acp.client_turn import _process_message
+from kiro_crew.acp.types import (
+    ACP_CLIENT_CAPABILITIES,
+    METHOD_ELICITATION_CREATE,
+    METHOD_KAS_MCP_ELICITATION,
+    JsonRpcMessage,
+)
 
 
-def test_elicitation_is_not_advertised_without_a_handler() -> None:
-    """Declaring `elicitation` with no handler is worse than declaring nothing.
+def test_elicitation_is_advertised_only_with_a_handler_on_both_drivers() -> None:
+    """`elicitation` is declared, and every driver classifies the method it invites.
 
-    It reads like a free forward-bet and is not one. A client that sees the
-    capability sends its human-in-the-loop prompts as `elicitation/create`
-    INSTEAD of falling back to `session/request_permission`; codex-acp gates on
-    `clientCapabilities.elicitation.form` exactly that way. We answer that method
-    with `-32601`, and the client turns the error into a cancellation of the tool
-    call the human was approving -- so the declaration does not wait quietly for
-    a handler, it breaks approval on every client that believes it.
-
-    Re-add the key in the same change that registers the handler.
+    The declaration is not a free forward-bet. The ACP schema gates
+    `elicitation/create` on it, so a standard harness that sees it forwards an MCP
+    server's elicitation to us (codex-acp: `shouldUseAcpElicitation` reads
+    `clientCapabilities.elicitation.form` / `.url` for a form with fields and a URL
+    ask; a tool approval is a message-only form and stays on
+    `session/request_permission`); if the method then reached
+    `_reject_unknown_server_request`, the `-32601` would cancel the tool call the
+    server was asking about. So the two halves are pinned together: the
+    capability names both modes, and BOTH classifiers (the shared runtime's and
+    the single-session client's) route the standard method and KAS's spelling to
+    the `elicitation` action rather than to `server_request_unknown`.
     """
-    assert "elicitation" not in ACP_CLIENT_CAPABILITIES
+    assert ACP_CLIENT_CAPABILITIES["elicitation"] == {"form": {}, "url": {}}
+    for method in (METHOD_ELICITATION_CREATE, METHOD_KAS_MCP_ELICITATION):
+        msg = JsonRpcMessage(id=7, method=method, params={"sessionId": "s"})
+        assert classify_notification(msg) == "elicitation", method
+        assert _process_message(_ClassifierHost(), msg, req_id=1) == "elicitation", method
+
+
+class _ClassifierHost:
+    """The slice of ``AcpClient`` ``_process_message`` reads before its method checks."""
+
+    _steer_turn = None
+
+    def _note_active_run(self, msg: JsonRpcMessage) -> None:
+        raise AssertionError("an elicitation request is not a session update")
+
+    def _settle_steer_answer(self, msg: JsonRpcMessage) -> bool:
+        return False
 
 
 def test_fs_and_terminal_stay_false() -> None:
@@ -62,6 +87,18 @@ def test_both_acp_transports_send_capabilities() -> None:
         assert "CLIENT_CAPABILITIES" in src.read_text(encoding="utf-8"), rel
 
 
+def _runtime_family_text() -> str:
+    """runtime.py and its owner modules (runtime_*.py), which hold code that was its own."""
+    import sys
+
+    from kiro_crew.acp import runtime
+
+    return "".join(
+        Path(sys.modules[name].__file__).read_text(encoding="utf-8")
+        for name in (runtime.__name__, *runtime._RUNTIME_OWNERS)
+    )
+
+
 def test_the_shared_process_transport_reads_capabilities_from_its_host() -> None:
     """The runtime must not carry a capability literal of its own.
 
@@ -69,8 +106,7 @@ def test_the_shared_process_transport_reads_capabilities_from_its_host() -> None
     actually sent, and the drift is invisible: both spellings compile and only a
     live session shows which set went out.
     """
-    src = Path(__file__).resolve().parents[1] / "src/kiro_crew/acp/runtime.py"
-    text = src.read_text(encoding="utf-8")
+    text = _runtime_family_text()
     # The declaration is read from the harness; the runtime only fills the
     # settings channel a host declares (``client_meta_settings``) before sending.
     assert "base = self._harness.client_capabilities" in text
@@ -91,7 +127,11 @@ def test_both_acp_transports_send_client_info_name() -> None:
     """
     for rel in ("src/kiro_crew/acp/client.py", "src/kiro_crew/acp/runtime.py"):
         src = Path(__file__).resolve().parents[1] / rel
-        text = src.read_text(encoding="utf-8")
+        # client.py's owner modules (client_*.py) hold code that was its own.
+        paths = [src, *sorted(src.parent.glob("client_*.py"))] if src.name == "client.py" else [src]
+        text = "".join(p.read_text(encoding="utf-8") for p in paths)
+        if src.name == "runtime.py":
+            text = _runtime_family_text()
         assert '"clientInfo": {"name": CLIENT_NAME' in text, rel
         # The flat key kiro-cli ignores must not come back.
         assert '"clientName": CLIENT_NAME' not in text, rel
@@ -134,8 +174,6 @@ def test_client_identity_is_declared_once_for_both_transports() -> None:
     assert runtime.CLIENT_NAME is client.CLIENT_NAME
     assert runtime.CLIENT_VERSION is client.CLIENT_VERSION
 
-    text = (Path(__file__).resolve().parents[1] / "src/kiro_crew/acp/runtime.py").read_text(
-        encoding="utf-8"
-    )
+    text = _runtime_family_text()
     assert "CLIENT_NAME = " not in text
     assert "CLIENT_VERSION = " not in text

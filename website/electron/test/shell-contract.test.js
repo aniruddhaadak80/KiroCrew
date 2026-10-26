@@ -20,8 +20,24 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..");
+
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
+
 const WINDOW_SOURCE = fs.readFileSync(path.join(ROOT, "window-lifecycle.js"), "utf-8");
-const GATEWAY_SOURCE = fs.readFileSync(path.join(ROOT, "gateway-supervisor.js"), "utf-8");
+const GATEWAY_SOURCE = SUPERVISOR_FILES
+  .map((file) => fs.readFileSync(path.join(ROOT, file), "utf-8"))
+  .join("\n");
 const PRELOAD_SOURCE = fs.readFileSync(path.join(ROOT, "preload.js"), "utf-8");
 const IPC_REGISTRAR_SOURCE = fs.readFileSync(path.join(ROOT, "ipc-registrar.js"), "utf-8");
 
@@ -136,6 +152,32 @@ test("the WSL preload invoke is registered by the IPC owner", () => {
   );
 });
 
+// The folder-pick bridge passes NOTHING from the page to the main process: the
+// dialog's options are fixed there, so the renderer cannot choose a default
+// path, properties or filters.
+test("the folder-pick preload invokes take no renderer arguments", () => {
+  assert.match(
+    PRELOAD_SOURCE,
+    /available:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("dashboard:can-pick-folder"\)/,
+    "window.folderPickAPI.available must invoke the probe with no arguments",
+  );
+  assert.match(
+    PRELOAD_SOURCE,
+    /pick:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("dashboard:pick-folder"\)/,
+    "window.folderPickAPI.pick must invoke the pick with no arguments",
+  );
+  assert.match(
+    IPC_REGISTRAR_SOURCE,
+    /ipcMain\.handle\("dashboard:pick-folder",\s*async\s*\(event\)\s*=>/,
+    "the pick handler must read nothing but the event",
+  );
+  assert.match(
+    IPC_REGISTRAR_SOURCE,
+    /ipcMain\.handle\("dashboard:can-pick-folder",\s*async\s*\(event\)\s*=>/,
+    "the probe handler must read nothing but the event",
+  );
+});
+
 // The three-gate local-dashboard check guards `wsl:detect`, both
 // `crash-reports:*` channels and `pane:clear-http-cache`. It was briefly written out twice, and two
 // hand-maintained spellings of a security check is one of them being tightened
@@ -149,7 +191,14 @@ test("the local-dashboard gate has exactly one spelling", () => {
     "gate 3 must be reached through the single assertLocalDashboard helper; "
       + `found ${probes.length} probe call sites, so the gate has been copied`,
   );
-  for (const channel of ["wsl:detect", "crash-reports:get", "crash-reports:reveal", "pane:clear-http-cache"]) {
+  for (const channel of [
+    "wsl:detect",
+    "crash-reports:get",
+    "crash-reports:reveal",
+    "pane:clear-http-cache",
+    "dashboard:pick-folder",
+    "dashboard:can-pick-folder",
+  ]) {
     assert.match(
       IPC_REGISTRAR_SOURCE,
       new RegExp(`assertLocalDashboard\\(event, "${channel}"\\)`),
@@ -290,9 +339,10 @@ test("the drag band keeps its height, its caption inset, and its focus-mode coll
   // the rule-body assertions above cannot see it.
   assert.match(
     dragBandCss(),
-    /right:\s*\$\{IS_WIN \? "138px" : LINUX_FRAMELESS \? "108px" : "0"\}/,
+    /right:\s*\$\{IS_WIN \? "var\(--mc-win-drag-reserve, 138px\)" : LINUX_FRAMELESS \? "108px" : "0"\}/,
     "the band must keep its per-platform right inset: full width on macOS, clear "
-      + "of the Windows caption overlay at 138px, and clear of the injected Linux "
+      + "of the Windows caption overlay (the zoom-aware --mc-win-drag-reserve var, "
+      + "138px fallback), and clear of the injected Linux "
       + "window controls at 108px",
   );
 });

@@ -90,6 +90,8 @@ export interface LegacyGoalLoop {
   id: string
   slotKey: string
   message: string
+  /** Epoch seconds when the loop was armed; 0 when an older record omitted it. */
+  createdAt?: number
   idleSecs: number
   maxCycles: number
   cycleCount: number
@@ -98,6 +100,19 @@ export interface LegacyGoalLoop {
   nextDueAt?: number
   maxRuntimeSecs?: number
   stoppedReason: string
+  /** The settled outcome of the loop's own watch (`success` / `blocked`, '' while
+   *  none), from the frame's `monitor_outcome`. The popover words a finished
+   *  watch by it: merged, or closed without merging. */
+  monitorOutcome: string
+  /** The kind of subject that watch observed (`gh-pr`, `work-ledger`), from the
+   *  frame's `monitor_kind`; '' with no watch. */
+  monitorKind: string
+  /** An active loop holding for an unanswered approval (the REST row's and
+   *  frame's `approval_stalled`). Present only when true. */
+  approvalStalled?: boolean
+  /** An active work-ledger watch holding while every open item waits on a person
+   *  (the REST row's and frame's `waiting_on_person`). Present only when true. */
+  waitingOnPerson?: boolean
   /** The kill-switch file the server substitutes for `{{STOP_FILE}}` at fire
    *  time; '' when the loop was armed with none. Carried by the REST reads
    *  (`asdict(loop)`), not by the websocket frame, which withholds paths -- so
@@ -125,6 +140,8 @@ export interface StructuredMonitor {
   monitorKind: PullRequestMonitorKind | string
   objective: 'review_ready' | string
   target: string
+  /** Epoch seconds when the monitor was armed; 0 when an older record omitted it. */
+  createdAt?: number
   cadenceSecs: number
   nextProbeAt: number
   wakeInstructions: string
@@ -198,15 +215,25 @@ function positive(value: unknown, fallback: number): number {
   return Number.isInteger(n) && n > 0 ? n : fallback
 }
 
+// The reader for a budget whose 0 is a meaning rather than a missing value.
+// `positive` would swap that 0 for the fallback, turning an explicit "no wake
+// ceiling" into whatever the default happens to be.
+function unlimitedOrPositive(value: unknown, fallback: number): number {
+  const n = finite(value, fallback)
+  return Number.isInteger(n) && n >= 0 ? n : fallback
+}
+
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }
 
+// The floor comes from the contract's own `minimum`, not from positivity: one
+// budget (`maxAgentTurns`) publishes a minimum of 0, where 0 means unlimited.
 function isBoundedInteger(
   value: unknown,
   limits: { minimum: number; maximum: number },
 ): value is number {
-  return isPositiveInteger(value) && value >= limits.minimum && value <= limits.maximum
+  return isCount(value) && value >= limits.minimum && value <= limits.maximum
 }
 
 function isCount(value: unknown): value is number {
@@ -290,12 +317,13 @@ function structuredFallback(
     monitorKind: text(monitor?.kind, 'unknown'),
     objective: text(monitor?.objective, 'unknown'),
     target: text(monitor?.target),
+    createdAt: finite(monitor?.created_ts),
     cadenceSecs: positive(monitor?.cadence_secs, STRUCTURED_MONITOR_DEFAULTS.cadenceSecs),
     nextProbeAt: finite(monitor?.next_probe_at),
     wakeInstructions: text(monitor?.wake_instructions),
     budgets: {
       maxRuntimeSecs: positive(budgets?.max_runtime_secs, STRUCTURED_MONITOR_DEFAULTS.maxRuntimeSecs),
-      maxAgentTurns: positive(budgets?.max_agent_turns, STRUCTURED_MONITOR_DEFAULTS.maxAgentTurns),
+      maxAgentTurns: unlimitedOrPositive(budgets?.max_agent_turns, STRUCTURED_MONITOR_DEFAULTS.maxAgentTurns),
       maxTokens: positive(budgets?.max_tokens, STRUCTURED_MONITOR_DEFAULTS.maxTokens),
       maxProviderErrors: positive(budgets?.max_provider_errors, STRUCTURED_MONITOR_DEFAULTS.maxProviderErrors),
     },
@@ -341,12 +369,20 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
   const slotKey = dashboardAutomationSlotKey(text(loop.slot_key, text(envelope.slot)))
   if (!id || !slotKey) return null
 
-  if (!owns(loop, 'monitor')) {
+  /* A GATED prompt loop is a goal loop with a watch, never a bounded monitor:
+     the `autonudge_state` frame withholds its `monitor` record and carries the
+     two scalars the Done wording needs, but the REST row (`GET /api/autonudge`,
+     the cold seed and the popover's cold read) ships the nested record and no
+     scalars. Read by `monitor` alone, that row was a structured monitor the
+     seed then dropped, so a finished goal reloaded as no goal at all. */
+  const gatedRecord = loop.gate === true ? object(loop.monitor) : null
+  if (!owns(loop, 'monitor') || loop.gate === true) {
     return {
       kind: 'legacy_goal_loop',
       id,
       slotKey,
       message: text(loop.message),
+      createdAt: finite(loop.created_ts),
       idleSecs: count(loop.idle_secs),
       maxCycles: count(loop.max_cycles),
       cycleCount: count(loop.cycle_count),
@@ -355,6 +391,10 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
       nextDueAt: finite(loop.next_due_ts),
       maxRuntimeSecs: count(loop.max_runtime_secs),
       stoppedReason: text(loop.stopped_reason),
+      monitorOutcome: text(loop.monitor_outcome, text(gatedRecord?.outcome)),
+      monitorKind: text(loop.monitor_kind, text(gatedRecord?.kind)),
+      ...(loop.approval_stalled === true ? { approvalStalled: true } : {}),
+      ...(loop.waiting_on_person === true ? { waitingOnPerson: true } : {}),
       ...(typeof loop.stop_sentinel_path === 'string'
         ? { stopSentinelPath: loop.stop_sentinel_path }
         : {}),
@@ -451,12 +491,13 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     monitorKind: text(monitor.kind),
     objective: text(monitor.objective),
     target: text(monitor.target),
+    createdAt: finite(monitor.created_ts),
     cadenceSecs: positive(monitor.cadence_secs, STRUCTURED_MONITOR_DEFAULTS.cadenceSecs),
     nextProbeAt: finite(monitor.next_probe_at) || finite(loop.next_due_ts),
     wakeInstructions: text(monitor.wake_instructions),
     budgets: {
       maxRuntimeSecs: positive(budgets.max_runtime_secs, STRUCTURED_MONITOR_DEFAULTS.maxRuntimeSecs),
-      maxAgentTurns: positive(budgets.max_agent_turns, STRUCTURED_MONITOR_DEFAULTS.maxAgentTurns),
+      maxAgentTurns: unlimitedOrPositive(budgets.max_agent_turns, STRUCTURED_MONITOR_DEFAULTS.maxAgentTurns),
       maxTokens: positive(budgets.max_tokens, STRUCTURED_MONITOR_DEFAULTS.maxTokens),
       maxProviderErrors: positive(budgets.max_provider_errors, STRUCTURED_MONITOR_DEFAULTS.maxProviderErrors),
     },
@@ -485,6 +526,21 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
       stoppedAt: finite(monitor.stopped_at),
     } : null,
   }
+}
+
+export function isAutomationRunning(record: AutomationRecord | null | undefined): boolean {
+  if (!record) return false
+  return record.kind === 'legacy_goal_loop'
+    ? record.active
+    : record.active && record.terminal === null
+}
+
+/** A proven active watch suitable for the avatar and Profile readout.
+ * Close safety is broader: an active future-schema record must still block
+ * close even though this build cannot truthfully animate or describe it. */
+export function isAutomationActive(record: AutomationRecord | null | undefined): boolean {
+  return isAutomationRunning(record)
+    && (record?.kind === 'legacy_goal_loop' || record?.actionable === true)
 }
 
 export function deriveAutomationStatus(record: AutomationRecord): MonitorStatus {

@@ -8,8 +8,9 @@ already owns them for the ``crew`` and ``session`` kinds::
 
 A member's log is a third KIND there rather than a second mechanism beside it.
 That is the whole point of this file being thin: the ``crew-log`` root is masked
-from the sandbox and fenced against the agent file tools (``security/paths.py``,
-``sandbox.py``), named at the root so every kind inherits it. A per-member log
+from the sandbox and fenced against the agent file tools (``security/paths_lists.py``,
+``sandbox_leaves.py``, ``sandbox_precreate.py``), named at the root so every kind
+inherits it. A per-member log
 stored anywhere else would need its own fence entry, and the next log added would
 miss it the same way -- an append-only record the agent can rewrite is not an
 append-only record, and that property has to hold by WHERE THE FILE LIVES rather
@@ -186,6 +187,26 @@ class MemberLog:
     def load(self) -> None:
         self._loaded = False
         self._ensure_loaded()
+
+    def close(self) -> None:
+        """Release the write ownership this instance's handle holds, NOW.
+
+        A ``MemberLog`` caches its :class:`CrewLog` in :attr:`_crew_log`, and that
+        handle owns the member's write lease from its first append until it is
+        dropped -- which, for an instance reachable only through a reference cycle,
+        waits for the cyclic collector rather than happening at refcount zero. This
+        makes the release deterministic for a caller retiring the instance (the
+        event-log service dropping a cached log, a test boundary), so the descriptor
+        does not linger under a directory being torn down. Harmless on a handle that
+        never wrote (no lease was taken) and idempotent. The instance is left
+        unloaded so a later read re-opens rather than serving a released handle.
+        """
+        handle = self._crew_log
+        if handle is not None:
+            handle.release_ownership()
+        self._crew_log = None
+        self._loaded = False
+        self._loaded_stat = None
 
     def _stat(self) -> tuple[int, int] | None:
         """``(size, mtime_ns)`` of the log file, or None when it is absent."""
