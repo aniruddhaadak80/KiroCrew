@@ -1855,6 +1855,9 @@ class TestABusyReplyCarriesItsContext:
             pass
 
         d.handle_message = AsyncMock(side_effect=_capture)  # type: ignore[method-assign]
+        # The queued turn completes before the drain: #23814's guard refuses
+        # to drain a still-busy session, so release it here.
+        sess._busy = False
         asyncio.run(d._drain_queue(self._KEY))
         # Exactly one audit, from the drain's single framing.
         assert audits == ["telegram_reply_parent"]
@@ -1890,6 +1893,9 @@ class TestABusyReplyCarriesItsContext:
             pass
 
         d.handle_message = AsyncMock(side_effect=_capture)  # type: ignore[method-assign]
+        # The queued turn completes before the drain: #23814's guard refuses
+        # to drain a still-busy session, so release it here.
+        sess._busy = False
         asyncio.run(d._drain_queue(self._KEY))
         assert audits == ["telegram_reply_parent"]
 
