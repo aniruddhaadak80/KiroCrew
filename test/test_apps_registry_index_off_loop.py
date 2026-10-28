@@ -49,23 +49,27 @@ def probe_threads(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def stub_sandbox_and_sel(monkeypatch):
-    """Stub the sandbox wrap and SEL so a probe test never spawns real git."""
+def stub_sandbox_and_sel(_floor_monkeypatch):
+    """Stub the sandbox wrap and SEL so a probe test never spawns real git.
+
+    Patches through ``_floor_monkeypatch``, not the test's shared
+    monkeypatch: an ``undo()`` in a test must not lift the sandbox stub.
+    """
 
     async def _passthrough_wrap(argv, **kwargs):
         return list(argv), None
 
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr(
         "kiro_crew.apps.registry_pipeline.indexes.wrap_argv_async", _passthrough_wrap
     )
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr(
         "kiro_crew.apps.registry_pipeline.indexes.cgroup_scope_argv", lambda argv: argv
     )
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr(
         "kiro_crew.apps.registry_pipeline.indexes.wrap_argv",
         lambda argv, **k: (list(argv), None),
     )
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr(
         "kiro_crew.apps.registry_pipeline.indexes._sel_fn",
         MagicMock(),
         raising=False,
